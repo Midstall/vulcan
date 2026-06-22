@@ -1,0 +1,33 @@
+//! Target-independent optimization framework: pass manager with cached analyses,
+//! plus the analyses and transforms over Vulcan IR. Freestanding (no libc/OS,
+//! allocator per call).
+
+const std = @import("std");
+const ir = @import("vulcan-ir");
+
+pub const cfg = @import("vulcan-opt/cfg.zig");
+pub const dominators = @import("vulcan-opt/dominators.zig");
+pub const loops = @import("vulcan-opt/loops.zig");
+pub const pass = @import("vulcan-opt/pass.zig");
+pub const constfold = @import("vulcan-opt/constfold.zig");
+pub const gvn = @import("vulcan-opt/gvn.zig");
+pub const licm = @import("vulcan-opt/licm.zig");
+pub const inlining = @import("vulcan-opt/inline.zig");
+pub const dce = @import("vulcan-opt/dce.zig");
+pub const lto = @import("vulcan-opt/lto.zig");
+pub const pgo = @import("vulcan-opt/pgo.zig");
+pub const lowerdiv = @import("vulcan-opt/lowerdiv.zig");
+pub const vectorize = @import("vulcan-opt/vectorize.zig");
+
+/// Default pipeline: constant folding, GVN/CSE, LICM, then DCE, to a fixpoint.
+pub const default_pipeline = [_]pass.Pass{ constfold.pass_def, gvn.pass_def, licm.pass_def, dce.pass_def };
+
+/// Optimize `func` in place with the default pipeline. Returns whether anything
+/// changed.
+pub fn optimize(allocator: std.mem.Allocator, func: *ir.function.Function) pass.Error!bool {
+    return pass.runToFixpoint(allocator, func, &default_pipeline, 16);
+}
+
+test {
+    std.testing.refAllDecls(@This());
+}

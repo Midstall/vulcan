@@ -1,0 +1,21 @@
+.{
+    .name = .vulcan,
+    .version = "0.0.0",
+    .fingerprint = 0xb0060bbb641fa177,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .uefi = .{
+            .url = "git+https://github.com/Midstall/uefi.zig#e5c9c30f847845c406da08dea2faf79964b0e793",
+            .hash = "uefi-0.1.0-1okz4b5QAAD-ImP4Q86o97td2DpQNfFhltlBjgnLdL8X",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "libs",
+        "frontends",
+        "test",
+        "LICENSE",
+        "README.md",
+    },
+}
