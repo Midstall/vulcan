@@ -1,12 +1,17 @@
 //! Inter-procedural function inlining. Replaces a `call` to a small callee with a
-//! clone of its body: callee parameters become the call's arguments, its
+//! clone of its body. Callee parameters become the call's arguments, its
 //! instructions are spliced into the caller at the call site, and its returned
 //! value replaces the call's result.
 //!
-//! Inlines only single-block, leaf, scalar callees: one block ending in `ret`, no
-//! calls of its own (no recursion), every instruction produces a result (no
-//! stores/`if`), and scalar types only (trivial type remapping). Multi-block
-//! callees need block splitting and are not handled.
+//! Both paths handle leaf callees (no calls of their own) with scalar-typed values.
+//! `inlineCall` takes a one-block `ret` callee and splices it in with no new blocks,
+//! which is the cleanest result. `inlineCallMulti` takes a callee that has its own
+//! control flow (`if`, loops, `store`, multiple `ret`s) and clones it block by block.
+//! It splits the caller block at the call into a continuation holding the post-call
+//! code, clones the callee's reachable blocks with values, blocks, and types remapped
+//! in reverse-postorder, and rewrites each `ret` into a jump to the continuation whose
+//! parameter carries the inlined return value. Aggregate types (struct_new, extract,
+//! vectors) are still excluded.
 
 const std = @import("std");
 const ir = @import("vulcan-ir");
@@ -90,9 +95,15 @@ fn inlineOne(allocator: std.mem.Allocator, caller: *Function, lookup: Lookup, fi
             if (filter) |f| if (!f.allow(bi)) continue;
             const name = caller.symbolName(caller.opcode(inst).call.symbol);
             const callee = lookup.get(name) orelse continue;
-            if (!inlinable(callee)) continue;
-            try inlineCall(allocator, caller, @intCast(bi), idx, inst, callee);
-            return true;
+            if (inlinable(callee)) {
+                try inlineCall(allocator, caller, @intCast(bi), idx, inst, callee); // single-block fast path
+                return true;
+            }
+            if (inlinableMulti(callee)) {
+                try inlineCallMulti(allocator, caller, @intCast(bi), idx, inst, callee);
+                return true;
+            }
+            continue;
         }
     }
     return false;
@@ -247,6 +258,182 @@ fn substituteValue(func: *Function, from: Value, to: Value) void {
     }
 }
 
+/// Whether `callee` (any number of blocks) can be inlined by the multi-block path. It must be a leaf
+/// with scalar parameter and result types and no aggregate ops. Control flow, stores, loops, and
+/// multiple returns are fine, since each `ret` turns into a jump to a continuation block.
+fn inlinableMulti(callee: *const Function) bool {
+    for (0..callee.blockCount()) |bi| {
+        const block: Block = @enumFromInt(bi);
+        for (callee.blockParams(block)) |p| if (!scalar(callee, callee.valueType(p))) return false;
+        for (callee.blockInsts(block)) |inst| switch (callee.opcode(inst)) {
+            .call, .call_indirect => return false, // keep it leaf, no nested inlining here
+            .struct_new, .extract => return false, // aggregate type remap is not handled
+            .@"if" => {}, // control flow, cloned in a later pass
+            .store => |st| _ = st, // yields no value, cloned in a later pass
+            .alloca => |al| if (!scalar(callee, al.elem)) return false,
+            else => {
+                const r = callee.instResult(inst) orelse return false;
+                if (!scalar(callee, callee.valueType(r))) return false;
+            },
+        };
+    }
+    return true;
+}
+
+/// The successor block indices of `b` (from its `if` exit instruction or its jump terminator).
+fn successorsOf(callee: *const Function, b: u32, buf: *[2]u32) []const u32 {
+    const block: Block = @enumFromInt(b);
+    for (callee.blockInsts(block)) |inst| {
+        if (callee.opcode(inst) == .@"if") {
+            const cf = callee.opcode(inst).@"if";
+            buf[0] = @intFromEnum(cf.then.target);
+            buf[1] = @intFromEnum(cf.@"else".target);
+            return buf[0..2];
+        }
+    }
+    if (callee.terminator(block)) |t| switch (t) {
+        .jump => |j| {
+            buf[0] = @intFromEnum(j.target);
+            return buf[0..1];
+        },
+        .ret => {},
+    };
+    return buf[0..0];
+}
+
+/// The reachable blocks of `callee` in reverse-postorder (so a value's defining block precedes every
+/// use, letting a single forward clone pass resolve all instruction operands). Caller owns the slice.
+fn reachableRpo(allocator: std.mem.Allocator, callee: *const Function) Error![]u32 {
+    const n = callee.blockCount();
+    const visited = try allocator.alloc(bool, n);
+    defer allocator.free(visited);
+    @memset(visited, false);
+    var order: std.ArrayList(u32) = .empty;
+    errdefer order.deinit(allocator);
+    var stack: std.ArrayList(struct { b: u32, ci: usize }) = .empty;
+    defer stack.deinit(allocator);
+    if (n > 0) {
+        visited[0] = true;
+        try stack.append(allocator, .{ .b = 0, .ci = 0 });
+    }
+    while (stack.items.len > 0) {
+        const top = &stack.items[stack.items.len - 1];
+        var buf: [2]u32 = undefined;
+        const succs = successorsOf(callee, top.b, &buf);
+        if (top.ci < succs.len) {
+            const s = succs[top.ci];
+            top.ci += 1;
+            if (!visited[s]) {
+                visited[s] = true;
+                try stack.append(allocator, .{ .b = s, .ci = 0 });
+            }
+        } else {
+            try order.append(allocator, top.b); // postorder: emit after all successors
+            _ = stack.pop();
+        }
+    }
+    std.mem.reverse(u32, order.items); // postorder reversed = RPO
+    return order.toOwnedSlice(allocator);
+}
+
+fn mapV(vmap: std.AutoHashMapUnmanaged(Value, Value), v: Value) Value {
+    return vmap.get(v).?;
+}
+
+/// Remap a callee value list (an edge's arguments) into fresh caller values. Caller owns the slice.
+fn remapArgs(allocator: std.mem.Allocator, callee: *const Function, vmap: std.AutoHashMapUnmanaged(Value, Value), list: ir.function.ValueList) Error![]Value {
+    const src = callee.valueList(list);
+    const out = try allocator.alloc(Value, src.len);
+    for (src, 0..) |v, i| out[i] = mapV(vmap, v);
+    return out;
+}
+
+fn inlineCallMulti(allocator: std.mem.Allocator, caller: *Function, bi: u32, call_idx: usize, call_inst: Inst, callee: *const Function) Error!void {
+    const b_block: Block = @enumFromInt(bi);
+    const call = caller.opcode(call_inst).call;
+    const args = try allocator.dupe(Value, caller.valueList(call.args));
+    defer allocator.free(args);
+    const call_result = caller.instResult(call_inst);
+
+    // Split the caller block at the call: a continuation block takes the code after the call, and the
+    // call's result becomes the continuation's parameter (fed by each inlined `ret`).
+    const cont = try caller.appendBlock();
+    var cont_param: ?Value = null;
+    if (call_result) |r| cont_param = try caller.appendBlockParam(cont, caller.valueType(r));
+    {
+        const b_insts = caller.blockInstsMut(b_block);
+        for (b_insts.items[call_idx + 1 ..]) |inst| try caller.blockInstsMut(cont).append(allocator, inst);
+        b_insts.shrinkRetainingCapacity(call_idx); // drop the call and the moved tail
+    }
+    caller.terminatorPtr(cont).* = caller.terminatorPtr(b_block).*; // CONT inherits B's original exit
+    caller.terminatorPtr(b_block).* = null;
+    if (call_result) |r| substituteValue(caller, r, cont_param.?);
+
+    // Clone the callee's reachable blocks.
+    var vmap: std.AutoHashMapUnmanaged(Value, Value) = .empty;
+    defer vmap.deinit(allocator);
+    var tmap: std.AutoHashMapUnmanaged(Type, Type) = .empty;
+    defer tmap.deinit(allocator);
+    var bmap: std.AutoHashMapUnmanaged(u32, Block) = .empty;
+    defer bmap.deinit(allocator);
+    const rpo = try reachableRpo(allocator, callee);
+    defer allocator.free(rpo);
+
+    for (rpo) |cb| try bmap.put(allocator, cb, try caller.appendBlock());
+    for (rpo) |cb| { // params of every cloned block (entry params get the call args below)
+        const nb = bmap.get(cb).?;
+        for (callee.blockParams(@enumFromInt(cb))) |p| {
+            const np = try caller.appendBlockParam(nb, try mapType(caller, callee, &tmap, callee.valueType(p)));
+            try vmap.put(allocator, p, np);
+        }
+    }
+    for (rpo) |cb| { // instructions, in RPO so operands are already mapped. `if` is handled below
+        const nb = bmap.get(cb).?;
+        for (callee.blockInsts(@enumFromInt(cb))) |cinst| switch (callee.opcode(cinst)) {
+            .@"if" => {},
+            .store => |st| try caller.appendStore(nb, mapV(vmap, st.value), mapV(vmap, st.ptr)),
+            else => |op| {
+                const cres = callee.instResult(cinst).?;
+                const rty = try mapType(caller, callee, &tmap, callee.valueType(cres));
+                const nres = try caller.appendInst(nb, rty, try mapOpcode(caller, callee, vmap, &tmap, op));
+                try vmap.put(allocator, cres, nres);
+            },
+        };
+    }
+    for (rpo) |cb| { // control flow: `if` exits and jump/ret terminators
+        const nb = bmap.get(cb).?;
+        const cblock: Block = @enumFromInt(cb);
+        var if_cf: ?ir.function.If = null;
+        for (callee.blockInsts(cblock)) |cinst| {
+            if (callee.opcode(cinst) == .@"if") {
+                if_cf = callee.opcode(cinst).@"if";
+                break;
+            }
+        }
+        if (if_cf) |cf| {
+            const ta = try remapArgs(allocator, callee, vmap, cf.then.args);
+            defer allocator.free(ta);
+            const ea = try remapArgs(allocator, callee, vmap, cf.@"else".args);
+            defer allocator.free(ea);
+            try caller.appendIf(nb, mapV(vmap, cf.cond), .{ .target = bmap.get(@intFromEnum(cf.then.target)).?, .args = ta }, .{ .target = bmap.get(@intFromEnum(cf.@"else".target)).?, .args = ea });
+            continue;
+        }
+        if (callee.terminator(cblock)) |t| switch (t) {
+            .ret => |v| {
+                if (v) |rv| try caller.setJump(nb, cont, &.{mapV(vmap, rv)}) else try caller.setJump(nb, cont, &.{});
+            },
+            .jump => |j| {
+                const ja = try remapArgs(allocator, callee, vmap, j.args);
+                defer allocator.free(ja);
+                try caller.setJump(nb, bmap.get(@intFromEnum(j.target)).?, ja);
+            },
+        };
+    }
+
+    // Enter the inlined body from the (now truncated) caller block, passing the call arguments.
+    try caller.setJump(b_block, bmap.get(0).?, args);
+}
+
 const TestLookup = struct {
     callee: *const Function,
     name: []const u8,
@@ -290,4 +477,49 @@ test "inlines a leaf helper and replaces the call result" {
     // The call is gone, replaced by the cloned mul/add, and `r` adds 1 to the
     // inlined sum.
     for (caller.blockInsts(b)) |inst| try std.testing.expect(caller.opcode(inst) != .call);
+}
+
+test "inlines a multi-block, two-return callee (the call is replaced by cloned control flow)" {
+    const allocator = std.testing.allocator;
+    const i32k = ir.types.TypeKind{ .int = .{ .signedness = .signed, .bits = 32 } };
+
+    // callee max(a, b): if a > b return a else return b  (3 blocks, two `ret`s)
+    var callee = Function.init(allocator);
+    defer callee.deinit();
+    {
+        const t = try callee.types.intern(i32k);
+        const bool_t = try callee.types.intern(.bool);
+        const entry = try callee.appendBlock();
+        const tb = try callee.appendBlock();
+        const eb = try callee.appendBlock();
+        const a = try callee.appendBlockParam(entry, t);
+        const b = try callee.appendBlockParam(entry, t);
+        const tv = try callee.appendBlockParam(tb, t);
+        const ev = try callee.appendBlockParam(eb, t);
+        const cmp = try callee.appendInst(entry, bool_t, .{ .icmp = .{ .op = .gt, .lhs = a, .rhs = b } });
+        try callee.appendIf(entry, cmp, .{ .target = tb, .args = &.{a} }, .{ .target = eb, .args = &.{b} });
+        callee.setTerminator(tb, .{ .ret = tv });
+        callee.setTerminator(eb, .{ .ret = ev });
+    }
+
+    // caller f(x): return max(x, 5) + 1
+    var caller = Function.init(allocator);
+    defer caller.deinit();
+    const ct = try caller.types.intern(i32k);
+    const cb = try caller.appendBlock();
+    const x = try caller.appendBlockParam(cb, ct);
+    const c5 = try caller.appendInst(cb, ct, .{ .iconst = 5 });
+    const m = try caller.appendCall(cb, ct, "max", &.{ x, c5 });
+    _ = try caller.appendArithImm(cb, ct, .add, m, 1);
+    caller.setTerminator(cb, .{ .ret = m }); // the add stays separate, which is fine for a structural check
+
+    var lk = TestLookup{ .callee = &callee, .name = "max" };
+    try std.testing.expect(try run(allocator, &caller, .{ .context = &lk, .func = TestLookup.get }));
+    // The call instruction is gone: it was replaced by the cloned callee body.
+    for (0..caller.blockCount()) |bi| {
+        for (caller.blockInsts(@enumFromInt(bi))) |inst| {
+            try std.testing.expect(caller.opcode(inst) != .call);
+        }
+    }
+    try std.testing.expect(caller.blockCount() > 1); // control flow was cloned in
 }

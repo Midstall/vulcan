@@ -8,6 +8,7 @@ const std = @import("std");
 const ir = @import("vulcan-ir");
 const isel = @import("isel.zig");
 const link = @import("link.zig");
+const dwarf = @import("../dwarf.zig");
 
 const Function = ir.function.Function;
 
@@ -44,11 +45,16 @@ pub const Reloc = struct {
     addend: i64 = 0,
 };
 
-/// A relocatable object: code plus the symbol table and the relocations on it.
+/// A non-alloc PROGBITS section carried verbatim (e.g. a DWARF `.debug_*` blob).
+pub const DebugSection = struct { name: []const u8, bytes: []const u8 };
+
+/// A relocatable object: code plus the symbol table and the relocations on it. `debug`
+/// sections (DWARF) are appended as plain PROGBITS, so a compiled object can ship debug info.
 pub const Object = struct {
     text: []const u8,
     symbols: []const Symbol,
     relocs: []const Reloc,
+    debug: []const DebugSection = &.{},
 };
 
 const ET_REL: u16 = 1;
@@ -137,9 +143,8 @@ pub fn write(allocator: std.mem.Allocator, obj: Object) Error![]u8 {
     next += 1;
     const strtab_ndx = next;
     next += 1;
-    const shstrtab_ndx = next;
-    next += 1;
-    const section_count = next;
+    // The .shstrtab index and total section count are finalized after the header list is
+    // built, since `debug` sections are inserted before it.
 
     // Symbol-name string table.
     var strtab = try StrTab.init(allocator);
@@ -193,7 +198,13 @@ pub fn write(allocator: std.mem.Allocator, obj: Object) Error![]u8 {
     if (has_rela) try headers.append(allocator, .{ .name = ".rela.text", .typ = SHT_RELA, .flags = SHF_INFO_LINK, .addralign = 8, .entsize = relaentsize, .link = symtab_ndx, .info = text_ndx, .bytes = rela, .size = rela_bytes });
     try headers.append(allocator, .{ .name = ".symtab", .typ = SHT_SYMTAB, .flags = 0, .addralign = 8, .entsize = symentsize, .link = strtab_ndx, .info = first_global, .bytes = symtab, .size = sym_bytes });
     try headers.append(allocator, .{ .name = ".strtab", .typ = SHT_STRTAB, .flags = 0, .addralign = 1, .bytes = strtab.bytes.items, .size = strtab.bytes.items.len });
+    // DWARF (or other) debug sections: plain PROGBITS, unreferenced by other sections.
+    for (obj.debug) |d| try headers.append(allocator, .{ .name = d.name, .typ = SHT_PROGBITS, .flags = 0, .addralign = 1, .bytes = d.bytes, .size = d.bytes.len });
     try headers.append(allocator, .{ .name = ".shstrtab", .typ = SHT_STRTAB, .flags = 0, .addralign = 1, .bytes = null, .size = 0 });
+
+    // `.shstrtab` is the last header; the section count includes the leading null section.
+    const shstrtab_ndx: u16 = @intCast(headers.items.len);
+    const section_count: u16 = @intCast(headers.items.len + 1);
 
     var offsets = try allocator.alloc(u64, headers.items.len);
     defer allocator.free(offsets);
@@ -308,6 +319,142 @@ pub fn writeModule(allocator: std.mem.Allocator, module: *const link.Module) Err
 fn symbolIndex(symbols: []const Symbol, name: []const u8) ?u32 {
     for (symbols, 0..) |s, i| if (std.mem.eql(u8, s.name, name)) return @intCast(i);
     return null;
+}
+
+/// Like `writeModule`, but also emits inline DWARF (`.debug_abbrev` / `.debug_info` /
+/// `.debug_line`) describing each function (name + PC range) and mapping code offsets to
+/// `source_file` line numbers (from the `debug.line` IR attributes). The result is a real
+/// relocatable object that ships debug info for objdump/gdb. Caller owns the bytes.
+pub fn writeModuleWithDebug(allocator: std.mem.Allocator, module: *const link.Module, source_file: []const u8) Error![]u8 {
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(allocator);
+    var globals: std.ArrayList(Symbol) = .empty;
+    defer globals.deinit(allocator);
+    var pending: std.ArrayList(Pending) = .empty;
+    defer pending.deinit(allocator);
+    var rows: std.ArrayList(dwarf.LineRow) = .empty;
+    defer rows.deinit(allocator);
+
+    for (module.functions.items) |entry| {
+        const start: u64 = text.items.len;
+        var compiled = try isel.compileFunction(allocator, entry.func);
+        defer compiled.deinit(allocator);
+        for (compiled.code) |word| {
+            var w: [4]u8 = undefined;
+            putInt(&w, u32, word);
+            try text.appendSlice(allocator, &w);
+        }
+        try globals.append(allocator, .{ .name = entry.name, .value = start, .size = @as(u64, compiled.code.len) * 4, .kind = .func, .defined = true });
+        for (compiled.relocs) |r| {
+            try pending.append(allocator, .{ .offset = start + @as(u64, r.offset) * 4, .name = r.symbol });
+        }
+        // Line rows are function-relative; shift to the module-relative .text offset.
+        for (compiled.lines) |e| try rows.append(allocator, .{ .address = start + e.offset, .line = e.line });
+    }
+
+    var symbols: std.ArrayList(Symbol) = .empty;
+    defer symbols.deinit(allocator);
+    try symbols.appendSlice(allocator, globals.items);
+    for (pending.items) |p| {
+        if (symbolIndex(symbols.items, p.name) == null) {
+            try symbols.append(allocator, .{ .name = p.name, .size = 0, .kind = .notype, .defined = false });
+        }
+    }
+    var relocs = try allocator.alloc(Reloc, pending.items.len);
+    defer allocator.free(relocs);
+    for (pending.items, 0..) |p, i| {
+        relocs[i] = .{ .offset = p.offset, .symbol = symbolIndex(symbols.items, p.name).?, .type = .call26 };
+    }
+
+    // DWARF: one subprogram DIE per function (PC range = its .text placement), carrying its
+    // IR return type as a base-type reference so a debugger shows a typed signature.
+    const subs = try allocator.alloc(dwarf.Subprogram, globals.items.len);
+    defer allocator.free(subs);
+    for (globals.items, 0..) |g, i| subs[i] = .{
+        .name = g.name,
+        .low_pc = g.value,
+        .high_pc = g.value + g.size,
+        .ret_type = returnBaseType(module.functions.items[i].func),
+    };
+
+    const abbrev = try dwarf.emitAbbrev(allocator);
+    defer allocator.free(abbrev);
+    // The object carries one line program at offset 0 of .debug_line, so link the CU to it via
+    // DW_AT_stmt_list. Now a debugger can go from a subprogram DIE straight to its source lines.
+    const info = try dwarf.emitInfo(allocator, .{ .name = source_file, .low_pc = 0, .high_pc = text.items.len, .subprograms = subs, .stmt_list = 0 });
+    defer allocator.free(info);
+    const line = try dwarf.emitLine(allocator, source_file, rows.items, text.items.len);
+    defer allocator.free(line);
+
+    return write(allocator, .{
+        .text = text.items,
+        .symbols = symbols.items,
+        .relocs = relocs,
+        .debug = &.{
+            .{ .name = ".debug_abbrev", .bytes = abbrev },
+            .{ .name = ".debug_info", .bytes = info },
+            .{ .name = ".debug_line", .bytes = line },
+        },
+    });
+}
+
+/// Map a function's IR return type (the type of its `ret` value) to a DWARF base type, or
+/// null for a void return or a non-primitive (aggregate) return. Names are C-like so a
+/// debugger prints a natural signature; distinct primitives get distinct names so the
+/// `.debug_info` base-type dedup keeps them apart.
+fn returnBaseType(func: *const Function) ?dwarf.BaseType {
+    const ret_val = for (0..func.blocks.items.len) |bi| {
+        const term = func.terminator(@enumFromInt(bi)) orelse continue;
+        switch (term) {
+            .ret => |maybe| if (maybe) |v| break v else return null,
+            else => {},
+        }
+    } else return null;
+
+    return switch (func.types.type_kind(func.valueType(ret_val))) {
+        .bool => .{ .name = "bool", .encoding = .boolean, .byte_size = 1 },
+        .float => |f| switch (f) {
+            .f32 => .{ .name = "float", .encoding = .float, .byte_size = 4 },
+            .f64 => .{ .name = "double", .encoding = .float, .byte_size = 8 },
+        },
+        .int => |i| blk: {
+            const bytes: u8 = @intCast((i.bits + 7) / 8);
+            const signed = i.signedness == .signed;
+            const name: []const u8 = switch (i.bits) {
+                8 => if (signed) "i8" else "u8",
+                16 => if (signed) "i16" else "u16",
+                32 => if (signed) "int" else "unsigned int",
+                64 => if (signed) "long" else "unsigned long",
+                else => if (signed) "int" else "unsigned",
+            };
+            break :blk .{ .name = name, .encoding = if (signed) .signed else .unsigned, .byte_size = bytes };
+        },
+        else => null, // ptr / vector / aggregate: no base-type DIE in this slice
+    };
+}
+
+test "returnBaseType reads the ret value's IR type" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const b = try func.appendBlock();
+    const v = try func.appendBlockParam(b, i32_t);
+    func.setTerminator(b, .{ .ret = v });
+
+    const bt = returnBaseType(&func).?;
+    try std.testing.expectEqualStrings("int", bt.name);
+    try std.testing.expectEqual(dwarf.Encoding.signed, bt.encoding);
+    try std.testing.expectEqual(@as(u8, 4), bt.byte_size);
+}
+
+test "returnBaseType is null for a void return" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const b = try func.appendBlock();
+    func.setTerminator(b, .{ .ret = null });
+    try std.testing.expectEqual(@as(?dwarf.BaseType, null), returnBaseType(&func));
 }
 
 test "writes an ELF64 AArch64 relocatable header" {

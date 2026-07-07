@@ -5,3 +5,5 @@ zig-pkg/
 result
 result-*
 *.o
+*.spv
+*.core

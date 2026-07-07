@@ -79,7 +79,11 @@ fn hostedMain(init: std.process.Init) !void {
         2 => try inst.call2(i32, i32, i32, export_name, iargs[0], iargs[1]),
         else => try inst.call3(i32, i32, i32, i32, export_name, iargs[0], iargs[1], iargs[2]),
     };
-    std.debug.print("{d}\n", .{result});
+    // The computed result is the program's output: stdout, not stderr.
+    var buf: [64]u8 = undefined;
+    var w = std.Io.File.stdout().writer(io, &buf);
+    try w.interface.print("{d}\n", .{result});
+    try w.interface.flush();
 }
 
 // An embedded module returning 1337: (func (export "main") (result i32) (i32.const 1000)

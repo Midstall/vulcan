@@ -208,6 +208,19 @@ pub fn subImm64(rd: Reg, rn: Reg, imm: u12) u32 {
     return 0xD1000000 | (@as(u32, imm) << 10) | (n(rn) << 5) | n(rd);
 }
 
+/// `add xd, xn, #imm12, LSL #12` (the shifted add-immediate form, sh=1). The
+/// imm12 is scaled by 4096, so this reaches stack frames wider than 12 bits when
+/// paired with the unshifted form. Rn/Rd 31 still means SP here (add/sub-immediate),
+/// which the shifted-register form would instead read as XZR.
+pub fn addImm64Shift(rd: Reg, rn: Reg, imm: u12) u32 {
+    return 0x91400000 | (@as(u32, imm) << 10) | (n(rn) << 5) | n(rd);
+}
+
+/// `sub xd, xn, #imm12, LSL #12` (the shifted sub-immediate form, sh=1).
+pub fn subImm64Shift(rd: Reg, rn: Reg, imm: u12) u32 {
+    return 0xD1400000 | (@as(u32, imm) << 10) | (n(rn) << 5) | n(rd);
+}
+
 /// `str wt, [xn, #off]` (32-bit store, `off` a multiple of 4).
 pub fn strW(rt: Reg, rn: Reg, off: u14) u32 {
     return 0xB9000000 | ((@as(u32, off) >> 2) << 10) | (n(rn) << 5) | n(rt);
@@ -364,6 +377,71 @@ pub fn fdivVec(rd: Reg, rn: Reg, rm: Reg) u32 {
     return 0x6E20FC00 | (n(rm) << 16) | (n(rn) << 5) | n(rd);
 }
 
+/// NEON `fneg Vd.4S, Vn.4S`: lane-wise floating-point negate over 4 single floats.
+pub fn fnegVec(rd: Reg, rn: Reg) u32 {
+    return 0x6EA0F800 | (n(rn) << 5) | n(rd);
+}
+
+/// NEON `fsqrt Vd.4S, Vn.4S`: lane-wise floating-point square root over 4 single floats.
+pub fn fsqrtVec(rd: Reg, rn: Reg) u32 {
+    return 0x6EA1F800 | (n(rn) << 5) | n(rd);
+}
+
+/// NEON `fmin Vd.4S, Vn.4S, Vm.4S`: lane-wise minimum (IEEE min) over 4 single floats.
+pub fn fminVec(rd: Reg, rn: Reg, rm: Reg) u32 {
+    return 0x4EA0F400 | (n(rm) << 16) | (n(rn) << 5) | n(rd);
+}
+
+/// NEON `fmax Vd.4S, Vn.4S, Vm.4S`: lane-wise maximum (IEEE max) over 4 single floats.
+pub fn fmaxVec(rd: Reg, rn: Reg, rm: Reg) u32 {
+    return 0x4E20F400 | (n(rm) << 16) | (n(rn) << 5) | n(rd);
+}
+
+// NEON lane-wise floating-point compares produce a per-lane MASK (all-ones 0xFFFFFFFF
+// when the relation holds, all-zeros otherwise) - exactly what `bsl` consumes for a
+// branch-free masked blend. `fcmeq`/`fcmgt`/`fcmge` are the >, >=, == primitives.
+// <, <=, != are formed by swapping operands or by `mvn`-ing an `fcmeq`.
+
+/// NEON `fcmeq Vd.4S, Vn.4S, Vm.4S`: per-lane equal mask.
+pub fn fcmeqVec(rd: Reg, rn: Reg, rm: Reg) u32 {
+    return 0x4E20E400 | (n(rm) << 16) | (n(rn) << 5) | n(rd);
+}
+
+/// NEON `fcmgt Vd.4S, Vn.4S, Vm.4S`: per-lane greater-than mask (Vn > Vm).
+pub fn fcmgtVec(rd: Reg, rn: Reg, rm: Reg) u32 {
+    return 0x6EA0E400 | (n(rm) << 16) | (n(rn) << 5) | n(rd);
+}
+
+/// NEON `fcmge Vd.4S, Vn.4S, Vm.4S`: per-lane greater-or-equal mask (Vn >= Vm).
+pub fn fcmgeVec(rd: Reg, rn: Reg, rm: Reg) u32 {
+    return 0x6E20E400 | (n(rm) << 16) | (n(rn) << 5) | n(rd);
+}
+
+/// NEON `mvn Vd.16B, Vn.16B` (alias of `not`): bitwise complement of a whole 128-bit
+/// register. Turns an `fcmeq` mask into a `!=` mask, or inverts any lane mask.
+pub fn mvnVec(rd: Reg, rn: Reg) u32 {
+    return 0x6E205800 | (n(rn) << 5) | n(rd);
+}
+
+/// NEON `bsl Vd.16B, Vn.16B, Vm.16B`: per-bit select - Vd = (Vn & Vd) | (Vm & ~Vd).
+/// With Vd holding a lane mask, this picks Vn's lane where the mask is set, Vm's where
+/// clear: the branch-free masked blend for a vectorized OpSelect / if-then-else.
+pub fn bslVec(rd: Reg, rn: Reg, rm: Reg) u32 {
+    return 0x6E601C00 | (n(rm) << 16) | (n(rn) << 5) | n(rd);
+}
+
+/// NEON `dup Vd.4S, Wn`: splat a 32-bit general register into all 4 lanes of a vector.
+/// Materializes a scalar (an interpolated varying, a constant) as a 4-lane vector.
+pub fn dupFromGpr(rd: Reg, rn: Reg) u32 {
+    return 0x4E040C00 | (n(rn) << 5) | n(rd);
+}
+
+/// NEON `dup Vd.4S, Vn.s[index]`: splat single-precision lane `index` across all 4 lanes.
+pub fn dupVecLane(rd: Reg, rn: Reg, index: u2) u32 {
+    const imm5: u32 = (@as(u32, index) << 3) | 0b100; // S element: index in bits[4:3]
+    return 0x4E000400 | (imm5 << 16) | (n(rn) << 5) | n(rd);
+}
+
 /// `dup sd, vn.s[index]`: copy single-precision lane `index` of a vector to a scalar
 /// register (the FP register file's S view). The standard way to extract a NEON lane.
 pub fn dupLane(rd: Reg, rn: Reg, index: u2) u32 {
@@ -475,10 +553,40 @@ test "known A64 encodings" {
     try std.testing.expectEqual(@as(u32, 0x52800540), movz(.x0, 42, 0));
 }
 
+test "NEON vector op encodings" {
+    // Cross-checked against the ARM A64 reference encodings (.4S form, v0/v1/v2).
+    try std.testing.expectEqual(@as(u32, 0x6EA0F800), fnegVec(.x0, .x0)); // fneg v0.4s, v0.4s
+    try std.testing.expectEqual(@as(u32, 0x6EA1F800), fsqrtVec(.x0, .x0)); // fsqrt v0.4s, v0.4s
+    try std.testing.expectEqual(@as(u32, 0x4EA2F400), fminVec(.x0, .x0, .x2)); // fmin v0.4s,v0.4s,v2.4s
+    try std.testing.expectEqual(@as(u32, 0x4E22F420), fmaxVec(.x0, .x1, .x2)); // fmax v0.4s,v1.4s,v2.4s
+    try std.testing.expectEqual(@as(u32, 0x4E22E420), fcmeqVec(.x0, .x1, .x2)); // fcmeq v0.4s,v1.4s,v2.4s
+    try std.testing.expectEqual(@as(u32, 0x6EA2E420), fcmgtVec(.x0, .x1, .x2)); // fcmgt v0.4s,v1.4s,v2.4s
+    try std.testing.expectEqual(@as(u32, 0x6E22E420), fcmgeVec(.x0, .x1, .x2)); // fcmge v0.4s,v1.4s,v2.4s
+    try std.testing.expectEqual(@as(u32, 0x6E621C20), bslVec(.x0, .x1, .x2)); // bsl v0.16b,v1.16b,v2.16b
+    try std.testing.expectEqual(@as(u32, 0x4E040C20), dupFromGpr(.x0, .x1)); // dup v0.4s, w1
+    try std.testing.expectEqual(@as(u32, 0x4E140420), dupVecLane(.x0, .x1, 2)); // dup v0.4s, v1.s[2]
+    try std.testing.expectEqual(@as(u32, 0x6E205820), mvnVec(.x0, .x1)); // mvn v0.16b, v1.16b
+}
+
 test "64-bit ALU sets the sf bit (bit 31) over the 32-bit form" {
     // The 64-bit forms are exactly the 32-bit ones with sf (bit 31) set.
     try std.testing.expectEqual(add(.x0, .x1, .x2) | (@as(u32, 1) << 31), add64(.x0, .x1, .x2));
     try std.testing.expectEqual(@as(u32, 0x8B020020), add64(.x0, .x1, .x2)); // add x0, x1, x2
     try std.testing.expectEqual(@as(u32, 0xCB020020), sub64(.x0, .x1, .x2)); // sub x0, x1, x2
     try std.testing.expectEqual(@as(u32, 0x9AC22020), lslv64(.x0, .x1, .x2)); // lsl x0, x1, x2
+}
+
+test "shifted add/sub immediate (LSL #12) for large stack frames" {
+    // The sh=1 form scales imm12 by 4096, so a frame wider than 12 bits opens in
+    // two instructions. Rn/Rd 31 stays SP here (add/sub-immediate form).
+    // sub sp, sp, #1, LSL #12  (== sub sp, sp, #4096)
+    try std.testing.expectEqual(@as(u32, 0xD14007FF), subImm64Shift(.zr, .zr, 1));
+    // add sp, sp, #1, LSL #12
+    try std.testing.expectEqual(@as(u32, 0x914007FF), addImm64Shift(.zr, .zr, 1));
+    // The shifted form is the unshifted opcode with sh (bit 22) set.
+    try std.testing.expectEqual(subImm64(.x0, .x1, 5) | (@as(u32, 1) << 22), subImm64Shift(.x0, .x1, 5));
+    try std.testing.expectEqual(addImm64(.x0, .x1, 5) | (@as(u32, 1) << 22), addImm64Shift(.x0, .x1, 5));
+    // A 5000-byte frame splits as hi=1 (×4096) + lo=904, reconstructing exactly.
+    const frame: usize = 5000;
+    try std.testing.expectEqual(@as(usize, 4096 * (frame >> 12) + (frame & 0xFFF)), frame);
 }

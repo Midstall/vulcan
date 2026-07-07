@@ -419,9 +419,19 @@ fn lowerFunction(allocator: std.mem.Allocator, ctx: Ctx, ft: FuncType, body: []c
     for (0..ngroups) |_| {
         const n = try c.u32leb();
         const ty = try irType(&func, try c.byte());
+        const is_float = switch (func.types.type_kind(ty)) {
+            .float => true,
+            else => false,
+        };
         for (0..n) |_| {
             const slot = try func.appendInst(entry, ptr_t, .{ .alloca = .{ .elem = ty } });
-            const z = try func.appendInst(entry, ty, .{ .iconst = 0 });
+            // Zero-init with a constant of the local's own kind: a float local needs a
+            // float zero, not an integer one typed as float (which a backend would
+            // materialize in the wrong register file).
+            const z = if (is_float)
+                try func.appendInst(entry, ty, .{ .fconst = 0 })
+            else
+                try func.appendInst(entry, ty, .{ .iconst = 0 });
             try func.appendStore(entry, z, slot);
             try locals.append(allocator, .{ .ptr = slot, .ty = ty });
         }

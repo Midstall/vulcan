@@ -76,13 +76,18 @@ const Fixup = struct { at: usize, target: u32 };
 pub const Reloc = struct { offset: usize, symbol: []const u8 };
 
 /// A compiled function: machine code plus its unresolved call relocations.
+/// A source-line row: the byte offset where a source line's code begins (from `debug.line` attrs).
+pub const LineEntry = struct { offset: u32, line: u32 };
+
 pub const Compiled = struct {
     code: []u8,
     relocs: []Reloc,
+    lines: []LineEntry = &.{},
 
     pub fn deinit(self: *Compiled, allocator: std.mem.Allocator) void {
         allocator.free(self.code);
         allocator.free(self.relocs);
+        allocator.free(self.lines);
     }
 };
 
@@ -92,6 +97,8 @@ const Ctx = struct {
     code: std.ArrayList(u8) = .empty,
     fixups: std.ArrayList(Fixup) = .empty,
     relocs: std.ArrayList(Reloc) = .empty,
+    lines: std.ArrayList(LineEntry) = .empty,
+    last_line: u32 = 0,
     xmm_base: i32 = 0, // rsp offset of the xmm spill area (16-byte slots)
     alloca_base: i32 = 0, // rsp offset of the alloca region (sits above the spill areas)
     alloca_off: std.AutoHashMapUnmanaged(Value, u32) = .{}, // each alloca result -> its byte offset in that region
@@ -194,6 +201,7 @@ pub fn compile(allocator: std.mem.Allocator, func: *const Function) Error!Compil
     defer ctx.code.deinit(allocator);
     defer ctx.fixups.deinit(allocator);
     defer ctx.relocs.deinit(allocator);
+    defer ctx.lines.deinit(allocator);
     defer ctx.alloca_off.deinit(allocator);
     var num_slots: u32 = 0;
     try assignRegs(allocator, func, &ctx.loc_of, &num_slots);
@@ -251,6 +259,14 @@ pub fn compile(allocator: std.mem.Allocator, func: *const Function) Error!Compil
         block_start[bi] = ctx.code.items.len;
         var terminated = false;
         for (func.blockInsts(block)) |inst| {
+            // Record a source-line row when this instruction starts a new line (byte offset = the
+            // current code length, since x86 code is already a byte stream).
+            if (lineOf(func, inst)) |line| {
+                if (line != ctx.last_line) {
+                    try ctx.lines.append(allocator, .{ .offset = @intCast(ctx.code.items.len), .line = line });
+                    ctx.last_line = line;
+                }
+            }
             if (func.opcode(inst) == .@"if") {
                 try emitIf(allocator, &ctx, func.opcode(inst).@"if");
                 terminated = true;
@@ -280,7 +296,19 @@ pub fn compile(allocator: std.mem.Allocator, func: *const Function) Error!Compil
         const rel: i32 = @intCast(@as(i64, @intCast(block_start[f.target])) - @as(i64, @intCast(f.at + 4)));
         std.mem.writeInt(u32, ctx.code.items[f.at..][0..4], @bitCast(rel), .little);
     }
-    return .{ .code = try ctx.code.toOwnedSlice(allocator), .relocs = try ctx.relocs.toOwnedSlice(allocator) };
+    return .{ .code = try ctx.code.toOwnedSlice(allocator), .relocs = try ctx.relocs.toOwnedSlice(allocator), .lines = try ctx.lines.toOwnedSlice(allocator) };
+}
+
+/// The `debug.line` source line attached to an IR instruction, if any.
+fn lineOf(func: *const Function, inst: ir.function.Inst) ?u32 {
+    var it = func.attributesOf(.{ .inst = inst });
+    while (it.next()) |attr| switch (attr) {
+        .custom => |c| if (std.mem.eql(u8, c.namespace, "debug") and std.mem.eql(u8, c.key, "line")) {
+            if (c.value == .int) return @intCast(c.value.int);
+        },
+        else => {},
+    };
+    return null;
 }
 
 fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Error!void {
@@ -301,9 +329,25 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
     const result = func.instResult(inst).?;
     switch (func.opcode(inst)) {
         .iconst => |c| {
-            const rd = ctx.dst(result, scratch1);
-            try ctx.put(allocator, encode.movImm(rd, @intCast(c)));
-            try ctx.store(allocator, result, rd);
+            if (isXmm(func, result)) {
+                // A float-typed integer constant (e.g. a zero-init). The result lives in
+                // an xmm register, so materialize the bits in a gpr and move them across,
+                // never a plain integer store into an xmm slot.
+                const rd = try ctx.dstXmm(result, xmm_scratch);
+                if (isDouble(func, result)) {
+                    try ctx.put(allocator, encode.movImm64(scratch1, @bitCast(c)));
+                    try ctx.put(allocator, encode.movqToXmm(rd, scratch1));
+                } else {
+                    const bits: u32 = @truncate(@as(u64, @bitCast(c)));
+                    try ctx.put(allocator, encode.movImm(scratch1, @bitCast(bits)));
+                    try ctx.put(allocator, encode.movdToXmm(rd, scratch1));
+                }
+                try ctx.storeXmm(allocator, result, rd);
+            } else {
+                const rd = ctx.dst(result, scratch1);
+                try ctx.put(allocator, encode.movImm(rd, @intCast(c)));
+                try ctx.store(allocator, result, rd);
+            }
         },
         .fconst => |val| {
             // Materialize the float bits in a scratch gpr, then move into xmm: 32 bits via
@@ -522,6 +566,46 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
                 if (rd != src) try ctx.put(allocator, encode.movReg(rd, src));
                 try ctx.store(allocator, result, rd);
             }
+        },
+        .unary => |u| {
+            const result_val = func.instResult(inst);
+            const src_float = isFloat(func, u.value);
+            if (u.op == .reinterpret) {
+                // int <-> float reinterpret: same width, movd/movq between gpr and xmm.
+                if (src_float) {
+                    // float -> int: xmm -> gpr.
+                    const src = try ctx.useXmm(allocator, u.value, xmm_op0);
+                    if (result_val) |res| {
+                        const rd = ctx.dst(res, scratch1);
+                        try ctx.put(allocator, if (isDouble(func, u.value)) encode.movqFromXmm(rd, src) else encode.movdFromXmm(rd, src));
+                        try ctx.store(allocator, res, rd);
+                    }
+                    // void result: src already loaded, nothing to do.
+                } else {
+                    // int -> float: gpr -> xmm.
+                    const src = try ctx.use(allocator, u.value, scratch1);
+                    if (result_val) |res| {
+                        const rd = try ctx.dstXmm(res, xmm_scratch);
+                        try ctx.put(allocator, if (isDouble(func, res)) encode.movqToXmm(rd, src) else encode.movdToXmm(rd, src));
+                        try ctx.storeXmm(allocator, res, rd);
+                    }
+                    // void result: src already loaded, nothing to do.
+                }
+                return;
+            }
+            // Float math unary ops: sqrt, ceil, floor, trunc, nearest. All live in xmm.
+            const src = try ctx.useXmm(allocator, u.value, xmm_op0);
+            const rd = try ctx.dstXmm(result_val.?, xmm_scratch);
+            const dbl = isDouble(func, u.value);
+            try ctx.put(allocator, switch (u.op) {
+                .sqrt => if (dbl) encode.sqrtsd(rd, src) else encode.sqrtss(rd, src),
+                .ceil => if (dbl) encode.roundsd(rd, src, 2) else encode.roundss(rd, src, 2),
+                .floor => if (dbl) encode.roundsd(rd, src, 1) else encode.roundss(rd, src, 1),
+                .trunc => if (dbl) encode.roundsd(rd, src, 3) else encode.roundss(rd, src, 3),
+                .nearest => if (dbl) encode.roundsd(rd, src, 0) else encode.roundss(rd, src, 0),
+                .reinterpret => unreachable,
+            });
+            try ctx.storeXmm(allocator, result_val.?, rd);
         },
         .call => |c| {
             // Move arguments into the System V argument registers (register sources through a

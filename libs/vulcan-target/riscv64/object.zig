@@ -9,6 +9,7 @@ const isel = @import("isel.zig");
 const link = @import("link.zig");
 const ld = @import("ld.zig");
 const encode = @import("encode.zig");
+const dwarf = @import("../dwarf.zig");
 const harness = @import("tests/harness.zig");
 
 pub const Error = std.mem.Allocator.Error || isel.Error;
@@ -65,6 +66,9 @@ pub const Reloc = struct {
 /// The pieces of a relocatable object: code and data section blobs, the symbol
 /// table, and the relocations (which apply to `.text`). `.bss` has no bytes,
 /// just a size. Empty sections are omitted from the output.
+/// A non-allocatable metadata section to append verbatim (e.g. `.debug_info`/`.debug_line`).
+pub const DebugSection = struct { name: []const u8, bytes: []const u8 };
+
 pub const Object = struct {
     text: []const u8,
     rodata: []const u8 = &.{},
@@ -72,6 +76,9 @@ pub const Object = struct {
     bss_size: u64 = 0,
     symbols: []const Symbol,
     relocs: []const Reloc,
+    /// Extra PROGBITS metadata sections (DWARF) placed after the allocatable sections. Symbols do
+    /// not reference them, so they need no section-index bookkeeping beyond the header count.
+    debug: []const DebugSection = &.{},
 };
 
 // ELF constants.
@@ -184,6 +191,7 @@ pub fn write(allocator: std.mem.Allocator, obj: Object) Error![]u8 {
         break :blk next;
     } else 0;
     if (has_rela) next += 1; // .rela.text
+    next += @intCast(obj.debug.len); // .debug_* metadata sections (no symbol references them)
     const symtab_ndx = next;
     next += 1;
     const strtab_ndx = next;
@@ -260,6 +268,8 @@ pub fn write(allocator: std.mem.Allocator, obj: Object) Error![]u8 {
     if (has_data) try headers.append(allocator, .{ .name = ".data", .typ = SHT_PROGBITS, .flags = SHF_ALLOC | SHF_WRITE, .addralign = 8, .bytes = obj.data, .size = obj.data.len });
     if (has_bss) try headers.append(allocator, .{ .name = ".bss", .typ = SHT_NOBITS, .flags = SHF_ALLOC | SHF_WRITE, .addralign = 8, .bytes = null, .size = obj.bss_size });
     if (has_rela) try headers.append(allocator, .{ .name = ".rela.text", .typ = SHT_RELA, .flags = SHF_INFO_LINK, .addralign = 8, .entsize = relaentsize, .link = symtab_ndx, .info = text_ndx, .bytes = rela, .size = rela_bytes });
+    // DWARF metadata sections (appended in the same order they were counted above).
+    for (obj.debug) |d| try headers.append(allocator, .{ .name = d.name, .typ = SHT_PROGBITS, .flags = 0, .addralign = 1, .bytes = d.bytes, .size = d.bytes.len });
     try headers.append(allocator, .{ .name = ".symtab", .typ = SHT_SYMTAB, .flags = 0, .addralign = 8, .entsize = symentsize, .link = strtab_ndx, .info = first_global, .bytes = symtab, .size = sym_bytes });
     try headers.append(allocator, .{ .name = ".strtab", .typ = SHT_STRTAB, .flags = 0, .addralign = 1, .bytes = strtab.bytes.items, .size = strtab.bytes.items.len });
     try headers.append(allocator, .{ .name = ".shstrtab", .typ = SHT_STRTAB, .flags = 0, .addralign = 1, .bytes = null, .size = 0 }); // filled in below
@@ -451,6 +461,172 @@ pub fn writeModule(allocator: std.mem.Allocator, module: *const link.Module) Err
     });
 }
 
+/// Like `writeModule`, but also emits inline DWARF: `.debug_abbrev` + `.debug_info` (a subprogram
+/// DIE per function with its PC range and IR return type) + `.debug_line` (address -> source line,
+/// from the functions' `debug.line` attributes), with the CU linked to the line program. So a
+/// debugger reads function names, ranges, typed signatures, and source lines on real RISC-V objects.
+pub fn writeModuleWithDebug(allocator: std.mem.Allocator, module: *const link.Module, source_file: []const u8) Error![]u8 {
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(allocator);
+    var globals: std.ArrayList(Symbol) = .empty;
+    defer globals.deinit(allocator);
+    var pending: std.ArrayList(PendingReloc) = .empty;
+    defer pending.deinit(allocator);
+    var rows: std.ArrayList(dwarf.LineRow) = .empty;
+    defer rows.deinit(allocator);
+    // Per-function DWARF info, in .text layout order.
+    const FnDie = struct { name: []const u8, low: u64, high: u64, func: *const Function };
+    var fndies: std.ArrayList(FnDie) = .empty;
+    defer fndies.deinit(allocator);
+
+    for (module.entries.items) |entry| {
+        const start: u64 = text.items.len;
+        var compiled = try isel.compileFunction(allocator, entry.func);
+        defer compiled.deinit(allocator);
+        for (compiled.code) |word| {
+            var w: [4]u8 = undefined;
+            putInt(&w, u32, word);
+            try text.appendSlice(allocator, &w);
+        }
+        const size = @as(u64, compiled.code.len) * 4;
+        try globals.append(allocator, .{ .name = entry.name, .value = start, .size = size, .kind = .func, .defined = true });
+        try fndies.append(allocator, .{ .name = entry.name, .low = start, .high = start + size, .func = entry.func });
+        for (compiled.relocs) |r| {
+            const off = start + @as(u64, r.offset) * 4;
+            switch (r.kind) {
+                .call => try pending.append(allocator, .{ .offset = off, .kind = .jal, .name = r.symbol }),
+                .pcrel_hi20 => try pending.append(allocator, .{ .offset = off, .kind = .hi20, .name = r.symbol }),
+                .pcrel_lo12 => try pending.append(allocator, .{ .offset = off, .kind = .lo12, .pair = start + @as(u64, r.pair) * 4 }),
+            }
+        }
+        // Line rows are function-relative; shift to the module-relative .text offset.
+        for (compiled.lines) |e| try rows.append(allocator, .{ .address = start + e.offset, .line = e.line });
+    }
+
+    // Data globals (rodata/data/bss).
+    var rodata: std.ArrayList(u8) = .empty;
+    defer rodata.deinit(allocator);
+    var data: std.ArrayList(u8) = .empty;
+    defer data.deinit(allocator);
+    var bss_size: u64 = 0;
+    for (module.data.items) |d| {
+        const section: SectionKind, const value: u64 = switch (d.kind) {
+            .rodata => blk: {
+                const s = rodata.items.len;
+                try rodata.appendSlice(allocator, d.bytes);
+                break :blk .{ .rodata, s };
+            },
+            .data => blk: {
+                const s = data.items.len;
+                try data.appendSlice(allocator, d.bytes);
+                break :blk .{ .data, s };
+            },
+            .bss => blk: {
+                const s = bss_size;
+                bss_size += d.size;
+                break :blk .{ .bss, s };
+            },
+        };
+        try globals.append(allocator, .{ .name = d.name, .value = value, .size = d.size, .kind = .object, .defined = true, .section = section });
+    }
+
+    // Local labels for each lo12's paired auipc (locals must precede globals in .symtab).
+    var locals: std.ArrayList(Symbol) = .empty;
+    defer locals.deinit(allocator);
+    var local_names: std.ArrayList([]u8) = .empty;
+    defer {
+        for (local_names.items) |n| allocator.free(n);
+        local_names.deinit(allocator);
+    }
+    for (pending.items) |*p| {
+        if (p.kind != .lo12) continue;
+        const name = try std.fmt.allocPrint(allocator, ".Lpcrel_hi{d}", .{p.pair});
+        try local_names.append(allocator, name);
+        try locals.append(allocator, .{ .name = name, .value = p.pair, .size = 0, .binding = .local, .kind = .notype, .defined = true });
+    }
+
+    var symbols: std.ArrayList(Symbol) = .empty;
+    defer symbols.deinit(allocator);
+    try symbols.appendSlice(allocator, locals.items);
+    try symbols.appendSlice(allocator, globals.items);
+    for (pending.items) |p| {
+        if (p.kind == .lo12) continue;
+        if (symbolIndex(symbols.items, p.name) == null) {
+            try symbols.append(allocator, .{ .name = p.name, .size = 0, .kind = .notype, .defined = false });
+        }
+    }
+
+    var relocs = try allocator.alloc(Reloc, pending.items.len);
+    defer allocator.free(relocs);
+    for (pending.items, 0..) |p, i| {
+        relocs[i] = switch (p.kind) {
+            .jal => .{ .offset = p.offset, .symbol = symbolIndex(symbols.items, p.name).?, .type = .jal },
+            .hi20 => .{ .offset = p.offset, .symbol = symbolIndex(symbols.items, p.name).?, .type = .pcrel_hi20 },
+            .lo12 => .{ .offset = p.offset, .symbol = localIndexAt(symbols.items, locals.items.len, p.pair), .type = .pcrel_lo12_i },
+        };
+    }
+
+    // DWARF sections: a subprogram DIE per function (with its typed return), plus the line program.
+    const subs = try allocator.alloc(dwarf.Subprogram, fndies.items.len);
+    defer allocator.free(subs);
+    for (fndies.items, 0..) |fd, i| subs[i] = .{ .name = fd.name, .low_pc = fd.low, .high_pc = fd.high, .ret_type = returnBaseType(fd.func) };
+
+    const abbrev = try dwarf.emitAbbrev(allocator);
+    defer allocator.free(abbrev);
+    // One line program at offset 0 of .debug_line, so link the CU to it via DW_AT_stmt_list.
+    const info = try dwarf.emitInfo(allocator, .{ .name = source_file, .low_pc = 0, .high_pc = text.items.len, .subprograms = subs, .stmt_list = 0 });
+    defer allocator.free(info);
+    const line = try dwarf.emitLine(allocator, source_file, rows.items, text.items.len);
+    defer allocator.free(line);
+
+    return write(allocator, .{
+        .text = text.items,
+        .rodata = rodata.items,
+        .data = data.items,
+        .bss_size = bss_size,
+        .symbols = symbols.items,
+        .relocs = relocs,
+        .debug = &.{
+            .{ .name = ".debug_abbrev", .bytes = abbrev },
+            .{ .name = ".debug_info", .bytes = info },
+            .{ .name = ".debug_line", .bytes = line },
+        },
+    });
+}
+
+/// Map a function's IR return type to a DWARF base type (C-like names), or null for a void /
+/// non-primitive return. Distinct primitives get distinct names so the base-type dedup keeps them apart.
+fn returnBaseType(func: *const Function) ?dwarf.BaseType {
+    const ret_val = for (0..func.blocks.items.len) |bi| {
+        const term = func.terminator(@enumFromInt(bi)) orelse continue;
+        switch (term) {
+            .ret => |maybe| if (maybe) |v| break v else return null,
+            else => {},
+        }
+    } else return null;
+
+    return switch (func.types.type_kind(func.valueType(ret_val))) {
+        .bool => .{ .name = "bool", .encoding = .boolean, .byte_size = 1 },
+        .float => |f| switch (f) {
+            .f32 => .{ .name = "float", .encoding = .float, .byte_size = 4 },
+            .f64 => .{ .name = "double", .encoding = .float, .byte_size = 8 },
+        },
+        .int => |i| blk: {
+            const bytes: u8 = @intCast((i.bits + 7) / 8);
+            const signed = i.signedness == .signed;
+            const name: []const u8 = switch (i.bits) {
+                8 => if (signed) "i8" else "u8",
+                16 => if (signed) "i16" else "u16",
+                32 => if (signed) "int" else "unsigned int",
+                64 => if (signed) "long" else "unsigned long",
+                else => if (signed) "int" else "unsigned",
+            };
+            break :blk .{ .name = name, .encoding = if (signed) .signed else .unsigned, .byte_size = bytes };
+        },
+        else => null, // ptr / vector / aggregate
+    };
+}
+
 /// Find the local label symbol covering `.text` byte offset `value` among the
 /// first `local_count` (local) symbols.
 fn localIndexAt(symbols: []const Symbol, local_count: usize, value: u64) u32 {
@@ -503,12 +679,14 @@ fn readelf(allocator: std.mem.Allocator, io: std.Io, bytes: []const u8, flag: []
     Nonce.counter += 1;
     const name = try std.fmt.allocPrint(allocator, "vulcan-obj-{d}.o", .{Nonce.counter});
     defer allocator.free(name);
-    const dir = std.Io.Dir.cwd();
-    try dir.writeFile(io, .{ .sub_path = name, .data = bytes });
-    defer dir.deleteFile(io, name) catch {};
+    // A unique temp dir with the child cwd set there, so relative names resolve and the
+    // process cwd is never written to (which was flaky).
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = name, .data = bytes });
 
     const argv = [_][]const u8{ "readelf", flag, name };
-    const result = std.process.run(allocator, io, .{ .argv = &argv }) catch |e| switch (e) {
+    const result = std.process.run(allocator, io, .{ .argv = &argv, .cwd = .{ .dir = tmp.dir } }) catch |e| switch (e) {
         error.FileNotFound => return error.SkipZigTest,
         else => return e,
     };
@@ -612,7 +790,12 @@ fn lldLink(allocator: std.mem.Allocator, io: std.Io, objs: []const []const u8, e
     const Nonce = struct {
         var counter: usize = 0;
     };
-    const dir = std.Io.Dir.cwd();
+    // Work in a unique temp directory with the child's cwd set there, so the argv just
+    // names the files. Writing to the process cwd made this flaky (the files could be
+    // missing or unwritable depending on where the test binary ran).
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = tmp.dir;
 
     // Write each object to its own file, collecting the names for the argv.
     var obj_names: std.ArrayList([]const u8) = .empty;
@@ -646,7 +829,7 @@ fn lldLink(allocator: std.mem.Allocator, io: std.Io, objs: []const []const u8, e
     try argv.appendSlice(allocator, obj_names.items);
     try argv.appendSlice(allocator, &.{ "-o", bin_name });
 
-    const result = std.process.run(allocator, io, .{ .argv = argv.items }) catch |e| switch (e) {
+    const result = std.process.run(allocator, io, .{ .argv = argv.items, .cwd = .{ .dir = tmp.dir } }) catch |e| switch (e) {
         error.FileNotFound => return error.SkipZigTest,
         else => return e,
     };
@@ -840,4 +1023,59 @@ test "linker resolves an R_RISCV_CALL far call (matches lld, runs on River)" {
     defer allocator.free(img_words);
     for (img_words, 0..) |*w, i| w.* = std.mem.readInt(u32, ours.code[i * 4 ..][0..4], .little);
     try std.testing.expectEqual(@as(i64, 7), try harness.runCode(io, allocator, img_words, &.{}, harness.river));
+}
+
+test "writeModuleWithDebug emits DWARF readelf reads (subprograms + CU line linkage)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const i32k = ir.types.TypeKind{ .int = .{ .signedness = .signed, .bits = 32 } };
+
+    // helper(x) -> x*3 ; main(x) -> helper(x). Two functions, a real intra-module call.
+    var helper = Function.init(allocator);
+    defer helper.deinit();
+    {
+        const t = try helper.types.intern(i32k);
+        const b = try helper.appendBlock();
+        const x = try helper.appendBlockParam(b, t);
+        const m = try helper.appendArithImm(b, t, .add, x, 5);
+        helper.setTerminator(b, .{ .ret = m });
+    }
+    var main_f = Function.init(allocator);
+    defer main_f.deinit();
+    {
+        const t = try main_f.types.intern(i32k);
+        const b = try main_f.appendBlock();
+        const x = try main_f.appendBlockParam(b, t);
+        const r = try main_f.appendCall(b, t, "helper", &.{x});
+        main_f.setTerminator(b, .{ .ret = r });
+    }
+    var module: link.Module = .{};
+    defer module.deinit(allocator);
+    try module.addFunction(allocator, "helper", &helper);
+    try module.addFunction(allocator, "main", &main_f);
+
+    const obj = try writeModuleWithDebug(allocator, &module, "mod.glsl");
+    defer allocator.free(obj);
+
+    // The three DWARF sections are present in the object.
+    const secs = readelf(allocator, io, obj, "-S") catch |e| switch (e) {
+        error.SkipZigTest => return error.SkipZigTest,
+        else => return e,
+    };
+    defer allocator.free(secs);
+    try std.testing.expect(std.mem.indexOf(u8, secs, ".debug_abbrev") != null);
+    try std.testing.expect(std.mem.indexOf(u8, secs, ".debug_info") != null);
+    try std.testing.expect(std.mem.indexOf(u8, secs, ".debug_line") != null);
+
+    // The CU decodes: both functions as subprograms, the CU linked to its line program, typed return.
+    const info = readelf(allocator, io, obj, "--debug-dump=info") catch |e| switch (e) {
+        error.SkipZigTest => return error.SkipZigTest,
+        else => return e,
+    };
+    defer allocator.free(info);
+    try std.testing.expect(std.mem.indexOf(u8, info, "DW_TAG_subprogram") != null);
+    try std.testing.expect(std.mem.indexOf(u8, info, "helper") != null);
+    try std.testing.expect(std.mem.indexOf(u8, info, "main") != null);
+    try std.testing.expect(std.mem.indexOf(u8, info, "DW_AT_stmt_list") != null);
+    try std.testing.expect(std.mem.indexOf(u8, info, "int") != null); // i32 return -> "int"
 }

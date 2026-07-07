@@ -22,6 +22,23 @@ const RegMap = std.AutoHashMapUnmanaged(Value, Reg);
 pub const Error = std.mem.Allocator.Error || error{Unsupported};
 
 const sp: Reg = .zr; // register 31 is the stack pointer in load/store/frame context
+
+/// Emit `rd = rn -/+ amount` via the add/sub-immediate form, splitting amounts
+/// wider than the 12-bit immediate across the unshifted and `LSL #12` forms (up to
+/// ~16MB in two instructions). The immediate form is required for SP operands
+/// (Rn/Rd 31 means SP), so the register form can not be used to adjust the frame.
+fn emitFrameImm(allocator: std.mem.Allocator, code: *std.ArrayList(u32), is_sub: bool, rd: Reg, rn: Reg, amount: usize) !void {
+    const lo: u12 = @intCast(amount & 0xFFF);
+    const hi: u12 = @intCast(amount >> 12); // shader frames are far below the 16MB ceiling
+    var src = rn;
+    if (hi != 0) {
+        try code.append(allocator, if (is_sub) encode.subImm64Shift(rd, src, hi) else encode.addImm64Shift(rd, src, hi));
+        src = rd;
+    }
+    if (lo != 0 or hi == 0) {
+        try code.append(allocator, if (is_sub) encode.subImm64(rd, src, lo) else encode.addImm64(rd, src, lo));
+    }
+}
 const spill_op = [_]Reg{ .x13, .x14 }; // GPR scratch for reloading operands
 const spill_res: Reg = .x15; // GPR scratch for a spilled result
 const scratch_imm: Reg = .x16; // arith-immediate constant / remainder quotient / fp bits
@@ -81,13 +98,19 @@ const Fixup = struct { at: usize, target: u32 };
 pub const Reloc = struct { offset: usize, symbol: []const u8 };
 
 /// Machine words plus the call relocations for the linker to resolve.
+/// One row of the source-line table: the byte offset (from the function start) where a new
+/// source line's code begins, and that line. Built from the `debug.line` IR attributes.
+pub const LineEntry = struct { offset: u32, line: u32 };
+
 pub const Compiled = struct {
     code: []u32,
     relocs: []Reloc,
+    lines: []LineEntry = &.{},
 
     pub fn deinit(self: *Compiled, allocator: std.mem.Allocator) void {
         allocator.free(self.code);
         allocator.free(self.relocs);
+        allocator.free(self.lines);
     }
 };
 
@@ -111,7 +134,31 @@ const Allocation = struct {
 pub fn selectFunction(allocator: std.mem.Allocator, func: *const Function) Error![]u32 {
     const compiled = try compileFunction(allocator, func);
     allocator.free(compiled.relocs);
+    allocator.free(compiled.lines);
     return compiled.code;
+}
+
+/// Compiled code plus its source-line table (from the `debug.line` IR attributes).
+pub const CodeWithLines = struct { code: []u32, lines: []LineEntry };
+
+/// Like `selectFunction`, but also returns the source-line table for DWARF `.debug_line`.
+/// Caller owns both slices.
+pub fn selectFunctionWithLines(allocator: std.mem.Allocator, func: *const Function) Error!CodeWithLines {
+    const compiled = try compileFunction(allocator, func);
+    allocator.free(compiled.relocs);
+    return .{ .code = compiled.code, .lines = compiled.lines };
+}
+
+/// The `debug.line` source line attached to an IR instruction, if any.
+fn lineOf(func: *const Function, inst: ir.function.Inst) ?u32 {
+    var it = func.attributesOf(.{ .inst = inst });
+    while (it.next()) |attr| switch (attr) {
+        .custom => |c| if (std.mem.eql(u8, c.namespace, "debug") and std.mem.eql(u8, c.key, "line")) {
+            if (c.value == .int) return @intCast(c.value.int);
+        },
+        else => {},
+    };
+    return null;
 }
 
 fn isLeaf(func: *const Function) bool {
@@ -180,12 +227,15 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function) Erro
     errdefer code.deinit(allocator);
     var relocs: std.ArrayList(Reloc) = .empty;
     errdefer relocs.deinit(allocator);
+    var lines: std.ArrayList(LineEntry) = .empty;
+    errdefer lines.deinit(allocator);
+    var last_line: u32 = 0; // suppress duplicate rows for consecutive same-line instructions
     var fixups: std.ArrayList(Fixup) = .empty;
     defer fixups.deinit(allocator);
     var block_start = try allocator.alloc(usize, nblocks);
     defer allocator.free(block_start);
 
-    if (frame > 0) try code.append(allocator, encode.subImm64(sp, sp, @intCast(frame)));
+    if (frame > 0) try emitFrameImm(allocator, &code, true, sp, sp, frame);
     if (!leaf) {
         try code.append(allocator, encode.strOff(.x30, sp, @intCast(lr_off)));
         for (alloc.saved_gpr.items, 0..) |r, i| try code.append(allocator, encode.strOff(r, sp, @intCast(gpr_saved_base + 8 * i)));
@@ -199,6 +249,31 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function) Erro
     defer allocator.free(plocs);
     computeArgLocs(func, eparams, plocs);
     for (eparams, plocs) |p, l| {
+        // A spilled parameter (e.g. a vector input that crosses a call - the callee-saved FP
+        // registers only preserve the low 64 bits, so a lane vector must live on the stack):
+        // store its incoming argument (register or caller stack slot) into its spill slot.
+        if (alloc.reg.get(p) == null) {
+            const slot_off: u15 = @intCast(spill_base + alloc.spill.get(p).? * 16);
+            if (l.idx < 8) {
+                const incoming: Reg = @enumFromInt(@as(u5, @intCast(l.idx)));
+                if (l.class == .fpr) {
+                    try code.append(allocator, if (isVector(func, p)) encode.strQ(incoming, sp, slot_off) else encode.strFp(incoming, sp, slot_off, true));
+                } else {
+                    try code.append(allocator, encode.strOff(incoming, sp, slot_off));
+                }
+            } else {
+                // An incoming stack parameter that is also spilled: load from the caller's
+                // outgoing area into a scratch, then store to our spill slot.
+                if (l.class == .fpr) {
+                    try code.append(allocator, encode.ldrFp(fp_spill_op[0], sp, @intCast(frame + 8 * (l.idx - 8)), false));
+                    try code.append(allocator, encode.strFp(fp_spill_op[0], sp, slot_off, true));
+                } else {
+                    try code.append(allocator, encode.ldrOff(spill_op[0], sp, @intCast(frame + 8 * (l.idx - 8))));
+                    try code.append(allocator, encode.strOff(spill_op[0], sp, slot_off));
+                }
+            }
+            continue;
+        }
         const pr = alloc.reg.get(p).?;
         if (l.idx < 8) {
             if (!leaf) {
@@ -206,7 +281,11 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function) Erro
                 try code.append(allocator, if (l.class == .fpr) encode.fmovReg(pr, incoming) else encode.mov(pr, incoming));
             }
         } else if (l.class == .fpr) {
-            return error.Unsupported; // floating-point stack parameters not handled
+            // A floating-point stack parameter (the 9th+ FP arg): the caller placed it in
+            // its outgoing-argument area, now just below our frame. Load it into the
+            // parameter's FP register. (A graphics shader with many scalarized varyings +
+            // synthesized derivative gradient inputs can exceed the 8 FP arg registers.)
+            try code.append(allocator, encode.ldrFp(pr, sp, @intCast(frame + 8 * (l.idx - 8)), false));
         } else {
             try code.append(allocator, encode.ldrOff(pr, sp, @intCast(frame + 8 * (l.idx - 8))));
         }
@@ -220,11 +299,32 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function) Erro
         var terminated = false;
 
         for (func.blockInsts(block)) |inst| {
+            // Record a source-line row when this instruction begins a new line (its
+            // `debug.line` attribute differs from the previous instruction's).
+            if (lineOf(func, inst)) |line| {
+                if (line != last_line) {
+                    try lines.append(allocator, .{ .offset = @intCast(code.items.len * 4), .line = line });
+                    last_line = line;
+                }
+            }
             switch (func.opcode(inst)) {
                 .iconst => |c| {
                     const result = func.instResult(inst).?;
                     const rd = resultReg(&alloc, func, result);
-                    if (isWide(func, result)) {
+                    if (regClass(func, result) == .fpr) {
+                        // A float-typed integer constant (the frontend zero-inits float
+                        // locals this way). The result lives in an fp register, so the
+                        // bits must go there via a GPR scratch, never a plain integer
+                        // move into the fp register's number.
+                        const d = isDouble(func, result);
+                        if (d) {
+                            try loadConst64(allocator, &code, scratch_imm, @bitCast(c));
+                        } else {
+                            const bits: u32 = @truncate(@as(u64, @bitCast(c)));
+                            try loadConst(allocator, &code, scratch_imm, @intCast(bits));
+                        }
+                        try code.append(allocator, encode.fmovFromGpr(rd, scratch_imm, d));
+                    } else if (isWide(func, result)) {
                         try loadConst64(allocator, &code, rd, @bitCast(c)); // full 64 bits (i64/ptr)
                     } else {
                         try loadConst(allocator, &code, rd, c);
@@ -255,6 +355,28 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function) Erro
                 },
                 .icmp => |cmp| {
                     const result = func.instResult(inst).?;
+                    if (isVector(func, cmp.lhs)) {
+                        // Vectorized compare (widened FS): produce a per-lane MASK
+                        // (all-ones where the relation holds, else all-zeros) in a
+                        // <4 x f32>-typed result. <, <= are >, >= with operands swapped.
+                        // != is the bitwise complement of ==.
+                        const rl = try ctx.loadOp(allocator, &code, cmp.lhs, fp_spill_op[0]);
+                        const rr = try ctx.loadOp(allocator, &code, cmp.rhs, fp_spill_op[1]);
+                        const rd = resultReg(&alloc, func, result);
+                        switch (cmp.op) {
+                            .eq => try code.append(allocator, encode.fcmeqVec(rd, rl, rr)),
+                            .ne => {
+                                try code.append(allocator, encode.fcmeqVec(rd, rl, rr));
+                                try code.append(allocator, encode.mvnVec(rd, rd));
+                            },
+                            .gt => try code.append(allocator, encode.fcmgtVec(rd, rl, rr)),
+                            .ge => try code.append(allocator, encode.fcmgeVec(rd, rl, rr)),
+                            .lt => try code.append(allocator, encode.fcmgtVec(rd, rr, rl)), // rl < rr  ==  rr > rl
+                            .le => try code.append(allocator, encode.fcmgeVec(rd, rr, rl)), // rl <= rr ==  rr >= rl
+                        }
+                        try storeResult(allocator, &code, ctx, result, rd);
+                        continue;
+                    }
                     if (regClass(func, cmp.lhs) == .fpr) {
                         const rl = try ctx.loadOp(allocator, &code, cmp.lhs, fp_spill_op[0]);
                         const rr = try ctx.loadOp(allocator, &code, cmp.rhs, fp_spill_op[1]);
@@ -273,6 +395,24 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function) Erro
                 },
                 .select => |s| {
                     const result = func.instResult(inst).?;
+                    if (isVector(func, result)) {
+                        // Vectorized masked blend (widened FS): cond is a per-lane mask
+                        // (<4 x f32>, all-ones/all-zeros), then/else are <4 x f32>. NEON
+                        // `bsl` selects then's lane where the mask is set, else's where
+                        // clear. bsl reads+writes its destination (the mask), so copy the
+                        // mask into the result register first, then bsl with then/else.
+                        const cm = try ctx.loadOp(allocator, &code, s.cond, fp_spill_op[0]);
+                        const tr = try ctx.loadOp(allocator, &code, s.then, fp_spill_op[1]);
+                        const el = try ctx.loadOp(allocator, &code, s.@"else", fp_spill_res);
+                        // Accumulate the blend into a fixed scratch (fp_move = v27, outside
+                        // every allocation pool) so it never aliases then/else/the result.
+                        try code.append(allocator, encode.movVec(fp_move, cm));
+                        try code.append(allocator, encode.bslVec(fp_move, tr, el));
+                        const rd = resultReg(&alloc, func, result);
+                        if (@intFromEnum(rd) != @intFromEnum(fp_move)) try code.append(allocator, encode.movVec(rd, fp_move));
+                        try storeResult(allocator, &code, ctx, result, rd);
+                        continue;
+                    }
                     const c = try ctx.loadOp(allocator, &code, s.cond, spill_op[0]); // cond is a gpr bool
                     if (regClass(func, result) == .fpr) {
                         const tr = try ctx.loadOp(allocator, &code, s.then, fp_spill_op[0]);
@@ -309,7 +449,17 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function) Erro
                     }
                     try storeResult(allocator, &code, ctx, result, rd);
                 },
-                .unary => |u| {
+                .unary => |u| if (isVector(func, func.instResult(inst).?)) {
+                    // Vectorized unary (a widened FS lane-op over <4 x f32>): NEON sqrt.
+                    const result = func.instResult(inst).?;
+                    const src = try ctx.loadOp(allocator, &code, u.value, fp_spill_op[0]);
+                    const rd = resultReg(&alloc, func, result);
+                    try code.append(allocator, switch (u.op) {
+                        .sqrt => encode.fsqrtVec(rd, src),
+                        else => return error.Unsupported,
+                    });
+                    try storeResult(allocator, &code, ctx, result, rd);
+                } else {
                     const result = func.instResult(inst).?;
                     const sc = regClass(func, u.value);
                     const dc = regClass(func, result);
@@ -340,7 +490,7 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function) Erro
                     const result = func.instResult(inst).?;
                     const off = alloca_base + alloca_off.get(result).?;
                     const rd = resultReg(&alloc, func, result);
-                    try code.append(allocator, encode.addImm64(rd, sp, @intCast(off)));
+                    try emitFrameImm(allocator, &code, false, rd, sp, off);
                     try storeResult(allocator, &code, ctx, result, rd);
                 },
                 .load => |l| {
@@ -472,7 +622,7 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function) Erro
                         for (alloc.saved_fpr.items, 0..) |r, i| try code.append(allocator, encode.ldrFp(r, sp, @intCast(fpr_saved_base + 8 * i), true));
                         try code.append(allocator, encode.ldrOff(.x30, sp, @intCast(lr_off)));
                     }
-                    if (frame > 0) try code.append(allocator, encode.addImm64(sp, sp, @intCast(frame)));
+                    if (frame > 0) try emitFrameImm(allocator, &code, false, sp, sp, frame);
                     try code.append(allocator, encode.ret());
                 },
                 .jump => |j| try ctx.emitJump(allocator, &code, &fixups, j),
@@ -485,7 +635,7 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function) Erro
         code.items[f.at] = encode.b(off);
     }
 
-    return .{ .code = try code.toOwnedSlice(allocator), .relocs = try relocs.toOwnedSlice(allocator) };
+    return .{ .code = try code.toOwnedSlice(allocator), .relocs = try relocs.toOwnedSlice(allocator), .lines = try lines.toOwnedSlice(allocator) };
 }
 
 const Terminator = ir.function.Terminator;
@@ -654,6 +804,15 @@ fn allocate(allocator: std.mem.Allocator, func: *const Function, leaf: bool) Err
     @memset(is_param, false);
     for (last_use) |*l| l.* = 0;
 
+    // Positions at which a call clobbers caller-saved registers. AAPCS only preserves the
+    // LOW 64 bits of the callee-saved FP registers v8..v15 across a call, so a 128-bit SIMD
+    // `<4 x f32>` held in one of them would lose its upper two lanes over a `bl`/`blr`. We
+    // record every call position and force-spill any VECTOR interval that spans a call to the
+    // stack (16-byte slots are fully preserved), keeping the widened (quad) FS correct when it
+    // gathers through a sampler_fn / math_fn call.
+    var call_positions = std.ArrayList(u32).empty;
+    defer call_positions.deinit(allocator);
+
     var pos: u32 = 0;
     for (0..nblocks) |bi| {
         const block: Block = @enumFromInt(bi);
@@ -666,6 +825,10 @@ fn allocate(allocator: std.mem.Allocator, func: *const Function, leaf: bool) Err
         for (func.blockInsts(block)) |inst| {
             forEachUse(func, inst, last_use, pos);
             if (func.instResult(inst)) |r| def_pos[@intFromEnum(r)] = pos;
+            switch (func.opcode(inst)) {
+                .call, .call_indirect => try call_positions.append(allocator, pos),
+                else => {},
+            }
             pos += 1;
         }
         block_end[bi] = pos;
@@ -748,6 +911,15 @@ fn allocate(allocator: std.mem.Allocator, func: *const Function, leaf: bool) Err
         }
         active.shrinkRetainingCapacity(w);
 
+        // A non-parameter VECTOR value that is live across a call must live on the stack: the
+        // callee-saved FP registers only preserve their low 64 bits, so a 128-bit lane vector
+        // in v8..v15 would be corrupted by the call. (Params are pinned/handled separately.
+        // A vector param crossing a call is spilled too, below.)
+        if (isVector(func, iv.value) and spansCall(call_positions.items, iv.start, iv.end)) {
+            try spillValue(allocator, &alloc, iv.value);
+            continue;
+        }
+
         if (free.pop()) |r| {
             try alloc.reg.put(allocator, iv.value, r);
             try active.append(allocator, .{ .end = iv.end, .value = iv.value, .reg = r, .is_param = iv.is_param });
@@ -812,6 +984,15 @@ fn spillValue(allocator: std.mem.Allocator, alloc: *Allocation, v: Value) Error!
 
 fn lessByStart(_: void, a: Interval, b: Interval) bool {
     return a.start < b.start;
+}
+
+/// Whether a value live over `[start, end)` is live ACROSS a call (a call position strictly
+/// between its definition and its last use). Such a vector value must be stack-resident.
+fn spansCall(call_positions: []const u32, start: u32, end: u32) bool {
+    for (call_positions) |p| {
+        if (p > start and p < end) return true;
+    }
+    return false;
 }
 
 fn markUse(last_use: []u32, v: Value, pos: u32) void {

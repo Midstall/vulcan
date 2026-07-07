@@ -88,6 +88,16 @@ pub fn build(b: *std.Build) void {
         },
     }) });
 
+    // The GLSL -> SPIR-V shader compiler executable (declared before the if/else so both
+    // the install/run-glsl step and the spirv tests can reference it).
+    const glsl_cli = b.addExecutable(.{ .name = "vulcan-glsl", .root_module = b.createModule(.{
+        .root_source_file = b.path("frontends/vulcan-glsl.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "vulcan-glsl", .module = vulcan_glsl }},
+    }) });
+    b.installArtifact(glsl_cli);
+
     // The deliverable follows `-Dtarget`'s OS: a no-OS target installs the freestanding
     // proof object. Any hosted/UEFI target installs the Wasm runner, whose `main` is the
     // host CLI or the boot-time app (chosen at comptime). One target in, one output out.
@@ -117,21 +127,33 @@ pub fn build(b: *std.Build) void {
             run_step.dependOn(&run_cli.step);
         }
 
-        // The GLSL -> SPIR-V shader compiler, a host-only tool (no UEFI entry point).
+        // The GLSL -> SPIR-V shader compiler CLI runner (glsl_cli is declared above).
         if (target.result.os.tag != .uefi) {
-            const glsl_cli = b.addExecutable(.{ .name = "vulcan-glsl", .root_module = b.createModule(.{
-                .root_source_file = b.path("frontends/vulcan-glsl.zig"),
-                .target = target,
-                .optimize = optimize,
-                .imports = &.{.{ .name = "vulcan-glsl", .module = vulcan_glsl }},
-            }) });
-            b.installArtifact(glsl_cli);
             const run_glsl = b.addRunArtifact(glsl_cli);
             if (b.args) |a| run_glsl.addArgs(a);
             const run_glsl_step = b.step("run-glsl", "Run the GLSL->SPIR-V compiler: -- <input.glsl> [stage] [-o out.spv]");
             run_glsl_step.dependOn(&run_glsl.step);
+
+            // The GLSL -> target-disassembly debugging tool: compile a shader and print the
+            // native (or Wasm) code for one of its functions.
+            const disasm_cli = b.addExecutable(.{ .name = "vulcan-disasm", .root_module = b.createModule(.{
+                .root_source_file = b.path("frontends/vulcan-disasm.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "vulcan-target", .module = vulcan_target },
+                    .{ .name = "vulcan-spirv", .module = vulcan_spirv },
+                },
+            }) });
+            b.installArtifact(disasm_cli);
+            const run_disasm = b.addRunArtifact(disasm_cli);
+            if (b.args) |a| run_disasm.addArgs(a);
+            const run_disasm_step = b.step("run-disasm", "Disassemble an ELF or SPIR-V binary to text assembly: -- <file>");
+            run_disasm_step.dependOn(&run_disasm.step);
         }
     }
+
+    // Declared above at top level so the spirv tests can depend on it.
 
     const test_step = b.step("test", "Run all tests");
 
@@ -160,9 +182,55 @@ pub fn build(b: *std.Build) void {
             .{ .name = "vulcan-ir", .module = vulcan_ir },
             .{ .name = "vulcan-wasm", .module = vulcan_wasm },
             .{ .name = "vulcan-target", .module = vulcan_target },
+            .{ .name = "vulcan-glsl", .module = vulcan_glsl },
         },
     }) });
     test_step.dependOn(&b.addRunArtifact(wasm_exec).step);
+
+    // C backend execution tests: emit C from IR, compile with the host `cc`, run, and
+    // cross-check against the native JIT. Skips when `cc` is absent.
+    const c_exec = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("libs/vulcan-target/c/tests/native.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "vulcan-ir", .module = vulcan_ir },
+            .{ .name = "vulcan-target", .module = vulcan_target },
+            .{ .name = "vulcan-glsl", .module = vulcan_glsl },
+            .{ .name = "vulcan-opt", .module = vulcan_opt },
+        },
+    }) });
+    test_step.dependOn(&b.addRunArtifact(c_exec).step);
+
+    // JS backend execution tests: emit JS from IR, run it with Node.js, cross-check against
+    // the native answer. Skips when no Node is found.
+    const js_exec = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("libs/vulcan-target/js/tests/native.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "vulcan-ir", .module = vulcan_ir },
+            .{ .name = "vulcan-target", .module = vulcan_target },
+            .{ .name = "vulcan-glsl", .module = vulcan_glsl },
+            .{ .name = "vulcan-opt", .module = vulcan_opt },
+        },
+    }) });
+    test_step.dependOn(&b.addRunArtifact(js_exec).step);
+
+    // Three-way differential: native JIT vs the C backend (cc) vs the JS backend (node) over
+    // GLSL, requiring all three to agree. Skips gracefully when a tool/host is unavailable.
+    const differential = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("libs/vulcan-target/tests/differential.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "vulcan-ir", .module = vulcan_ir },
+            .{ .name = "vulcan-target", .module = vulcan_target },
+            .{ .name = "vulcan-glsl", .module = vulcan_glsl },
+            .{ .name = "vulcan-wasm", .module = vulcan_wasm },
+        },
+    }) });
+    test_step.dependOn(&b.addRunArtifact(differential).step);
 
     // GLSL frontend tests: parsing/lowering (IR only), plus execution (GLSL -> IR ->
     // host JIT -> run) for scalar functions.

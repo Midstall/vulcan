@@ -397,6 +397,14 @@ pub const Function = struct {
         return self.values.items[@intFromEnum(value)].ty;
     }
 
+    /// Retype a value in place (its defining instruction / param is unchanged). Used by
+    /// the SIMD widener to re-type a scalar value to a packed vector without rebuilding
+    /// the SSA graph. The caller is responsible for keeping the def consistent (e.g.
+    /// splatting a scalar constant that becomes a vector).
+    pub fn setValueType(self: *Function, value: Value, ty: Type) void {
+        self.values.items[@intFromEnum(value)].ty = ty;
+    }
+
     /// The textual name number of a value: its position in a deterministic walk
     /// (block by block, parameters then instruction results). A pure function of
     /// structure, so the text round-trips.
@@ -521,7 +529,7 @@ pub const Function = struct {
         return self.insts.items.len;
     }
 
-    // -- mutable accessors, for passes like legalization --
+    // mutable accessors, for passes like legalization
 
     /// A mutable pointer to an instruction's opcode (to rewrite operands).
     pub fn opcodeMut(self: *Function, inst: Inst) *Opcode {

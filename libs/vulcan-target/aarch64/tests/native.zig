@@ -8,10 +8,266 @@ const builtin = @import("builtin");
 const ir = @import("vulcan-ir");
 const opt = @import("vulcan-opt");
 const isel = @import("../isel.zig");
+const disasm = @import("../disasm.zig");
 const link = @import("../link.zig");
 const jit = @import("../jit.zig");
 
 const Function = ir.function.Function;
+
+/// Compile `func` to A64 and assert its disassembled listing equals `expected`. This round-trips
+/// codegen through the disassembler, so it checks the actual instructions and register allocation
+/// rather than just the run result, and works on any host since it never executes the code.
+fn expectAsm(func: *const Function, expected: []const u8) !void {
+    const a = std.testing.allocator;
+    const code = try isel.selectFunction(a, func);
+    defer a.free(code);
+    const text = try disasm.format(a, code);
+    defer a.free(text);
+    try std.testing.expectEqualStrings(expected, text);
+}
+
+test "codegen+disasm round-trip: integer add" {
+    const a = std.testing.allocator;
+    var func = Function.init(a);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const e = try func.appendBlock();
+    const x = try func.appendBlockParam(e, i32_t);
+    const y = try func.appendBlockParam(e, i32_t);
+    const s = try func.appendInst(e, i32_t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = y } });
+    func.setTerminator(e, .{ .ret = s });
+
+    try expectAsm(&func,
+        \\0000: 0b010007  add w7, w0, w1
+        \\0004: aa0703e0  mov x0, x7
+        \\0008: d65f03c0  ret
+        \\
+    );
+}
+
+test "codegen+disasm round-trip: a returned constant" {
+    const a = std.testing.allocator;
+    var func = Function.init(a);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const e = try func.appendBlock();
+    const v = try func.appendInst(e, i32_t, .{ .iconst = 42 });
+    func.setTerminator(e, .{ .ret = v });
+
+    try expectAsm(&func,
+        \\0000: 52800547  mov w7, #0x2a
+        \\0004: aa0703e0  mov x0, x7
+        \\0008: d65f03c0  ret
+        \\
+    );
+}
+
+test "codegen+disasm round-trip: control flow (max via if/else)" {
+    const a = std.testing.allocator;
+    var func = Function.init(a);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const e = try func.appendBlock();
+    const x = try func.appendBlockParam(e, i32_t);
+    const y = try func.appendBlockParam(e, i32_t);
+    const m = try func.appendBlock();
+    const r = try func.appendBlockParam(m, i32_t);
+    const c = try func.appendInst(e, bool_t, .{ .icmp = .{ .op = .gt, .lhs = x, .rhs = y } });
+    try func.appendIf(e, c, .{ .target = m, .args = &.{x} }, .{ .target = m, .args = &.{y} });
+    func.setTerminator(m, .{ .ret = r });
+
+    // Exercises the disassembler on real branch offsets (cbnz/b .+N), cset, and block-edge
+    // moves. A regression in branch selection or edge lowering would change the listing.
+    try expectAsm(&func,
+        \\0000: 6b01001f  cmp w0, w1
+        \\0004: 1a9fd7e7  cset w7, gt
+        \\0008: 35000067  cbnz w7, .+12
+        \\000c: aa0103e7  mov x7, x1
+        \\0010: 14000003  b .+12
+        \\0014: aa0003e7  mov x7, x0
+        \\0018: 14000001  b .+4
+        \\001c: aa0703e0  mov x0, x7
+        \\0020: d65f03c0  ret
+        \\
+    );
+}
+
+test "codegen+disasm round-trip: scalar float add" {
+    const a = std.testing.allocator;
+    var func = Function.init(a);
+    defer func.deinit();
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const e = try func.appendBlock();
+    const x = try func.appendBlockParam(e, f32_t);
+    const y = try func.appendBlockParam(e, f32_t);
+    const s = try func.appendInst(e, f32_t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = y } });
+    func.setTerminator(e, .{ .ret = s });
+
+    try expectAsm(&func,
+        \\0000: 1e212807  fadd s7, s0, s1
+        \\0004: 1e6040e0  fmov d0, d7
+        \\0008: d65f03c0  ret
+        \\
+    );
+}
+
+test "codegen+disasm round-trip: register spilling opens a frame and spills to the stack" {
+    // Many simultaneously-live values exceed the register budget, forcing the allocator to
+    // spill. Rather than assert an exact (allocator-dependent) listing, check the shape:
+    // a stack frame is opened and there is at least one stack store and one stack reload.
+    // This validates spill codegen and the disassembly of stack memory ops on real output.
+    const a = std.testing.allocator;
+    var func = Function.init(a);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const e = try func.appendBlock();
+    const x = try func.appendBlockParam(e, i32_t);
+    var vals: [24]ir.function.Value = undefined;
+    for (0..vals.len) |i| vals[i] = try func.appendArithImm(e, i32_t, .add, x, @intCast(i + 1));
+    var acc = vals[0];
+    for (1..vals.len) |i| acc = try func.appendInst(e, i32_t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = vals[i] } });
+    func.setTerminator(e, .{ .ret = acc });
+
+    const code = try isel.selectFunction(a, &func);
+    defer a.free(code);
+    const text = try disasm.format(a, code);
+    defer a.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "sub sp, sp, #") != null); // prologue frame
+    try std.testing.expect(std.mem.indexOf(u8, text, "str ") != null); // a spill store
+    try std.testing.expect(std.mem.indexOf(u8, text, "ldr ") != null); // a reload
+    try std.testing.expect(std.mem.indexOf(u8, text, ", [sp") != null); // to/from a stack slot
+    try std.testing.expect(std.mem.indexOf(u8, text, "ret") != null);
+}
+
+test "codegen+disasm round-trip: a call emits the ABI frame and bl" {
+    // f(x) = g(x) + 1. Exercises the whole call ABI at the instruction level: a frame that
+    // saves the link register, a `bl` to the callee (an unresolved relocation, so offset 0),
+    // and the epilogue that restores and returns. Robust markers, not an exact listing.
+    const a = std.testing.allocator;
+    var func = Function.init(a);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const e = try func.appendBlock();
+    const x = try func.appendBlockParam(e, i32_t);
+    const r = try func.appendCall(e, i32_t, "g", &.{x});
+    const s = try func.appendArithImm(e, i32_t, .add, r, 1);
+    func.setTerminator(e, .{ .ret = s });
+
+    const code = try isel.selectFunction(a, &func);
+    defer a.free(code);
+    const text = try disasm.format(a, code);
+    defer a.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "sub sp, sp, #") != null); // prologue
+    try std.testing.expect(std.mem.indexOf(u8, text, "str x30, [sp") != null); // save the link register
+    try std.testing.expect(std.mem.indexOf(u8, text, "bl .") != null); // the call
+    try std.testing.expect(std.mem.indexOf(u8, text, "ldr x30, [sp") != null); // restore the link register
+    try std.testing.expect(std.mem.indexOf(u8, text, "add sp, sp, #") != null); // epilogue
+    try std.testing.expect(std.mem.indexOf(u8, text, "ret") != null);
+}
+
+test "dwarf: a linked module's real functions describe as DWARF (readelf-validated)" {
+    // Compile and link a 2-function module, turn its symbol table into DWARF subprograms at the
+    // functions' actual addresses, emit a debug ELF, and confirm readelf decodes it. This is the
+    // DWARF emitter connected to actual codegen, not hand-written addresses.
+    const a = std.testing.allocator;
+    const dwarf = @import("../../dwarf.zig");
+    const i32k = ir.types.TypeKind{ .int = .{ .signedness = .signed, .bits = 32 } };
+
+    var g = Function.init(a);
+    defer g.deinit();
+    const gi = try g.types.intern(i32k);
+    const gb = try g.appendBlock();
+    const gx = try g.appendBlockParam(gb, gi);
+    const gm = try g.appendArithImm(gb, gi, .mul, gx, 3);
+    g.setTerminator(gb, .{ .ret = gm });
+
+    var f = Function.init(a);
+    defer f.deinit();
+    const fi = try f.types.intern(i32k);
+    const fb = try f.appendBlock();
+    const fa = try f.appendBlockParam(fb, fi);
+    const called = try f.appendCall(fb, fi, "helper", &.{fa});
+    f.setTerminator(fb, .{ .ret = called });
+
+    var module = link.Module{};
+    defer module.deinit(a);
+    try module.addFunction(a, "helper", &g);
+    try module.addFunction(a, "main", &f);
+    var linked = try link.compileModule(a, &module);
+    defer linked.deinit(a);
+
+    const base: u64 = 0x400000;
+    const code_size: u64 = linked.code.len * 4; // aarch64 words -> bytes
+    const syms = try a.alloc(dwarf.SymIn, linked.symbols.len);
+    defer a.free(syms);
+    for (linked.symbols, 0..) |s, i| syms[i] = .{ .name = s.name, .offset = s.offset };
+    const subs = try dwarf.subprogramsFromSymbols(a, base, code_size, syms);
+    defer a.free(subs);
+
+    const elf = try dwarf.emitDebugElf(a, .{ .name = "module.glsl", .low_pc = base, .high_pc = base + code_size, .subprograms = subs });
+    defer a.free(elf);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "m.dbg", .data = elf });
+    const res = std.process.run(a, std.testing.io, .{ .argv = &.{ "readelf", "--debug-dump=info", "m.dbg" }, .cwd = .{ .dir = tmp.dir } }) catch |err| switch (err) {
+        error.FileNotFound => return error.SkipZigTest,
+        else => return err,
+    };
+    defer a.free(res.stdout);
+    defer a.free(res.stderr);
+    try std.testing.expect(std.mem.indexOf(u8, res.stdout, "helper") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.stdout, "main") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.stdout, "DW_TAG_subprogram") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.stdout, "400000") != null); // the real base PC
+}
+
+test "module disasm: linked functions get labels and a resolved, named call" {
+    // A two-function module (main calls helper) linked so the `bl` relocation resolves.
+    // formatModule labels each function at its offset and annotates the resolved call with
+    // the callee name (`<helper>`), so a linked image reads as a symbolized listing.
+    const a = std.testing.allocator;
+    const i32k = ir.types.TypeKind{ .int = .{ .signedness = .signed, .bits = 32 } };
+
+    var g = Function.init(a);
+    defer g.deinit();
+    const gi = try g.types.intern(i32k);
+    const gb = try g.appendBlock();
+    const gx = try g.appendBlockParam(gb, gi);
+    const gm = try g.appendArithImm(gb, gi, .mul, gx, 3);
+    g.setTerminator(gb, .{ .ret = gm });
+
+    var f = Function.init(a);
+    defer f.deinit();
+    const fi = try f.types.intern(i32k);
+    const fb = try f.appendBlock();
+    const fa = try f.appendBlockParam(fb, fi);
+    const fbp = try f.appendBlockParam(fb, fi);
+    const called = try f.appendCall(fb, fi, "helper", &.{fa});
+    const fsum = try f.appendInst(fb, fi, .{ .arith = .{ .op = .add, .lhs = called, .rhs = fbp } });
+    f.setTerminator(fb, .{ .ret = fsum });
+
+    var module = link.Module{};
+    defer module.deinit(a);
+    try module.addFunction(a, "helper", &g);
+    try module.addFunction(a, "main", &f);
+    var linked = try link.compileModule(a, &module);
+    defer linked.deinit(a);
+
+    const syms = try a.alloc(disasm.Sym, linked.symbols.len);
+    defer a.free(syms);
+    for (linked.symbols, 0..) |s, i| syms[i] = .{ .name = s.name, .word = s.offset / 4 };
+    const text = try disasm.formatModule(a, linked.code, syms);
+    defer a.free(text);
+
+    // The `bl` in main resolves back to helper and is annotated with its name.
+    try std.testing.expect(std.mem.indexOf(u8, text, "helper:\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "main:\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "bl .-48  <helper>") != null);
+}
 
 /// A named function for `runModule`. The entry must be first.
 pub const NamedFunc = struct { name: []const u8, func: *Function };
@@ -70,7 +326,23 @@ fn callI32(buf: *const jit.CodeBuffer, args: []const i32) !i32 {
 }
 
 fn expectRun(allocator: std.mem.Allocator, func: *Function, args: []const i32, expected: i32) !void {
-    try std.testing.expectEqual(expected, try run(allocator, func, args));
+    const got = try run(allocator, func, args);
+    if (got != expected) {
+        // A codegen bug: dump the disassembly so the wrong instruction / register is visible
+        // at a glance instead of just a wrong number (the whole point of the in-tree disasm).
+        dumpDisasm(allocator, func, got, expected);
+        return error.TestExpectedEqual;
+    }
+}
+
+/// Print the compiled function's disassembly alongside a value mismatch. Best-effort: any
+/// error here is swallowed so it never masks the original test failure.
+fn dumpDisasm(allocator: std.mem.Allocator, func: *const Function, got: i32, expected: i32) void {
+    const code = isel.selectFunction(allocator, func) catch return;
+    defer allocator.free(code);
+    const text = disasm.format(allocator, code) catch return;
+    defer allocator.free(text);
+    std.debug.print("\ncodegen mismatch: got {d}, expected {d}. disassembly:\n{s}\n", .{ got, expected, text });
 }
 
 fn i32func(allocator: std.mem.Allocator) !Function {
@@ -1554,5 +1826,364 @@ test "object+ld+exec: link two functions into a runnable ELF and execute it nati
     switch (proc.term) {
         .exited => |code| try std.testing.expectEqual(@as(u8, 42), code), // dbl(20) + 2
         else => return error.BackendFailed,
+    }
+}
+
+test "native: unsigned div/shr/compare and unsigned int->float" {
+    const allocator = std.testing.allocator;
+
+    { // udiv: 0xFFFFFFFF / 2 = 0x7FFFFFFF (signed sdiv would give 0)
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const u = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const b = try f.appendBlock();
+        const a = try f.appendBlockParam(b, u);
+        const d = try f.appendBlockParam(b, u);
+        const r = try f.appendInst(b, u, .{ .arith = .{ .op = .div, .lhs = a, .rhs = d } });
+        f.setTerminator(b, .{ .ret = r });
+        try expectRun(allocator, &f, &.{ -1, 2 }, 0x7FFFFFFF);
+    }
+    { // lsr: 0x80000000 >> 1 = 0x40000000 (signed asr would give 0xC0000000)
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const u = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const b = try f.appendBlock();
+        const a = try f.appendBlockParam(b, u);
+        const r = try f.appendArithImm(b, u, .shr, a, 1);
+        f.setTerminator(b, .{ .ret = r });
+        try expectRun(allocator, &f, &.{@bitCast(@as(u32, 0x80000000))}, 0x40000000);
+    }
+    { // unsigned compare: (-1 as u32) <u 1 is false
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const u = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const bool_t = try f.types.intern(.bool);
+        const b = try f.appendBlock();
+        const a = try f.appendBlockParam(b, u);
+        const d = try f.appendBlockParam(b, u);
+        const c = try f.appendInst(b, bool_t, .{ .icmp = .{ .op = .lt, .lhs = a, .rhs = d } });
+        const one = try f.appendInst(b, u, .{ .iconst = 1 });
+        const zero = try f.appendInst(b, u, .{ .iconst = 0 });
+        const r = try f.appendInst(b, u, .{ .select = .{ .cond = c, .then = one, .@"else" = zero } });
+        f.setTerminator(b, .{ .ret = r });
+        try expectRun(allocator, &f, &.{ -1, 1 }, 0);
+        try expectRun(allocator, &f, &.{ 1, 2 }, 1);
+    }
+    { // unsigned int -> f64: (f64)(u32)0xFFFFFFFF = 4294967295.0 (signed would be -1.0)
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const u = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        const f64t = try f.types.intern(.{ .float = .f64 });
+        const b = try f.appendBlock();
+        const a = try f.appendBlockParam(b, u);
+        const r = try f.appendInst(b, f64t, .{ .convert = .{ .value = a } });
+        f.setTerminator(b, .{ .ret = r });
+        try std.testing.expectEqual(@as(f64, 4294967295.0), try runF64(allocator, &f, &.{-1}));
+    }
+}
+
+test "disasm: source-annotated listing of a real -g object (full DWARF-read pipeline)" {
+    // cc -g a real function, then run the whole vulcan-disasm pipeline on it: findText ->
+    // sectionByName(.debug_line) -> decodeLine -> formatElfWithLines, and confirm the source-line
+    // markers land in the listing. Host must be aarch64 for cc to emit an aarch64 object.
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const dwarf = @import("../../dwarf.zig");
+    const elf_read = @import("../../elf_read.zig");
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "add.c", .data = "int add(int a, int b) {\n  int c = a + b;\n  return c;\n}\n" });
+    const cc = std.process.run(a, io, .{ .argv = &.{ "cc", "-gdwarf-4", "-O0", "-c", "add.c", "-o", "add.o" }, .cwd = .{ .dir = tmp.dir } }) catch |e| switch (e) {
+        error.FileNotFound => return error.SkipZigTest,
+        else => return e,
+    };
+    defer a.free(cc.stdout);
+    defer a.free(cc.stderr);
+    if (cc.term != .exited or cc.term.exited != 0) return error.SkipZigTest;
+    const obj = try tmp.dir.readFileAlloc(io, "add.o", a, .limited(4 << 20));
+    defer a.free(obj);
+
+    const t = try elf_read.findText(obj);
+    if (t.machine != elf_read.EM_AARCH64) return error.SkipZigTest; // non-aarch64 host
+    const dl = (try elf_read.sectionByName(obj, ".debug_line")) orelse return error.SkipZigTest;
+    const rows = try dwarf.decodeLine(a, dl);
+    defer a.free(rows);
+
+    var lines: std.ArrayList(disasm.AddrLine) = .empty;
+    defer lines.deinit(a);
+    for (rows) |r| if (!r.end_sequence) try lines.append(a, .{ .addr = r.address, .line = r.line });
+    std.mem.sort(disasm.AddrLine, lines.items, {}, struct {
+        fn lt(_: void, x: disasm.AddrLine, y: disasm.AddrLine) bool {
+            return x.addr < y.addr;
+        }
+    }.lt);
+
+    const words = try a.alloc(u32, t.bytes.len / 4);
+    defer a.free(words);
+    for (words, 0..) |*w, i| w.* = std.mem.readInt(u32, t.bytes[i * 4 ..][0..4], .little);
+    const listing = try disasm.formatElfWithLines(a, words, t.addr, &.{}, lines.items);
+    defer a.free(listing);
+
+    // The real source's body lines appear as markers interleaved in the disassembly.
+    try std.testing.expect(std.mem.indexOf(u8, listing, "; line 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listing, "; line 3") != null);
+}
+
+test "pipeline: algebraic identities simplify then run correctly on aarch64" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    // Every subterm is an identity: x*1=x, x-x=0, x&x=x, x^x=0. So the function computes
+    // ((x*1) + (x-x)) + ((x&x) - (x^x)) = (x + 0) + (x - 0) = 2x. simplify must preserve that.
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const b = try func.appendBlock();
+    const x = try func.appendBlockParam(b, t);
+    const one = try func.appendInst(b, t, .{ .iconst = 1 });
+    const m1 = try func.appendInst(b, t, .{ .arith = .{ .op = .mul, .lhs = x, .rhs = one } }); // x
+    const sxx = try func.appendInst(b, t, .{ .arith = .{ .op = .sub, .lhs = x, .rhs = x } }); // 0
+    const axx = try func.appendInst(b, t, .{ .arith = .{ .op = .bit_and, .lhs = x, .rhs = x } }); // x
+    const xxx = try func.appendInst(b, t, .{ .arith = .{ .op = .bit_xor, .lhs = x, .rhs = x } }); // 0
+    const l = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = m1, .rhs = sxx } }); // x
+    const r = try func.appendInst(b, t, .{ .arith = .{ .op = .sub, .lhs = axx, .rhs = xxx } }); // x
+    const sum = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = l, .rhs = r } }); // 2x
+    func.setTerminator(b, .{ .ret = sum });
+
+    try std.testing.expect(try opt.optimize(allocator, &func));
+    try expectRun(allocator, &func, &.{21}, 42); // 2 * 21
+}
+
+test "pipeline: strength reduction (mul/div/rem by powers of two) runs correctly on aarch64" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    // Unsigned so div/rem reduce to shift/mask: f(x) = (x*4) + (x/2) + (x%2).
+    // For x = 10: 40 + 5 + 0 = 45. After strength: (x<<2) + (x>>1) + (x&1).
+    const t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const b = try func.appendBlock();
+    const x = try func.appendBlockParam(b, t);
+    const m = try func.appendArithImm(b, t, .mul, x, 4); // x << 2
+    const d = try func.appendArithImm(b, t, .div, x, 2); // x >> 1
+    const r = try func.appendArithImm(b, t, .rem, x, 2); // x & 1
+    const s1 = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = m, .rhs = d } });
+    const s2 = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = s1, .rhs = r } });
+    func.setTerminator(b, .{ .ret = s2 });
+
+    try std.testing.expect(try opt.optimize(allocator, &func));
+    try expectRun(allocator, &func, &.{10}, 45);
+}
+
+test "pipeline: a constant-condition select folds away and runs correctly on aarch64" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    // f(a, b) = (1 < 2) ? a : b. constfold resolves 1<2 to true, then simplify folds the select to a.
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const b = try func.appendBlock();
+    const a = try func.appendBlockParam(b, t);
+    const bb = try func.appendBlockParam(b, t);
+    const c1 = try func.appendInst(b, t, .{ .iconst = 1 });
+    const c2 = try func.appendInst(b, t, .{ .iconst = 2 });
+    const cmp = try func.appendInst(b, bool_t, .{ .icmp = .{ .op = .lt, .lhs = c1, .rhs = c2 } });
+    const sel = try func.appendInst(b, t, .{ .select = .{ .cond = cmp, .then = a, .@"else" = bb } });
+    func.setTerminator(b, .{ .ret = sel });
+
+    try std.testing.expect(try opt.optimize(allocator, &func));
+    try expectRun(allocator, &func, &.{ 7, 9 }, 7); // picks a = 7
+}
+
+test "pipeline: branch folding drops a dead arm and runs correctly on aarch64" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const then_b = try func.appendBlock();
+    const else_b = try func.appendBlock();
+    const merge = try func.appendBlock();
+    const x = try func.appendBlockParam(entry, t);
+    const tv = try func.appendBlockParam(then_b, t);
+    const ev = try func.appendBlockParam(else_b, t);
+    const rv = try func.appendBlockParam(merge, t);
+    const c1 = try func.appendInst(entry, t, .{ .iconst = 1 });
+    const c2 = try func.appendInst(entry, t, .{ .iconst = 2 });
+    const cmp = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .gt, .lhs = c1, .rhs = c2 } }); // false
+    try func.appendIf(entry, cmp, .{ .target = then_b, .args = &.{x} }, .{ .target = else_b, .args = &.{x} });
+    const t100 = try func.appendArithImm(then_b, t, .add, tv, 100); // dead path
+    try func.setJump(then_b, merge, &.{t100});
+    const e1 = try func.appendArithImm(else_b, t, .add, ev, 1);
+    try func.setJump(else_b, merge, &.{e1});
+    func.setTerminator(merge, .{ .ret = rv });
+
+    // The full default pipeline: constfold makes cmp constant-false, branchfold turns entry's if into
+    // `jump else_b` (leaving then_b dead), and GVN/LICM/DCE run over the CFG that still contains the
+    // unreachable, param-carrying then_b, which the now-reachability-aware analyses tolerate.
+    try std.testing.expect(try opt.optimize(allocator, &func));
+    try expectRun(allocator, &func, &.{41}, 42); // takes the else path: x + 1
+}
+
+/// Build a function whose result `opt.optimize` must leave unchanged. The equivalence tests below
+/// each run the unoptimized and optimized forms and assert they agree on real hardware.
+fn eqIdentitiesStrength(func: *Function) !void {
+    // (x*1) + (x-x) + (x*4) = 5x  (arith identities + strength reduction)
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const b = try func.appendBlock();
+    const x = try func.appendBlockParam(b, t);
+    const m1 = try func.appendArithImm(b, t, .mul, x, 1);
+    const sxx = try func.appendInst(b, t, .{ .arith = .{ .op = .sub, .lhs = x, .rhs = x } });
+    const m4 = try func.appendArithImm(b, t, .mul, x, 4);
+    const s1 = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = m1, .rhs = sxx } });
+    const s2 = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = s1, .rhs = m4 } });
+    func.setTerminator(b, .{ .ret = s2 });
+}
+
+fn eqConstSelect(func: *Function) !void {
+    // (1 < 2) ? x*2 : x*3  -> 2x  (constfold + select fold + strength)
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const b = try func.appendBlock();
+    const x = try func.appendBlockParam(b, t);
+    const c1 = try func.appendInst(b, t, .{ .iconst = 1 });
+    const c2 = try func.appendInst(b, t, .{ .iconst = 2 });
+    const cmp = try func.appendInst(b, bool_t, .{ .icmp = .{ .op = .lt, .lhs = c1, .rhs = c2 } });
+    const m2 = try func.appendArithImm(b, t, .mul, x, 2);
+    const m3 = try func.appendArithImm(b, t, .mul, x, 3);
+    const sel = try func.appendInst(b, t, .{ .select = .{ .cond = cmp, .then = m2, .@"else" = m3 } });
+    func.setTerminator(b, .{ .ret = sel });
+}
+
+fn eqConstBranch(func: *Function) !void {
+    // if (2 > 1) return x+10 else return x-10  -> x+10  (branch folding)
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const a = try func.appendBlock();
+    const bb = try func.appendBlock();
+    const x = try func.appendBlockParam(entry, t);
+    const av = try func.appendBlockParam(a, t);
+    const bv = try func.appendBlockParam(bb, t);
+    const c1 = try func.appendInst(entry, t, .{ .iconst = 1 });
+    const c2 = try func.appendInst(entry, t, .{ .iconst = 2 });
+    const cmp = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .gt, .lhs = c2, .rhs = c1 } });
+    try func.appendIf(entry, cmp, .{ .target = a, .args = &.{x} }, .{ .target = bb, .args = &.{x} });
+    const ap = try func.appendArithImm(a, t, .add, av, 10);
+    func.setTerminator(a, .{ .ret = ap });
+    const bm = try func.appendArithImm(bb, t, .sub, bv, 10);
+    func.setTerminator(bb, .{ .ret = bm });
+}
+
+fn eqSelfCmpSelect(func: *Function) !void {
+    // (x == x) ? x+1 : x-1  -> x+1  (self-comparison fold + select fold)
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const b = try func.appendBlock();
+    const x = try func.appendBlockParam(b, t);
+    const cmp = try func.appendInst(b, bool_t, .{ .icmp = .{ .op = .eq, .lhs = x, .rhs = x } });
+    const p = try func.appendArithImm(b, t, .add, x, 1);
+    const q = try func.appendArithImm(b, t, .sub, x, 1);
+    const sel = try func.appendInst(b, t, .{ .select = .{ .cond = cmp, .then = p, .@"else" = q } });
+    func.setTerminator(b, .{ .ret = sel });
+}
+
+test "optimization is semantics-preserving: opt vs non-opt agree on aarch64" {
+    const allocator = std.testing.allocator;
+    const builders = [_]*const fn (*Function) anyerror!void{
+        eqIdentitiesStrength, eqConstSelect, eqConstBranch, eqSelfCmpSelect,
+    };
+    const args = [_]i32{ 0, 1, 7, 100, -3 };
+    for (builders) |build| {
+        for (args) |arg| {
+            var f0 = Function.init(allocator);
+            defer f0.deinit();
+            try build(&f0);
+            const reference = try run(allocator, &f0, &.{arg});
+
+            var f1 = Function.init(allocator);
+            defer f1.deinit();
+            try build(&f1);
+            _ = try opt.optimize(allocator, &f1);
+            const optimized = try run(allocator, &f1, &.{arg});
+
+            try std.testing.expectEqual(reference, optimized);
+        }
+    }
+}
+
+test "multi-block inlining preserves semantics on aarch64 (callee has a loop)" {
+    const allocator = std.testing.allocator;
+    const i32k = ir.types.TypeKind{ .int = .{ .signedness = .signed, .bits = 32 } };
+
+    // callee sumto(n) = 0+1+...+(n-1), a counted loop: 4 blocks with a back-edge (body -> loop).
+    const buildCallee = struct {
+        fn go(a: std.mem.Allocator) !Function {
+            var f = Function.init(a);
+            const t = try f.types.intern(i32k);
+            const bt = try f.types.intern(.bool);
+            const entry = try f.appendBlock();
+            const loop = try f.appendBlock();
+            const body = try f.appendBlock();
+            const done = try f.appendBlock();
+            const n = try f.appendBlockParam(entry, t);
+            const i = try f.appendBlockParam(loop, t);
+            const acc = try f.appendBlockParam(loop, t);
+            const bi = try f.appendBlockParam(body, t);
+            const bacc = try f.appendBlockParam(body, t);
+            const racc = try f.appendBlockParam(done, t);
+            const zero = try f.appendInst(entry, t, .{ .iconst = 0 });
+            try f.setJump(entry, loop, &.{ zero, zero });
+            const cmp = try f.appendInst(loop, bt, .{ .icmp = .{ .op = .lt, .lhs = i, .rhs = n } });
+            try f.appendIf(loop, cmp, .{ .target = body, .args = &.{ i, acc } }, .{ .target = done, .args = &.{acc} });
+            const ni = try f.appendArithImm(body, t, .add, bi, 1);
+            const nacc = try f.appendInst(body, t, .{ .arith = .{ .op = .add, .lhs = bacc, .rhs = bi } });
+            try f.setJump(body, loop, &.{ ni, nacc });
+            f.setTerminator(done, .{ .ret = racc });
+            return f;
+        }
+    }.go;
+    // caller f(x) = sumto(x) + 100  (code after the call exercises the continuation split).
+    const buildCaller = struct {
+        fn go(a: std.mem.Allocator) !Function {
+            var f = Function.init(a);
+            const t = try f.types.intern(i32k);
+            const b = try f.appendBlock();
+            const x = try f.appendBlockParam(b, t);
+            const s = try f.appendCall(b, t, "sumto", &.{x});
+            const r = try f.appendArithImm(b, t, .add, s, 100);
+            f.setTerminator(b, .{ .ret = r });
+            return f;
+        }
+    }.go;
+
+    const Lk = struct {
+        callee: *const Function,
+        fn get(ctx: *anyopaque, name: []const u8) ?*const Function {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return if (std.mem.eql(u8, name, "sumto")) self.callee else null;
+        }
+    };
+
+    for ([_]i32{ 0, 1, 5, 10 }) |arg| {
+        // Reference: the linked module (a real call), non-inlined.
+        var callee0 = try buildCallee(allocator);
+        defer callee0.deinit();
+        var caller0 = try buildCaller(allocator);
+        defer caller0.deinit();
+        const reference = try runModule(allocator, &.{ .{ .name = "f", .func = &caller0 }, .{ .name = "sumto", .func = &callee0 } }, &.{arg});
+
+        // Inlined: clone the callee's blocks (loop and all) into the caller, then run the one function.
+        var callee1 = try buildCallee(allocator);
+        defer callee1.deinit();
+        var caller1 = try buildCaller(allocator);
+        defer caller1.deinit();
+        var lk = Lk{ .callee = &callee1 };
+        try std.testing.expect(try opt.inlining.run(allocator, &caller1, .{ .context = &lk, .func = Lk.get }));
+        for (0..caller1.blockCount()) |bi| for (caller1.blockInsts(@enumFromInt(bi))) |inst| {
+            try std.testing.expect(caller1.opcode(inst) != .call); // the call was inlined away
+        };
+        const inlined = try run(allocator, &caller1, &.{arg});
+
+        try std.testing.expectEqual(reference, inlined);
     }
 }

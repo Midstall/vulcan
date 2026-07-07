@@ -148,6 +148,10 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
                     const ty = intType(func, c.lhs) orelse break :blk null;
                     break :blk evalCmp(c.op, lc, rc, ty);
                 },
+                // `convert` is deliberately not folded. In this IR an int-to-int convert is a plain
+                // register move that keeps the low bits with no width truncation, the way aarch64 isel
+                // lowers it. A C-style `wrap` here would disagree with codegen, which the equivalence
+                // differential caught.
                 else => null,
             };
             if (folded) |value| {

@@ -15,14 +15,23 @@ pub const Dominators = struct {
     /// The immediate dominator of each block (itself for the entry and for
     /// unreachable blocks).
     idom: []u32,
+    /// Whether each block is reachable from the entry. Unreachable blocks have a
+    /// degenerate dominance relation (dominated by everything), so consumers that
+    /// walk the CFG (e.g. loop detection) must exclude them via `isReachable`.
+    reachable: []bool,
 
     pub fn deinit(self: *Dominators, allocator: std.mem.Allocator) void {
         allocator.free(self.dom);
         allocator.free(self.idom);
+        allocator.free(self.reachable);
     }
 
     pub fn dominates(self: *const Dominators, a: usize, b: usize) bool {
         return self.dom[b * self.n + a];
+    }
+
+    pub fn isReachable(self: *const Dominators, b: usize) bool {
+        return self.reachable[b];
     }
 
     /// Whether `a` strictly dominates `b` (dominates and is not `b`).
@@ -41,6 +50,25 @@ pub fn compute(allocator: std.mem.Allocator, func: *const Function) std.mem.Allo
     var cfg = try cfg_mod.build(allocator, func);
     defer cfg.deinit(allocator);
     const n = cfg.blockCount();
+
+    // Reachability from the entry (block 0), by CFG traversal.
+    const reachable = try allocator.alloc(bool, n);
+    errdefer allocator.free(reachable);
+    @memset(reachable, false);
+    if (n > 0) {
+        reachable[0] = true;
+        var stack: std.ArrayList(u32) = .empty;
+        defer stack.deinit(allocator);
+        try stack.append(allocator, 0);
+        while (stack.pop()) |b| {
+            for (cfg.successors(b)) |s| {
+                if (!reachable[s]) {
+                    reachable[s] = true;
+                    try stack.append(allocator, s);
+                }
+            }
+        }
+    }
 
     const dom = try allocator.alloc(bool, n * n);
     errdefer allocator.free(dom);
@@ -83,7 +111,7 @@ pub fn compute(allocator: std.mem.Allocator, func: *const Function) std.mem.Allo
     errdefer allocator.free(idom);
     for (0..n) |b| {
         idom[b] = @intCast(b); // entry and unreachable map to themselves
-        if (b == 0) continue;
+        if (b == 0 or !reachable[b]) continue; // unreachable blocks have a degenerate dom relation
         for (0..n) |d| {
             if (d == b or !dom[b * n + d]) continue; // d must strictly dominate b
             var lowest = true;
@@ -102,7 +130,7 @@ pub fn compute(allocator: std.mem.Allocator, func: *const Function) std.mem.Allo
         }
     }
 
-    return .{ .n = n, .dom = dom, .idom = idom };
+    return .{ .n = n, .dom = dom, .idom = idom, .reachable = reachable };
 }
 
 test "dominators of a diamond" {
@@ -138,4 +166,27 @@ test "dominators of a diamond" {
     try std.testing.expectEqual(@as(u32, 0), doms.immediateDominator(1));
     try std.testing.expectEqual(@as(u32, 0), doms.immediateDominator(2));
     try std.testing.expectEqual(@as(u32, 0), doms.immediateDominator(3));
+}
+
+test "unreachable blocks are flagged and map their idom to themselves" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const entry = try func.appendBlock();
+    const exit = try func.appendBlock();
+    const orphan = try func.appendBlock(); // no incoming edges
+    const x = try func.appendBlockParam(entry, t);
+    const ev = try func.appendBlockParam(exit, t);
+    const ov = try func.appendBlockParam(orphan, t);
+    try func.setJump(entry, exit, &.{x});
+    func.setTerminator(exit, .{ .ret = ev });
+    try func.setJump(orphan, exit, &.{ov}); // dead edge into exit
+
+    var doms = try compute(allocator, &func);
+    defer doms.deinit(allocator);
+    try std.testing.expect(doms.isReachable(0)); // entry
+    try std.testing.expect(doms.isReachable(1)); // exit (via entry)
+    try std.testing.expect(!doms.isReachable(2)); // orphan
+    try std.testing.expectEqual(@as(u32, 2), doms.immediateDominator(2)); // orphan -> itself, not garbage
 }

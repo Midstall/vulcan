@@ -9,6 +9,13 @@ pub const aarch64 = @import("vulcan-target/aarch64.zig");
 pub const x86 = @import("vulcan-target/x86.zig");
 pub const x86_64 = @import("vulcan-target/x86_64.zig");
 pub const nvidia = @import("vulcan-target/nvidia.zig");
+pub const wasm = @import("vulcan-target/wasm.zig");
+
+/// Portable C99 source backend: lowers an IR function to equivalent C.
+pub const c = @import("vulcan-target/c.zig");
+
+/// JavaScript source backend: lowers an IR function to equivalent JS.
+pub const js = @import("vulcan-target/js.zig");
 
 /// virgl/Gallium TGSI text: lowers a graphics IR function to the textual shader
 /// form `tgsi_text_translate` accepts (the GPU-paravirtual path).
@@ -19,6 +26,12 @@ pub const tgsi = @import("vulcan-target/tgsi.zig");
 /// linker (`ld.writeElfExec`).
 pub const pe = @import("vulcan-target/pe.zig");
 pub const image = @import("vulcan-target/image.zig");
+
+/// DWARF debug-info emitter (arch-independent container), for debugger support.
+pub const dwarf = @import("vulcan-target/dwarf.zig");
+
+/// Minimal ELF reader: locate `.text` + machine so a disassembler can be picked.
+pub const elf_read = @import("vulcan-target/elf_read.zig");
 
 /// Shared register-allocation support (target-independent live intervals).
 pub const regalloc = @import("vulcan-target/regalloc.zig");

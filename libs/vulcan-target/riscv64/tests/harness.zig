@@ -9,6 +9,7 @@ const std = @import("std");
 const ir = @import("vulcan-ir");
 const encode = @import("../encode.zig");
 const emit = @import("../emit.zig");
+const compress = @import("../compress.zig");
 const isel = @import("../isel.zig");
 const schedule = @import("../schedule.zig");
 const link = @import("../link.zig");
@@ -29,7 +30,15 @@ pub const Backend = struct {
     name: []const u8,
     incompatible: bool = false,
     reason: []const u8 = "",
-    /// Build the full argv to run the firmware at `elf_path`. Caller owns it.
+    /// A Linux user-mode backend (e.g. qemu-riscv64): the program is a plain static ELF whose entry
+    /// stub calls the function, writes the 8-byte result to stdout via the `write` syscall, and exits
+    /// via `exit`. When false, the firmware path (MMIO-UART, self-loop) is used instead.
+    user_mode: bool = false,
+    /// RVC-compress the program before running it, but ONLY when it is provably self-contained (a
+    /// single function, or a linked module with no pending relocations) so compression cannot shift a
+    /// relocation target it does not know about. Validates the compressor across the whole corpus.
+    compress_rvc: bool = false,
+    /// Build the full argv to run the ELF at `elf_path`. Caller owns it.
     buildArgv: *const fn (allocator: std.mem.Allocator, elf_path: []const u8) std.mem.Allocator.Error![]const []const u8,
 };
 
@@ -53,8 +62,22 @@ fn unusedArgv(allocator: std.mem.Allocator, elf_path: []const u8) std.mem.Alloca
     return allocator.dupe([]const u8, &.{});
 }
 
+fn qemuUserArgv(allocator: std.mem.Allocator, elf_path: []const u8) std.mem.Allocator.Error![]const []const u8 {
+    // qemu-riscv64 user mode runs the static ELF directly under the Linux syscall ABI.
+    return allocator.dupe([]const u8, &.{ "qemu-riscv64", elf_path });
+}
+
 /// River functional emulator (Midstall's CPU): the reference backend.
 pub const river = Backend{ .name = "river-emulator", .buildArgv = riverArgv };
+
+/// QEMU user-mode (`qemu-riscv64`): runs the same case corpus as a plain Linux static ELF, so the
+/// codegen executes on any dev machine with qemu even when River/Spike are absent. Skips if qemu is
+/// not on PATH.
+pub const qemu_user = Backend{ .name = "qemu-riscv64", .user_mode = true, .buildArgv = qemuUserArgv };
+
+/// Like `qemu_user`, but RVC-compresses every self-contained case first, so the whole corpus doubles
+/// as an execution test of the compressor on real, diverse codegen. Skips if qemu is absent.
+pub const qemu_user_rvc = Backend{ .name = "qemu-riscv64", .user_mode = true, .compress_rvc = true, .buildArgv = qemuUserArgv };
 
 /// Spike (the RISC-V ISA simulator). Incompatible for now: it has no MMIO 16550
 /// UART at 0x10000000. Output goes through HTIF tohost, so the firmware's UART
@@ -107,6 +130,32 @@ pub fn buildStub(allocator: std.mem.Allocator, args: []const i64) std.mem.Alloca
     return w.toOwnedSlice(allocator);
 }
 
+/// User-mode entry stub: load arguments into a0.., call the function placed right after, then write
+/// the returned a0 to stdout as 8 LE bytes via the `write` syscall and `exit(0)`. The kernel gives a
+/// valid sp and an enabled FPU, so (unlike the firmware stub) neither is set up here. Caller owns it.
+pub fn buildUserStub(allocator: std.mem.Allocator, args: []const i64) std.mem.Allocator.Error![]u32 {
+    var w: std.ArrayList(u32) = .empty;
+    errdefer w.deinit(allocator);
+
+    for (args, 0..) |arg, i| try loadImmInto(allocator, &w, argReg(i), arg);
+    const call_idx = w.items.len;
+    try w.append(allocator, encode.jal(.x1, 0)); // call the function (offset patched below)
+    // a0 now holds the result. Spill it to the stack and write those 8 bytes to fd 1.
+    try w.append(allocator, encode.addi(.x2, .x2, -16)); // sp -= 16
+    try w.append(allocator, encode.sd(.x10, .x2, 0)); // sd a0, 0(sp)
+    try w.append(allocator, encode.addi(.x10, .x0, 1)); // a0 = 1 (stdout)
+    try w.append(allocator, encode.addi(.x11, .x2, 0)); // a1 = sp (buffer)
+    try w.append(allocator, encode.addi(.x12, .x0, 8)); // a2 = 8 (length)
+    try w.append(allocator, encode.addi(.x17, .x0, 64)); // a7 = 64 (write)
+    try w.append(allocator, encode.ecall());
+    try w.append(allocator, encode.addi(.x10, .x0, 0)); // a0 = 0 (status)
+    try w.append(allocator, encode.addi(.x17, .x0, 93)); // a7 = 93 (exit)
+    try w.append(allocator, encode.ecall());
+    const fn_off: i21 = @intCast((w.items.len - call_idx) * 4);
+    w.items[call_idx] = encode.jal(.x1, fn_off);
+    return w.toOwnedSlice(allocator);
+}
+
 /// Wrap a code image into a flat rv64 firmware ELF loaded at `entry`, entering at
 /// `entry`. Delegates to the linker's production ELF writer. Caller owns it.
 pub fn writeElf(allocator: std.mem.Allocator, code: []const u8, entry: u64) std.mem.Allocator.Error![]u8 {
@@ -126,41 +175,58 @@ pub fn compileFunc(allocator: std.mem.Allocator, func: *Function) !std.ArrayList
     return list;
 }
 
-/// Compile `func`, run it on `backend` with `args`, and return a0.
+/// Compile `func`, run it on `backend` with `args`, and return a0. A single function is self-
+/// contained (any `call` would need linking), so RVC compression is safe when the backend asks.
 pub fn runFunc(io: std.Io, allocator: std.mem.Allocator, func: *Function, args: []const i64, backend: Backend) !i64 {
     var words = try compileFunc(allocator, func);
     defer words.deinit(allocator);
-    return runCode(io, allocator, words.items, args, backend);
+    return runProgram(io, allocator, words.items, args, backend, backend.compress_rvc);
 }
 
-/// Like `runFunc`, but for a whole linked module (entry first).
+/// Like `runFunc`, but for a whole linked module (entry first). Compression is only safe when the
+/// module has no pending relocations (every call resolved to an internal `jal`, no external data).
 pub fn runModule(io: std.Io, allocator: std.mem.Allocator, module: *const link.Module, args: []const i64, backend: Backend) !i64 {
     var linked = try link.compileModule(allocator, module);
     defer linked.deinit(allocator);
-    return runCode(io, allocator, linked.code, args, backend);
+    const can_compress = backend.compress_rvc and linked.relocs.len == 0;
+    return runProgram(io, allocator, linked.code, args, backend, can_compress);
 }
 
 /// Run an already-linked code image (entry at word 0) on `backend`.
 pub fn runCode(io: std.Io, allocator: std.mem.Allocator, code: []const u32, args: []const i64, backend: Backend) !i64 {
+    return runProgram(io, allocator, code, args, backend, false);
+}
+
+fn runProgram(io: std.Io, allocator: std.mem.Allocator, code: []const u32, args: []const i64, backend: Backend, compress_it: bool) !i64 {
     if (backend.incompatible) return error.SkipZigTest;
 
-    const stub = try buildStub(allocator, args);
+    const stub = if (backend.user_mode) try buildUserStub(allocator, args) else try buildStub(allocator, args);
     defer allocator.free(stub);
     const program = try allocator.alloc(u32, stub.len + code.len);
     defer allocator.free(program);
     @memcpy(program[0..stub.len], stub);
     @memcpy(program[stub.len..], code);
 
-    const bytes = try emit.emitBytes(allocator, program);
+    // Self-contained programs may be RVC-compressed (stub + body are all PC-relative); compress
+    // recomputes the stub's call jal for the shrunk layout.
+    const bytes = if (compress_it) try compress.compress(allocator, program) else try emit.emitBytes(allocator, program);
     defer allocator.free(bytes);
-    const elf = try writeElf(allocator, bytes, load_address);
+    // User-mode: a static ELF at a low base, entered at the stub. Firmware: flat image at DRAM base.
+    const user_base: u64 = 0x10000;
+    const elf = if (backend.user_mode)
+        try (@import("../ld.zig")).writeElfExec(allocator, bytes, bytes.len, user_base, user_base)
+    else
+        try writeElf(allocator, bytes, load_address);
     defer allocator.free(elf);
 
-    // Write the firmware into a unique temp directory and run the backend with its
-    // cwd set there, so the argv just names the file (no cache-path assumptions).
+    // Write the ELF into a unique temp directory and run the backend with its cwd set there, so the
+    // argv just names the file (no cache-path assumptions). User-mode qemu needs the file executable.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(io, .{ .sub_path = "firmware.elf", .data = elf });
+    if (backend.user_mode)
+        try tmp.dir.writeFile(io, .{ .sub_path = "firmware.elf", .data = elf, .flags = .{ .permissions = .executable_file } })
+    else
+        try tmp.dir.writeFile(io, .{ .sub_path = "firmware.elf", .data = elf });
 
     const argv = try backend.buildArgv(allocator, "firmware.elf");
     defer allocator.free(argv);

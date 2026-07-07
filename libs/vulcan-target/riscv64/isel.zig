@@ -680,13 +680,18 @@ pub const Reloc = struct {
 };
 
 /// A compiled function: machine words plus the relocations its calls need.
+/// One source-line-table row: the byte offset where a new source line's code begins.
+pub const LineEntry = struct { offset: u32, line: u32 };
+
 pub const Compiled = struct {
     code: []u32,
     relocs: []Reloc,
+    lines: []LineEntry = &.{},
 
     pub fn deinit(self: *Compiled, allocator: std.mem.Allocator) void {
         allocator.free(self.code);
         allocator.free(self.relocs);
+        allocator.free(self.lines);
     }
 };
 
@@ -695,7 +700,30 @@ pub const Compiled = struct {
 pub fn selectFunction(allocator: std.mem.Allocator, func: *const Function) Error![]u32 {
     const compiled = try compileFunction(allocator, func);
     allocator.free(compiled.relocs);
+    allocator.free(compiled.lines);
     return compiled.code;
+}
+
+/// Compiled code plus its source-line table (from the `debug.line` IR attributes), for DWARF.
+pub const CodeWithLines = struct { code: []u32, lines: []LineEntry };
+
+/// Like `selectFunction`, but also returns the source-line table. Caller owns both slices.
+pub fn selectFunctionWithLines(allocator: std.mem.Allocator, func: *const Function) Error!CodeWithLines {
+    const compiled = try compileFunction(allocator, func);
+    allocator.free(compiled.relocs);
+    return .{ .code = compiled.code, .lines = compiled.lines };
+}
+
+/// The `debug.line` source line attached to an IR instruction, if any.
+fn lineOf(func: *const Function, inst: ir.function.Inst) ?u32 {
+    var it = func.attributesOf(.{ .inst = inst });
+    while (it.next()) |attr| switch (attr) {
+        .custom => |c| if (std.mem.eql(u8, c.namespace, "debug") and std.mem.eql(u8, c.key, "line")) {
+            if (c.value == .int) return @intCast(c.value.int);
+        },
+        else => {},
+    };
+    return null;
 }
 
 /// Compile a function to machine words and call relocations.
@@ -707,6 +735,9 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function) Erro
     errdefer code.deinit(allocator);
     var relocs: std.ArrayList(Reloc) = .empty;
     errdefer relocs.deinit(allocator);
+    var lines: std.ArrayList(LineEntry) = .empty;
+    errdefer lines.deinit(allocator);
+    var last_line: u32 = 0;
 
     // Stack frame: lay out an offset for every `alloca` slot. The whole frame is
     // rounded to the 16-byte ABI alignment below.
@@ -844,6 +875,13 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function) Erro
         // A structured `if` is the block's exit. The trailing terminator is dead.
         var exited = false;
         for (func.blockInsts(block)) |inst| {
+            // Record a source-line row when this instruction starts a new line.
+            if (lineOf(func, inst)) |line| {
+                if (line != last_line) {
+                    try lines.append(allocator, .{ .offset = @intCast(code.items.len * 4), .line = line });
+                    last_line = line;
+                }
+            }
             switch (func.opcode(inst)) {
                 .arith => |a| {
                     if (isVector(func, func.valueType(a.lhs))) {
@@ -919,7 +957,19 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function) Erro
                     if (ai_spill) |idx| try code.append(allocator, encode.sd(rd, .x2, @intCast(spill_base + idx * 8)));
                 },
                 .iconst => |c| {
-                    const rd = alloc.int.get(func.instResult(inst).?).?;
+                    const res = func.instResult(inst).?;
+                    if (isFloat(func, func.valueType(res))) {
+                        // A float-typed integer constant (a zero-init). Materialize the
+                        // bits and move them into the float register, never an integer
+                        // register the value was never assigned.
+                        if (is64Float(func, func.valueType(res))) return error.Unsupported;
+                        const fr = alloc.float.get(res).?;
+                        const bits: u32 = @truncate(@as(u64, @bitCast(c)));
+                        try loadImm32(allocator, &code, scratch_reg, bits);
+                        try code.append(allocator, encode.fmv_w_x(fr, scratch_reg));
+                        continue;
+                    }
+                    const rd = alloc.int.get(res).?;
 
                     if (c >= -2048 and c <= 2047) {
                         // Fits a 12-bit immediate: `addi rd, zero, imm`.
@@ -1277,6 +1327,7 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function) Erro
     return .{
         .code = try code.toOwnedSlice(allocator),
         .relocs = try relocs.toOwnedSlice(allocator),
+        .lines = try lines.toOwnedSlice(allocator),
     };
 }
 

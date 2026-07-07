@@ -49,6 +49,7 @@ pub fn analyze(allocator: std.mem.Allocator, func: *const Function) std.mem.Allo
     }
 
     for (0..n) |b| {
+        if (!doms.isReachable(b)) continue; // an unreachable block is dominated by all -> no spurious back-edges
         for (cfg.successors(b)) |s| {
             if (!doms.dominates(s, b)) continue; // not a back-edge
             const gop = try headers.getOrPut(allocator, s);

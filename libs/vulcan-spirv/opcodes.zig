@@ -28,6 +28,7 @@ pub const Glsl = struct {
     pub const s_abs = 5;
     pub const floor = 8;
     pub const ceil = 9;
+    pub const fract = 10;
     pub const sin = 13;
     pub const cos = 14;
     pub const tan = 15;
@@ -41,6 +42,9 @@ pub const Glsl = struct {
     pub const log2 = 30;
     pub const sqrt = 31;
     pub const inverse_sqrt = 32;
+    pub const length = 66; // length(v) = sqrt(dot(v, v))
+    pub const cross = 68; // cross(a, b): 3-component vector cross product
+    pub const normalize = 69; // normalize(v) = v * inversesqrt(dot(v, v))
     pub const f_min = 37;
     pub const u_min = 38;
     pub const s_min = 39;
@@ -58,6 +62,7 @@ pub const TypeBool = 20;
 pub const TypeInt = 21;
 pub const TypeFloat = 22;
 pub const TypeVector = 23;
+pub const TypeMatrix = 24; // `cols` column vectors of a vector type
 pub const TypeImage = 25;
 pub const TypeSampledImage = 27;
 pub const TypeArray = 28;
@@ -66,12 +71,44 @@ pub const TypeStruct = 30;
 pub const TypePointer = 32;
 pub const TypeFunction = 33;
 
+/// Combine a separate image + sampler into a sampled image (for a following sample).
+/// A combined-image-sampler is already a sampled image, so this just forwards it.
+pub const SampledImage = 86;
+
 /// Sample a sampled-image with implicit level-of-detail (fragment shaders only).
 pub const ImageSampleImplicitLod = 87;
+
+/// Sample a sampled-image with an explicit level-of-detail / gradient. Treated the
+/// same as the implicit form by the CPU sampler (LOD/grad operands are ignored).
+pub const ImageSampleExplicitLod = 88;
+
+/// `OpImageSampleDrefImplicitLod resultType result sampledImage coordinate Dref`: a depth-COMPARE
+/// sample (sampler2DShadow). The `Dref` reference is compared against the fetched depth and the
+/// result is a SCALAR (the compare pass fraction), not a vec4. Fragment shaders only.
+pub const ImageSampleDrefImplicitLod = 89;
+
+/// The explicit-LOD form of the depth-compare sample. Treated like the implicit form by the CPU
+/// sampler (the LOD operand is ignored).
+pub const ImageSampleDrefExplicitLod = 90;
+
+/// `OpImageGather resultType result sampledImage coordinate component`: gather one channel of the
+/// 4 bilinear-footprint texels (GLSL textureGather). The reader lowers it to a host gather call.
+pub const ImageGather = 96;
+
+/// `OpImage resultType result sampledImage`: extract the raw image from a sampled image (needed as
+/// the operand of OpImageFetch). The reader carries the descriptor pointer through it unchanged.
+pub const Image = 100;
+
+/// `OpImageFetch resultType result image coordinate [operands lod]`: fetch the exact texel at an
+/// INTEGER coordinate of the given LOD - no sampler/filtering (GLSL texelFetch). The reader lowers
+/// it to a host fetch call.
+pub const ImageFetch = 95;
 
 /// `OpTypeImage` Dim operand (subset the frontend emits).
 pub const Dim = struct {
     pub const dim_2d = 1;
+    pub const dim_3d = 2;
+    pub const cube = 3;
 };
 
 /// SPIR-V storage classes (subset the frontend recognizes).
@@ -88,7 +125,10 @@ pub const StorageClass = struct {
 /// SPIR-V decorations the frontend reads.
 pub const Decoration = struct {
     pub const block = 2; // a struct used as a UBO/push-constant interface block
+    pub const row_major = 4; // a matrix member stored row-major (default is ColMajor)
+    pub const col_major = 5; // a matrix member stored column-major
     pub const array_stride = 6;
+    pub const matrix_stride = 7; // bytes between consecutive matrix columns (or rows, row-major)
     pub const builtin = 11;
     pub const location = 30;
     pub const binding = 33;
@@ -99,11 +139,16 @@ pub const Decoration = struct {
 /// SPIR-V builtins the frontend recognizes (value of a BuiltIn decoration).
 pub const BuiltIn = struct {
     pub const position = 0; // gl_Position (a vertex-shader clip-space output)
+    pub const point_size = 1; // gl_PointSize (a vertex-shader scalar point-size output)
     pub const frag_coord = 15; // gl_FragCoord (a fragment-shader window-space input)
+    pub const point_coord = 16; // gl_PointCoord (a fragment-shader vec2 point-sprite coord, 0..1)
+    pub const front_facing = 17; // gl_FrontFacing (a fragment-shader bool input)
+    pub const frag_depth = 22; // gl_FragDepth (a fragment-shader depth output)
     pub const workgroup_id = 26;
     pub const local_invocation_id = 27;
     pub const global_invocation_id = 28;
     pub const vertex_index = 42; // gl_VertexIndex (a vertex-shader input)
+    pub const instance_index = 43; // gl_InstanceIndex (a vertex-shader input)
 };
 
 /// SPIR-V execution models (first operand of OpEntryPoint): which pipeline stage the
@@ -135,6 +180,7 @@ pub const FunctionCall = 57;
 pub const Label = 248;
 pub const Branch = 249;
 pub const BranchConditional = 250;
+pub const Switch = 251;
 pub const Phi = 245;
 pub const Return = 253;
 pub const ReturnValue = 254;
@@ -214,6 +260,10 @@ pub const VectorShuffle = 79;
 pub const CompositeConstruct = 80;
 pub const CompositeExtract = 81;
 pub const VectorTimesScalar = 142;
+pub const MatrixTimesScalar = 143;
+pub const VectorTimesMatrix = 144;
+pub const MatrixTimesVector = 145;
+pub const MatrixTimesMatrix = 146;
 pub const Dot = 148;
 
 // Misc.

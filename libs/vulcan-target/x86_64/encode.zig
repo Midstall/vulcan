@@ -255,6 +255,36 @@ pub fn cvtss2sd(dst: Xmm, src: Xmm) Inst {
 pub fn cvtsd2ss(dst: Xmm, src: Xmm) Inst {
     return sseRR(0xF2, 0x5A, dst, src);
 }
+/// Scalar single-precision `sqrtss dst, src` (F3 0F 51 /r).
+pub fn sqrtss(dst: Xmm, src: Xmm) Inst {
+    return sseRR(0xF3, 0x51, dst, src);
+}
+/// Scalar double-precision `sqrtsd dst, src` (F2 0F 51 /r).
+pub fn sqrtsd(dst: Xmm, src: Xmm) Inst {
+    return sseRR(0xF2, 0x51, dst, src);
+}
+/// `roundss dst, src, imm8` (F3 0F 3A /11 ib): IEEE rounding for f32.
+pub fn roundss(dst: Xmm, src: Xmm, imm: u8) Inst {
+    const r = xn(dst);
+    const b = xn(src);
+    const mod: u8 = 0xC0 | ((r & 7) << 3) | (b & 7);
+    if (r >= 8 or b >= 8) {
+        const rex: u8 = 0x40 | (@as(u8, @intFromBool(r >= 8)) << 2) | @intFromBool(b >= 8);
+        return Inst.of(&.{ 0xF3, rex, 0x0F, 0x3A, 0x11, mod, imm });
+    }
+    return Inst.of(&.{ 0xF3, 0x0F, 0x3A, 0x11, mod, imm });
+}
+/// `roundsd dst, src, imm8` (F2 0F 3A /11 ib): IEEE rounding for f64.
+pub fn roundsd(dst: Xmm, src: Xmm, imm: u8) Inst {
+    const r = xn(dst);
+    const b = xn(src);
+    const mod: u8 = 0xC0 | ((r & 7) << 3) | (b & 7);
+    if (r >= 8 or b >= 8) {
+        const rex: u8 = 0x40 | (@as(u8, @intFromBool(r >= 8)) << 2) | @intFromBool(b >= 8);
+        return Inst.of(&.{ 0xF2, rex, 0x0F, 0x3A, 0x11, mod, imm });
+    }
+    return Inst.of(&.{ 0xF2, 0x0F, 0x3A, 0x11, mod, imm });
+}
 /// `cvtsi2sd dst, src` (F2 0F 2A /r): 32-bit signed int in a gpr to a scalar double.
 pub fn cvtsi2sd(dst: Xmm, src: Reg) Inst {
     return sseXmmGpr(0xF2, 0x2A, dst, src);
@@ -713,6 +743,20 @@ test "known SSE encodings" {
     try std.testing.expectEqualSlices(u8, &.{ 0x48, 0xB8, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11 }, movImm64(.rax, 0x1122334455667788).slice()); // movabs rax, imm64
     try std.testing.expectEqualSlices(u8, &.{ 0xF3, 0x0F, 0x10, 0x84, 0x24, 0x10, 0x00, 0x00, 0x00 }, movssLoad(.xmm0, 0x10).slice()); // movss xmm0, [rsp+16]
     try std.testing.expectEqualSlices(u8, &.{ 0x0F, 0x11, 0x8C, 0x24, 0x20, 0x00, 0x00, 0x00 }, movupsStore(0x20, .xmm1).slice()); // movups [rsp+32], xmm1
+    // sqrtss xmm0, xmm1 -> F3 0F 51 C1
+    try std.testing.expectEqualSlices(u8, &.{ 0xF3, 0x0F, 0x51, 0xC1 }, sqrtss(.xmm0, .xmm1).slice());
+    // sqrtsd xmm0, xmm1 -> F2 0F 51 C1
+    try std.testing.expectEqualSlices(u8, &.{ 0xF2, 0x0F, 0x51, 0xC1 }, sqrtsd(.xmm0, .xmm1).slice());
+    // roundss xmm0, xmm1, 0x00 (nearest) -> F3 0F 3A 11 C1 00
+    try std.testing.expectEqualSlices(u8, &.{ 0xF3, 0x0F, 0x3A, 0x11, 0xC1, 0x00 }, roundss(.xmm0, .xmm1, 0x00).slice());
+    // roundss xmm0, xmm1, 0x01 (floor) -> F3 0F 3A 11 C1 01
+    try std.testing.expectEqualSlices(u8, &.{ 0xF3, 0x0F, 0x3A, 0x11, 0xC1, 0x01 }, roundss(.xmm0, .xmm1, 0x01).slice());
+    // roundss xmm0, xmm1, 0x02 (ceil) -> F3 0F 3A 11 C1 02
+    try std.testing.expectEqualSlices(u8, &.{ 0xF3, 0x0F, 0x3A, 0x11, 0xC1, 0x02 }, roundss(.xmm0, .xmm1, 0x02).slice());
+    // roundss xmm0, xmm1, 0x03 (trunc) -> F3 0F 3A 11 C1 03
+    try std.testing.expectEqualSlices(u8, &.{ 0xF3, 0x0F, 0x3A, 0x11, 0xC1, 0x03 }, roundss(.xmm0, .xmm1, 0x03).slice());
+    // roundsd xmm0, xmm1, 0x01 (floor) -> F2 0F 3A 11 C1 01
+    try std.testing.expectEqualSlices(u8, &.{ 0xF2, 0x0F, 0x3A, 0x11, 0xC1, 0x01 }, roundsd(.xmm0, .xmm1, 0x01).slice());
 }
 
 test "known AVX (VEX 256-bit) encodings" {

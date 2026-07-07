@@ -64,6 +64,10 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
     // earlier loop moves instructions between blocks).
     const def_block = try allocator.alloc(u32, func.valueCount());
     defer allocator.free(def_block);
+    // Only live block params and instruction results get assigned below. Default everything
+    // to the entry block so a value with no live definition, like one orphaned by an earlier
+    // rewrite, never leaves the invariant scan reading uninitialized memory.
+    @memset(def_block, 0);
 
     // Instructions to move, paired with their source block. Collected in
     // dependency-respecting order (program order, fixpoint), then applied.

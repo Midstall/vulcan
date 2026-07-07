@@ -7,6 +7,7 @@ const ir = @import("vulcan-ir");
 const encode = @import("encode.zig");
 const object = @import("object.zig");
 const link = @import("link.zig");
+const compress = @import("compress.zig");
 const harness = @import("tests/harness.zig");
 
 const Function = ir.function.Function;
@@ -311,6 +312,18 @@ pub fn linkObjects(allocator: std.mem.Allocator, objs: []const []const u8, base:
 /// and jumps, then routes the call to the stub. Without a resolver, undefined
 /// symbols are an error, as before.
 pub fn linkObjectsResolved(allocator: std.mem.Allocator, objs: []const []const u8, base: u64, resolver: ?Resolver) Error!Image {
+    return linkImpl(allocator, objs, base, resolver, false);
+}
+
+/// Like `linkObjectsResolved`, but RVC-compresses each object's `.text` before layout (the C-extension
+/// output path). Every relocation site is pinned 32-bit so the linker can still patch it, and reloc
+/// offsets + `.text` symbol values are remapped onto the shrunk layout; the normal resolution passes
+/// then compute correct call/PC-relative values against the compressed addresses.
+pub fn linkObjectsCompressed(allocator: std.mem.Allocator, objs: []const []const u8, base: u64, resolver: ?Resolver) Error!Image {
+    return linkImpl(allocator, objs, base, resolver, true);
+}
+
+fn linkImpl(allocator: std.mem.Allocator, objs: []const []const u8, base: u64, resolver: ?Resolver, compress_text: bool) Error!Image {
     var parsed = try allocator.alloc(ParsedObject, objs.len);
     var parsed_n: usize = 0;
     defer {
@@ -321,6 +334,38 @@ pub fn linkObjectsResolved(allocator: std.mem.Allocator, objs: []const []const u
     for (objs, 0..) |obj_bytes, oi| {
         parsed[oi] = try parseObject(allocator, obj_bytes);
         parsed_n = oi + 1;
+    }
+
+    // Compress each object's `.text` before layout. Pin every reloc site (call/PC-relative) so the
+    // linker's later patches land on intact 32-bit instructions, and remap this object's reloc
+    // offsets and `.text` symbol values through the shrunk-layout offset map.
+    var owned_texts = try allocator.alloc(?[]u8, parsed_n);
+    for (owned_texts) |*t| t.* = null;
+    defer {
+        for (owned_texts) |t| if (t) |b| allocator.free(b);
+        allocator.free(owned_texts);
+    }
+    if (compress_text) {
+        for (0..parsed_n) |oi| {
+            const p = &parsed[oi];
+            const nwords = p.text.len / 4;
+            if (nwords == 0) continue;
+            const words = try allocator.alloc(u32, nwords);
+            defer allocator.free(words);
+            for (0..nwords) |k| words[k] = std.mem.readInt(u32, p.text[k * 4 ..][0..4], .little);
+            const pins = try allocator.alloc(usize, p.relocs.len);
+            defer allocator.free(pins);
+            for (p.relocs, 0..) |r, ri| pins[ri] = @intCast(r.offset / 4);
+            const offmap = try allocator.alloc(usize, nwords + 1);
+            defer allocator.free(offmap);
+            const cbytes = try compress.compressPinned(allocator, words, pins, offmap);
+            for (p.relocs) |*r| r.offset = offmap[@intCast(r.offset / 4)];
+            for (p.symbols) |*s| {
+                if (s.section == .text and s.defined) s.value = offmap[@intCast(s.value / 4)];
+            }
+            owned_texts[oi] = cbytes;
+            p.text = cbytes;
+        }
     }
 
     // Pack each object's sections within its region, recording per-object offsets.

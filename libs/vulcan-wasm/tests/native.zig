@@ -5,6 +5,9 @@
 const std = @import("std");
 const wasm = @import("vulcan-wasm");
 const native = @import("vulcan-target").native;
+const ir = @import("vulcan-ir");
+const wtarget = @import("vulcan-target").wasm;
+const glsl = @import("vulcan-glsl");
 
 const valtype_i32: u8 = 0x7F;
 const valtype_i64: u8 = 0x7E;
@@ -925,4 +928,1334 @@ test "wasm: unreachable code after return is skipped" {
     const bytes = try oneFunctionModule(allocator, &.{}, &.{valtype_i32}, &body, "f");
     defer allocator.free(bytes);
     try std.testing.expectEqual(@as(i64, 42), try runi(allocator, bytes, "f", &.{}));
+}
+
+/// Build a `(i32, i32) -> i32` function that extracts one field of a two-field
+/// struct built from its two params, so the return value proves the extract index.
+fn structPickFn(func: *ir.function.Function, index: u32) !void {
+    const t_i32 = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const st = try func.types.intern(.{ .@"struct" = &.{ t_i32, t_i32 } });
+    const b0 = try func.appendBlock();
+    const a = try func.appendBlockParam(b0, t_i32);
+    const b = try func.appendBlockParam(b0, t_i32);
+    const v = try func.appendStructNew(b0, st, &.{ a, b });
+    const field = try func.appendInst(b0, t_i32, .{ .extract = .{ .aggregate = v, .index = index } });
+    func.setTerminator(b0, .{ .ret = field });
+}
+
+test "wasm target: struct_new + extract lowers and round-trips" {
+    const allocator = std.testing.allocator;
+
+    // fst(a, b) returns field 0 (a), snd(a, b) returns field 1 (b).
+    var fst = ir.function.Function.init(allocator);
+    defer fst.deinit();
+    try structPickFn(&fst, 0);
+    var snd = ir.function.Function.init(allocator);
+    defer snd.deinit();
+    try structPickFn(&snd, 1);
+
+    var m = wtarget.link.Module.init(allocator);
+    defer m.deinit();
+    try m.addFunction("fst", &fst);
+    try m.addFunction("snd", &snd);
+    var linked = try wtarget.link.compileModule(allocator, &m);
+    defer linked.deinit(allocator);
+
+    var inst = try wasm.Instance.instantiate(allocator, linked.module, &.{});
+    defer inst.deinit();
+    try std.testing.expectEqual(@as(i32, 3), try inst.call2(i32, i32, i32, "fst", 3, 7));
+    try std.testing.expectEqual(@as(i32, 7), try inst.call2(i32, i32, i32, "snd", 3, 7));
+    try std.testing.expectEqual(@as(i32, 20), try inst.call2(i32, i32, i32, "snd", 10, 20));
+}
+
+test "wasm target: if/else selection (max) round-trips" {
+    const allocator = std.testing.allocator;
+
+    // max(a, b): a diamond where both if arms jump to a merge block carrying the
+    // larger value as a phi parameter.
+    var f = ir.function.Function.init(allocator);
+    defer f.deinit();
+    const t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const entry = try f.appendBlock();
+    const a = try f.appendBlockParam(entry, t);
+    const b = try f.appendBlockParam(entry, t);
+    const merge = try f.appendBlock();
+    const r = try f.appendBlockParam(merge, t);
+    const c = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .gt, .lhs = a, .rhs = b } });
+    try f.appendIf(entry, c, .{ .target = merge, .args = &.{a} }, .{ .target = merge, .args = &.{b} });
+    f.setTerminator(merge, .{ .ret = r });
+
+    var m = wtarget.link.Module.init(allocator);
+    defer m.deinit();
+    try m.addFunction("max", &f);
+    var linked = try wtarget.link.compileModule(allocator, &m);
+    defer linked.deinit(allocator);
+
+    var inst = try wasm.Instance.instantiate(allocator, linked.module, &.{});
+    defer inst.deinit();
+    try std.testing.expectEqual(@as(i32, 4), try inst.call2(i32, i32, i32, "max", 3, 4));
+    try std.testing.expectEqual(@as(i32, 7), try inst.call2(i32, i32, i32, "max", 7, 2));
+}
+
+test "wasm target: nested if/else (sign) round-trips" {
+    const allocator = std.testing.allocator;
+
+    // sign(x): x>0 -> 1, else (x<0 -> -1, else 0). The inner if's merge is the outer
+    // merge, so the emitter must not emit it twice or at the wrong nesting.
+    var f = ir.function.Function.init(allocator);
+    defer f.deinit();
+    const t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const entry = try f.appendBlock();
+    const x = try f.appendBlockParam(entry, t);
+    const neg = try f.appendBlock();
+    const merge = try f.appendBlock();
+    const r = try f.appendBlockParam(merge, t);
+
+    const z0 = try f.appendInst(entry, t, .{ .iconst = 0 });
+    const c1 = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .gt, .lhs = x, .rhs = z0 } });
+    const p1 = try f.appendInst(entry, t, .{ .iconst = 1 });
+    try f.appendIf(entry, c1, .{ .target = merge, .args = &.{p1} }, .{ .target = neg, .args = &.{} });
+    try f.addAttr(.{ .block = entry }, .{ .custom = .{ .namespace = "cf", .key = "merge", .value = .{ .int = @intFromEnum(merge) } } });
+
+    const z1 = try f.appendInst(neg, t, .{ .iconst = 0 });
+    const c2 = try f.appendInst(neg, bool_t, .{ .icmp = .{ .op = .lt, .lhs = x, .rhs = z1 } });
+    const m1 = try f.appendInst(neg, t, .{ .iconst = -1 });
+    const z2 = try f.appendInst(neg, t, .{ .iconst = 0 });
+    try f.appendIf(neg, c2, .{ .target = merge, .args = &.{m1} }, .{ .target = merge, .args = &.{z2} });
+
+    f.setTerminator(merge, .{ .ret = r });
+
+    var m = wtarget.link.Module.init(allocator);
+    defer m.deinit();
+    try m.addFunction("sign", &f);
+    var linked = try wtarget.link.compileModule(allocator, &m);
+    defer linked.deinit(allocator);
+
+    var inst = try wasm.Instance.instantiate(allocator, linked.module, &.{});
+    defer inst.deinit();
+    try std.testing.expectEqual(@as(i32, 1), try inst.call1(i32, i32, "sign", 42));
+    try std.testing.expectEqual(@as(i32, -1), try inst.call1(i32, i32, "sign", -7));
+    try std.testing.expectEqual(@as(i32, 0), try inst.call1(i32, i32, "sign", 0));
+}
+
+test "wasm target: loop (sum 1..n) round-trips" {
+    const allocator = std.testing.allocator;
+
+    // sum(n) = 1 + 2 + ... + n, a header/body/exit loop with phi-carried acc and i.
+    var f = ir.function.Function.init(allocator);
+    defer f.deinit();
+    const t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const entry = try f.appendBlock();
+    const n = try f.appendBlockParam(entry, t);
+    const header = try f.appendBlock();
+    const sum = try f.appendBlockParam(header, t);
+    const i = try f.appendBlockParam(header, t);
+    const body = try f.appendBlock();
+    const exit = try f.appendBlock();
+    const r = try f.appendBlockParam(exit, t);
+
+    const zero = try f.appendInst(entry, t, .{ .iconst = 0 });
+    const one = try f.appendInst(entry, t, .{ .iconst = 1 });
+    try f.setJump(entry, header, &.{ zero, one });
+
+    const cond = try f.appendInst(header, bool_t, .{ .icmp = .{ .op = .le, .lhs = i, .rhs = n } });
+    try f.appendIf(header, cond, .{ .target = body, .args = &.{} }, .{ .target = exit, .args = &.{sum} });
+    // Mark the structured loop: merge (exit) and continue (the back-edge block).
+    try f.addAttr(.{ .block = header }, .{ .custom = .{ .namespace = "cf", .key = "merge", .value = .{ .int = @intFromEnum(exit) } } });
+    try f.addAttr(.{ .block = header }, .{ .custom = .{ .namespace = "cf", .key = "continue", .value = .{ .int = @intFromEnum(body) } } });
+
+    const sum2 = try f.appendInst(body, t, .{ .arith = .{ .op = .add, .lhs = sum, .rhs = i } });
+    const inext = try f.appendArithImm(body, t, .add, i, 1);
+    try f.setJump(body, header, &.{ sum2, inext });
+
+    f.setTerminator(exit, .{ .ret = r });
+
+    var m = wtarget.link.Module.init(allocator);
+    defer m.deinit();
+    try m.addFunction("sum", &f);
+    var linked = try wtarget.link.compileModule(allocator, &m);
+    defer linked.deinit(allocator);
+
+    var inst = try wasm.Instance.instantiate(allocator, linked.module, &.{});
+    defer inst.deinit();
+    try std.testing.expectEqual(@as(i32, 15), try inst.call1(i32, i32, "sum", 5));
+    try std.testing.expectEqual(@as(i32, 55), try inst.call1(i32, i32, "sum", 10));
+}
+
+test "wasm target: if nested inside a loop round-trips" {
+    const allocator = std.testing.allocator;
+
+    // clampSum(n): acc=0; for i in 1..n { if acc < 100 acc += i }  (an if in the body,
+    // whose merge is the loop's continue block).
+    var f = ir.function.Function.init(allocator);
+    defer f.deinit();
+    const t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const entry = try f.appendBlock();
+    const n = try f.appendBlockParam(entry, t);
+    const header = try f.appendBlock();
+    const acc = try f.appendBlockParam(header, t);
+    const i = try f.appendBlockParam(header, t);
+    const body = try f.appendBlock();
+    const add = try f.appendBlock();
+    const bmerge = try f.appendBlock();
+    const acc3 = try f.appendBlockParam(bmerge, t);
+    const exit = try f.appendBlock();
+    const accf = try f.appendBlockParam(exit, t);
+
+    const acc0 = try f.appendInst(entry, t, .{ .iconst = 0 });
+    const istart = try f.appendInst(entry, t, .{ .iconst = 1 });
+    try f.setJump(entry, header, &.{ acc0, istart });
+
+    const cond = try f.appendInst(header, bool_t, .{ .icmp = .{ .op = .le, .lhs = i, .rhs = n } });
+    try f.appendIf(header, cond, .{ .target = body, .args = &.{} }, .{ .target = exit, .args = &.{acc} });
+    try f.addAttr(.{ .block = header }, .{ .custom = .{ .namespace = "cf", .key = "merge", .value = .{ .int = @intFromEnum(exit) } } });
+    try f.addAttr(.{ .block = header }, .{ .custom = .{ .namespace = "cf", .key = "continue", .value = .{ .int = @intFromEnum(bmerge) } } });
+
+    const hundred = try f.appendInst(body, t, .{ .iconst = 100 });
+    const c2 = try f.appendInst(body, bool_t, .{ .icmp = .{ .op = .lt, .lhs = acc, .rhs = hundred } });
+    try f.appendIf(body, c2, .{ .target = add, .args = &.{} }, .{ .target = bmerge, .args = &.{acc} });
+    try f.addAttr(.{ .block = body }, .{ .custom = .{ .namespace = "cf", .key = "merge", .value = .{ .int = @intFromEnum(bmerge) } } });
+
+    const acc2 = try f.appendInst(add, t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = i } });
+    try f.setJump(add, bmerge, &.{acc2});
+
+    const inext = try f.appendArithImm(bmerge, t, .add, i, 1);
+    try f.setJump(bmerge, header, &.{ acc3, inext });
+
+    f.setTerminator(exit, .{ .ret = accf });
+
+    var m = wtarget.link.Module.init(allocator);
+    defer m.deinit();
+    try m.addFunction("clampSum", &f);
+    var linked = try wtarget.link.compileModule(allocator, &m);
+    defer linked.deinit(allocator);
+
+    var inst = try wasm.Instance.instantiate(allocator, linked.module, &.{});
+    defer inst.deinit();
+    try std.testing.expectEqual(@as(i32, 15), try inst.call1(i32, i32, "clampSum", 5));
+    try std.testing.expectEqual(@as(i32, 105), try inst.call1(i32, i32, "clampSum", 20));
+}
+
+test "wasm target: i64 arithmetic round-trips" {
+    const allocator = std.testing.allocator;
+    var f = ir.function.Function.init(allocator);
+    defer f.deinit();
+    const t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
+    const entry = try f.appendBlock();
+    const a = try f.appendBlockParam(entry, t);
+    const b = try f.appendBlockParam(entry, t);
+    const s = try f.appendInst(entry, t, .{ .arith = .{ .op = .add, .lhs = a, .rhs = b } });
+    f.setTerminator(entry, .{ .ret = s });
+
+    var m = wtarget.link.Module.init(allocator);
+    defer m.deinit();
+    try m.addFunction("add64", &f);
+    var linked = try wtarget.link.compileModule(allocator, &m);
+    defer linked.deinit(allocator);
+    var inst = try wasm.Instance.instantiate(allocator, linked.module, &.{});
+    defer inst.deinit();
+    // A value that needs the full 64 bits (would truncate on a 32-bit path).
+    try std.testing.expectEqual(@as(i64, 0x1_0000_0001), try inst.call2(i64, i64, i64, "add64", 0x1_0000_0000, 1));
+}
+
+test "wasm target: f64 arithmetic round-trips" {
+    const allocator = std.testing.allocator;
+    var f = ir.function.Function.init(allocator);
+    defer f.deinit();
+    const t = try f.types.intern(.{ .float = .f64 });
+    const entry = try f.appendBlock();
+    const a = try f.appendBlockParam(entry, t);
+    const b = try f.appendBlockParam(entry, t);
+    const s = try f.appendInst(entry, t, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = b } });
+    f.setTerminator(entry, .{ .ret = s });
+
+    var m = wtarget.link.Module.init(allocator);
+    defer m.deinit();
+    try m.addFunction("muld", &f);
+    var linked = try wtarget.link.compileModule(allocator, &m);
+    defer linked.deinit(allocator);
+    var inst = try wasm.Instance.instantiate(allocator, linked.module, &.{});
+    defer inst.deinit();
+    try std.testing.expectEqual(@as(f64, 8.0), try inst.call2(f64, f64, f64, "muld", 2.5, 3.2));
+}
+
+test "wasm target: narrow i8 store/load sign-extends round-trips" {
+    const allocator = std.testing.allocator;
+    // s8(x: i8) = load_s8(store8(x)): stores the low byte, reloads sign-extended.
+    var f = ir.function.Function.init(allocator);
+    defer f.deinit();
+    const i8t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 8 } });
+    const ptr = try f.types.intern(.ptr);
+    const b = try f.appendBlock();
+    const x = try f.appendBlockParam(b, i8t);
+    const slot = try f.appendInst(b, ptr, .{ .alloca = .{ .elem = i8t } });
+    try f.appendStore(b, x, slot);
+    const r = try f.appendInst(b, i8t, .{ .load = .{ .ptr = slot } });
+    f.setTerminator(b, .{ .ret = r });
+
+    var m = wtarget.link.Module.init(allocator);
+    defer m.deinit();
+    try m.addFunction("s8", &f);
+    var linked = try wtarget.link.compileModule(allocator, &m);
+    defer linked.deinit(allocator);
+    var inst = try wasm.Instance.instantiate(allocator, linked.module, &.{});
+    defer inst.deinit();
+    // 200 = 0xC8, stored as a byte, reloaded as a signed i8 = -56.
+    try std.testing.expectEqual(@as(i32, -56), try inst.call1(i32, i32, "s8", 200));
+    try std.testing.expectEqual(@as(i32, 50), try inst.call1(i32, i32, "s8", 50));
+}
+
+test "wasm target: unary reinterpret (f64<->i64) and sqrt round-trip" {
+    const allocator = std.testing.allocator;
+
+    // rt(x: f64) = reinterpret_f64(reinterpret_i64(x)) == x (exercises the f64 reinterpret).
+    var f_rt = ir.function.Function.init(allocator);
+    defer f_rt.deinit();
+    {
+        const f64t = try f_rt.types.intern(.{ .float = .f64 });
+        const i64t = try f_rt.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
+        const b = try f_rt.appendBlock();
+        const x = try f_rt.appendBlockParam(b, f64t);
+        const bits = try f_rt.appendInst(b, i64t, .{ .unary = .{ .op = .reinterpret, .value = x } });
+        const back = try f_rt.appendInst(b, f64t, .{ .unary = .{ .op = .reinterpret, .value = bits } });
+        f_rt.setTerminator(b, .{ .ret = back });
+    }
+    // sqrtd(x: f64) = sqrt(x).
+    var f_sq = ir.function.Function.init(allocator);
+    defer f_sq.deinit();
+    {
+        const f64t = try f_sq.types.intern(.{ .float = .f64 });
+        const b = try f_sq.appendBlock();
+        const x = try f_sq.appendBlockParam(b, f64t);
+        const r = try f_sq.appendInst(b, f64t, .{ .unary = .{ .op = .sqrt, .value = x } });
+        f_sq.setTerminator(b, .{ .ret = r });
+    }
+
+    var m = wtarget.link.Module.init(allocator);
+    defer m.deinit();
+    try m.addFunction("rt", &f_rt);
+    try m.addFunction("sqrtd", &f_sq);
+    var linked = try wtarget.link.compileModule(allocator, &m);
+    defer linked.deinit(allocator);
+    var inst = try wasm.Instance.instantiate(allocator, linked.module, &.{});
+    defer inst.deinit();
+    try std.testing.expectEqual(@as(f64, 3.14159), try inst.call1(f64, f64, "rt", 3.14159));
+    try std.testing.expectEqual(@as(f64, 4.0), try inst.call1(f64, f64, "sqrtd", 16.0));
+}
+
+test "wasm target: unsigned vs signed compare round-trips" {
+    const allocator = std.testing.allocator;
+    // ltu(a, b) = a <_u b, using an unsigned i32. -1 (0xFFFFFFFF) <_u 1 is false.
+    var f = ir.function.Function.init(allocator);
+    defer f.deinit();
+    const u32t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const entry = try f.appendBlock();
+    const a = try f.appendBlockParam(entry, u32t);
+    const b = try f.appendBlockParam(entry, u32t);
+    const c = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = a, .rhs = b } });
+    // widen bool to i32 for the ABI: return c ? 1 : 0 via select on constants.
+    const one = try f.appendInst(entry, u32t, .{ .iconst = 1 });
+    const zero = try f.appendInst(entry, u32t, .{ .iconst = 0 });
+    const r = try f.appendInst(entry, u32t, .{ .select = .{ .cond = c, .then = one, .@"else" = zero } });
+    f.setTerminator(entry, .{ .ret = r });
+
+    var m = wtarget.link.Module.init(allocator);
+    defer m.deinit();
+    try m.addFunction("ltu", &f);
+    var linked = try wtarget.link.compileModule(allocator, &m);
+    defer linked.deinit(allocator);
+    var inst = try wasm.Instance.instantiate(allocator, linked.module, &.{});
+    defer inst.deinit();
+    try std.testing.expectEqual(@as(i32, 0), try inst.call2(i32, i32, i32, "ltu", -1, 1)); // 0xFFFFFFFF <u 1 = false
+    try std.testing.expectEqual(@as(i32, 1), try inst.call2(i32, i32, i32, "ltu", 1, 2));
+}
+
+test "wasm target: unsigned div and shr use the unsigned wasm ops" {
+    const allocator = std.testing.allocator;
+    const u32t_of = struct {
+        fn t(f: *ir.function.Function) !ir.types.Type {
+            return f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+        }
+    }.t;
+
+    { // divu(a, b) = a / b unsigned. 0xFFFFFFFF / 2 = 0x7FFFFFFF (unsigned), signed -1/2 = 0.
+        var f = ir.function.Function.init(allocator);
+        defer f.deinit();
+        const u = try u32t_of(&f);
+        const b = try f.appendBlock();
+        const a = try f.appendBlockParam(b, u);
+        const d = try f.appendBlockParam(b, u);
+        const r = try f.appendInst(b, u, .{ .arith = .{ .op = .div, .lhs = a, .rhs = d } });
+        f.setTerminator(b, .{ .ret = r });
+        var m = wtarget.link.Module.init(allocator);
+        defer m.deinit();
+        try m.addFunction("divu", &f);
+        var linked = try wtarget.link.compileModule(allocator, &m);
+        defer linked.deinit(allocator);
+        var inst = try wasm.Instance.instantiate(allocator, linked.module, &.{});
+        defer inst.deinit();
+        try std.testing.expectEqual(@as(i32, 0x7FFFFFFF), try inst.call2(i32, i32, i32, "divu", -1, 2));
+    }
+    { // shru(a) = a >> 1 logical. 0x80000000 >> 1 = 0x40000000 (unsigned), arithmetic = 0xC0000000.
+        var f = ir.function.Function.init(allocator);
+        defer f.deinit();
+        const u = try u32t_of(&f);
+        const b = try f.appendBlock();
+        const a = try f.appendBlockParam(b, u);
+        const r = try f.appendArithImm(b, u, .shr, a, 1);
+        f.setTerminator(b, .{ .ret = r });
+        var m = wtarget.link.Module.init(allocator);
+        defer m.deinit();
+        try m.addFunction("shru", &f);
+        var linked = try wtarget.link.compileModule(allocator, &m);
+        defer linked.deinit(allocator);
+        var inst = try wasm.Instance.instantiate(allocator, linked.module, &.{});
+        defer inst.deinit();
+        try std.testing.expectEqual(@as(i32, 0x40000000), try inst.call1(i32, i32, "shru", @bitCast(@as(u32, 0x80000000))));
+    }
+}
+
+test "wasm target: i32 -> i64 sign-extend conversion round-trips" {
+    const allocator = std.testing.allocator;
+    var f = ir.function.Function.init(allocator);
+    defer f.deinit();
+    const i32t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const i64t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
+    const b = try f.appendBlock();
+    const x = try f.appendBlockParam(b, i32t);
+    const w = try f.appendInst(b, i64t, .{ .convert = .{ .value = x } }); // i32 -> i64
+    f.setTerminator(b, .{ .ret = w });
+
+    var m = wtarget.link.Module.init(allocator);
+    defer m.deinit();
+    try m.addFunction("sx", &f);
+    var linked = try wtarget.link.compileModule(allocator, &m);
+    defer linked.deinit(allocator);
+    var inst = try wasm.Instance.instantiate(allocator, linked.module, &.{});
+    defer inst.deinit();
+    try std.testing.expectEqual(@as(i64, -5), try inst.call1(i64, i32, "sx", -5)); // sign-extended
+    try std.testing.expectEqual(@as(i64, 7), try inst.call1(i64, i32, "sx", 7));
+}
+
+test "wasm target: i64 -> i32 wrap and f32 <-> f64 conversions round-trip" {
+    const allocator = std.testing.allocator;
+    var f_wrap = ir.function.Function.init(allocator);
+    defer f_wrap.deinit();
+    {
+        const i32t = try f_wrap.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+        const i64t = try f_wrap.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
+        const b = try f_wrap.appendBlock();
+        const x = try f_wrap.appendBlockParam(b, i64t);
+        const w = try f_wrap.appendInst(b, i32t, .{ .convert = .{ .value = x } }); // i64 -> i32 wrap
+        f_wrap.setTerminator(b, .{ .ret = w });
+    }
+    var f_pd = ir.function.Function.init(allocator);
+    defer f_pd.deinit();
+    {
+        // widen(x: f32) -> f64 then narrow back, times 2 to make truncation visible: (f32)((f64)x * 2)
+        const f32t = try f_pd.types.intern(.{ .float = .f32 });
+        const f64t = try f_pd.types.intern(.{ .float = .f64 });
+        const b = try f_pd.appendBlock();
+        const x = try f_pd.appendBlockParam(b, f32t);
+        const wide = try f_pd.appendInst(b, f64t, .{ .convert = .{ .value = x } }); // f32 -> f64
+        const two = try f_pd.appendInst(b, f64t, .{ .fconst = 2.0 });
+        const scaled = try f_pd.appendInst(b, f64t, .{ .arith = .{ .op = .mul, .lhs = wide, .rhs = two } });
+        const narrow = try f_pd.appendInst(b, f32t, .{ .convert = .{ .value = scaled } }); // f64 -> f32
+        f_pd.setTerminator(b, .{ .ret = narrow });
+    }
+
+    var m = wtarget.link.Module.init(allocator);
+    defer m.deinit();
+    try m.addFunction("wrap", &f_wrap);
+    try m.addFunction("pd", &f_pd);
+    var linked = try wtarget.link.compileModule(allocator, &m);
+    defer linked.deinit(allocator);
+    var inst = try wasm.Instance.instantiate(allocator, linked.module, &.{});
+    defer inst.deinit();
+    // 0x1_0000_0007 wraps to 7.
+    try std.testing.expectEqual(@as(i32, 7), try inst.call1(i32, i64, "wrap", 0x1_0000_0007));
+    try std.testing.expectEqual(@as(f32, 5.0), try inst.call1(f32, f32, "pd", 2.5));
+}
+
+/// Differential test: compile the same GLSL `float f(float)` through the aarch64
+/// native backend and through the wasm target, and require they agree on `x`. A
+/// mismatch is a bug in one backend that neither's own tests would catch alone.
+fn diffGlslF32(allocator: std.mem.Allocator, src: []const u8, name: []const u8, x: f32) !void {
+    if (@import("builtin").cpu.arch != .aarch64) return error.SkipZigTest;
+    var mod = try glsl.compile(allocator, src);
+    defer mod.deinit(allocator);
+    const f = mod.find(name) orelse return error.MissingFunction;
+
+    // Native aarch64 path.
+    var buf = try native.jitFunction(allocator, f);
+    defer buf.deinit();
+    const native_result = buf.entry(*const fn (f32) callconv(.c) f32, 0)(x);
+
+    // Wasm target path (IR -> wasm -> frontend re-lower -> native JIT).
+    var m = wtarget.link.Module.init(allocator);
+    defer m.deinit();
+    try m.addFunction(name, f);
+    var linked = try wtarget.link.compileModule(allocator, &m);
+    defer linked.deinit(allocator);
+    var inst = try wasm.Instance.instantiate(allocator, linked.module, &.{});
+    defer inst.deinit();
+    const wasm_result = try inst.call1(f32, f32, name, x);
+
+    std.testing.expectEqual(native_result, wasm_result) catch |e| {
+        std.debug.print("\ndiff {s}({d}): native={d} wasm={d}\n", .{ name, x, native_result, wasm_result });
+        return e;
+    };
+}
+
+/// Float-argument, int-result differential (e.g. int(x) conversions).
+fn diffGlslF2I(allocator: std.mem.Allocator, src: []const u8, name: []const u8, x: f32) !void {
+    if (@import("builtin").cpu.arch != .aarch64) return error.SkipZigTest;
+    var mod = try glsl.compile(allocator, src);
+    defer mod.deinit(allocator);
+    const f = mod.find(name) orelse return error.MissingFunction;
+
+    var buf = try native.jitFunction(allocator, f);
+    defer buf.deinit();
+    const native_result = buf.entry(*const fn (f32) callconv(.c) i32, 0)(x);
+
+    var m = wtarget.link.Module.init(allocator);
+    defer m.deinit();
+    try m.addFunction(name, f);
+    var linked = try wtarget.link.compileModule(allocator, &m);
+    defer linked.deinit(allocator);
+    var inst = try wasm.Instance.instantiate(allocator, linked.module, &.{});
+    defer inst.deinit();
+    const wasm_result = try inst.call1(i32, f32, name, x);
+
+    std.testing.expectEqual(native_result, wasm_result) catch |e| {
+        std.debug.print("\ndiff {s}({d}): native={d} wasm={d}\n", .{ name, x, native_result, wasm_result });
+        return e;
+    };
+}
+
+test "wasm target vs aarch64: float->int conversion (saturation)" {
+    const allocator = std.testing.allocator;
+    const src = "int f(float x){ return int(x); }";
+    // In-range agree; the interesting cases are out of i32 range, where aarch64 fcvtzs
+    // saturates. The wasm target must match (saturating trunc), not trap.
+    for ([_]f32{ 2.7, -3.9, 0.0, 100.5, -100.5, 3.0e9, -3.0e9, 1.0e30 }) |x| {
+        try diffGlslF2I(allocator, src, "f", x);
+    }
+}
+
+/// Integer version of the differential test.
+fn diffGlslI32(allocator: std.mem.Allocator, src: []const u8, name: []const u8, x: i32) !void {
+    if (@import("builtin").cpu.arch != .aarch64) return error.SkipZigTest;
+    var mod = try glsl.compile(allocator, src);
+    defer mod.deinit(allocator);
+    const f = mod.find(name) orelse return error.MissingFunction;
+
+    var buf = try native.jitFunction(allocator, f);
+    defer buf.deinit();
+    const native_result = buf.entry(*const fn (i32) callconv(.c) i32, 0)(x);
+
+    var m = wtarget.link.Module.init(allocator);
+    defer m.deinit();
+    try m.addFunction(name, f);
+    var linked = try wtarget.link.compileModule(allocator, &m);
+    defer linked.deinit(allocator);
+    var inst = try wasm.Instance.instantiate(allocator, linked.module, &.{});
+    defer inst.deinit();
+    const wasm_result = try inst.call1(i32, i32, name, x);
+
+    std.testing.expectEqual(native_result, wasm_result) catch |e| {
+        std.debug.print("\ndiff {s}({d}): native={d} wasm={d}\n", .{ name, x, native_result, wasm_result });
+        return e;
+    };
+}
+
+test "wasm target vs aarch64: differential over GLSL scalar functions" {
+    const allocator = std.testing.allocator;
+    const fcases = [_]struct { src: []const u8, name: []const u8, xs: []const f32 }{
+        .{ .src = "float f(float x){ return x*x - 2.0*x + 1.0; }", .name = "f", .xs = &.{ 0.0, 1.0, 3.5, -2.0 } },
+        .{ .src = "float f(float x){ return clamp(x, 0.0, 1.0); }", .name = "f", .xs = &.{ -1.0, 0.3, 2.0 } },
+        .{ .src = "float f(float x){ return abs(x) + sqrt(abs(x)); }", .name = "f", .xs = &.{ 4.0, -9.0, 0.25 } },
+        .{ .src = "float f(float x){ return x < 0.0 ? -x : x*2.0; }", .name = "f", .xs = &.{ -3.0, 5.0 } },
+        .{ .src = "float f(float x){ return floor(x) + fract(x); }", .name = "f", .xs = &.{ 3.75, -1.25 } },
+        .{ .src = "float f(float x){ return mix(1.0, 3.0, x); }", .name = "f", .xs = &.{ 0.0, 0.5, 1.0 } },
+        .{ .src = "float f(float x){ float s=0.0; for(int i=0;i<3;i=i+1) s=s+x; return s; }", .name = "f", .xs = &.{ 2.0, -1.5 } },
+        .{ .src = "float f(float x){ return sign(x) + step(0.5, x); }", .name = "f", .xs = &.{ -2.0, 0.0, 0.75 } },
+        .{ .src = "float f(float x){ return mod(x, 3.0); }", .name = "f", .xs = &.{ 7.0, -1.0, 3.0 } },
+        .{ .src = "float f(float x){ return max(min(x, 4.0), -4.0) / 2.0; }", .name = "f", .xs = &.{ 10.0, -10.0, 1.0 } },
+    };
+    inline for (fcases) |c| {
+        for (c.xs) |x| try diffGlslF32(allocator, c.src, c.name, x);
+    }
+
+    const icases = [_]struct { src: []const u8, name: []const u8, xs: []const i32 }{
+        .{ .src = "int f(int x){ return x*x + x; }", .name = "f", .xs = &.{ 0, 3, -4, 100 } },
+        .{ .src = "int f(int x){ return x / 3 + x % 3; }", .name = "f", .xs = &.{ 10, -10, 7 } },
+        .{ .src = "int f(int x){ if (x > 0) return 1; else if (x < 0) return -1; return 0; }", .name = "f", .xs = &.{ 5, -5, 0 } },
+        .{ .src = "int f(int x){ int c=0; for(int i=0;i<x;i=i+1) if (i>1) c=c+i; return c; }", .name = "f", .xs = &.{ 5, 2, 0 } },
+        .{ .src = "int f(int x){ return (x << 2) | (x & 3); }", .name = "f", .xs = &.{ 5, -1, 0 } },
+        .{ .src = "int f(int x){ return ~x + (x ^ 15); }", .name = "f", .xs = &.{ 5, -1, 0, 255 } },
+        .{ .src = "int f(int x){ return 1 << x; }", .name = "f", .xs = &.{ 0, 1, 15, 30, 31 } }, // 1<<31 = INT_MIN
+        .{ .src = "int f(int x){ return x * x; }", .name = "f", .xs = &.{ 46341, 100000, -46341 } }, // i32 mul overflow wraps
+        .{ .src = "int f(int x){ return x + 2000000000; }", .name = "f", .xs = &.{ 2000000000, -1, 500000000 } }, // add overflow wraps
+        .{ .src = "int f(int x){ return x >> 31; }", .name = "f", .xs = &.{ -1, 1, -2147483648 } }, // arithmetic shift, sign fill
+    };
+    inline for (icases) |c| {
+        for (c.xs) |x| try diffGlslI32(allocator, c.src, c.name, x);
+    }
+}
+
+test "wasm target vs aarch64: differential over GLSL switch statements" {
+    const allocator = std.testing.allocator;
+    // A switch desugars to a nested if/else chain in the frontend; this checks the wasm
+    // backend lowers that chain the same as aarch64 across matched, grouped, default, and
+    // unmatched selectors.
+    const src =
+        \\int f(int x){
+        \\  int r = 0;
+        \\  switch (x) {
+        \\    case 0: r = 10; break;
+        \\    case 1:
+        \\    case 2: r = 20; break;
+        \\    case 3: r = 30; break;
+        \\    default: r = 99; break;
+        \\  }
+        \\  return r;
+        \\}
+    ;
+    for ([_]i32{ 0, 1, 2, 3, 7, -1 }) |x| try diffGlslI32(allocator, src, "f", x);
+
+    // A switch nested inside a loop, with continue targeting the loop (skip i == 2).
+    const src2 =
+        \\int f(int n){
+        \\  int sum = 0;
+        \\  for (int i = 0; i < n; i = i + 1) {
+        \\    switch (i) {
+        \\      case 2: continue;
+        \\      default: break;
+        \\    }
+        \\    sum = sum + i;
+        \\  }
+        \\  return sum;
+        \\}
+    ;
+    for ([_]i32{ 0, 3, 5, 8 }) |n| try diffGlslI32(allocator, src2, "f", n);
+}
+
+test "wasm target vs aarch64: break and continue inside an if inside a loop" {
+    const allocator = std.testing.allocator;
+    // These exercise a `br` from inside a wasm `if` out to an enclosing loop scope, which
+    // needs the if nesting counted in the branch depth, and the loop's continue block being
+    // a real branch target (both paths of the if reconverge on it).
+    const brk = "int f(int n){ int s=0; for(int i=0;i<n;i=i+1){ if(i==3) break; s=s+i; } return s; }";
+    for ([_]i32{ 0, 2, 5, 10 }) |n| try diffGlslI32(allocator, brk, "f", n);
+
+    const cont = "int f(int n){ int s=0; for(int i=0;i<n;i=i+1){ if(i==2) continue; s=s+i; } return s; }";
+    for ([_]i32{ 0, 2, 5, 8 }) |n| try diffGlslI32(allocator, cont, "f", n);
+}
+
+test "wasm target vs aarch64: integer composites (arrays, structs)" {
+    const allocator = std.testing.allocator;
+    const cases = [_][]const u8{
+        // Integer array: constant-indexed stores + unrolled-loop read.
+        "int f(int x){ int a[3]; a[0]=x; a[1]=x+1; a[2]=x+2; int s=0; for(int i=0;i<3;i=i+1){ s=s+a[i]; } return s; }",
+        // Struct with int members.
+        "struct S { int a; int b; }; int f(int x){ S s; s.a = x*2; s.b = x+7; return s.a - s.b; }",
+        // Array of ivec2, accumulate components.
+        "int f(int x){ ivec2 a[2]; a[0]=ivec2(x,1); a[1]=ivec2(2,x); int s=0; for(int i=0;i<2;i=i+1){ s = s + a[i].x*10 + a[i].y; } return s; }",
+        // Uninitialized int array then partial fill (zero-init of the rest must be int 0).
+        "int f(int x){ int a[4]; a[1]=x; return a[0]*1000 + a[1]; }",
+    };
+    inline for (cases) |src| {
+        for ([_]i32{ 0, 1, 3, -2, 100 }) |x| try diffGlslI32(allocator, src, "f", x);
+    }
+}
+
+test "wasm target vs aarch64: integer vectors through all control flow" {
+    const allocator = std.testing.allocator;
+    // Integer-vector loop/if/inline phis were a class of native-codegen bug (f32-typed phi
+    // params). Sweep ivec through every control-flow shape to catch stragglers.
+    const cases = [_][]const u8{
+        // ivec through if/else merge (mergeVal).
+        "int f(int x){ ivec2 v; if(x > 0){ v = ivec2(x, 1); } else { v = ivec2(0, x); } return v.x*10 + v.y; }",
+        // ivec through a ternary.
+        "int f(int x){ ivec2 v = (x > 5) ? ivec2(x, 2) : ivec2(2, x); return v.x*10 + v.y; }",
+        // ivec accumulator through a loop with a conditional update.
+        "int f(int n){ ivec2 acc = ivec2(0, 0); for(int i=0;i<n;i=i+1){ if(i%2==0) acc = acc + ivec2(i, 1); else acc = acc + ivec2(1, i); } return acc.x*100 + acc.y; }",
+        // ivec through nested loops.
+        "int f(int n){ ivec2 acc = ivec2(0,0); for(int i=0;i<n;i=i+1){ for(int j=0;j<2;j=j+1){ acc = acc + ivec2(i, j); } } return acc.x*100 + acc.y; }",
+        // uvec accumulator (unsigned) through a loop.
+        "int f(int n){ uvec2 acc = uvec2(0u, 0u); for(int i=0;i<n;i=i+1){ acc = acc + uvec2(uint(i), 1u); } return int(acc.x*100u + acc.y); }",
+        // ivec through inlined helper with ivec params inside a loop.
+        "int dot2(ivec2 a, ivec2 b){ return a.x*b.x + a.y*b.y; } int f(int n){ int s=0; for(int i=0;i<n;i=i+1){ s = s + dot2(ivec2(i,1), ivec2(2,i)); } return s; }",
+    };
+    inline for (cases) |src| {
+        for ([_]i32{ 0, 1, 2, 3, 5, 8, -1 }) |x| try diffGlslI32(allocator, src, "f", x);
+    }
+}
+
+test "wasm target vs aarch64: complex programs combining features" {
+    const allocator = std.testing.allocator;
+    // Realistic mixes: control flow + vectors + integer + builtins, where feature
+    // interactions (not single ops) are the likely bug source.
+    const icases = [_][]const u8{
+        // Loop accumulating an integer with a switch inside, min/max on the result.
+        "int f(int n){ int s=0; for(int i=0;i<n;i=i+1){ switch(i%3){ case 0: s=s+i; break; case 1: s=s-1; break; default: s=s+bitCount(i); } } return clamp(s, -50, 50); }",
+        // Nested loops with break/continue, integer vectors, and bitwise reduce.
+        "int f(int n){ ivec2 acc = ivec2(0,0); for(int i=0;i<n;i=i+1){ if(i==5) break; for(int j=0;j<3;j=j+1){ if(j==i) continue; acc = acc + ivec2(i, j); } } return acc.x*100 + acc.y; }",
+        // Bit manipulation pipeline.
+        "int f(int x){ int r = bitfieldReverse(x); r = bitfieldExtract(r, 8, 16); return findMSB(r) + bitCount(r & 0xFF); }",
+        // Fixed-point pack/unpack round-trip with arithmetic.
+        "int f(int x){ float t = float(x & 0xFF) / 255.0; uint p = packUnorm4x8(vec4(t, t*0.5, 1.0-t, 1.0)); vec4 v = unpackUnorm4x8(p); return int((v.x + v.y + v.z + v.w) * 63.75 + 0.5); }",
+    };
+    inline for (icases) |src| {
+        for ([_]i32{ 0, 1, 3, 5, 7, 12, 200, -1, 0x12345678 }) |x| try diffGlslI32(allocator, src, "f", x);
+    }
+    const fcases = [_][]const u8{
+        // Vector math + control flow producing a float.
+        "float f(float x){ vec3 v = vec3(x, x*0.5, 1.0); float acc = 0.0; for(int i=0;i<3;i=i+1){ if(v[i] > 0.5) acc = acc + sqrt(abs(v[i])); } return acc; }",
+        // Nested conditionals selecting between builtin results.
+        "float f(float x){ float r; if(x < 0.0){ r = -sqrt(-x); } else if(x < 1.0){ r = mix(0.0, 1.0, x); } else { r = floor(x) + fract(x)*2.0; } return clamp(r, -10.0, 10.0); }",
+    };
+    inline for (fcases) |src| {
+        for ([_]f32{ -4.0, -0.5, 0.0, 0.3, 0.75, 2.5, 9.9 }) |x| try diffGlslF32(allocator, src, "f", x);
+    }
+}
+
+test "wasm target vs aarch64: float builtins" {
+    const allocator = std.testing.allocator;
+    const cases = [_][]const u8{
+        "float f(float x){ return sqrt(x*x + 1.0); }",
+        "float f(float x){ return floor(x) + ceil(x*0.5); }",
+        "float f(float x){ return fract(x) - trunc(x*0.25); }",
+        "float f(float x){ return abs(x) + sign(x); }",
+        "float f(float x){ return clamp(x, -1.0, 1.0) + mix(2.0, 4.0, fract(x)); }",
+        "float f(float x){ return mod(x, 3.0) + step(0.5, fract(x)); }",
+        "float f(float x){ return min(x, 2.0) * max(x, -2.0); }",
+        "float f(float x){ return smoothstep(0.0, 1.0, x); }",
+    };
+    inline for (cases) |src| {
+        for ([_]f32{ -3.25, -1.0, 0.0, 0.5, 1.75, 4.0, 7.3 }) |x| try diffGlslF32(allocator, src, "f", x);
+    }
+}
+
+test "wasm target vs aarch64: matrices" {
+    const allocator = std.testing.allocator;
+    const cases = [_][]const u8{
+        // mat2 * vec2, read a component.
+        "float f(float x){ mat2 m = mat2(1.0, 2.0, 3.0, 4.0); vec2 r = m * vec2(x, 1.0); return r.x + r.y; }",
+        // mat3 construction and mat*vec.
+        "float f(float x){ mat3 m = mat3(x, 0.0, 0.0, 0.0, x, 0.0, 0.0, 0.0, x); vec3 r = m * vec3(1.0, 2.0, 3.0); return r.x + r.y + r.z; }",
+        // mat2 * mat2 then apply.
+        "float f(float x){ mat2 a = mat2(x, 1.0, 0.0, x); mat2 b = mat2(2.0, 0.0, 1.0, 2.0); mat2 c = a * b; vec2 r = c * vec2(1.0, 1.0); return r.x + r.y; }",
+    };
+    inline for (cases) |src| {
+        for ([_]f32{ 0.0, 1.0, 2.5, -1.5 }) |x| try diffGlslF32(allocator, src, "f", x);
+    }
+}
+
+test "wasm target vs aarch64: integer bit builtins and pack/unpack" {
+    const allocator = std.testing.allocator;
+    // Bit builtins (SWAR + shifts/select) and pack/unpack (nearest-round + float<->int
+    // convert). The round op and float->uint convert are the likely untested wasm spots.
+    const cases = [_][]const u8{
+        "int f(int x){ return bitCount(x); }",
+        "int f(int x){ return findLSB(x); }",
+        "int f(int x){ return findMSB(x); }",
+        "int f(int x){ return findMSB(uint(x)); }",
+        "int f(int x){ return bitfieldReverse(x); }",
+        "int f(int x){ return bitfieldExtract(x, 4, 8); }",
+        "int f(int x){ return int(bitfieldInsert(uint(x), uint(15), 4, 4)); }",
+        "int f(int x){ float fx = float(x) * 0.01; return int(packUnorm4x8(vec4(fx, 0.0, 0.5, 1.0))); }",
+        "int f(int x){ float fx = float(x) * 0.01; return int(packSnorm4x8(vec4(fx, -0.5, 1.0, -1.0))); }",
+        "int f(int x){ vec4 v = unpackUnorm4x8(uint(x)); return int((v.x + v.z) * 255.0 + 0.5); }",
+        "int f(int x){ vec4 v = unpackSnorm4x8(uint(x)); return int(v.y * 100.0); }",
+    };
+    inline for (cases) |src| {
+        for ([_]i32{ 0, 1, 3, 0xFF, -1, 0x12345678, 0x663300FF }) |x| try diffGlslI32(allocator, src, "f", x);
+    }
+}
+
+test "wasm target vs aarch64: integer vectors, unsigned ops, and bit reinterpret" {
+    const allocator = std.testing.allocator;
+    // Cross-validate the new GLSL integer/unsigned-vector and reinterpret features on the
+    // wasm backend. The reinterpret (unary op) and unsigned shift/divide are the likely
+    // untested spots.
+    const cases = [_][]const u8{
+        // ivec integer division (truncates, unlike float).
+        "int f(int x){ ivec3 v = ivec3(x, 3, 0); return v.x / v.y; }",
+        // ivec component-wise add + bitwise.
+        "int f(int x){ ivec2 a = ivec2(x,2); ivec2 b = ivec2(3,x); ivec2 c = a + b; return (c.x << 4) | (c.y & 7); }",
+        // uvec unsigned right-shift (int->uint reinterpret + logical shift).
+        "int f(int x){ uvec2 v = uvec2(x, 1); return int(v.x >> v.y); }",
+        // uvec unsigned division of a high-bit value.
+        "int f(int x){ uvec2 v = uvec2(x, 2); return int(v.x / v.y); }",
+        // bit reinterpret round-trip through a float register.
+        "int f(int x){ return floatBitsToInt(intBitsToFloat(x)); }",
+        // float->int bits of a computed float.
+        "int f(int x){ float g = float(x) * 0.5; return floatBitsToInt(g); }",
+    };
+    inline for (cases) |src| {
+        for ([_]i32{ 0, 1, 3, 5, -1, -2, 1065353216 }) |x| try diffGlslI32(allocator, src, "f", x);
+    }
+}
+
+test "wasm target vs aarch64: deeply nested control flow" {
+    const allocator = std.testing.allocator;
+    const cases = [_][]const u8{
+        // Nested loops, break in the inner loop (breaks only the inner).
+        "int f(int n){ int s=0; for(int i=0;i<n;i=i+1){ for(int j=0;j<n;j=j+1){ if(j==2) break; s=s+j; } s=s+i; } return s; }",
+        // Nested loops, continue in the inner loop.
+        "int f(int n){ int s=0; for(int i=0;i<n;i=i+1){ for(int j=0;j<n;j=j+1){ if(j==1) continue; s=s+j; } } return s; }",
+        // break guarded by a doubly-nested if.
+        "int f(int n){ int s=0; for(int i=0;i<n;i=i+1){ if(i>0){ if(i==3) break; } s=s+i; } return s; }",
+        // Early return from inside an if inside a loop.
+        "int f(int n){ int s=0; for(int i=0;i<n;i=i+1){ if(i==3) return s; s=s+i; } return s; }",
+        // continue in the inner, break in the outer, both if-guarded.
+        "int f(int n){ int s=0; for(int i=0;i<n;i=i+1){ if(i==4) break; for(int j=0;j<n;j=j+1){ if(j==i) continue; s=s+1; } } return s; }",
+        // while loop with a break and a continue in if/else arms.
+        "int f(int n){ int s=0; int i=0; while(i<n){ i=i+1; if(i==2) continue; if(i==5) break; s=s+i; } return s; }",
+        // if/else where each arm loops (branch depth differs per arm).
+        "int f(int n){ int s=0; if(n>0){ for(int i=0;i<n;i=i+1) s=s+i; } else { for(int i=0;i<3;i=i+1) s=s-i; } return s; }",
+    };
+    inline for (cases) |src| {
+        for ([_]i32{ 0, 1, 3, 5, 8 }) |n| try diffGlslI32(allocator, src, "f", n);
+    }
+}
+
+test "wasm target vs aarch64: float control flow with phis" {
+    const allocator = std.testing.allocator;
+    // Float-typed loop/if bodies build float block-param phis, a different codegen path
+    // than the integer cases: accumulators, conditional accumulation, and early exit.
+    const cases = [_][]const u8{
+        "float f(float x){ float s=0.0; for(int i=0;i<5;i=i+1){ if(x>0.0) s=s+x; else s=s-x; } return s; }",
+        "float f(float x){ float a=x; for(int i=0;i<4;i=i+1){ a=a*0.5; if(a<0.1) break; } return a; }",
+        "float f(float x){ float s=0.0; for(int i=0;i<6;i=i+1){ if(x<0.0) continue; s=s+x*float(i); } return s; }",
+        "float f(float x){ float r; if(x>1.0){ r=x*x; } else { r=x+x; } return r; }",
+    };
+    inline for (cases) |src| {
+        for ([_]f32{ -2.0, 0.0, 0.5, 3.0 }) |x| try diffGlslF32(allocator, src, "f", x);
+    }
+}
+
+test "wasm target vs aarch64: large function body (256+ byte encoding)" {
+    const allocator = std.testing.allocator;
+    // A long straight-line body compiles to well over 256 bytes of wasm, exercising the
+    // multi-byte LEB128 body-length encoding end to end (compile AND run correct).
+    const src =
+        \\int f(int x){
+        \\  int a=x; a=a+1; a=a*2; a=a-3; a=a+4; a=a*5; a=a-6; a=a+7; a=a*8; a=a-9;
+        \\  a=a+10; a=a*11; a=a-12; a=a+13; a=a*14; a=a-15; a=a+16; a=a*17; a=a-18;
+        \\  a=a+19; a=a*2; a=a-21; a=a+22; a=a*2; a=a-24; a=a+25; a=a*2; a=a-27;
+        \\  a=a+28; a=a*2; a=a-30; a=a+31; a=a*2; a=a-33; a=a+34; a=a*2; a=a-36;
+        \\  return a;
+        \\}
+    ;
+    for ([_]i32{ 0, 1, -1, 7 }) |x| try diffGlslI32(allocator, src, "f", x);
+}
+
+test "wasm target: GLSL scalar function compiles and runs end-to-end" {
+    const allocator = std.testing.allocator;
+    // min/max lower to float compare + select, exercising the whole pipeline:
+    // GLSL -> IR -> wasm target -> frontend re-lower -> native JIT -> run.
+    const src =
+        \\float clampf(float x) { return min(max(x, 0.0), 1.0); }
+    ;
+    var mod = try glsl.compile(allocator, src);
+    defer mod.deinit(allocator);
+    const f = mod.find("clampf") orelse return error.MissingFunction;
+
+    var m = wtarget.link.Module.init(allocator);
+    defer m.deinit();
+    try m.addFunction("clampf", f);
+    var linked = try wtarget.link.compileModule(allocator, &m);
+    defer linked.deinit(allocator);
+    var inst = try wasm.Instance.instantiate(allocator, linked.module, &.{});
+    defer inst.deinit();
+    try std.testing.expectEqual(@as(f32, 0.5), try inst.call1(f32, f32, "clampf", 0.5));
+    try std.testing.expectEqual(@as(f32, 0.0), try inst.call1(f32, f32, "clampf", -2.0));
+    try std.testing.expectEqual(@as(f32, 1.0), try inst.call1(f32, f32, "clampf", 3.0));
+}
+
+test "wasm target: GLSL if-inside-loop runs end-to-end" {
+    const allocator = std.testing.allocator;
+    // countPos(n): count i in [0, n) with i > 2. An if nested in a loop with a
+    // conditional accumulator (phi through both the loop and the selection).
+    const src =
+        \\int countPos(int n) { int c = 0; for (int i = 0; i < n; i = i + 1) { if (i > 2) c = c + 1; } return c; }
+    ;
+    var mod = try glsl.compile(allocator, src);
+    defer mod.deinit(allocator);
+    const f = mod.find("countPos") orelse return error.MissingFunction;
+
+    var m = wtarget.link.Module.init(allocator);
+    defer m.deinit();
+    try m.addFunction("countPos", f);
+    var linked = try wtarget.link.compileModule(allocator, &m);
+    defer linked.deinit(allocator);
+    var inst = try wasm.Instance.instantiate(allocator, linked.module, &.{});
+    defer inst.deinit();
+    try std.testing.expectEqual(@as(i32, 2), try inst.call1(i32, i32, "countPos", 5)); // i=3,4
+    try std.testing.expectEqual(@as(i32, 0), try inst.call1(i32, i32, "countPos", 3));
+}
+
+test "wasm target: GLSL loop runs end-to-end" {
+    const allocator = std.testing.allocator;
+    // A for-loop sum: the frontend produces a header/body/exit loop with
+    // cf.merge/cf.continue attrs, exercising the wasm target's loop emitter.
+    const src =
+        \\int sumn(int n) { int s = 0; for (int i = 1; i <= n; i = i + 1) s = s + i; return s; }
+    ;
+    var mod = try glsl.compile(allocator, src);
+    defer mod.deinit(allocator);
+    const f = mod.find("sumn") orelse return error.MissingFunction;
+
+    var m = wtarget.link.Module.init(allocator);
+    defer m.deinit();
+    try m.addFunction("sumn", f);
+    var linked = try wtarget.link.compileModule(allocator, &m);
+    defer linked.deinit(allocator);
+    var inst = try wasm.Instance.instantiate(allocator, linked.module, &.{});
+    defer inst.deinit();
+    try std.testing.expectEqual(@as(i32, 15), try inst.call1(i32, i32, "sumn", 5));
+    try std.testing.expectEqual(@as(i32, 55), try inst.call1(i32, i32, "sumn", 10));
+}
+
+test "wasm target: GLSL function with control flow runs end-to-end" {
+    const allocator = std.testing.allocator;
+    // An if with an early return: the frontend produces a real multi-block CFG with
+    // cf.merge attrs, exercising the wasm target's structured control-flow emitter.
+    const src =
+        \\float absf(float x) { if (x < 0.0) return -x; return x; }
+    ;
+    var mod = try glsl.compile(allocator, src);
+    defer mod.deinit(allocator);
+    const f = mod.find("absf") orelse return error.MissingFunction;
+
+    var m = wtarget.link.Module.init(allocator);
+    defer m.deinit();
+    try m.addFunction("absf", f);
+    var linked = try wtarget.link.compileModule(allocator, &m);
+    defer linked.deinit(allocator);
+    var inst = try wasm.Instance.instantiate(allocator, linked.module, &.{});
+    defer inst.deinit();
+    try std.testing.expectEqual(@as(f32, 3.0), try inst.call1(f32, f32, "absf", -3.0));
+    try std.testing.expectEqual(@as(f32, 2.0), try inst.call1(f32, f32, "absf", 2.0));
+}
+
+test "wasm target: f32 select (min) round-trips" {
+    const allocator = std.testing.allocator;
+    // fmin(a, b) = (a < b) ? a : b, a float-operand select.
+    var f = ir.function.Function.init(allocator);
+    defer f.deinit();
+    const ft = try f.types.intern(.{ .float = .f32 });
+    const bool_t = try f.types.intern(.bool);
+    const entry = try f.appendBlock();
+    const a = try f.appendBlockParam(entry, ft);
+    const b = try f.appendBlockParam(entry, ft);
+    const lt = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = a, .rhs = b } });
+    const r = try f.appendInst(entry, ft, .{ .select = .{ .cond = lt, .then = a, .@"else" = b } });
+    f.setTerminator(entry, .{ .ret = r });
+
+    var m = wtarget.link.Module.init(allocator);
+    defer m.deinit();
+    try m.addFunction("fmin", &f);
+    var linked = try wtarget.link.compileModule(allocator, &m);
+    defer linked.deinit(allocator);
+    var inst = try wasm.Instance.instantiate(allocator, linked.module, &.{});
+    defer inst.deinit();
+    try std.testing.expectEqual(@as(f32, 2.5), try inst.call2(f32, f32, f32, "fmin", 2.5, 7.5));
+    try std.testing.expectEqual(@as(f32, 1.0), try inst.call2(f32, f32, f32, "fmin", 4.0, 1.0));
+}
+
+test "wasm target: f32 arithmetic round-trips" {
+    const allocator = std.testing.allocator;
+
+    var f = ir.function.Function.init(allocator);
+    defer f.deinit();
+    const ft = try f.types.intern(.{ .float = .f32 });
+    const entry = try f.appendBlock();
+    const a = try f.appendBlockParam(entry, ft);
+    const b = try f.appendBlockParam(entry, ft);
+    const sum = try f.appendInst(entry, ft, .{ .arith = .{ .op = .add, .lhs = a, .rhs = b } });
+    f.setTerminator(entry, .{ .ret = sum });
+
+    var m = wtarget.link.Module.init(allocator);
+    defer m.deinit();
+    try m.addFunction("faddf", &f);
+    var linked = try wtarget.link.compileModule(allocator, &m);
+    defer linked.deinit(allocator);
+
+    var inst = try wasm.Instance.instantiate(allocator, linked.module, &.{});
+    defer inst.deinit();
+    try std.testing.expectEqual(@as(f32, 3.75), try inst.call2(f32, f32, f32, "faddf", 1.5, 2.25));
+}
+
+test "wasm target: direct call resolves by name not interning order" {
+    const allocator = std.testing.allocator;
+
+    // decoy(x)=x+1 at index 0, target(x)=x+100 at index 1, main(x)=target(x) at index 2.
+    // In `main`, "target" is the first interned symbol (id 0). If the backend used the
+    // symbol id as the function index it would call decoy (index 0) and return x+1.
+    var decoy = ir.function.Function.init(allocator);
+    defer decoy.deinit();
+    var target = ir.function.Function.init(allocator);
+    defer target.deinit();
+    var mainf = ir.function.Function.init(allocator);
+    defer mainf.deinit();
+    inline for (.{ .{ &decoy, 1 }, .{ &target, 100 } }) |pair| {
+        const fp = pair[0];
+        const t = try fp.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+        const b = try fp.appendBlock();
+        const x = try fp.appendBlockParam(b, t);
+        const r = try fp.appendArithImm(b, t, .add, x, pair[1]);
+        fp.setTerminator(b, .{ .ret = r });
+    }
+    {
+        const t = try mainf.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+        const b = try mainf.appendBlock();
+        const x = try mainf.appendBlockParam(b, t);
+        const r = try mainf.appendCall(b, t, "target", &.{x});
+        mainf.setTerminator(b, .{ .ret = r });
+    }
+
+    var m = wtarget.link.Module.init(allocator);
+    defer m.deinit();
+    try m.addFunction("decoy", &decoy);
+    try m.addFunction("target", &target);
+    try m.addFunction("main", &mainf);
+    var linked = try wtarget.link.compileModule(allocator, &m);
+    defer linked.deinit(allocator);
+
+    var inst = try wasm.Instance.instantiate(allocator, linked.module, &.{});
+    defer inst.deinit();
+    try std.testing.expectEqual(@as(i32, 105), try inst.call1(i32, i32, "main", 5));
+}
+
+test "wasm target: int->float convert with mixed-type locals round-trips" {
+    const allocator = std.testing.allocator;
+
+    // scale(n: i32) -> f32 = float(n) * 2.5. Mixes an i32 param with f32 values, which
+    // exercises the grouped-by-valtype local layout and float zero-init.
+    var f = ir.function.Function.init(allocator);
+    defer f.deinit();
+    const it = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ft = try f.types.intern(.{ .float = .f32 });
+    const entry = try f.appendBlock();
+    const n = try f.appendBlockParam(entry, it);
+    const nf = try f.appendInst(entry, ft, .{ .convert = .{ .value = n } });
+    const k = try f.appendInst(entry, ft, .{ .fconst = 2.5 });
+    const r = try f.appendInst(entry, ft, .{ .arith = .{ .op = .mul, .lhs = nf, .rhs = k } });
+    f.setTerminator(entry, .{ .ret = r });
+
+    var m = wtarget.link.Module.init(allocator);
+    defer m.deinit();
+    try m.addFunction("scale", &f);
+    var linked = try wtarget.link.compileModule(allocator, &m);
+    defer linked.deinit(allocator);
+
+    var inst = try wasm.Instance.instantiate(allocator, linked.module, &.{});
+    defer inst.deinit();
+    try std.testing.expectEqual(@as(f32, 10.0), try inst.call1(f32, i32, "scale", 4));
+    try std.testing.expectEqual(@as(f32, -7.5), try inst.call1(f32, i32, "scale", -3));
+}
+
+test "wasm target: stack frame + control flow + cross-block alloca" {
+    const allocator = std.testing.allocator;
+    // absStore(x): slot = alloca; if x < 0 { store -x } else { store x }; return *slot.
+    // The alloca (sp-relative) is written from two branches and read in the merge.
+    var f = ir.function.Function.init(allocator);
+    defer f.deinit();
+    const t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try f.types.intern(.bool);
+    const ptr = try f.types.intern(.ptr);
+    const entry = try f.appendBlock();
+    const x = try f.appendBlockParam(entry, t);
+    const neg = try f.appendBlock();
+    const pos = try f.appendBlock();
+    const merge = try f.appendBlock();
+
+    const slot = try f.appendInst(entry, ptr, .{ .alloca = .{ .elem = t } });
+    const zero = try f.appendInst(entry, t, .{ .iconst = 0 });
+    const isneg = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = x, .rhs = zero } });
+    try f.appendIf(entry, isneg, .{ .target = neg, .args = &.{} }, .{ .target = pos, .args = &.{} });
+    try f.addAttr(.{ .block = entry }, .{ .custom = .{ .namespace = "cf", .key = "merge", .value = .{ .int = @intFromEnum(merge) } } });
+
+    const nx = try f.appendInst(neg, t, .{ .arith = .{ .op = .sub, .lhs = zero, .rhs = x } });
+    try f.appendStore(neg, nx, slot);
+    try f.setJump(neg, merge, &.{});
+
+    try f.appendStore(pos, x, slot);
+    try f.setJump(pos, merge, &.{});
+
+    const r = try f.appendInst(merge, t, .{ .load = .{ .ptr = slot } });
+    f.setTerminator(merge, .{ .ret = r });
+
+    var m = wtarget.link.Module.init(allocator);
+    defer m.deinit();
+    try m.addFunction("absStore", &f);
+    var linked = try wtarget.link.compileModule(allocator, &m);
+    defer linked.deinit(allocator);
+    var inst = try wasm.Instance.instantiate(allocator, linked.module, &.{});
+    defer inst.deinit();
+    try std.testing.expectEqual(@as(i32, 5), try inst.call1(i32, i32, "absStore", -5));
+    try std.testing.expectEqual(@as(i32, 3), try inst.call1(i32, i32, "absStore", 3));
+}
+
+test "wasm target: cross-call allocas do not alias (stack pointer)" {
+    const allocator = std.testing.allocator;
+    const i32t_of = struct {
+        fn t(f: *ir.function.Function) !ir.types.Type {
+            return f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+        }
+    }.t;
+
+    // callee(): allocate a slot, store 7, return it. Writes to the shared stack.
+    var callee = ir.function.Function.init(allocator);
+    defer callee.deinit();
+    {
+        const t = try i32t_of(&callee);
+        const ptr = try callee.types.intern(.ptr);
+        const b = try callee.appendBlock();
+        const slot = try callee.appendInst(b, ptr, .{ .alloca = .{ .elem = t } });
+        const seven = try callee.appendInst(b, t, .{ .iconst = 7 });
+        try callee.appendStore(b, seven, slot);
+        const r = try callee.appendInst(b, t, .{ .load = .{ .ptr = slot } });
+        callee.setTerminator(b, .{ .ret = r });
+    }
+    // caller(): store 1000 into its own slot, call callee(), reload the slot, add.
+    // With static offsets callee's store would clobber the slot (14). With a stack
+    // pointer the frames are disjoint (1007).
+    var caller = ir.function.Function.init(allocator);
+    defer caller.deinit();
+    {
+        const t = try i32t_of(&caller);
+        const ptr = try caller.types.intern(.ptr);
+        const b = try caller.appendBlock();
+        const slot = try caller.appendInst(b, ptr, .{ .alloca = .{ .elem = t } });
+        const k = try caller.appendInst(b, t, .{ .iconst = 1000 });
+        try caller.appendStore(b, k, slot);
+        const c = try caller.appendCall(b, t, "callee", &.{});
+        const reloaded = try caller.appendInst(b, t, .{ .load = .{ .ptr = slot } });
+        const sum = try caller.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = reloaded, .rhs = c } });
+        caller.setTerminator(b, .{ .ret = sum });
+    }
+
+    var m = wtarget.link.Module.init(allocator);
+    defer m.deinit();
+    try m.addFunction("callee", &callee);
+    try m.addFunction("caller", &caller);
+    var linked = try wtarget.link.compileModule(allocator, &m);
+    defer linked.deinit(allocator);
+    var inst = try wasm.Instance.instantiate(allocator, linked.module, &.{});
+    defer inst.deinit();
+    try std.testing.expectEqual(@as(i32, 1007), try inst.call0(i32, "caller"));
+}
+
+test "wasm target: alloca + store/load through linear memory round-trips" {
+    const allocator = std.testing.allocator;
+
+    // memsum(a, b): store a and b into two distinct alloca slots, load them back, add.
+    var f = ir.function.Function.init(allocator);
+    defer f.deinit();
+    const t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr = try f.types.intern(.ptr);
+    const entry = try f.appendBlock();
+    const a = try f.appendBlockParam(entry, t);
+    const b = try f.appendBlockParam(entry, t);
+    const p = try f.appendInst(entry, ptr, .{ .alloca = .{ .elem = t } });
+    const q = try f.appendInst(entry, ptr, .{ .alloca = .{ .elem = t } });
+    try f.appendStore(entry, a, p);
+    try f.appendStore(entry, b, q);
+    const x = try f.appendInst(entry, t, .{ .load = .{ .ptr = p } });
+    const y = try f.appendInst(entry, t, .{ .load = .{ .ptr = q } });
+    const sum = try f.appendInst(entry, t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = y } });
+    f.setTerminator(entry, .{ .ret = sum });
+
+    var m = wtarget.link.Module.init(allocator);
+    defer m.deinit();
+    try m.addFunction("memsum", &f);
+    var linked = try wtarget.link.compileModule(allocator, &m);
+    defer linked.deinit(allocator);
+
+    var inst = try wasm.Instance.instantiate(allocator, linked.module, &.{});
+    defer inst.deinit();
+    try std.testing.expectEqual(@as(i32, 30), try inst.call2(i32, i32, i32, "memsum", 10, 20));
+    try std.testing.expectEqual(@as(i32, 7), try inst.call2(i32, i32, i32, "memsum", 5, 2));
+}
+
+/// Build a `(i32) -> i32` function computing `x * k` via arith_imm.
+fn scaleFn(func: *ir.function.Function, k: i64) !void {
+    const t_i32 = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const b0 = try func.appendBlock();
+    const x = try func.appendBlockParam(b0, t_i32);
+    const r = try func.appendInst(b0, t_i32, .{ .arith_imm = .{ .op = .mul, .lhs = x, .imm = k } });
+    func.setTerminator(b0, .{ .ret = r });
+}
+
+test "wasm target: call_indirect lowers and round-trips" {
+    const allocator = std.testing.allocator;
+
+    // func0 double(x)=x*2, func1 triple(x)=x*3, func2 dispatch(sel,x)=table[sel](x).
+    var f_double = ir.function.Function.init(allocator);
+    defer f_double.deinit();
+    try scaleFn(&f_double, 2);
+    var f_triple = ir.function.Function.init(allocator);
+    defer f_triple.deinit();
+    try scaleFn(&f_triple, 3);
+
+    var f_disp = ir.function.Function.init(allocator);
+    defer f_disp.deinit();
+    const t_i32 = try f_disp.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const b0 = try f_disp.appendBlock();
+    const sel = try f_disp.appendBlockParam(b0, t_i32);
+    const x = try f_disp.appendBlockParam(b0, t_i32);
+    const r = try f_disp.appendCallIndirect(b0, t_i32, sel, &.{x});
+    f_disp.setTerminator(b0, .{ .ret = r });
+
+    var m = wtarget.link.Module.init(allocator);
+    defer m.deinit();
+    try m.addFunction("double", &f_double);
+    try m.addFunction("triple", &f_triple);
+    try m.addFunction("dispatch", &f_disp);
+    var linked = try wtarget.link.compileModule(allocator, &m);
+    defer linked.deinit(allocator);
+
+    var inst = try wasm.Instance.instantiate(allocator, linked.module, &.{});
+    defer inst.deinit();
+    try std.testing.expectEqual(@as(i32, 10), try inst.call2(i32, i32, i32, "dispatch", 0, 5));
+    try std.testing.expectEqual(@as(i32, 15), try inst.call2(i32, i32, i32, "dispatch", 1, 5));
+}
+
+/// Differential runner for a hand-built IR module (memory ops and calls, which the GLSL
+/// path never emits): build once, run the `entry` function on aarch64 natively and through
+/// the wasm target, and require the results match.
+fn diffIRModule(allocator: std.mem.Allocator, funcs: []const native.ModuleFunction, entry: []const u8, arg: i32) !void {
+    if (@import("builtin").cpu.arch != .aarch64) return error.SkipZigTest;
+
+    var jm = try native.jitModule(allocator, funcs);
+    defer jm.deinit();
+    const nat = jm.entry(*const fn (i32) callconv(.c) i32, entry).?(arg);
+
+    var m = wtarget.link.Module.init(allocator);
+    defer m.deinit();
+    for (funcs) |ff| try m.addFunction(ff.name, ff.func);
+    var linked = try wtarget.link.compileModule(allocator, &m);
+    defer linked.deinit(allocator);
+    var inst = try wasm.Instance.instantiate(allocator, linked.module, &.{});
+    defer inst.deinit();
+    const w = try inst.call1(i32, i32, entry, arg);
+
+    std.testing.expectEqual(nat, w) catch |e| {
+        std.debug.print("\ndiffIR {s}({d}): native={d} wasm={d}\n", .{ entry, arg, nat, w });
+        return e;
+    };
+}
+
+fn i32ty(f: *ir.function.Function) !ir.types.Type {
+    return f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+}
+
+test "wasm vs aarch64: multiple allocas do not alias" {
+    const allocator = std.testing.allocator;
+    // f(x): a=x+1 in slot A, b=x*3 in slot B, return load(A)*load(B) - load(A).
+    var f = ir.function.Function.init(allocator);
+    defer f.deinit();
+    const t = try i32ty(&f);
+    const ptr = try f.types.intern(.ptr);
+    const b = try f.appendBlock();
+    const x = try f.appendBlockParam(b, t);
+    const sa = try f.appendInst(b, ptr, .{ .alloca = .{ .elem = t } });
+    const sb = try f.appendInst(b, ptr, .{ .alloca = .{ .elem = t } });
+    const va = try f.appendArithImm(b, t, .add, x, 1);
+    const vb = try f.appendArithImm(b, t, .mul, x, 3);
+    try f.appendStore(b, va, sa);
+    try f.appendStore(b, vb, sb);
+    const la = try f.appendInst(b, t, .{ .load = .{ .ptr = sa } });
+    const lb = try f.appendInst(b, t, .{ .load = .{ .ptr = sb } });
+    const prod = try f.appendInst(b, t, .{ .arith = .{ .op = .mul, .lhs = la, .rhs = lb } });
+    const res = try f.appendInst(b, t, .{ .arith = .{ .op = .sub, .lhs = prod, .rhs = la } });
+    f.setTerminator(b, .{ .ret = res });
+
+    for ([_]i32{ 0, 1, 4, -2, 10 }) |x_val| {
+        try diffIRModule(allocator, &.{.{ .name = "f", .func = &f }}, "f", x_val);
+    }
+}
+
+test "wasm vs aarch64: nested calls with arguments" {
+    const allocator = std.testing.allocator;
+    // add3(p) = p+3; dbl(p) = p*2; f(x) = dbl(add3(x)) = (x+3)*2.
+    var add3 = ir.function.Function.init(allocator);
+    defer add3.deinit();
+    {
+        const t = try i32ty(&add3);
+        const b = try add3.appendBlock();
+        const p = try add3.appendBlockParam(b, t);
+        const r = try add3.appendArithImm(b, t, .add, p, 3);
+        add3.setTerminator(b, .{ .ret = r });
+    }
+    var dbl = ir.function.Function.init(allocator);
+    defer dbl.deinit();
+    {
+        const t = try i32ty(&dbl);
+        const b = try dbl.appendBlock();
+        const p = try dbl.appendBlockParam(b, t);
+        const r = try dbl.appendArithImm(b, t, .mul, p, 2);
+        dbl.setTerminator(b, .{ .ret = r });
+    }
+    var f = ir.function.Function.init(allocator);
+    defer f.deinit();
+    {
+        const t = try i32ty(&f);
+        const b = try f.appendBlock();
+        const x = try f.appendBlockParam(b, t);
+        const c1 = try f.appendCall(b, t, "add3", &.{x});
+        const c2 = try f.appendCall(b, t, "dbl", &.{c1});
+        f.setTerminator(b, .{ .ret = c2 });
+    }
+    const funcs = [_]native.ModuleFunction{
+        .{ .name = "add3", .func = &add3 },
+        .{ .name = "dbl", .func = &dbl },
+        .{ .name = "f", .func = &f },
+    };
+    for ([_]i32{ 0, 1, 5, -4 }) |x_val| try diffIRModule(allocator, &funcs, "f", x_val);
+}
+
+test "wasm vs aarch64: value live across a call and a memory slot" {
+    const allocator = std.testing.allocator;
+    // helper(p) = p*10; f(x): t=x+5 (lives across the call), c=helper(x),
+    // store t into a slot, return load(slot)+c = (x+5) + x*10.
+    var helper = ir.function.Function.init(allocator);
+    defer helper.deinit();
+    {
+        const t = try i32ty(&helper);
+        const b = try helper.appendBlock();
+        const p = try helper.appendBlockParam(b, t);
+        const r = try helper.appendArithImm(b, t, .mul, p, 10);
+        helper.setTerminator(b, .{ .ret = r });
+    }
+    var f = ir.function.Function.init(allocator);
+    defer f.deinit();
+    {
+        const t = try i32ty(&f);
+        const ptr = try f.types.intern(.ptr);
+        const b = try f.appendBlock();
+        const x = try f.appendBlockParam(b, t);
+        const tv = try f.appendArithImm(b, t, .add, x, 5);
+        const slot = try f.appendInst(b, ptr, .{ .alloca = .{ .elem = t } });
+        try f.appendStore(b, tv, slot);
+        const c = try f.appendCall(b, t, "helper", &.{x});
+        const lt = try f.appendInst(b, t, .{ .load = .{ .ptr = slot } });
+        const res = try f.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = lt, .rhs = c } });
+        f.setTerminator(b, .{ .ret = res });
+    }
+    const funcs = [_]native.ModuleFunction{
+        .{ .name = "helper", .func = &helper },
+        .{ .name = "f", .func = &f },
+    };
+    for ([_]i32{ 0, 1, 7, -3, 100 }) |x_val| try diffIRModule(allocator, &funcs, "f", x_val);
 }

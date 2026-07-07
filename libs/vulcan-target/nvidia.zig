@@ -10,6 +10,10 @@ const std = @import("std");
 pub const encode = @import("nvidia/encode.zig");
 pub const isel = @import("nvidia/isel.zig");
 pub const schedule = @import("nvidia/schedule.zig");
+/// The sm_120 SASS disassembler (the strict inverse of `encode`): dumps a readable
+/// per-instruction listing with register numbers + scoreboard bits, for the
+/// register-allocation / liveness diff during GPU bring-up.
+pub const disasm = @import("nvidia/disasm.zig");
 
 /// Cross-cutting tests (no GPU execution here, so structural only). The SPIR-V ->
 /// IR -> SASS path validates the frontend-to-GPU pipeline.

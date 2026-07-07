@@ -5,7 +5,7 @@
 //!
 //! Parses the GLSL source, lowers it to Vulcan IR, and emits a SPIR-V entry-point shader
 //! for the chosen stage (default: fragment). The binary is written to `<output.spv>` (or
-//! `<input>.spv` if `-o` is omitted), and a one-line summary is printed to stderr.
+//! `<input>.spv` if `-o` is omitted), and a one-line summary is printed to stdout.
 
 const std = @import("std");
 const glsl = @import("vulcan-glsl");
@@ -47,4 +47,9 @@ pub fn main(init: std.process.Init) !void {
 
     const out_path = output orelse try std.fmt.allocPrint(allocator, "{s}.spv", .{input});
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = std.mem.sliceAsBytes(words) });
+
+    var buf: [256]u8 = undefined;
+    var w = std.Io.File.stdout().writer(io, &buf);
+    try w.interface.print("{s}: {s} shader, {d} words -> {s}\n", .{ input, @tagName(stage), words.len, out_path });
+    try w.interface.flush();
 }

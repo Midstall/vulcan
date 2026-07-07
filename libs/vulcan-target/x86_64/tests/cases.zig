@@ -115,6 +115,19 @@ fn memory(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {
         f.setTerminator(b, .{ .ret = r });
         try expectRun(io, allocator, &f, &.{0x5A}, 0x5A, backend); // round-trips the byte 0x5A
     }
+    { // a float-typed integer constant (how the frontend zero-inits float locals):
+        // x + (0.0 typed as a float iconst) == x. The const must land in an xmm register,
+        // not a gpr.
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const t = try f.types.intern(.{ .float = .f32 });
+        const b = try f.appendBlock();
+        const x = try f.appendBlockParam(b, t);
+        const z = try f.appendInst(b, t, .{ .iconst = 0 });
+        const r = try f.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = z } });
+        f.setTerminator(b, .{ .ret = r });
+        try h.expectRunFloat(io, allocator, &f, &.{@as(f32, 3.5)}, 3.5, backend);
+    }
     { // a float slot: alloca f32, store x + y, load it back, return it.
         var f = Function.init(allocator);
         defer f.deinit();
