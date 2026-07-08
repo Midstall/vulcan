@@ -75,6 +75,17 @@ fn intBits(func: *const Function, v: Value) u16 {
         else => 64,
     };
 }
+/// Whether the function makes any call (direct or indirect), so its frame needs 16-byte
+/// call-site alignment.
+fn hasCall(func: *const Function) bool {
+    for (0..func.blockCount()) |bi| {
+        for (func.blockInsts(@enumFromInt(bi))) |inst| switch (func.opcode(inst)) {
+            .call, .call_indirect => return true,
+            else => {},
+        };
+    }
+    return false;
+}
 
 const Fixup = struct { at: usize, target: u32 };
 
@@ -222,7 +233,13 @@ pub fn compile(allocator: std.mem.Allocator, func: *const Function) Error!Compil
     const alloca_base: u64 = (xmm_base + @as(u64, xmm_slots) * 32 + 15) & ~@as(u64, 15);
     ctx.alloca_base = @intCast(alloca_base);
     const alloca_bytes = try computeAllocaSlots(allocator, func, &ctx.alloca_off);
-    const frame: i32 = @intCast((alloca_base + alloca_bytes + 15) & ~@as(u64, 15));
+    // A function that makes calls must keep RSP 16-aligned at the call site: System V requires
+    // RSP+8 aligned at a callee's entry, so RSP here is 8 (mod 16), and a 16-multiple frame would
+    // leave calls 8 off, faulting a callee that reads its stack with movaps on real hardware
+    // (qemu-user does not enforce this). Pad the frame by 8 so RSP at a call site lands on a 16
+    // boundary. A leaf function needs no such padding.
+    const frame_base = (alloca_base + alloca_bytes + 15) & ~@as(u64, 15);
+    const frame: i32 = @intCast(if (hasCall(func)) frame_base + 8 else frame_base);
 
     const block_start = try allocator.alloc(usize, nblocks);
     defer allocator.free(block_start);
@@ -1348,4 +1365,38 @@ test "selects a straight-line arithmetic function" {
     const code = try selectFunction(allocator, &func);
     defer allocator.free(code);
     try std.testing.expectEqual(@as(u8, 0xC3), code[code.len - 1]); // ends in ret
+}
+
+test "a call keeps RSP 16-aligned at the call site (movaps-safe host calls)" {
+    // A callee reading its stack with movaps faults on real hardware when the caller's RSP is
+    // misaligned (qemu-user does not enforce this, so only a codegen check catches it). Entry RSP
+    // is 8 (mod 16), so the prologue frame must be 8 (mod 16) to land calls on a 16 boundary.
+    const allocator = std.testing.allocator;
+    var callee = Function.init(allocator);
+    defer callee.deinit();
+    {
+        const t = try callee.types.intern(.{ .float = .f32 });
+        const b = try callee.appendBlock();
+        const a = try callee.appendBlockParam(b, t);
+        callee.setTerminator(b, .{ .ret = a });
+    }
+    var caller = Function.init(allocator);
+    defer caller.deinit();
+    {
+        const t = try caller.types.intern(.{ .float = .f32 });
+        const b = try caller.appendBlock();
+        const x = try caller.appendBlockParam(b, t);
+        const r = try caller.appendCall(b, t, "helper", &.{x});
+        caller.setTerminator(b, .{ .ret = r });
+    }
+    const code = try selectFunction(allocator, &caller);
+    defer allocator.free(code);
+    const text = try @import("disasm.zig").format(allocator, code);
+    defer allocator.free(text);
+    const marker = "sub rsp, ";
+    const at = std.mem.indexOf(u8, text, marker) orelse return error.NoPrologue;
+    const rest = text[at + marker.len ..];
+    const end = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
+    const frame = try std.fmt.parseInt(u32, rest[0..end], 10);
+    try std.testing.expectEqual(@as(u32, 8), frame % 16);
 }
