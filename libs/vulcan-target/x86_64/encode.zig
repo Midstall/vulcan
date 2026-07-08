@@ -155,6 +155,29 @@ pub fn divps(dst: Xmm, src: Xmm) Inst {
 pub fn movupsRR(dst: Xmm, src: Xmm) Inst {
     return ssePacked(0x10, dst, src);
 }
+/// Packed bitwise `andps`/`andnps`/`orps dst, src` (0F 54/55/56 /r). andnps computes
+/// `dst = (NOT dst) AND src`. All SSE1, so present on the x86-64 baseline.
+pub fn andps(dst: Xmm, src: Xmm) Inst {
+    return ssePacked(0x54, dst, src);
+}
+pub fn andnps(dst: Xmm, src: Xmm) Inst {
+    return ssePacked(0x55, dst, src);
+}
+pub fn orps(dst: Xmm, src: Xmm) Inst {
+    return ssePacked(0x56, dst, src);
+}
+/// Packed compare `cmpps dst, src, imm8` (0F C2 /r ib): per lane `dst = predicate(dst, src) ?
+/// all-ones : all-zero`. imm predicates: 0=EQ 1=LT 2=LE 4=NEQ 5=NLT 6=NLE (ordered 0/1/2/4).
+pub fn cmpps(dst: Xmm, src: Xmm, imm: u8) Inst {
+    const r = xn(dst);
+    const b = xn(src);
+    const mod: u8 = 0xC0 | ((r & 7) << 3) | (b & 7);
+    if (r >= 8 or b >= 8) {
+        const rex: u8 = 0x40 | (@as(u8, @intFromBool(r >= 8)) << 2) | @intFromBool(b >= 8);
+        return Inst.of(&.{ rex, 0x0F, 0xC2, mod, imm });
+    }
+    return Inst.of(&.{ 0x0F, 0xC2, mod, imm });
+}
 
 // AVX (256-bit YMM) via the VEX prefix. AVX instructions are three-operand (dst = src1 op
 // src2) and 256 bits wide (VEX.L = 1). Always uses the 3-byte VEX (C4 ...) form so any of
@@ -262,6 +285,21 @@ pub fn sqrtss(dst: Xmm, src: Xmm) Inst {
 /// Scalar double-precision `sqrtsd dst, src` (F2 0F 51 /r).
 pub fn sqrtsd(dst: Xmm, src: Xmm) Inst {
     return sseRR(0xF2, 0x51, dst, src);
+}
+/// Packed single-precision `sqrtps dst, src` (0F 51 /r): per-lane square root (SSE1).
+pub fn sqrtps(dst: Xmm, src: Xmm) Inst {
+    return ssePacked(0x51, dst, src);
+}
+/// `roundps dst, src, imm8` (66 0F 3A 08 /r ib): per-lane IEEE rounding for f32 (SSE4.1).
+pub fn roundps(dst: Xmm, src: Xmm, imm: u8) Inst {
+    const r = xn(dst);
+    const b = xn(src);
+    const mod: u8 = 0xC0 | ((r & 7) << 3) | (b & 7);
+    if (r >= 8 or b >= 8) {
+        const rex: u8 = 0x40 | (@as(u8, @intFromBool(r >= 8)) << 2) | @intFromBool(b >= 8);
+        return Inst.of(&.{ 0x66, rex, 0x0F, 0x3A, 0x08, mod, imm });
+    }
+    return Inst.of(&.{ 0x66, 0x0F, 0x3A, 0x08, mod, imm });
 }
 /// `roundss dst, src, imm8` (F3 0F 3A /11 ib): IEEE rounding for f32.
 pub fn roundss(dst: Xmm, src: Xmm, imm: u8) Inst {
@@ -630,6 +668,48 @@ pub fn movFromMem(dst: Reg, base: Reg, disp: i32) Inst {
 pub fn movToMem(base: Reg, disp: i32, src: Reg) Inst {
     return movMem(0x89, src, base, disp);
 }
+/// A memory mov without REX.W (32-bit operand): reads/writes 4 bytes. A 32-bit load
+/// zero-extends into the full 64-bit register.
+fn movMem32(op: u8, data: Reg, base: Reg, disp: i32) Inst {
+    const u: u32 = @bitCast(disp);
+    const r = n(data);
+    const b = n(base);
+    const modrm_byte: u8 = 0x80 | ((r & 7) << 3) | (b & 7); // mod=10, reg=data, rm=base
+    const ext = r >= 8 or b >= 8;
+    const rex: u8 = 0x40 | (@as(u8, @intFromBool(r >= 8)) << 2) | @intFromBool(b >= 8);
+    const sib = (b & 7) == 4; // rsp/r12 base needs a SIB byte
+    var buf: [8]u8 = undefined;
+    var i: usize = 0;
+    if (ext) {
+        buf[i] = rex;
+        i += 1;
+    }
+    buf[i] = op;
+    i += 1;
+    buf[i] = modrm_byte;
+    i += 1;
+    if (sib) {
+        buf[i] = 0x24;
+        i += 1;
+    }
+    buf[i] = @truncate(u);
+    buf[i + 1] = @truncate(u >> 8);
+    buf[i + 2] = @truncate(u >> 16);
+    buf[i + 3] = @truncate(u >> 24);
+    return Inst.of(buf[0 .. i + 4]);
+}
+/// 32-bit integer load `mov r32, [base+disp]` (zero-extends to the 64-bit register).
+pub fn movFromMem32(dst: Reg, base: Reg, disp: i32) Inst {
+    return movMem32(0x8B, dst, base, disp);
+}
+/// 32-bit integer store `mov [base+disp], r32` (writes exactly 4 bytes).
+pub fn movToMem32(base: Reg, disp: i32, src: Reg) Inst {
+    return movMem32(0x89, src, base, disp);
+}
+/// Sign-extending 32-bit load `movsxd r64, [base+disp]` (63 /r, REX.W): a signed i32 into i64.
+pub fn movsxdFromMem(dst: Reg, base: Reg, disp: i32) Inst {
+    return movMem(0x63, dst, base, disp);
+}
 
 /// `lea dst, [rsp + disp32]` (REX.W 8D /r): materialize a stack address (e.g. an alloca slot).
 /// The rsp base needs the 0x24 SIB byte, mod=10 for the disp32 form.
@@ -696,6 +776,15 @@ pub fn movupsStoreMem(base: Reg, disp: i32, src: Xmm) Inst {
 pub fn callRel(rel: i32) Inst {
     const u: u32 = @bitCast(rel);
     return Inst.of(&.{ 0xE8, @truncate(u), @truncate(u >> 8), @truncate(u >> 16), @truncate(u >> 24) });
+}
+
+/// `call r64` (FF /2): an indirect call through a register. No REX.W (call defaults to
+/// 64-bit operand size in long mode); r8..r15 need the REX.B extension bit.
+pub fn callReg(reg: Reg) Inst {
+    const rn = n(reg);
+    const mrm: u8 = 0xD0 | (rn & 7); // ModRM mod=11, reg field=/2, rm=reg
+    if (rn >= 8) return Inst.of(&.{ 0x41, 0xFF, mrm });
+    return Inst.of(&.{ 0xFF, mrm });
 }
 
 /// `ret` (near return).

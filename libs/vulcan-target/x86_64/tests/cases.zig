@@ -196,6 +196,41 @@ fn vectors(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {
     try vectorSpill(io, allocator, backend);
     try widevectors(io, allocator, backend);
     try vectorParamCall(io, allocator, backend);
+    try vectorSqrtSelect(io, allocator, backend);
+}
+
+fn vectorSqrtSelect(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {
+    // Two per-lane SSE paths the graphics quad FS needs: packed sqrt (sqrtps, every lane, not
+    // just lane 0) and a per-lane max built from a vector compare + vector select (cmpps mask
+    // then and/andn/or). max(sqrt(a), b) reduced over the 4 lanes.
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const t = try f.types.intern(.{ .float = .f32 });
+    const v4 = try f.types.intern(.{ .vector = .{ .len = 4, .elem = t } });
+    const b = try f.appendBlock();
+    var ap: [4]ir.function.Value = undefined;
+    var bp: [4]ir.function.Value = undefined;
+    for (0..4) |i| ap[i] = try f.appendBlockParam(b, t);
+    for (0..4) |i| bp[i] = try f.appendBlockParam(b, t);
+    const va = try f.appendInst(b, v4, .{ .struct_new = .{ .fields = try f.internValueList(&ap) } });
+    const vb = try f.appendInst(b, v4, .{ .struct_new = .{ .fields = try f.internValueList(&bp) } });
+    const sq = try f.appendInst(b, v4, .{ .unary = .{ .op = .sqrt, .value = va } }); // sqrt(a) per lane
+    const mask = try f.appendInst(b, v4, .{ .icmp = .{ .op = .gt, .lhs = sq, .rhs = vb } }); // sqrt(a) > b
+    const mx = try f.appendInst(b, v4, .{ .select = .{ .cond = mask, .then = sq, .@"else" = vb } }); // per-lane max
+    var c: [4]ir.function.Value = undefined;
+    for (0..4) |i| c[i] = try f.appendInst(b, t, .{ .extract = .{ .aggregate = mx, .index = @intCast(i) } });
+    const s01 = try f.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = c[0], .rhs = c[1] } });
+    const s012 = try f.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = s01, .rhs = c[2] } });
+    const s = try f.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = s012, .rhs = c[3] } });
+    f.setTerminator(b, .{ .ret = s });
+
+    // Non-round lanes so every one flows through sqrtps + the mask select and the reduced sum
+    // has a distinctive low byte (the harness compares only the low byte of the f32 result).
+    const av = [4]f32{ 2.0, 8.0, 5.0, 3.0 }; // sqrt -> 1.414, 2.828, 2.236, 1.732 (all > b)
+    const bv = [4]f32{ 1.0, 1.0, 1.0, 1.0 };
+    var expect: f32 = 0;
+    for (0..4) |i| expect += @max(@sqrt(av[i]), bv[i]);
+    try h.expectRunFloat(io, allocator, &f, &.{ av[0], av[1], av[2], av[3], bv[0], bv[1], bv[2], bv[3] }, expect, backend);
 }
 
 fn vectorParamCall(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {

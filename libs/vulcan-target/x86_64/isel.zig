@@ -68,6 +68,13 @@ fn isDouble(func: *const Function, v: Value) bool {
 fn isXmm(func: *const Function, v: Value) bool {
     return isFloat(func, v) or isVector(func, v);
 }
+/// The bit width of an integer value, or 64 for non-integers (the safe 64-bit default).
+fn intBits(func: *const Function, v: Value) u16 {
+    return switch (func.types.type_kind(func.valueType(v))) {
+        .int => |i| i.bits,
+        else => 64,
+    };
+}
 
 const Fixup = struct { at: usize, target: u32 };
 
@@ -326,7 +333,77 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
             try ctx.put(allocator, if (isVector(func, st.value)) encode.movupsStoreMem(base, 0, val) else if (isDouble(func, st.value)) encode.movsdStoreMem(base, 0, val) else encode.movssStoreMem(base, 0, val));
         } else {
             const val = try ctx.use(allocator, st.value, scratch1);
-            try ctx.put(allocator, encode.movToMem(base, 0, val));
+            // Store the value's own width: a 32-bit int writes 4 bytes, not 8 (an 8-byte store
+            // would clobber the next element of a tightly-packed i32 array).
+            try ctx.put(allocator, if (intBits(func, st.value) <= 32) encode.movToMem32(base, 0, val) else encode.movToMem(base, 0, val));
+        }
+        return;
+    }
+    if (func.opcode(inst) == .call_indirect) {
+        // Indirect call through a function pointer (e.g. the software sampler helper, which
+        // returns nothing and writes its result through a pointer arg, so this has no result).
+        // Stage the target into r10 (survives the arg moves and the call, never an arg reg),
+        // move the arguments into the System V arg registers, then `call r10`.
+        const c = func.opcode(inst).call_indirect;
+        const tgt = try ctx.use(allocator, c.target, scratch1);
+        if (tgt != scratch1) try ctx.put(allocator, encode.movReg(scratch1, tgt));
+        const args = func.valueList(c.args);
+        var moves: std.ArrayList(Move) = .empty;
+        defer moves.deinit(allocator);
+        var xmm_moves: std.ArrayList(XmmMove) = .empty;
+        defer xmm_moves.deinit(allocator);
+        var gi: usize = 0;
+        var xi: usize = 0;
+        for (args) |arg| {
+            if (isXmm(func, arg)) {
+                if (xi >= xmm_arg_regs.len) return error.Unsupported; // fp stack args not handled
+                const dst = xmm_arg_regs[xi];
+                xi += 1;
+                switch (ctx.loc(arg)) {
+                    .xmm => |src| if (src != dst) try xmm_moves.append(allocator, .{ .src = src, .dst = dst, .wide = isWide(func, arg) }),
+                    .xmm_spill => {}, // reloaded after the parallel move
+                    else => unreachable,
+                }
+            } else {
+                if (gi >= arg_regs.len) return error.Unsupported;
+                const dst = arg_regs[gi];
+                gi += 1;
+                switch (ctx.loc(arg)) {
+                    .reg => |src| if (src != dst) try moves.append(allocator, .{ .src = src, .dst = dst }),
+                    .spill => {},
+                    else => unreachable,
+                }
+            }
+        }
+        try parallelMove(allocator, ctx, &moves);
+        try parallelMoveXmm(allocator, ctx, &xmm_moves);
+        gi = 0;
+        xi = 0;
+        for (args) |arg| {
+            if (isXmm(func, arg)) {
+                const dst = xmm_arg_regs[xi];
+                xi += 1;
+                if (ctx.loc(arg) == .xmm_spill) {
+                    const disp = ctx.xmmDisp(ctx.loc(arg).xmm_spill);
+                    try ctx.put(allocator, if (isWide(func, arg)) encode.vmovupsLoad(dst, disp) else if (isVector(func, arg)) encode.movupsLoad(dst, disp) else encode.movssLoad(dst, disp));
+                }
+            } else {
+                const dst = arg_regs[gi];
+                gi += 1;
+                if (ctx.loc(arg) == .spill) try ctx.put(allocator, encode.movFromStack(dst, slotDisp(ctx.loc(arg).spill)));
+            }
+        }
+        try ctx.put(allocator, encode.callReg(scratch1)); // call r10
+        if (func.instResult(inst)) |res| {
+            if (isXmm(func, res)) {
+                const rd = try ctx.dstXmm(res, xmm_scratch); // fp result comes back in xmm0
+                if (rd != xmm_ret) try ctx.put(allocator, if (isWide(func, res)) encode.vmovupsRR(rd, xmm_ret) else encode.movupsRR(rd, xmm_ret));
+                try ctx.storeXmm(allocator, res, rd);
+            } else {
+                const rd = ctx.dst(res, scratch1);
+                if (rd != .rax) try ctx.put(allocator, encode.movReg(rd, .rax));
+                try ctx.store(allocator, res, rd);
+            }
         }
         return;
     }
@@ -483,6 +560,29 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
             }
         },
         .icmp => |cmp| {
+            if (isVector(func, cmp.lhs)) {
+                // Per-lane float compare via cmpps, producing an all-ones/all-zero lane mask that
+                // a later vector select reads. gt/ge have no ordered SSE predicate, so swap the
+                // operands and use lt/le. Compare in xmm_scratch (cmpps overwrites its first
+                // operand) then move to the result register.
+                const rl = try ctx.useXmm(allocator, cmp.lhs, xmm_op0);
+                const rr = try ctx.useXmm(allocator, cmp.rhs, xmm_op1);
+                const swap = cmp.op == .gt or cmp.op == .ge;
+                const first = if (swap) rr else rl;
+                const second = if (swap) rl else rr;
+                const pred: u8 = switch (cmp.op) {
+                    .eq => 0,
+                    .ne => 4,
+                    .lt, .gt => 1, // LT (gt swapped to lt)
+                    .le, .ge => 2, // LE (ge swapped to le)
+                };
+                try ctx.put(allocator, encode.movupsRR(xmm_scratch, first));
+                try ctx.put(allocator, encode.cmpps(xmm_scratch, second, pred));
+                const rd = try ctx.dstXmm(result, xmm_scratch);
+                if (rd != xmm_scratch) try ctx.put(allocator, encode.movupsRR(rd, xmm_scratch));
+                try ctx.storeXmm(allocator, result, rd);
+                return;
+            }
             if (isFloat(func, cmp.lhs)) {
                 // Float compare via ucomiss + setcc. The bool result lives in a gpr.
                 const rd = ctx.dst(result, scratch1);
@@ -520,6 +620,23 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
             try ctx.store(allocator, result, rd);
         },
         .select => |s| {
+            if (isVector(func, result)) {
+                // Per-lane vector select from a cmpps mask: result = (then & mask) | (else & ~mask).
+                // SSE1 and/andn/or only (no SSE4.1 blendv on the baseline). Build both halves in the
+                // reserved scratch xmms so the operand registers are never clobbered.
+                const mask = try ctx.useXmm(allocator, s.cond, xmm_op0);
+                const tr = try ctx.useXmm(allocator, s.then, xmm_op1);
+                const el = try ctx.useXmm(allocator, s.@"else", xmm_scratch);
+                try ctx.put(allocator, encode.movupsRR(xmm_op0, mask)); // op0 = mask, for the two ands
+                try ctx.put(allocator, encode.movupsRR(xmm_scratch, tr));
+                try ctx.put(allocator, encode.andps(xmm_scratch, xmm_op0)); // then & mask
+                try ctx.put(allocator, encode.andnps(xmm_op0, el)); // op0 = (~mask) & else
+                try ctx.put(allocator, encode.orps(xmm_scratch, xmm_op0)); // combine both halves
+                const rd = try ctx.dstXmm(result, xmm_scratch);
+                if (rd != xmm_scratch) try ctx.put(allocator, encode.movupsRR(rd, xmm_scratch));
+                try ctx.storeXmm(allocator, result, rd);
+                return;
+            }
             // x86 has no SSE conditional move, and the result register may alias an operand,
             // so lower select as a two-armed branch: each arm writes exactly one operand into
             // the result, touching nothing else. Works for both gpr and xmm results.
@@ -595,6 +712,21 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
                     }
                     // void result: src already loaded, nothing to do.
                 }
+                return;
+            }
+            // Vector math unary: the packed forms so every lane is computed, not just lane 0.
+            if (isVector(func, result_val.?)) {
+                const src = try ctx.useXmm(allocator, u.value, xmm_op0);
+                const rd = try ctx.dstXmm(result_val.?, xmm_scratch);
+                try ctx.put(allocator, switch (u.op) {
+                    .sqrt => encode.sqrtps(rd, src),
+                    .ceil => encode.roundps(rd, src, 2),
+                    .floor => encode.roundps(rd, src, 1),
+                    .trunc => encode.roundps(rd, src, 3),
+                    .nearest => encode.roundps(rd, src, 0),
+                    .reinterpret => unreachable,
+                });
+                try ctx.storeXmm(allocator, result_val.?, rd);
                 return;
             }
             // Float math unary ops: sqrt, ceil, floor, trunc, nearest. All live in xmm.
@@ -741,7 +873,14 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
                 try ctx.storeXmm(allocator, result, rd);
             } else {
                 const rd = ctx.dst(result, scratch1);
-                try ctx.put(allocator, encode.movFromMem(rd, base, 0));
+                // Load the value's own width: a 32-bit int reads 4 bytes (an 8-byte load would
+                // pull garbage from the next array element into the upper half, which then
+                // breaks a 64-bit compare). Sign-extend a signed i32, zero-extend otherwise.
+                if (intBits(func, result) <= 32) {
+                    try ctx.put(allocator, if (isSigned(func, result)) encode.movsxdFromMem(rd, base, 0) else encode.movFromMem32(rd, base, 0));
+                } else {
+                    try ctx.put(allocator, encode.movFromMem(rd, base, 0));
+                }
                 try ctx.store(allocator, result, rd);
             }
         },
@@ -991,7 +1130,7 @@ fn callPositions(allocator: std.mem.Allocator, func: *const Function) Error![]u3
     for (0..func.blockCount()) |bi| {
         pos += 1; // block parameters
         for (func.blockInsts(@enumFromInt(bi))) |inst| {
-            if (func.opcode(inst) == .call) try positions.append(allocator, pos);
+            if (func.opcode(inst) == .call or func.opcode(inst) == .call_indirect) try positions.append(allocator, pos);
             pos += 1;
         }
         pos += 1; // terminator
