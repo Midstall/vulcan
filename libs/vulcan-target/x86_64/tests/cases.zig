@@ -195,6 +195,49 @@ fn vectors(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {
 
     try vectorSpill(io, allocator, backend);
     try widevectors(io, allocator, backend);
+    try vectorParamCall(io, allocator, backend);
+}
+
+fn vectorParamCall(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {
+    // A callee receives a <4 x f32> PARAMETER (not one built from scalars inside it): main packs
+    // a vector from its scalar args and calls helper(v), whose prologue must accept a vector-typed
+    // parameter arriving in an xmm register. Guards the entry-param classification (a vector param
+    // lives in xmm, so it must be handled like a float param, not routed to the gpr path).
+    const link = @import("../link.zig");
+    var fhelper = Function.init(allocator);
+    defer fhelper.deinit();
+    {
+        const t = try fhelper.types.intern(.{ .float = .f32 });
+        const v4 = try fhelper.types.intern(.{ .vector = .{ .len = 4, .elem = t } });
+        const b = try fhelper.appendBlock();
+        const v = try fhelper.appendBlockParam(b, v4);
+        var e: [4]ir.function.Value = undefined;
+        for (0..4) |i| e[i] = try fhelper.appendInst(b, t, .{ .extract = .{ .aggregate = v, .index = @intCast(i) } });
+        const s01 = try fhelper.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = e[0], .rhs = e[1] } });
+        const s012 = try fhelper.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = s01, .rhs = e[2] } });
+        const s = try fhelper.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = s012, .rhs = e[3] } });
+        fhelper.setTerminator(b, .{ .ret = s });
+    }
+    var fmain = Function.init(allocator);
+    defer fmain.deinit();
+    {
+        const t = try fmain.types.intern(.{ .float = .f32 });
+        const v4 = try fmain.types.intern(.{ .vector = .{ .len = 4, .elem = t } });
+        const b = try fmain.appendBlock();
+        var p: [4]ir.function.Value = undefined;
+        for (0..4) |i| p[i] = try fmain.appendBlockParam(b, t);
+        const v = try fmain.appendInst(b, v4, .{ .struct_new = .{ .fields = try fmain.internValueList(&p) } });
+        const called = try fmain.appendCall(b, t, "helper", &.{v});
+        fmain.setTerminator(b, .{ .ret = called });
+    }
+    var module: link.Module = .{};
+    defer module.deinit(allocator);
+    try module.addFunction(allocator, "main", &fmain);
+    try module.addFunction(allocator, "helper", &fhelper);
+    // Non-round lane values so the reduced sum has a distinctive low byte (the harness compares
+    // only the low byte of the f32 result). A dropped or misread lane changes that byte.
+    const pv = [4]f32{ 1.1, 2.2, 3.3, 4.5 };
+    try h.expectRunFloatModule(io, allocator, &module, &.{ pv[0], pv[1], pv[2], pv[3] }, ((pv[0] + pv[1]) + pv[2]) + pv[3], backend);
 }
 
 fn widevectors(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {

@@ -232,13 +232,17 @@ pub fn compile(allocator: std.mem.Allocator, func: *const Function) Error!Compil
     var gpr_i: usize = 0;
     var xmm_i: usize = 0;
     for (eparams) |p| {
-        if (isFloat(func, p)) {
+        if (isXmm(func, p)) {
+            // A vector param also lives in an xmm register, so classify by isXmm (float or
+            // vector), matching the call-site arg handling. A scalar float moves/stores as
+            // 128-bit (movups, the extra lanes are harmless); a 128-bit vector as movups; a
+            // 256-bit vector as vmovups so no lanes are dropped.
             if (xmm_i >= xmm_arg_regs.len) return error.Unsupported; // fp stack args not handled
             const incoming = xmm_arg_regs[xmm_i];
             xmm_i += 1;
             switch (ctx.loc(p)) {
-                .xmm => |x| if (x != incoming) try ctx.put(allocator, encode.movupsRR(x, incoming)), // no fp move cycles for a single arg
-                .xmm_spill => |slot| try ctx.put(allocator, encode.movssStore(ctx.xmmDisp(slot), incoming)),
+                .xmm => |x| if (x != incoming) try ctx.put(allocator, if (isWide(func, p)) encode.vmovupsRR(x, incoming) else encode.movupsRR(x, incoming)), // no fp move cycles for a single arg
+                .xmm_spill => |slot| try ctx.put(allocator, if (isWide(func, p)) encode.vmovupsStore(ctx.xmmDisp(slot), incoming) else if (isVector(func, p)) encode.movupsStore(ctx.xmmDisp(slot), incoming) else encode.movssStore(ctx.xmmDisp(slot), incoming)),
                 else => unreachable,
             }
         } else {
