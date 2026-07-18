@@ -2558,30 +2558,38 @@ fn countIrMatmuls(func: *const Function) usize {
     return count;
 }
 
-test "matmul_recog: raw nest fails register allocation but the recognized function compiles" {
-    // Executable pin for the register-pressure asymmetry described above. The RAW scalar loop nest,
-    // even after `splitCriticalEdges` lowers its block-arg loop `if`s, still returns
-    // `error.Unsupported` from `selectFunctionForModel`: its nest is reachable, so its many live
-    // counters/pointers exhaust the integer file. The allocator now SPILLS the surplus int block
-    // params rather than rejecting them, but the nest then uses spilled pointer params as load/store
-    // bases, which emission does not yet reload - so it still fails cleanly, now at emission. The
-    // RECOGNIZED function, by contrast, COMPILES: `apply` orphaned the nest and isel is reachability-
-    // aware, so the dead scaffolding is skipped and only the reachable preheader + `matmul` + `ret`
-    // are lowered. This is the plan-17 enabler proven end to end.
+test "matmul_recog: both the raw nest and the recognized function compile, and recognition raises exactly one matmul" {
+    // Structural pin for the recognition path. The RAW scalar loop nest raises NO matmul (0), the
+    // RECOGNIZED form raises exactly one, and both compile through `selectFunctionForModel`.
+    //
+    // History: this test used to assert the raw nest FAILED to compile with `error.Unsupported`. That
+    // was a symptom of the earlier spill-current integer allocator, which whole-spilled the value it
+    // was placing at each exhaustion point, and so eventually spilled one of the nest's loop pointer
+    // bases. Emission has no reload path for a spilled load/store base (riscv64/isel.zig: it returns
+    // `error.Unsupported` there), so the whole compile failed. The integer allocator is now
+    // eviction-based (Belady/furthest-next-use): at an exhaustion point it evicts the active value
+    // whose NEXT use is furthest, keeping the hot values resident. The nest's pointer bases are read
+    // every loop iteration, so their next use is always near and they are never chosen as the victim.
+    // They stay in registers, no spilled base ever reaches emission, and the raw nest now compiles to
+    // correct code (the values that DO spill are whole-interval spills emission reloads at every use).
+    // The recognized path remains the intended fast path (`apply` orphans the nest, reachability-aware
+    // isel lowers only the preheader + `matmul` + `ret`); it is exercised end to end, with sysemu
+    // execution, by "matmul_recog differential" below.
     const allocator = std.testing.allocator;
     const model = mm.modelFor(.@"et-soc");
 
-    // The raw form is the canonical nest: no recognition, edges split, still cannot allocate (nest is reachable).
+    // The raw form is the canonical nest: no recognition, edges split. Eviction keeps its pointer
+    // bases resident, so it now compiles.
     var func_raw = Function.init(allocator);
     defer func_raw.deinit();
     try mm.matmul_recog.buildMatmulNest(&func_raw, .{ .m = 2, .n = 4, .k = 3 });
     try std.testing.expectEqual(@as(usize, 0), countIrMatmuls(&func_raw));
     try isel.splitCriticalEdges(allocator, &func_raw);
-    try std.testing.expectError(error.Unsupported, isel.selectFunctionForModel(allocator, &func_raw, model));
+    const raw_code = try isel.selectFunctionForModel(allocator, &func_raw, model);
+    allocator.free(raw_code);
 
     // The recognized form is the same nest raised to the matmul op (orphaning the nest), edges split. isel now
-    // skips the unreachable scaffolding, so the register pressure that sank the raw nest is gone
-    // and this compiles to real code.
+    // skips the unreachable scaffolding, so only the reachable preheader + `matmul` + `ret` are lowered.
     var func_recog = Function.init(allocator);
     defer func_recog.deinit();
     try mm.matmul_recog.buildMatmulNest(&func_recog, .{ .m = 2, .n = 4, .k = 3 });

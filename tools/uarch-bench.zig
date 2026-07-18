@@ -160,6 +160,33 @@ fn buildMulChain(allocator: std.mem.Allocator) anyerror!Function {
     return func;
 }
 
+/// A register-pressure kernel: fn(a, b) = sum over k in 1..=20 of (a*k + b). All 20 products are live
+/// simultaneously until the final sum, so the whole-interval linear-scan allocator MUST spill (the GPR
+/// pool is ~12 registers). Used to confirm spilling exists and to measure the live-range-splitting win.
+fn buildPressureKernel(allocator: std.mem.Allocator) anyerror!Function {
+    var func = Function.init(allocator);
+    errdefer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const entry = try func.appendBlock();
+    const a = try func.appendBlockParam(entry, i32_t);
+    const b = try func.appendBlockParam(entry, i32_t);
+    var terms: [20]Value = undefined;
+    var k: i64 = 1;
+    while (k <= 20) : (k += 1) {
+        const kc = try func.appendInst(entry, i32_t, .{ .iconst = k });
+        const ak = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = kc } });
+        terms[@intCast(k - 1)] = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .add, .lhs = ak, .rhs = b } });
+    }
+    // Left-leaning sum tree so every term stays live until it is folded in.
+    var acc = terms[0];
+    var j: usize = 1;
+    while (j < terms.len) : (j += 1) {
+        acc = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = terms[j] } });
+    }
+    func.setTerminator(entry, .{ .ret = acc });
+    return func;
+}
+
 /// A counted sum-reduction loop: `s = 0; for (i = 0; i < n; i += 1) s += i; return s`. Exercises
 /// unroll (expose ILP across iterations) and schedule together.
 fn buildSumLoop(allocator: std.mem.Allocator) anyerror!Function {
@@ -772,6 +799,18 @@ pub fn benchModel(allocator: std.mem.Allocator, io: std.Io, model: *const Model,
         buildMulChain,
         &.{ .{-5}, .{-3}, .{-2}, .{-1}, .{0}, .{1}, .{2}, .{3}, .{5}, .{7} },
         .{5},
+    );
+
+    try benchGeneric(
+        *const fn (i32, i32) callconv(.c) i32,
+        allocator,
+        io,
+        model,
+        w,
+        "pressure",
+        buildPressureKernel,
+        &.{ .{ 1, 2 }, .{ 3, 5 }, .{ -2, 7 }, .{ 0, 0 }, .{ 100, -100 } },
+        .{ 7, 11 },
     );
 
     try benchGeneric(
