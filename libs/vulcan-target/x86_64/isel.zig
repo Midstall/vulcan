@@ -217,6 +217,7 @@ fn slotDisp(slot: u32) i32 {
 pub fn selectFunction(allocator: std.mem.Allocator, func: *const Function) Error![]u8 {
     const compiled = try compile(allocator, func);
     allocator.free(compiled.relocs);
+    allocator.free(compiled.lines);
     return compiled.code;
 }
 
@@ -264,7 +265,7 @@ pub fn compile(allocator: std.mem.Allocator, func: *const Function) Error!Compil
     // Prologue: reserve the spill frame, then move each argument from its ABI register to
     // the entry parameter's location (a register parallel move, or a store for a spilled
     // parameter).
-    if (frame > 0) try ctx.put(allocator, encode.aluImm(5, .rsp, frame)); // sub rsp, frame
+    if (frame > 0) try ctx.put(allocator, encode.aluImm(5, .rsp, frame, true)); // sub rsp, frame (64-bit stack ptr)
     // System V passes general args in rdi,rsi,... and fp args in xmm0,xmm1,... (separate
     // sequences), so each class has its own incoming-register index.
     const eparams = func.blockParams(@enumFromInt(0));
@@ -272,13 +273,36 @@ pub fn compile(allocator: std.mem.Allocator, func: *const Function) Error!Compil
     defer arg_moves.deinit(allocator);
     var gpr_i: usize = 0;
     var xmm_i: usize = 0;
+    // Args beyond the ABI registers arrive on the stack, in declaration order. At entry [rsp+frame]
+    // holds the return address (the prologue already did `sub rsp, frame`), so the first stack arg is
+    // at [rsp+frame+8], the next at [rsp+frame+16], and so on.
+    var stack_arg: u32 = 0;
     for (eparams) |p| {
         if (isXmm(func, p)) {
             // A vector param also lives in an xmm register, so classify by isXmm (float or
             // vector), matching the call-site arg handling. A scalar float moves/stores as
             // 128-bit (movups, the extra lanes are harmless); a 128-bit vector as movups; a
             // 256-bit vector as vmovups so no lanes are dropped.
-            if (xmm_i >= xmm_arg_regs.len) return error.Unsupported; // fp stack args not handled
+            if (xmm_i >= xmm_arg_regs.len) {
+                // Fp stack arg. System V lays them out in 8-byte slots above the return address, so
+                // slot k is at [rsp + frame + 8 + k*8]. Only a scalar float is handled; a vector on the
+                // stack would span several slots (rare, unsupported). Load it (scalar movss) into the
+                // param's home, via the xmm scratch when the home is a spill slot.
+                // An f64 stack arg would need a 64-bit `movsd` load (movss reads only its low 4 bytes
+                // and would truncate the double); reject it fail-closed until a movsd path exists.
+                if (isVector(func, p) or isWide(func, p) or isDouble(func, p)) return error.Unsupported;
+                const off: i32 = frame + 8 + @as(i32, @intCast(stack_arg)) * 8;
+                stack_arg += 1;
+                switch (ctx.loc(p)) {
+                    .xmm => |x| try ctx.put(allocator, encode.movssLoad(x, off)),
+                    .xmm_spill => |slot| {
+                        try ctx.put(allocator, encode.movssLoad(xmm_scratch, off));
+                        try ctx.put(allocator, encode.movssStore(ctx.xmmDisp(slot), xmm_scratch));
+                    },
+                    else => unreachable,
+                }
+                continue;
+            }
             const incoming = xmm_arg_regs[xmm_i];
             xmm_i += 1;
             switch (ctx.loc(p)) {
@@ -287,7 +311,7 @@ pub fn compile(allocator: std.mem.Allocator, func: *const Function) Error!Compil
                 else => unreachable,
             }
         } else {
-            if (gpr_i >= arg_regs.len) return error.Unsupported;
+            if (gpr_i >= arg_regs.len) return error.Unsupported; // gpr stack args not handled yet
             const incoming = arg_regs[gpr_i];
             gpr_i += 1;
             switch (ctx.loc(p)) {
@@ -330,7 +354,7 @@ pub fn compile(allocator: std.mem.Allocator, func: *const Function) Error!Compil
                         if (src != ret_reg) try ctx.put(allocator, encode.movReg(ret_reg, src));
                     }
                 }
-                if (frame > 0) try ctx.put(allocator, encode.aluImm(0, .rsp, frame)); // add rsp, frame
+                if (frame > 0) try ctx.put(allocator, encode.aluImm(0, .rsp, frame, true)); // add rsp, frame (64-bit stack ptr)
                 try ctx.put(allocator, encode.ret());
             },
             .jump => |j| try emitJump(allocator, &ctx, j),
@@ -389,9 +413,15 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
             }
         } else {
             const val = try ctx.use(allocator, st.value, scratch1);
-            // Store the value's own width: a 32-bit int writes 4 bytes, not 8 (an 8-byte store
-            // would clobber the next element of a tightly-packed i32 array).
-            try ctx.put(allocator, if (intBits(func, st.value) <= 32) encode.movToMem32(base, 0, val) else encode.movToMem(base, 0, val));
+            // Store the value's own width so exactly the object's bytes are written, never more:
+            // an 8-bit store writes 1 byte, a 16-bit 2, a 32-bit 4, a 64-bit/pointer 8. A wider
+            // store would clobber the next element of a tightly-packed array (e.g. an i8 store8).
+            try ctx.put(allocator, switch (intBits(func, st.value)) {
+                0...8 => encode.movToMem8(base, 0, val),
+                9...16 => encode.movToMem16(base, 0, val),
+                17...32 => encode.movToMem32(base, 0, val),
+                else => encode.movToMem(base, 0, val),
+            });
         }
         return;
     }
@@ -481,13 +511,26 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
                     try ctx.put(allocator, encode.movqToXmm(rd, scratch1));
                 } else {
                     const bits: u32 = @truncate(@as(u64, @bitCast(c)));
-                    try ctx.put(allocator, encode.movImm(scratch1, @bitCast(bits)));
+                    try ctx.put(allocator, encode.movImm(scratch1, @bitCast(bits), false)); // 32-bit float bits into a gpr
                     try ctx.put(allocator, encode.movdToXmm(rd, scratch1));
                 }
                 try ctx.storeXmm(allocator, result, rd);
             } else {
                 const rd = ctx.dst(result, scratch1);
-                try ctx.put(allocator, encode.movImm(rd, @intCast(c)));
+                // A 64-bit constant needs the full imm64 mov; `movImm` only carries a
+                // sign-extended imm32, and `@intCast(c)` would panic on any value outside i32
+                // (e.g. the 64-bit SWAR popcount masks, or a 0x80000000 sign mask). For a
+                // <=32-bit result, take the low 32 bits as a bit pattern (movImm sign-extends
+                // them into the 64-bit register, which a 32-bit use reads back correctly).
+                if (intBits(func, result) > 32) {
+                    try ctx.put(allocator, encode.movImm64(rd, @bitCast(c)));
+                } else {
+                    // A <=32-bit constant: the zero-extending `mov r32, imm32` puts the exact
+                    // low-32 bit pattern in the register and clears the upper 32, keeping the
+                    // clean-upper-bits invariant that the width-aware ops rely on.
+                    const bits: u32 = @truncate(@as(u64, @bitCast(c)));
+                    try ctx.put(allocator, encode.movImm(rd, @bitCast(bits), false));
+                }
                 try ctx.store(allocator, result, rd);
             }
         },
@@ -503,7 +546,7 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
                 // half first, `@as(f32, @as(f16, val))`), keeping the invariant that an f16 in
                 // a register is its exact-half f32 form. f32 keeps its full value.
                 const bits: u32 = @bitCast(if (isHalf(func, result)) @as(f32, @as(f16, @floatCast(val))) else @as(f32, @floatCast(val)));
-                try ctx.put(allocator, encode.movImm(scratch1, @bitCast(bits)));
+                try ctx.put(allocator, encode.movImm(scratch1, @bitCast(bits), false)); // 32-bit float bits into a gpr
                 try ctx.put(allocator, encode.movdToXmm(rd, scratch1));
             }
             try ctx.storeXmm(allocator, result, rd);
@@ -564,11 +607,18 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
                 return;
             }
             const signed = isSigned(func, a.lhs);
+            // 64-bit operand size only for i64 (and any wider); i32/i16/i8 use 32-bit ops, whose
+            // result auto-zeroes the upper 32 bits so the value stays clean.
+            const w64 = intBits(func, result) > 32;
             switch (a.op) {
                 .div, .rem => {
+                    // The dividend width follows the operands: a 32-bit divide sign-extends with
+                    // cdq (not cqo) and uses the 32-bit idiv/div, reading only E(D)X:EAX so a
+                    // dirty upper half of RAX is ignored (e.g. u32 divu(-1, 2) = 0x7FFFFFFF).
+                    const dw = intBits(func, a.lhs) > 32;
                     try ctx.put(allocator, encode.movReg(.rax, try ctx.use(allocator, a.lhs, scratch1)));
-                    try ctx.put(allocator, if (signed) encode.cqo() else encode.xorr(.rdx, .rdx));
-                    try ctx.put(allocator, if (signed) encode.idiv(try ctx.use(allocator, a.rhs, scratch2)) else encode.divu(try ctx.use(allocator, a.rhs, scratch2)));
+                    try ctx.put(allocator, if (signed) (if (dw) encode.cqo() else encode.cdq()) else encode.xorr(.rdx, .rdx, dw));
+                    try ctx.put(allocator, if (signed) encode.idiv(try ctx.use(allocator, a.rhs, scratch2), dw) else encode.divu(try ctx.use(allocator, a.rhs, scratch2), dw));
                     const rd = ctx.dst(result, scratch1);
                     const res: Reg = if (a.op == .div) .rax else .rdx;
                     if (rd != res) try ctx.put(allocator, encode.movReg(rd, res));
@@ -579,7 +629,9 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
                     try ctx.put(allocator, encode.movReg(.rcx, try ctx.use(allocator, a.rhs, scratch2)));
                     const rd = ctx.dst(result, scratch1);
                     if (rd != rl) try ctx.put(allocator, encode.movReg(rd, rl));
-                    try ctx.put(allocator, if (a.op == .shl) encode.shlCl(rd) else if (signed) encode.sarCl(rd) else encode.shrCl(rd));
+                    // A 32-bit shr/sar shifts within 32 bits (filling from bit 31), which an i32
+                    // needs; a 64-bit shift would cross bit 31/32 and corrupt the result.
+                    try ctx.put(allocator, if (a.op == .shl) encode.shlCl(rd, w64) else if (signed) encode.sarCl(rd, w64) else encode.shrCl(rd, w64));
                     try ctx.store(allocator, result, rd);
                 },
                 else => {
@@ -587,39 +639,45 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
                     const rr = try ctx.use(allocator, a.rhs, scratch2);
                     const rd = ctx.dst(result, scratch1);
                     if (rd != rl) try ctx.put(allocator, encode.movReg(rd, rl));
-                    try ctx.put(allocator, try binary(a.op, rd, rr));
+                    try ctx.put(allocator, try binary(a.op, rd, rr, w64));
                     try ctx.store(allocator, result, rd);
                 },
             }
         },
         .arith_imm => |a| {
             const imm: i32 = @intCast(a.imm);
+            // 64-bit operand size only for i64 (and wider); a <=32-bit result uses 32-bit ops.
+            const w64 = intBits(func, result) > 32;
             switch (a.op) {
                 .mul => {
                     const rd = ctx.dst(result, scratch1);
-                    try ctx.put(allocator, encode.imulImm(rd, try ctx.use(allocator, a.lhs, scratch1), imm));
+                    try ctx.put(allocator, encode.imulImm(rd, try ctx.use(allocator, a.lhs, scratch1), imm, w64));
                     try ctx.store(allocator, result, rd);
                 },
                 .add, .sub, .bit_and, .bit_or, .bit_xor => {
                     const rl = try ctx.use(allocator, a.lhs, scratch1);
                     const rd = ctx.dst(result, scratch1);
                     if (rd != rl) try ctx.put(allocator, encode.movReg(rd, rl));
-                    try ctx.put(allocator, encode.aluImm(aluDigit(a.op), rd, imm));
+                    try ctx.put(allocator, encode.aluImm(aluDigit(a.op), rd, imm, w64));
                     try ctx.store(allocator, result, rd);
                 },
                 .shl, .shr => {
                     const rl = try ctx.use(allocator, a.lhs, scratch1);
                     const rd = ctx.dst(result, scratch1);
                     if (rd != rl) try ctx.put(allocator, encode.movReg(rd, rl));
-                    try ctx.put(allocator, encode.shiftImm(shiftDigit(a.op, isSigned(func, a.lhs)), rd, @truncate(@as(u32, @bitCast(imm)))));
+                    // A 32-bit shr/sar fills from bit 31, which is what the signExt lowering of
+                    // i32.extend8_s/16_s ((x << 24) >> 24) and the clz/ctz smears rely on; a
+                    // 64-bit shift would sign-extend from bit 39/47 instead.
+                    try ctx.put(allocator, encode.shiftImm(shiftDigit(a.op, isSigned(func, a.lhs)), rd, @truncate(@as(u32, @bitCast(imm))), w64));
                     try ctx.store(allocator, result, rd);
                 },
                 .div, .rem => {
                     const signed = isSigned(func, a.lhs);
+                    const dw = intBits(func, a.lhs) > 32;
                     try ctx.put(allocator, encode.movReg(.rax, try ctx.use(allocator, a.lhs, scratch1)));
-                    try ctx.put(allocator, if (signed) encode.cqo() else encode.xorr(.rdx, .rdx));
-                    try ctx.put(allocator, encode.movImm(scratch2, imm));
-                    try ctx.put(allocator, if (signed) encode.idiv(scratch2) else encode.divu(scratch2));
+                    try ctx.put(allocator, if (signed) (if (dw) encode.cqo() else encode.cdq()) else encode.xorr(.rdx, .rdx, dw));
+                    try ctx.put(allocator, encode.movImm(scratch2, imm, dw)); // divisor at the operand width
+                    try ctx.put(allocator, if (signed) encode.idiv(scratch2, dw) else encode.divu(scratch2, dw));
                     const rd = ctx.dst(result, scratch1);
                     const res: Reg = if (a.op == .div) .rax else .rdx;
                     if (rd != res) try ctx.put(allocator, encode.movReg(rd, res));
@@ -664,7 +722,9 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
                     try ctx.put(allocator, encode.movzxByte(rd, rd));
                     try ctx.put(allocator, encode.setcc(scratch2, if (cmp.op == .eq) .np else .p));
                     try ctx.put(allocator, encode.movzxByte(scratch2, scratch2));
-                    try ctx.put(allocator, if (cmp.op == .eq) encode.andr(rd, scratch2) else encode.orr(rd, scratch2));
+                    // Combine the two zero-extended 0/1 bytes. The bool result is <=32 bits, so a
+                    // 32-bit and/or is used (correct for the clean 0/1 operands either way).
+                    try ctx.put(allocator, if (cmp.op == .eq) encode.andr(rd, scratch2, intBits(func, result) > 32) else encode.orr(rd, scratch2, intBits(func, result) > 32));
                     try ctx.store(allocator, result, rd);
                     return;
                 }
@@ -682,7 +742,9 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
             const rl = try ctx.use(allocator, cmp.lhs, scratch1);
             const rr = try ctx.use(allocator, cmp.rhs, scratch2);
             const rd = ctx.dst(result, scratch1);
-            try ctx.put(allocator, encode.cmp(rl, rr));
+            // Compare at the operand width: an i32 compare sets flags from the low 32 bits, so a
+            // dirty upper half (e.g. a sign-extended incoming i32 arg) does not skew the result.
+            try ctx.put(allocator, encode.cmp(rl, rr, intBits(func, cmp.lhs) > 32));
             try ctx.put(allocator, encode.setcc(rd, condOf(cmp.op, isSigned(func, cmp.lhs))));
             try ctx.put(allocator, encode.movzxByte(rd, rd));
             try ctx.store(allocator, result, rd);
@@ -709,7 +771,9 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
             // so lower select as a two-armed branch: each arm writes exactly one operand into
             // the result, touching nothing else. Works for both gpr and xmm results.
             const c = try ctx.use(allocator, s.cond, scratch1);
-            try ctx.put(allocator, encode.testReg(c, c));
+            // Test at the condition's width so a raw i32 cond with a dirty upper half is not
+            // read as nonzero on its garbage bits.
+            try ctx.put(allocator, encode.testReg(c, c, intBits(func, s.cond) > 32));
             try ctx.put(allocator, encode.jcc(.e, 0)); // je -> else arm (cond == 0), patched
             const je_at = ctx.code.items.len - 4;
             try selectInto(allocator, ctx, result, s.then);
@@ -970,14 +1034,17 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
                 try ctx.storeXmm(allocator, result, rd);
             } else {
                 const rd = ctx.dst(result, scratch1);
-                // Load the value's own width: a 32-bit int reads 4 bytes (an 8-byte load would
-                // pull garbage from the next array element into the upper half, which then
-                // breaks a 64-bit compare). Sign-extend a signed i32, zero-extend otherwise.
-                if (intBits(func, result) <= 32) {
-                    try ctx.put(allocator, if (isSigned(func, result)) encode.movsxdFromMem(rd, base, 0) else encode.movFromMem32(rd, base, 0));
-                } else {
-                    try ctx.put(allocator, encode.movFromMem(rd, base, 0));
-                }
+                // Load exactly the value's own width so no bytes beyond the object are read (a
+                // wider load would pull garbage from the next array element into the register).
+                // A narrow load sign-extends a signed value and zero-extends an unsigned one, and
+                // the extend targets a 32-bit register so the upper 32 bits end up clean.
+                const signed = isSigned(func, result);
+                try ctx.put(allocator, switch (intBits(func, result)) {
+                    0...8 => if (signed) encode.movsxByteFromMem(rd, base, 0) else encode.movzxByteFromMem(rd, base, 0),
+                    9...16 => if (signed) encode.movsxWordFromMem(rd, base, 0) else encode.movzxWordFromMem(rd, base, 0),
+                    17...32 => if (signed) encode.movsxdFromMem(rd, base, 0) else encode.movFromMem32(rd, base, 0),
+                    else => encode.movFromMem(rd, base, 0),
+                });
                 try ctx.store(allocator, result, rd);
             }
         },
@@ -986,8 +1053,10 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
 }
 
 fn emitIf(allocator: std.mem.Allocator, ctx: *Ctx, cf: ir.function.If) Error!void {
+    const func = ctx.func;
     const cond = try ctx.use(allocator, cf.cond, scratch1);
-    try ctx.put(allocator, encode.testReg(cond, cond));
+    // Test at the condition's width so a dirty upper half of a raw i32 cond is ignored.
+    try ctx.put(allocator, encode.testReg(cond, cond, intBits(func, cf.cond) > 32));
     const jnz = try emitBranch(allocator, ctx, encode.jcc(.ne, 0));
     try emitMoves(allocator, ctx, cf.@"else");
     try emitBranchTo(allocator, ctx, encode.jmp(0), @intFromEnum(cf.@"else".target));
@@ -1128,14 +1197,14 @@ fn parallelMoveXmm(allocator: std.mem.Allocator, ctx: *Ctx, moves: *std.ArrayLis
     }
 }
 
-fn binary(op: ir.function.BinOp, dst: Reg, src: Reg) Error!encode.Inst {
+fn binary(op: ir.function.BinOp, dst: Reg, src: Reg, w: bool) Error!encode.Inst {
     return switch (op) {
-        .add => encode.add(dst, src),
-        .sub => encode.sub(dst, src),
-        .mul => encode.imul(dst, src),
-        .bit_and => encode.andr(dst, src),
-        .bit_or => encode.orr(dst, src),
-        .bit_xor => encode.xorr(dst, src),
+        .add => encode.add(dst, src, w),
+        .sub => encode.sub(dst, src, w),
+        .mul => encode.imul(dst, src, w),
+        .bit_and => encode.andr(dst, src, w),
+        .bit_or => encode.orr(dst, src, w),
+        .bit_xor => encode.xorr(dst, src, w),
         .div, .rem, .shl, .shr => error.Unsupported,
     };
 }
@@ -1239,13 +1308,13 @@ fn callPositions(allocator: std.mem.Allocator, func: *const Function) Error![]u3
 /// the prologue moves arguments into their assigned locations. R10/R11 are reserved as
 /// spill/move scratch. RAX/RDX/RCX are reserved for division/shifts.
 fn assignRegs(allocator: std.mem.Allocator, func: *const Function, loc_of: *std.AutoHashMapUnmanaged(Value, Loc), num_slots: *u32) Error!void {
-    { // each class of entry parameter must fit in its ABI argument registers (no stack args)
+    { // general args must fit the gpr ABI registers; fp args beyond xmm0..7 are loaded from the stack
+        // by the prologue (System V callee-side stack args). Gpr stack args are not handled yet.
         var gpr_params: usize = 0;
-        var xmm_params: usize = 0;
         for (func.blockParams(@enumFromInt(0))) |p| {
-            if (isXmm(func, p)) xmm_params += 1 else gpr_params += 1;
+            if (!isXmm(func, p)) gpr_params += 1;
         }
-        if (gpr_params > arg_regs.len or xmm_params > xmm_arg_regs.len) return error.Unsupported;
+        if (gpr_params > arg_regs.len) return error.Unsupported;
     }
 
     const needs = fixedRegNeeds(func);

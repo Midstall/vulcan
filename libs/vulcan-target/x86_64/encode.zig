@@ -335,27 +335,27 @@ pub fn roundps(dst: Xmm, src: Xmm, imm: u8) Inst {
     }
     return Inst.of(&.{ 0x66, 0x0F, 0x3A, 0x08, mod, imm });
 }
-/// `roundss dst, src, imm8` (F3 0F 3A /11 ib): IEEE rounding for f32.
+/// `roundss dst, src, imm8` (66 0F 3A 0A /r ib): IEEE rounding for f32 (SSE4.1).
 pub fn roundss(dst: Xmm, src: Xmm, imm: u8) Inst {
     const r = xn(dst);
     const b = xn(src);
     const mod: u8 = 0xC0 | ((r & 7) << 3) | (b & 7);
     if (r >= 8 or b >= 8) {
         const rex: u8 = 0x40 | (@as(u8, @intFromBool(r >= 8)) << 2) | @intFromBool(b >= 8);
-        return Inst.of(&.{ 0xF3, rex, 0x0F, 0x3A, 0x11, mod, imm });
+        return Inst.of(&.{ 0x66, rex, 0x0F, 0x3A, 0x0A, mod, imm });
     }
-    return Inst.of(&.{ 0xF3, 0x0F, 0x3A, 0x11, mod, imm });
+    return Inst.of(&.{ 0x66, 0x0F, 0x3A, 0x0A, mod, imm });
 }
-/// `roundsd dst, src, imm8` (F2 0F 3A /11 ib): IEEE rounding for f64.
+/// `roundsd dst, src, imm8` (66 0F 3A 0B /r ib): IEEE rounding for f64 (SSE4.1).
 pub fn roundsd(dst: Xmm, src: Xmm, imm: u8) Inst {
     const r = xn(dst);
     const b = xn(src);
     const mod: u8 = 0xC0 | ((r & 7) << 3) | (b & 7);
     if (r >= 8 or b >= 8) {
         const rex: u8 = 0x40 | (@as(u8, @intFromBool(r >= 8)) << 2) | @intFromBool(b >= 8);
-        return Inst.of(&.{ 0xF2, rex, 0x0F, 0x3A, 0x11, mod, imm });
+        return Inst.of(&.{ 0x66, rex, 0x0F, 0x3A, 0x0B, mod, imm });
     }
-    return Inst.of(&.{ 0xF2, 0x0F, 0x3A, 0x11, mod, imm });
+    return Inst.of(&.{ 0x66, 0x0F, 0x3A, 0x0B, mod, imm });
 }
 /// `cvtsi2sd dst, src` (F2 0F 2A /r): 32-bit signed int in a gpr to a scalar double.
 pub fn cvtsi2sd(dst: Xmm, src: Reg) Inst {
@@ -447,21 +447,39 @@ fn rexW(reg: Reg, rm: Reg) u8 {
     return 0x48 | (@as(u8, @intFromBool(n(reg) >= 8)) << 2) | @intFromBool(n(rm) >= 8);
 }
 
+/// The REX prefix for a two-register op at the requested operand size, or null when none is
+/// needed. `w` = true selects 64-bit operand size (REX.W). At 32-bit operand size a REX.B/REX.R
+/// is still required to name r8..r15, so a REX with W=0 is emitted then. When neither applies
+/// (32-bit and both operands are rax..rdi), no REX byte is emitted at all: a bare 0x40 is legal
+/// but non-canonical, and omitting it keeps the 32-bit encodings minimal.
+fn rexRR(reg: Reg, rm: Reg, w: bool) ?u8 {
+    const ext: u8 = (@as(u8, @intFromBool(n(reg) >= 8)) << 2) | @intFromBool(n(rm) >= 8);
+    if (w) return 0x48 | ext;
+    if (ext != 0) return 0x40 | ext;
+    return null;
+}
+
 /// Register-direct ModRM byte (mod = 11).
 fn modrm(reg: Reg, rm: Reg) u8 {
     return 0xC0 | ((n(reg) & 7) << 3) | (n(rm) & 7);
 }
 
-/// A 64-bit two-register ALU op: `opcode` with `reg` as the source and `rm` as the
-/// destination (the `/r` form, e.g. ADD/SUB/MOV r/m64, r64).
-fn aluRR(opcode: u8, src: Reg, dst: Reg) Inst {
-    return Inst.of(&.{ rexW(src, dst), opcode, modrm(src, dst) });
+/// A two-register ALU op: `opcode` with `reg` as the source and `rm` as the destination (the
+/// `/r` form, e.g. ADD/SUB/MOV r/m, r). `w` picks the operand size: true = 64-bit (REX.W),
+/// false = 32-bit. A 32-bit op auto-zeroes the upper 32 bits of its destination register, so
+/// i32/i16/i8 values stay clean and every downstream width-sensitive op reads the right value.
+fn aluRR(opcode: u8, src: Reg, dst: Reg, w: bool) Inst {
+    if (rexRR(src, dst, w)) |rex| return Inst.of(&.{ rex, opcode, modrm(src, dst) });
+    return Inst.of(&.{ opcode, modrm(src, dst) });
 }
 
-/// `mov dst, imm32` (C7 /0): load a sign-extended 32-bit immediate.
-pub fn movImm(dst: Reg, imm: i32) Inst {
+/// `mov dst, imm` loading an immediate. `w` = true is `mov r64, imm32` (REX.W C7 /0), which
+/// SIGN-extends the imm32 to 64 bits. `w` = false is `mov r32, imm32` (B8+rd id), which
+/// ZERO-extends into the full 64-bit register, keeping a <=32-bit result clean in its upper
+/// half. No REX is emitted for a 32-bit mov to rax..rdi.
+pub fn movImm(dst: Reg, imm: i32, w: bool) Inst {
     const u: u32 = @bitCast(imm);
-    return Inst.of(&.{
+    if (w) return Inst.of(&.{
         0x48 | @as(u8, @intFromBool(n(dst) >= 8)),
         0xC7,
         0xC0 | (n(dst) & 7), // /0
@@ -470,51 +488,17 @@ pub fn movImm(dst: Reg, imm: i32) Inst {
         @truncate(u >> 16),
         @truncate(u >> 24),
     });
-}
-
-/// `mov dst, src` (89 /r: store the reg operand into the r/m operand).
-pub fn movReg(dst: Reg, src: Reg) Inst {
-    return aluRR(0x89, src, dst);
-}
-
-/// `add dst, src` (01 /r).
-pub fn add(dst: Reg, src: Reg) Inst {
-    return aluRR(0x01, src, dst);
-}
-
-/// `sub dst, src` (29 /r).
-pub fn sub(dst: Reg, src: Reg) Inst {
-    return aluRR(0x29, src, dst);
-}
-
-/// `and dst, src` (21 /r).
-pub fn andr(dst: Reg, src: Reg) Inst {
-    return aluRR(0x21, src, dst);
-}
-
-/// `or dst, src` (09 /r).
-pub fn orr(dst: Reg, src: Reg) Inst {
-    return aluRR(0x09, src, dst);
-}
-
-/// `xor dst, src` (31 /r).
-pub fn xorr(dst: Reg, src: Reg) Inst {
-    return aluRR(0x31, src, dst);
-}
-
-/// `imul dst, src` (0F AF /r: dst = dst * src). Two-operand signed multiply.
-pub fn imul(dst: Reg, src: Reg) Inst {
-    return Inst.of(&.{ rexW(dst, src), 0x0F, 0xAF, modrm(dst, src) });
-}
-
-/// An ALU op against a 32-bit immediate (REX.W 81 /digit id): ADD=/0, OR=/1,
-/// AND=/4, SUB=/5, XOR=/6.
-pub fn aluImm(digit: u3, dst: Reg, imm: i32) Inst {
-    const u: u32 = @bitCast(imm);
+    // 32-bit `mov r32, imm32`: zero-extends. r8..r15 need REX.B (W=0), rax..rdi need none.
+    if (n(dst) >= 8) return Inst.of(&.{
+        0x41,
+        0xB8 | (n(dst) & 7),
+        @truncate(u),
+        @truncate(u >> 8),
+        @truncate(u >> 16),
+        @truncate(u >> 24),
+    });
     return Inst.of(&.{
-        0x48 | @as(u8, @intFromBool(n(dst) >= 8)),
-        0x81,
-        0xC0 | (@as(u8, digit) << 3) | (n(dst) & 7),
+        0xB8 | (n(dst) & 7),
         @truncate(u),
         @truncate(u >> 8),
         @truncate(u >> 16),
@@ -522,62 +506,135 @@ pub fn aluImm(digit: u3, dst: Reg, imm: i32) Inst {
     });
 }
 
-/// `imul dst, src, imm32` (REX.W 69 /r id): dst = src * imm (three-operand).
-pub fn imulImm(dst: Reg, src: Reg, imm: i32) Inst {
+/// `mov dst, src` (89 /r: store the reg operand into the r/m operand). Always 64-bit: a plain
+/// register copy is width-agnostic (a clean i32 stays clean, a dirty upper half is cleaned by
+/// the next width-sensitive op that reads it), so this stays REX.W for byte-identical moves.
+pub fn movReg(dst: Reg, src: Reg) Inst {
+    return aluRR(0x89, src, dst, true);
+}
+
+/// `add dst, src` (01 /r).
+pub fn add(dst: Reg, src: Reg, w: bool) Inst {
+    return aluRR(0x01, src, dst, w);
+}
+
+/// `sub dst, src` (29 /r).
+pub fn sub(dst: Reg, src: Reg, w: bool) Inst {
+    return aluRR(0x29, src, dst, w);
+}
+
+/// `and dst, src` (21 /r).
+pub fn andr(dst: Reg, src: Reg, w: bool) Inst {
+    return aluRR(0x21, src, dst, w);
+}
+
+/// `or dst, src` (09 /r).
+pub fn orr(dst: Reg, src: Reg, w: bool) Inst {
+    return aluRR(0x09, src, dst, w);
+}
+
+/// `xor dst, src` (31 /r).
+pub fn xorr(dst: Reg, src: Reg, w: bool) Inst {
+    return aluRR(0x31, src, dst, w);
+}
+
+/// `imul dst, src` (0F AF /r: dst = dst * src). Two-operand signed multiply. `w` picks the
+/// operand size (a 32-bit imul zero-extends its 32-bit product into the destination).
+pub fn imul(dst: Reg, src: Reg, w: bool) Inst {
+    if (rexRR(dst, src, w)) |rex| return Inst.of(&.{ rex, 0x0F, 0xAF, modrm(dst, src) });
+    return Inst.of(&.{ 0x0F, 0xAF, modrm(dst, src) });
+}
+
+/// The optional REX prefix for a single-register op at operand size `w`, given whether that
+/// register is r8..r15 (`ext`). true = 64-bit (REX.W), false = 32-bit (REX.B only if extended,
+/// otherwise no REX at all so the encoding stays minimal).
+fn rexOne(ext: bool, w: bool) ?u8 {
+    if (w) return 0x48 | @as(u8, @intFromBool(ext));
+    if (ext) return 0x41; // REX.B, W=0
+    return null;
+}
+
+/// An ALU op against a 32-bit immediate (81 /digit id): ADD=/0, OR=/1, AND=/4, SUB=/5,
+/// XOR=/6. `w` picks the operand size (REX.W for 64-bit, none/REX.B for 32-bit).
+pub fn aluImm(digit: u3, dst: Reg, imm: i32, w: bool) Inst {
     const u: u32 = @bitCast(imm);
-    return Inst.of(&.{
-        rexW(dst, src),     0x69,
-        modrm(dst, src),    @truncate(u),
-        @truncate(u >> 8),  @truncate(u >> 16),
-        @truncate(u >> 24),
-    });
+    const mrm: u8 = 0xC0 | (@as(u8, digit) << 3) | (n(dst) & 7);
+    if (rexOne(n(dst) >= 8, w)) |rex| return Inst.of(&.{ rex, 0x81, mrm, @truncate(u), @truncate(u >> 8), @truncate(u >> 16), @truncate(u >> 24) });
+    return Inst.of(&.{ 0x81, mrm, @truncate(u), @truncate(u >> 8), @truncate(u >> 16), @truncate(u >> 24) });
 }
 
-/// A shift of `dst` by an immediate count (REX.W C1 /digit ib): SHL=/4, SHR=/5,
-/// SAR=/7.
-pub fn shiftImm(digit: u3, dst: Reg, imm8: u8) Inst {
-    return Inst.of(&.{ 0x48 | @as(u8, @intFromBool(n(dst) >= 8)), 0xC1, 0xC0 | (@as(u8, digit) << 3) | (n(dst) & 7), imm8 });
+/// `imul dst, src, imm32` (69 /r id): dst = src * imm (three-operand). `w` picks the operand
+/// size.
+pub fn imulImm(dst: Reg, src: Reg, imm: i32, w: bool) Inst {
+    const u: u32 = @bitCast(imm);
+    const mrm = modrm(dst, src);
+    if (rexRR(dst, src, w)) |rex| return Inst.of(&.{ rex, 0x69, mrm, @truncate(u), @truncate(u >> 8), @truncate(u >> 16), @truncate(u >> 24) });
+    return Inst.of(&.{ 0x69, mrm, @truncate(u), @truncate(u >> 8), @truncate(u >> 16), @truncate(u >> 24) });
 }
 
-/// `cqo` (REX.W 99): sign-extend RAX into RDX:RAX (the dividend for `idiv`).
+/// A shift of `dst` by an immediate count (C1 /digit ib): SHL=/4, SHR=/5, SAR=/7. `w` picks the
+/// operand size: a 32-bit shr/sar shifts within 32 bits (filling from bit 31), which is what an
+/// i32 needs, where a 64-bit shift would cross bit 31/32.
+pub fn shiftImm(digit: u3, dst: Reg, imm8: u8, w: bool) Inst {
+    const mrm: u8 = 0xC0 | (@as(u8, digit) << 3) | (n(dst) & 7);
+    if (rexOne(n(dst) >= 8, w)) |rex| return Inst.of(&.{ rex, 0xC1, mrm, imm8 });
+    return Inst.of(&.{ 0xC1, mrm, imm8 });
+}
+
+/// `cqo` (REX.W 99): sign-extend RAX into RDX:RAX (the 64-bit dividend for `idiv`).
 pub fn cqo() Inst {
     return Inst.of(&.{ 0x48, 0x99 });
 }
 
-/// `idiv src` (REX.W F7 /7): signed divide RDX:RAX by `src`, quotient -> RAX,
-/// remainder -> RDX. `src` must not be RAX or RDX.
-pub fn idiv(src: Reg) Inst {
-    return Inst.of(&.{ 0x48 | @as(u8, @intFromBool(n(src) >= 8)), 0xF7, 0xC0 | (7 << 3) | (n(src) & 7) });
+/// `cdq` (99, no REX.W): sign-extend EAX into EDX:EAX (the 32-bit dividend for a 32-bit `idiv`).
+pub fn cdq() Inst {
+    return Inst.of(&.{0x99});
 }
 
-/// `div src` (REX.W F7 /6): unsigned divide RDX:RAX by `src` (clear RDX first).
-pub fn divu(src: Reg) Inst {
-    return Inst.of(&.{ 0x48 | @as(u8, @intFromBool(n(src) >= 8)), 0xF7, 0xC0 | (6 << 3) | (n(src) & 7) });
+/// `idiv src` (F7 /7): signed divide (RDX:RAX or EDX:EAX by `src`), quotient -> (R/E)AX,
+/// remainder -> (R/E)DX. `src` must not be RAX or RDX. `w` picks the operand size.
+pub fn idiv(src: Reg, w: bool) Inst {
+    const mrm: u8 = 0xC0 | (7 << 3) | (n(src) & 7);
+    if (rexOne(n(src) >= 8, w)) |rex| return Inst.of(&.{ rex, 0xF7, mrm });
+    return Inst.of(&.{ 0xF7, mrm });
 }
 
-/// A shift of `dst` by the count in CL (REX.W D3 /digit). `shl` = /4, `shr` = /5
-/// (logical), `sar` = /7 (arithmetic).
-fn shiftCl(digit: u8, dst: Reg) Inst {
-    return Inst.of(&.{ 0x48 | @as(u8, @intFromBool(n(dst) >= 8)), 0xD3, 0xC0 | (digit << 3) | (n(dst) & 7) });
-}
-pub fn shlCl(dst: Reg) Inst {
-    return shiftCl(4, dst);
-}
-pub fn shrCl(dst: Reg) Inst {
-    return shiftCl(5, dst);
-}
-pub fn sarCl(dst: Reg) Inst {
-    return shiftCl(7, dst);
+/// `div src` (F7 /6): unsigned divide (RDX:RAX or EDX:EAX by `src`, clear the high half first).
+/// `w` picks the operand size: a 32-bit div reads only EAX (the low 32 bits) as the dividend, so
+/// a dirty upper half of RAX is correctly ignored.
+pub fn divu(src: Reg, w: bool) Inst {
+    const mrm: u8 = 0xC0 | (6 << 3) | (n(src) & 7);
+    if (rexOne(n(src) >= 8, w)) |rex| return Inst.of(&.{ rex, 0xF7, mrm });
+    return Inst.of(&.{ 0xF7, mrm });
 }
 
-/// `cmp a, b` (39 /r): compute `a - b` and set flags (operands unchanged).
-pub fn cmp(a: Reg, b: Reg) Inst {
-    return aluRR(0x39, b, a);
+/// A shift of `dst` by the count in CL (D3 /digit). `shl` = /4, `shr` = /5 (logical), `sar` =
+/// /7 (arithmetic). `w` picks the operand size.
+fn shiftCl(digit: u8, dst: Reg, w: bool) Inst {
+    const mrm: u8 = 0xC0 | (digit << 3) | (n(dst) & 7);
+    if (rexOne(n(dst) >= 8, w)) |rex| return Inst.of(&.{ rex, 0xD3, mrm });
+    return Inst.of(&.{ 0xD3, mrm });
+}
+pub fn shlCl(dst: Reg, w: bool) Inst {
+    return shiftCl(4, dst, w);
+}
+pub fn shrCl(dst: Reg, w: bool) Inst {
+    return shiftCl(5, dst, w);
+}
+pub fn sarCl(dst: Reg, w: bool) Inst {
+    return shiftCl(7, dst, w);
 }
 
-/// `test a, b` (85 /r): compute `a & b` and set flags. `test r, r` tests for zero.
-pub fn testReg(a: Reg, b: Reg) Inst {
-    return aluRR(0x85, b, a);
+/// `cmp a, b` (39 /r): compute `a - b` and set flags (operands unchanged). `w` picks the
+/// operand size, so an i32 compare sets flags from the low 32 bits only.
+pub fn cmp(a: Reg, b: Reg, w: bool) Inst {
+    return aluRR(0x39, b, a, w);
+}
+
+/// `test a, b` (85 /r): compute `a & b` and set flags. `test r, r` tests for zero. `w` picks
+/// the operand size.
+pub fn testReg(a: Reg, b: Reg, w: bool) Inst {
+    return aluRR(0x85, b, a, w);
 }
 
 /// A condition code (the low nibble of the Jcc/SETcc opcode).
@@ -811,6 +868,85 @@ pub fn movToMem16(base: Reg, disp: i32, src: Reg) Inst {
     return Inst.of(buf[0 .. i + 4]);
 }
 
+/// `mov byte ptr [base+disp32], src` (88 /r): store the low 8 bits of `src` (exactly 1 byte).
+/// A REX prefix is emitted whenever the source names one of spl/bpl/sil/dil (register index
+/// 4..7) so the low byte is addressed rather than the legacy ah/ch/dh/bh, and also for any
+/// r8..15 source or base. A base of rsp/r12 needs the 0x24 SIB byte.
+pub fn movToMem8(base: Reg, disp: i32, src: Reg) Inst {
+    const u: u32 = @bitCast(disp);
+    const r = n(src);
+    const b = n(base);
+    const modrm_byte: u8 = 0x80 | ((r & 7) << 3) | (b & 7); // mod=10 (disp32), reg=src, rm=base
+    // Any source register index >= 4 needs a REX prefix to select spl/bpl/sil/dil/r8b..r15b as
+    // an 8-bit operand (without REX, indices 4..7 mean ah/ch/dh/bh).
+    const need_rex = r >= 4 or b >= 8;
+    const rex: u8 = 0x40 | (@as(u8, @intFromBool(r >= 8)) << 2) | @intFromBool(b >= 8);
+    const sib = (b & 7) == 4;
+    var buf: [8]u8 = undefined;
+    var i: usize = 0;
+    if (need_rex) {
+        buf[i] = rex;
+        i += 1;
+    }
+    buf[i] = 0x88;
+    buf[i + 1] = modrm_byte;
+    i += 2;
+    if (sib) {
+        buf[i] = 0x24;
+        i += 1;
+    }
+    buf[i] = @truncate(u);
+    buf[i + 1] = @truncate(u >> 8);
+    buf[i + 2] = @truncate(u >> 16);
+    buf[i + 3] = @truncate(u >> 24);
+    return Inst.of(buf[0 .. i + 4]);
+}
+
+/// A sign/zero-extending narrow load `movsx`/`movzx dst32, byte/word ptr [base+disp32]` (two-
+/// byte opcode `0F op`). The destination is a 32-bit register (no REX.W), so the load extends
+/// into 32 bits and the 32-bit write auto-zeroes the upper 32, keeping an i8/i16 result clean.
+/// A base of rsp/r12 needs the 0x24 SIB byte; an r8..15 dst or base needs a REX bit.
+fn extMem(op: u8, dst: Reg, base: Reg, disp: i32) Inst {
+    const u: u32 = @bitCast(disp);
+    const r = n(dst);
+    const b = n(base);
+    const modrm_byte: u8 = 0x80 | ((r & 7) << 3) | (b & 7); // mod=10 (disp32), reg=dst, rm=base
+    const ext = r >= 8 or b >= 8;
+    const rex: u8 = 0x40 | (@as(u8, @intFromBool(r >= 8)) << 2) | @intFromBool(b >= 8);
+    const sib = (b & 7) == 4;
+    var buf: [9]u8 = undefined;
+    var i: usize = 0;
+    if (ext) {
+        buf[i] = rex;
+        i += 1;
+    }
+    buf[i] = 0x0F;
+    buf[i + 1] = op;
+    buf[i + 2] = modrm_byte;
+    i += 3;
+    if (sib) {
+        buf[i] = 0x24;
+        i += 1;
+    }
+    buf[i] = @truncate(u);
+    buf[i + 1] = @truncate(u >> 8);
+    buf[i + 2] = @truncate(u >> 16);
+    buf[i + 3] = @truncate(u >> 24);
+    return Inst.of(buf[0 .. i + 4]);
+}
+/// `movsx r32, byte ptr [base+disp]` (0F BE): load 1 byte, sign-extended (a signed i8 load).
+pub fn movsxByteFromMem(dst: Reg, base: Reg, disp: i32) Inst {
+    return extMem(0xBE, dst, base, disp);
+}
+/// `movzx r32, byte ptr [base+disp]` (0F B6): load 1 byte, zero-extended (an unsigned i8 load).
+pub fn movzxByteFromMem(dst: Reg, base: Reg, disp: i32) Inst {
+    return extMem(0xB6, dst, base, disp);
+}
+/// `movsx r32, word ptr [base+disp]` (0F BF): load 2 bytes, sign-extended (a signed i16 load).
+pub fn movsxWordFromMem(dst: Reg, base: Reg, disp: i32) Inst {
+    return extMem(0xBF, dst, base, disp);
+}
+
 /// `lea dst, [rsp + disp32]` (REX.W 8D /r): materialize a stack address (e.g. an alloca slot).
 /// The rsp base needs the 0x24 SIB byte, mod=10 for the disp32 form.
 pub fn leaFromStack(dst: Reg, disp: i32) Inst {
@@ -898,11 +1034,20 @@ pub fn syscall() Inst {
 }
 
 test "known x86-64 encodings" {
-    try std.testing.expectEqualSlices(u8, &.{ 0x48, 0xC7, 0xC0, 0x2A, 0x00, 0x00, 0x00 }, movImm(.rax, 42).slice()); // mov rax, 42
+    // 64-bit (REX.W) forms.
+    try std.testing.expectEqualSlices(u8, &.{ 0x48, 0xC7, 0xC0, 0x2A, 0x00, 0x00, 0x00 }, movImm(.rax, 42, true).slice()); // mov rax, 42
     try std.testing.expectEqualSlices(u8, &.{ 0x48, 0x89, 0xD8 }, movReg(.rax, .rbx).slice()); // mov rax, rbx
-    try std.testing.expectEqualSlices(u8, &.{ 0x48, 0x01, 0xD8 }, add(.rax, .rbx).slice()); // add rax, rbx
-    try std.testing.expectEqualSlices(u8, &.{ 0x48, 0x29, 0xD8 }, sub(.rax, .rbx).slice()); // sub rax, rbx
-    try std.testing.expectEqualSlices(u8, &.{ 0x48, 0x0F, 0xAF, 0xC3 }, imul(.rax, .rbx).slice()); // imul rax, rbx
+    try std.testing.expectEqualSlices(u8, &.{ 0x48, 0x01, 0xD8 }, add(.rax, .rbx, true).slice()); // add rax, rbx
+    try std.testing.expectEqualSlices(u8, &.{ 0x48, 0x29, 0xD8 }, sub(.rax, .rbx, true).slice()); // sub rax, rbx
+    try std.testing.expectEqualSlices(u8, &.{ 0x48, 0x0F, 0xAF, 0xC3 }, imul(.rax, .rbx, true).slice()); // imul rax, rbx
+    // 32-bit forms: no REX for rax..rdi, and `mov r32, imm32` uses the zero-extending B8+rd.
+    try std.testing.expectEqualSlices(u8, &.{ 0xB8, 0x2A, 0x00, 0x00, 0x00 }, movImm(.rax, 42, false).slice()); // mov eax, 42
+    try std.testing.expectEqualSlices(u8, &.{ 0x01, 0xD8 }, add(.rax, .rbx, false).slice()); // add eax, ebx
+    try std.testing.expectEqualSlices(u8, &.{ 0x29, 0xD8 }, sub(.rax, .rbx, false).slice()); // sub eax, ebx
+    try std.testing.expectEqualSlices(u8, &.{ 0x0F, 0xAF, 0xC3 }, imul(.rax, .rbx, false).slice()); // imul eax, ebx
+    // A 32-bit op naming r8..r15 still needs a REX (W=0) for the extension bit.
+    try std.testing.expectEqualSlices(u8, &.{ 0x41, 0xB8, 0x2A, 0x00, 0x00, 0x00 }, movImm(.r8, 42, false).slice()); // mov r8d, 42
+    try std.testing.expectEqualSlices(u8, &.{ 0x44, 0x01, 0xC0 }, add(.rax, .r8, false).slice()); // add eax, r8d
     try std.testing.expectEqualSlices(u8, &.{0xC3}, ret().slice());
     // r8 needs REX.B. mov r8, rax: REX.WB=0x49, 89 /r reg=rax(0) rm=r8(0) -> C0.
     try std.testing.expectEqualSlices(u8, &.{ 0x49, 0x89, 0xC0 }, movReg(.r8, .rax).slice());
@@ -936,16 +1081,16 @@ test "known SSE encodings" {
     try std.testing.expectEqualSlices(u8, &.{ 0xF3, 0x0F, 0x51, 0xC1 }, sqrtss(.xmm0, .xmm1).slice());
     // sqrtsd xmm0, xmm1 -> F2 0F 51 C1
     try std.testing.expectEqualSlices(u8, &.{ 0xF2, 0x0F, 0x51, 0xC1 }, sqrtsd(.xmm0, .xmm1).slice());
-    // roundss xmm0, xmm1, 0x00 (nearest) -> F3 0F 3A 11 C1 00
-    try std.testing.expectEqualSlices(u8, &.{ 0xF3, 0x0F, 0x3A, 0x11, 0xC1, 0x00 }, roundss(.xmm0, .xmm1, 0x00).slice());
-    // roundss xmm0, xmm1, 0x01 (floor) -> F3 0F 3A 11 C1 01
-    try std.testing.expectEqualSlices(u8, &.{ 0xF3, 0x0F, 0x3A, 0x11, 0xC1, 0x01 }, roundss(.xmm0, .xmm1, 0x01).slice());
-    // roundss xmm0, xmm1, 0x02 (ceil) -> F3 0F 3A 11 C1 02
-    try std.testing.expectEqualSlices(u8, &.{ 0xF3, 0x0F, 0x3A, 0x11, 0xC1, 0x02 }, roundss(.xmm0, .xmm1, 0x02).slice());
-    // roundss xmm0, xmm1, 0x03 (trunc) -> F3 0F 3A 11 C1 03
-    try std.testing.expectEqualSlices(u8, &.{ 0xF3, 0x0F, 0x3A, 0x11, 0xC1, 0x03 }, roundss(.xmm0, .xmm1, 0x03).slice());
-    // roundsd xmm0, xmm1, 0x01 (floor) -> F2 0F 3A 11 C1 01
-    try std.testing.expectEqualSlices(u8, &.{ 0xF2, 0x0F, 0x3A, 0x11, 0xC1, 0x01 }, roundsd(.xmm0, .xmm1, 0x01).slice());
+    // roundss xmm0, xmm1, 0x00 (nearest) -> 66 0F 3A 0A C1 00 (SSE4.1)
+    try std.testing.expectEqualSlices(u8, &.{ 0x66, 0x0F, 0x3A, 0x0A, 0xC1, 0x00 }, roundss(.xmm0, .xmm1, 0x00).slice());
+    // roundss xmm0, xmm1, 0x01 (floor) -> 66 0F 3A 0A C1 01
+    try std.testing.expectEqualSlices(u8, &.{ 0x66, 0x0F, 0x3A, 0x0A, 0xC1, 0x01 }, roundss(.xmm0, .xmm1, 0x01).slice());
+    // roundss xmm0, xmm1, 0x02 (ceil) -> 66 0F 3A 0A C1 02
+    try std.testing.expectEqualSlices(u8, &.{ 0x66, 0x0F, 0x3A, 0x0A, 0xC1, 0x02 }, roundss(.xmm0, .xmm1, 0x02).slice());
+    // roundss xmm0, xmm1, 0x03 (trunc) -> 66 0F 3A 0A C1 03
+    try std.testing.expectEqualSlices(u8, &.{ 0x66, 0x0F, 0x3A, 0x0A, 0xC1, 0x03 }, roundss(.xmm0, .xmm1, 0x03).slice());
+    // roundsd xmm0, xmm1, 0x01 (floor) -> 66 0F 3A 0B C1 01
+    try std.testing.expectEqualSlices(u8, &.{ 0x66, 0x0F, 0x3A, 0x0B, 0xC1, 0x01 }, roundsd(.xmm0, .xmm1, 0x01).slice());
 }
 
 test "known F16C encodings" {
@@ -997,11 +1142,23 @@ test "memory-operand encodings" {
     try std.testing.expectEqualSlices(u8, &.{ 0x66, 0x89, 0x82, 0x00, 0x00, 0x00, 0x00 }, movToMem16(.rdx, 0, .rax).slice());
     // mov word ptr [rsp+8], ax needs the SIB byte: 66 89, reg=rax(0) rm=rsp(4) -> 0x84.
     try std.testing.expectEqualSlices(u8, &.{ 0x66, 0x89, 0x84, 0x24, 0x08, 0x00, 0x00, 0x00 }, movToMem16(.rsp, 8, .rax).slice());
+    // mov byte ptr [rdx+0], al (88 /r): no REX for a low source (rax), reg=rax(0) rm=rdx(2) -> 0x82.
+    try std.testing.expectEqualSlices(u8, &.{ 0x88, 0x82, 0x00, 0x00, 0x00, 0x00 }, movToMem8(.rdx, 0, .rax).slice());
+    // mov byte ptr [rdx+0], sil: rsi (index 6) needs a REX to address sil, else it means dh.
+    try std.testing.expectEqualSlices(u8, &.{ 0x40, 0x88, 0xB2, 0x00, 0x00, 0x00, 0x00 }, movToMem8(.rdx, 0, .rsi).slice());
+    // movsx eax, byte ptr [rcx+16] (0F BE): sign-extending i8 load, reg=rax(0) rm=rcx(1) -> 0x81.
+    try std.testing.expectEqualSlices(u8, &.{ 0x0F, 0xBE, 0x81, 0x10, 0x00, 0x00, 0x00 }, movsxByteFromMem(.rax, .rcx, 16).slice());
+    // movzx eax, byte ptr [rcx+0] (0F B6): zero-extending i8 load.
+    try std.testing.expectEqualSlices(u8, &.{ 0x0F, 0xB6, 0x81, 0x00, 0x00, 0x00, 0x00 }, movzxByteFromMem(.rax, .rcx, 0).slice());
+    // movsx eax, word ptr [rcx+0] (0F BF): sign-extending i16 load.
+    try std.testing.expectEqualSlices(u8, &.{ 0x0F, 0xBF, 0x81, 0x00, 0x00, 0x00, 0x00 }, movsxWordFromMem(.rax, .rcx, 0).slice());
 }
 
 test "control-flow encodings" {
-    try std.testing.expectEqualSlices(u8, &.{ 0x48, 0x39, 0xD8 }, cmp(.rax, .rbx).slice()); // cmp rax, rbx
-    try std.testing.expectEqualSlices(u8, &.{ 0x48, 0x85, 0xC0 }, testReg(.rax, .rax).slice()); // test rax, rax
+    try std.testing.expectEqualSlices(u8, &.{ 0x48, 0x39, 0xD8 }, cmp(.rax, .rbx, true).slice()); // cmp rax, rbx
+    try std.testing.expectEqualSlices(u8, &.{ 0x48, 0x85, 0xC0 }, testReg(.rax, .rax, true).slice()); // test rax, rax
+    try std.testing.expectEqualSlices(u8, &.{ 0x39, 0xD8 }, cmp(.rax, .rbx, false).slice()); // cmp eax, ebx (32-bit)
+    try std.testing.expectEqualSlices(u8, &.{ 0x85, 0xC0 }, testReg(.rax, .rax, false).slice()); // test eax, eax (32-bit)
     try std.testing.expectEqualSlices(u8, &.{ 0x40, 0x0F, 0x9F, 0xC0 }, setcc(.rax, .g).slice()); // setg al
     try std.testing.expectEqualSlices(u8, &.{ 0x48, 0x0F, 0xB6, 0xC0 }, movzxByte(.rax, .rax).slice()); // movzx rax, al
     try std.testing.expectEqualSlices(u8, &.{ 0x0F, 0x85, 0x00, 0x00, 0x00, 0x00 }, jcc(.ne, 0).slice()); // jne
@@ -1010,9 +1167,17 @@ test "control-flow encodings" {
 }
 
 test "division and shift encodings" {
+    // 64-bit forms.
     try std.testing.expectEqualSlices(u8, &.{ 0x48, 0x99 }, cqo().slice()); // cqo
-    try std.testing.expectEqualSlices(u8, &.{ 0x48, 0xF7, 0xF9 }, idiv(.rcx).slice()); // idiv rcx
-    try std.testing.expectEqualSlices(u8, &.{ 0x48, 0xF7, 0xF1 }, divu(.rcx).slice()); // div rcx
-    try std.testing.expectEqualSlices(u8, &.{ 0x48, 0xD3, 0xE0 }, shlCl(.rax).slice()); // shl rax, cl
-    try std.testing.expectEqualSlices(u8, &.{ 0x48, 0xD3, 0xF8 }, sarCl(.rax).slice()); // sar rax, cl
+    try std.testing.expectEqualSlices(u8, &.{ 0x48, 0xF7, 0xF9 }, idiv(.rcx, true).slice()); // idiv rcx
+    try std.testing.expectEqualSlices(u8, &.{ 0x48, 0xF7, 0xF1 }, divu(.rcx, true).slice()); // div rcx
+    try std.testing.expectEqualSlices(u8, &.{ 0x48, 0xD3, 0xE0 }, shlCl(.rax, true).slice()); // shl rax, cl
+    try std.testing.expectEqualSlices(u8, &.{ 0x48, 0xD3, 0xF8 }, sarCl(.rax, true).slice()); // sar rax, cl
+    // 32-bit forms: cdq (no REX.W) sign-extends eax->edx, and idiv/div/shifts drop REX.W.
+    try std.testing.expectEqualSlices(u8, &.{0x99}, cdq().slice()); // cdq
+    try std.testing.expectEqualSlices(u8, &.{ 0xF7, 0xF9 }, idiv(.rcx, false).slice()); // idiv ecx
+    try std.testing.expectEqualSlices(u8, &.{ 0xF7, 0xF1 }, divu(.rcx, false).slice()); // div ecx
+    try std.testing.expectEqualSlices(u8, &.{ 0xD3, 0xE0 }, shlCl(.rax, false).slice()); // shl eax, cl
+    try std.testing.expectEqualSlices(u8, &.{ 0xD3, 0xF8 }, sarCl(.rax, false).slice()); // sar eax, cl
+    try std.testing.expectEqualSlices(u8, &.{ 0xD3, 0xE8 }, shrCl(.rax, false).slice()); // shr eax, cl
 }

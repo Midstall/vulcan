@@ -76,7 +76,7 @@ test "codegen+disasm round-trip: integer add" {
         \\0000: mov r9, rdi
         \\0003: mov r8, rsi
         \\0006: mov rdi, r9
-        \\0009: add rdi, r8
+        \\0009: add edi, r8d
         \\000c: mov rax, rdi
         \\000f: ret
         \\
@@ -106,7 +106,7 @@ test "codegen+disasm round-trip: control flow (max via if/else)" {
     try std.testing.expectEqualStrings(
         \\0000: mov r9, rdi
         \\0003: mov r8, rsi
-        \\0006: cmp r9, r8
+        \\0006: cmp r9d, r8d
         \\0009: setg dil
         \\000d: movzx rdi, dil
         \\0011: test rdi, rdi

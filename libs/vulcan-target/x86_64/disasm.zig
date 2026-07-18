@@ -742,19 +742,21 @@ fn expectOne(inst: encode.Inst, expected: []const u8) !void {
 }
 
 test "round-trips integer ops" {
-    try expectOne(encode.movImm(.rax, 42), "mov rax, 42");
+    // These round-trip the 64-bit (REX.W) forms, so each width-parameterized encoder is called
+    // with w = true to match the 64-bit register names in the expected disassembly.
+    try expectOne(encode.movImm(.rax, 42, true), "mov rax, 42");
     try expectOne(encode.movReg(.rax, .rbx), "mov rax, rbx");
-    try expectOne(encode.add(.rax, .rbx), "add rax, rbx");
-    try expectOne(encode.sub(.rcx, .rdx), "sub rcx, rdx");
-    try expectOne(encode.xorr(.rax, .rax), "xor rax, rax");
-    try expectOne(encode.imul(.rax, .rbx), "imul rax, rbx");
-    try expectOne(encode.cmp(.rsi, .rdi), "cmp rsi, rdi");
-    try expectOne(encode.aluImm(0, .rax, 5), "add rax, 5");
-    try expectOne(encode.aluImm(5, .rbx, 7), "sub rbx, 7");
-    try expectOne(encode.imulImm(.rax, .rbx, 3), "imul rax, rbx, 3");
-    try expectOne(encode.shiftImm(4, .rax, 2), "shl rax, 2");
-    try expectOne(encode.shrCl(.rbx), "shr rbx, cl");
-    try expectOne(encode.idiv(.rcx), "idiv rcx");
+    try expectOne(encode.add(.rax, .rbx, true), "add rax, rbx");
+    try expectOne(encode.sub(.rcx, .rdx, true), "sub rcx, rdx");
+    try expectOne(encode.xorr(.rax, .rax, true), "xor rax, rax");
+    try expectOne(encode.imul(.rax, .rbx, true), "imul rax, rbx");
+    try expectOne(encode.cmp(.rsi, .rdi, true), "cmp rsi, rdi");
+    try expectOne(encode.aluImm(0, .rax, 5, true), "add rax, 5");
+    try expectOne(encode.aluImm(5, .rbx, 7, true), "sub rbx, 7");
+    try expectOne(encode.imulImm(.rax, .rbx, 3, true), "imul rax, rbx, 3");
+    try expectOne(encode.shiftImm(4, .rax, 2, true), "shl rax, 2");
+    try expectOne(encode.shrCl(.rbx, true), "shr rbx, cl");
+    try expectOne(encode.idiv(.rcx, true), "idiv rcx");
     try expectOne(encode.cqo(), "cqo");
     try expectOne(encode.movImm64(.r8, 0x1234), "mov r8, 4660");
     try expectOne(encode.ret(), "ret");
