@@ -259,7 +259,7 @@ fn strideOf(func: *const Function, block: Block, biv: Value, target: Value) ?i64
             .arith_imm => |a| if (a.lhs == biv) switch (a.op) {
                 .add => a.imm,
                 .sub => -a.imm,
-                .mul, .div, .rem, .bit_and, .bit_or, .bit_xor, .shl, .shr => null,
+                .mul, .mulh, .div, .rem, .bit_and, .bit_or, .bit_xor, .shl, .shr => null,
             } else null,
             else => null, // any other opcode is not a recognized constant-stride shape
         };

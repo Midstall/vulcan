@@ -33,7 +33,7 @@ const Key = struct {
 
 fn isCommutative(op: ir.function.BinOp) bool {
     return switch (op) {
-        .add, .mul, .bit_and, .bit_or, .bit_xor => true,
+        .add, .mul, .mulh, .bit_and, .bit_or, .bit_xor => true,
         .sub, .div, .rem, .shl, .shr => false,
     };
 }

@@ -930,6 +930,21 @@ pub fn remu(rd: Reg, rs1: Reg, rs2: Reg) u32 {
     return rType(0b0110011, 0b111, 0b0000001, rd, rs1, rs2);
 }
 
+/// `mulh rd, rs1, rs2` (high 64 bits of the signed 64x64 product, M extension)
+pub fn mulh(rd: Reg, rs1: Reg, rs2: Reg) u32 {
+    return rType(0b0110011, 0b001, 0b0000001, rd, rs1, rs2);
+}
+
+/// `mulhu rd, rs1, rs2` (high 64 bits of the unsigned 64x64 product, M extension)
+pub fn mulhu(rd: Reg, rs1: Reg, rs2: Reg) u32 {
+    return rType(0b0110011, 0b011, 0b0000001, rd, rs1, rs2);
+}
+
+/// `mulhsu rd, rs1, rs2` (high 64 of a signed rs1 by unsigned rs2 product, M extension)
+pub fn mulhsu(rd: Reg, rs1: Reg, rs2: Reg) u32 {
+    return rType(0b0110011, 0b010, 0b0000001, rd, rs1, rs2);
+}
+
 /// `and rd, rs1, rs2`
 pub fn and_(rd: Reg, rs1: Reg, rs2: Reg) u32 {
     return rType(0b0110011, 0b111, 0b0000000, rd, rs1, rs2);
@@ -1619,6 +1634,9 @@ test "encodes the arithmetic and bitwise R-type instructions" {
     try std.testing.expectEqual(@as(u32, 0x403100b3), sub(.x1, .x2, .x3));
     try std.testing.expectEqual(@as(u32, 0x023100b3), mul(.x1, .x2, .x3));
     try std.testing.expectEqual(@as(u32, 0x023140b3), div(.x1, .x2, .x3));
+    try std.testing.expectEqual(@as(u32, 0x023110b3), mulh(.x1, .x2, .x3));
+    try std.testing.expectEqual(@as(u32, 0x023120b3), mulhsu(.x1, .x2, .x3));
+    try std.testing.expectEqual(@as(u32, 0x023130b3), mulhu(.x1, .x2, .x3));
     try std.testing.expectEqual(@as(u32, 0x003170b3), and_(.x1, .x2, .x3));
     try std.testing.expectEqual(@as(u32, 0x003160b3), or_(.x1, .x2, .x3));
     try std.testing.expectEqual(@as(u32, 0x003140b3), xor_(.x1, .x2, .x3));

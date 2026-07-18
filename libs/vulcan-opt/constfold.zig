@@ -54,6 +54,20 @@ fn evalBin(op: BinOp, lhs: i64, rhs: i64, ty: IntTy) ?i64 {
             .unsigned => @bitCast((wrapU(a, ty.bits)) >> @intCast(@as(u64, @bitCast(rhs)) & 63)),
             .signed => wrap(lhs, ty.bits, .signed) >> @intCast(@as(u64, @bitCast(rhs)) & 63),
         },
+        .mulh => blk: {
+            // High half of the full-width product: multiply the width-correct operands in 2x width,
+            // shift the low `bits` off. Signedness selects the arithmetic (and thus the sign fill).
+            const l = wrap(lhs, ty.bits, ty.signedness);
+            const r = wrap(rhs, ty.bits, ty.signedness);
+            break :blk switch (ty.signedness) {
+                .signed => @intCast((@as(i128, l) * @as(i128, r)) >> @intCast(ty.bits)),
+                .unsigned => ublk: {
+                    const lu: u128 = wrapU(@bitCast(l), ty.bits);
+                    const ru: u128 = wrapU(@bitCast(r), ty.bits);
+                    break :ublk @bitCast(@as(u64, @truncate((lu * ru) >> @intCast(ty.bits))));
+                },
+            };
+        },
         .div, .rem => blk: {
             if (rhs == 0) return null; // division by zero: leave it to runtime
             const l = wrap(lhs, ty.bits, ty.signedness);

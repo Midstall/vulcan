@@ -33,6 +33,10 @@ pub const BinOp = enum {
     bit_xor,
     shl,
     shr,
+    /// High half of the full-width product (`(lhs *widen rhs) >> bits`). Signedness comes from
+    /// the operand type, like `div`/`rem`: signed operands take the signed high multiply, unsigned
+    /// the unsigned one. The magic-number divide lowering (`strength.zig`) is its only producer.
+    mulh,
 
     /// The symbolic operator this relation prints as.
     pub fn symbol(self: BinOp) []const u8 {
@@ -47,6 +51,7 @@ pub const BinOp = enum {
             .bit_xor => "^",
             .shl => "<<",
             .shr => ">>",
+            .mulh => "*h",
         };
     }
 };

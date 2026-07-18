@@ -76,6 +76,7 @@ fn simplify(op: BinOp, lhs: Value, rhs: ?Value, lc: ?i64, rc: ?i64, same: bool) 
         },
         .div => if (rc == 1) return .{ .value = lhs }, // x / 1  (x / x is UB when x == 0, so skipped)
         .rem => if (rc == 1) return .{ .constant = 0 }, // x % 1
+        .mulh => if (lc == 0 or rc == 0) return .{ .constant = 0 }, // high half of x*0 is 0
     }
     return .none;
 }

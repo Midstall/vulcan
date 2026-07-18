@@ -73,6 +73,16 @@ pub fn mul(rd: Reg, rn: Reg, rm: Reg) u32 {
     return 0x1B000000 | (n(rm) << 16) | (31 << 10) | (n(rn) << 5) | n(rd);
 }
 
+/// `smulh xd, xn, xm` (high 64 bits of the signed 64x64 product). Ra (bits 14:10) is 31.
+pub fn smulh(rd: Reg, rn: Reg, rm: Reg) u32 {
+    return 0x9B407C00 | (n(rm) << 16) | (n(rn) << 5) | n(rd);
+}
+
+/// `umulh xd, xn, xm` (high 64 bits of the unsigned 64x64 product). Ra (bits 14:10) is 31.
+pub fn umulh(rd: Reg, rn: Reg, rm: Reg) u32 {
+    return 0x9BC07C00 | (n(rm) << 16) | (n(rn) << 5) | n(rd);
+}
+
 /// `and wd, wn, wm` (32-bit register bitwise and).
 pub fn andr(rd: Reg, rn: Reg, rm: Reg) u32 {
     return 0x0A000000 | (n(rm) << 16) | (n(rn) << 5) | n(rd);
@@ -702,6 +712,11 @@ test "known A64 encodings" {
     try std.testing.expectEqual(@as(u32, 0xD65F03C0), ret());
     // `movz w0, #42` (used as a JIT smoke-test instruction).
     try std.testing.expectEqual(@as(u32, 0x52800540), movz(.x0, 42, 0));
+}
+
+test "smulh / umulh encoding (high half of a 64x64 product)" {
+    try std.testing.expectEqual(@as(u32, 0x9b4a7d28), smulh(.x8, .x9, .x10));
+    try std.testing.expectEqual(@as(u32, 0x9bca7d28), umulh(.x8, .x9, .x10));
 }
 
 test "nop encoding" {

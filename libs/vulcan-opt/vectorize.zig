@@ -155,7 +155,7 @@ fn isScalarI32(func: *const Function, v: Value) bool {
 fn piSupportsOp(op: BinOp) bool {
     return switch (op) {
         .add, .sub, .mul, .bit_and, .bit_or, .bit_xor, .shl, .shr => true,
-        .div, .rem => false,
+        .div, .rem, .mulh => false,
     };
 }
 

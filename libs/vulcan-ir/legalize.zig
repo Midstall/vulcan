@@ -271,7 +271,7 @@ fn powerOfTwoShift(c: i64) ?i64 {
 fn immHasForm(op: function.BinOp) bool {
     return switch (op) {
         .add, .sub, .bit_and, .bit_or, .bit_xor, .shl, .shr => true,
-        .mul, .div, .rem => false,
+        .mul, .mulh, .div, .rem => false,
     };
 }
 
@@ -311,8 +311,8 @@ fn foldArith(op: function.BinOp, lhs: i64, rhs: i64) ?i64 {
         .bit_and => lhs & rhs,
         .bit_or => lhs | rhs,
         .bit_xor => lhs ^ rhs,
-        // Shifts depend on signedness/width, left for runtime, not folded.
-        .shl, .shr => null,
+        // Shifts and the high-multiply depend on signedness/width, left for runtime, not folded.
+        .shl, .shr, .mulh => null,
     };
 }
 

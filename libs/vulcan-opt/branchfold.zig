@@ -45,15 +45,27 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
         }
         const j = if_at orelse continue;
         const cf = func.opcode(func.blockInsts(block)[j]).@"if";
-        const cv = consts[@intFromEnum(cf.cond)] orelse continue;
 
-        // Constant condition: drop the `if`, jump straight to the taken arm.
-        const taken = if (cv != 0) cf.then else cf.@"else";
+        // A constant condition jumps straight to the taken arm; a branch whose two arms are the same
+        // edge (same target and same arguments) is pointless whatever the condition, so it collapses
+        // to that single jump. Either way the `if` is dropped and the block gets an unconditional
+        // terminator.
+        const taken: ir.function.Jump = if (consts[@intFromEnum(cf.cond)]) |cv|
+            (if (cv != 0) cf.then else cf.@"else")
+        else if (cf.then.target == cf.@"else".target and sameArgs(func, cf.then, cf.@"else"))
+            cf.then
+        else
+            continue;
         _ = func.blockInstsMut(block).orderedRemove(j);
         func.setTerminator(block, .{ .jump = taken });
         changed = true;
     }
     return changed;
+}
+
+/// Whether two edges pass identical argument lists (so their only difference could be the target).
+fn sameArgs(func: *const Function, a: ir.function.Jump, b: ir.function.Jump) bool {
+    return std.mem.eql(ir.function.Value, func.blockArgs(a), func.blockArgs(b));
 }
 
 const testing = std.testing;
@@ -84,6 +96,30 @@ test "branchfold: a constant condition becomes an unconditional jump to the take
         try testing.expectEqual(if (case[1]) a else b, term.jump.target);
         for (func.blockInsts(entry)) |inst| try testing.expect(func.opcode(inst) != .@"if"); // if is gone
     }
+}
+
+test "branchfold: a runtime branch whose arms are the same edge collapses to a jump" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const target = try func.appendBlock();
+    const cond = try func.appendBlockParam(entry, bool_t); // runtime condition
+    const tv = try func.appendBlockParam(target, t);
+    const x = try func.appendInst(entry, t, .{ .iconst = 5 });
+    // if cond -> target(x) else target(x): both arms identical.
+    try func.appendIf(entry, cond, .{ .target = target, .args = &.{x} }, .{ .target = target, .args = &.{x} });
+    func.setTerminator(target, .{ .ret = tv });
+
+    var analyses = pass.Analyses{ .allocator = allocator, .func = &func };
+    defer analyses.deinit();
+    try testing.expect(try run(allocator, &func, &analyses));
+    const term = func.terminator(entry).?;
+    try testing.expect(term == .jump);
+    try testing.expectEqual(target, term.jump.target);
+    for (func.blockInsts(entry)) |inst| try testing.expect(func.opcode(inst) != .@"if");
 }
 
 test "branchfold: a runtime condition is left alone" {

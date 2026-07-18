@@ -913,6 +913,7 @@ fn emitInst(
             try emitArith(func, types, value_local, half, a.lhs, a.rhs, a.op, result, code);
         },
         .arith_imm => |a| {
+            if (a.op == .mulh) return error.Unsupported; // no immediate high-multiply form
             // Materialize imm as a const, then arith.
             const ty = if (result) |r| func.valueType(r) else func.valueType(a.lhs);
             const lhs_local = value_local[@intFromEnum(a.lhs)];
@@ -1325,6 +1326,9 @@ fn arithI32(op: BinOp, signed: std.builtin.Signedness) u8 {
         .bit_xor => encode.I32Op.bit_xor,
         .shl => encode.I32Op.shl,
         .shr => if (signed == .signed) encode.I32Op.shr_s else encode.I32Op.shr_u,
+        // wasm has no high-multiply; `expandMulh` rewrites `mulh` into plain multiplies/shifts
+        // before this backend's isel, so it never reaches here.
+        .mulh => unreachable,
     };
 }
 
@@ -1340,6 +1344,9 @@ fn arithI64(op: BinOp, signed: std.builtin.Signedness) u8 {
         .bit_xor => encode.I64Op.bit_xor,
         .shl => encode.I64Op.shl,
         .shr => if (signed == .signed) encode.I64Op.shr_s else encode.I64Op.shr_u,
+        // wasm has no high-multiply; `expandMulh` rewrites `mulh` into plain multiplies/shifts
+        // before this backend's isel, so it never reaches here.
+        .mulh => unreachable,
     };
 }
 
@@ -1394,6 +1401,9 @@ fn emitArith(
     result: ?Value,
     code: *std.ArrayList(u8),
 ) Error!void {
+    // wasm has no high-multiply and this backend runs no `expandMulh`; reject cleanly rather than
+    // reach the `unreachable` in arithI32/arithI64. Only the 64-bit magic-divide lowering emits it.
+    if (op == .mulh) return error.Unsupported;
     const ty = if (result) |r| func.valueType(r) else func.valueType(lhs);
     const lhs_local = value_local[@intFromEnum(lhs)];
     const rhs_local = value_local[@intFromEnum(rhs)];
