@@ -32,6 +32,26 @@ const move_scratch: Reg = .r11; // parallel-move cycle scratch (non-overlapping 
 /// spill slot, or an xmm stack spill slot (16-byte, holds a scalar float or a whole vector).
 const Loc = union(enum) { reg: Reg, xmm: encode.Xmm, spill: u32, xmm_spill: u32 };
 
+/// One piece of a split GPR value's life: the value lives in `loc` from position `from` until the
+/// next segment (or, for the last one, to the end of its range). `segments[0].from` is the value's
+/// def position, so a lookup at any position at or after the def resolves to some segment. Task 7c
+/// fills the segment map. While it is empty, `loc` falls back to the whole-life `loc_of` lookup and
+/// emission is byte-identical to before splitting.
+const Segment = struct { from: u32, loc: Loc };
+
+/// A store the emitter must insert at a split boundary. `at` is the instruction position the
+/// store lands before (the position at which the GPR pool was exhausted for a tail split). The
+/// store writes the victim's register to its new slot BEFORE the taker (the value defined at
+/// `at`) overwrites that register, so the victim's tail uses reload the correct bits. Task 7c
+/// only produces `.store`. The `.reload` kind is reserved for the second-chance reload task (7d).
+const SplitAction = struct {
+    at: u32,
+    kind: enum { store, reload },
+    value: Value,
+    reg: Reg,
+    slot: u32,
+};
+
 const Xmm = encode.Xmm;
 const xmm_arg_regs = [_]Xmm{ .xmm0, .xmm1, .xmm2, .xmm3, .xmm4, .xmm5, .xmm6, .xmm7 };
 const xmm_ret: Xmm = .xmm0;
@@ -131,8 +151,23 @@ const Ctx = struct {
     xmm_base: i32 = 0, // rsp offset of the xmm spill area (16-byte slots)
     alloca_base: i32 = 0, // rsp offset of the alloca region (sits above the spill areas)
     alloca_off: std.AutoHashMapUnmanaged(Value, u32) = .{}, // each alloca result -> its byte offset in that region
+    // Split GPR values only: value -> ascending-by-`from` segment list. Empty means no value was
+    // split, so `loc` falls back to `loc_of` and emission is byte-identical (Task 7c fills it).
+    segments: std.AutoHashMapUnmanaged(Value, []Segment) = .{},
+    // Stores to emit at split boundaries, in ascending-`at` order after the sort in `compile`.
+    // Empty means no value was split, so emission is byte-identical to before splitting.
+    actions: std.ArrayList(SplitAction) = .empty,
+    def_pos: []u32 = &.{}, // per value: its def position (duped from local liveness, and the emission assert reads it)
+    pos: u32 = 0, // current emission position, threaded per instruction so `loc` can pick the active segment
 
     fn loc(self: *const Ctx, v: Value) Loc {
+        if (self.segments.get(v)) |segs| {
+            var chosen = segs[0]; // non-empty, ascending by `from`
+            for (segs) |s| {
+                if (s.from <= self.pos) chosen = s else break;
+            }
+            return chosen.loc;
+        }
         return self.loc_of.get(v).?;
     }
     fn put(self: *Ctx, allocator: std.mem.Allocator, inst: encode.Inst) Error!void {
@@ -221,6 +256,62 @@ pub fn selectFunction(allocator: std.mem.Allocator, func: *const Function) Error
     return compiled.code;
 }
 
+/// Test hook: run GPR allocation for `func` and report how many values were tail-split (their
+/// life spans a register prefix plus a spill tail). Zero means no split occurred. The execution
+/// tests call this to assert a case actually exercises the splitter before checking its results.
+pub fn splitCountForTest(allocator: std.mem.Allocator, func: *const Function) Error!usize {
+    var loc_of: std.AutoHashMapUnmanaged(Value, Loc) = .{};
+    defer loc_of.deinit(allocator);
+    var segments: std.AutoHashMapUnmanaged(Value, []Segment) = .{};
+    defer {
+        var it = segments.valueIterator();
+        while (it.next()) |s| allocator.free(s.*);
+        segments.deinit(allocator);
+    }
+    var actions: std.ArrayList(SplitAction) = .empty;
+    defer actions.deinit(allocator);
+    var num_slots: u32 = 0;
+    var def_pos: []u32 = &.{};
+    defer allocator.free(def_pos);
+    try assignRegs(allocator, func, &loc_of, &num_slots, &def_pos, &segments, &actions);
+    return segments.count();
+}
+
+/// Test hook: run GPR allocation for `func` and report how many values were SECOND-CHANCE
+/// RE-HOMED, a value whose segment list holds a `.reg` segment after a `.spill` segment (spilled,
+/// then brought back into a register for its remaining tail uses). Exists so an execution test can
+/// prove second-chance reload actually fired, not merely that a tail split happened (which a plain
+/// per-use reload would also satisfy).
+pub fn reHomeCountForTest(allocator: std.mem.Allocator, func: *const Function) Error!usize {
+    var loc_of: std.AutoHashMapUnmanaged(Value, Loc) = .{};
+    defer loc_of.deinit(allocator);
+    var segments: std.AutoHashMapUnmanaged(Value, []Segment) = .{};
+    defer {
+        var it = segments.valueIterator();
+        while (it.next()) |s| allocator.free(s.*);
+        segments.deinit(allocator);
+    }
+    var actions: std.ArrayList(SplitAction) = .empty;
+    defer actions.deinit(allocator);
+    var num_slots: u32 = 0;
+    var def_pos: []u32 = &.{};
+    defer allocator.free(def_pos);
+    try assignRegs(allocator, func, &loc_of, &num_slots, &def_pos, &segments, &actions);
+    var count: usize = 0;
+    var it = segments.valueIterator();
+    while (it.next()) |segs| {
+        var saw_slot = false;
+        for (segs.*) |s| switch (s.loc) {
+            .spill => saw_slot = true,
+            .reg => if (saw_slot) {
+                count += 1;
+            },
+            .xmm, .xmm_spill => {},
+        };
+    }
+    return count;
+}
+
 /// Compile `func` to machine code plus its call relocations. Caller owns it.
 pub fn compile(allocator: std.mem.Allocator, func: *const Function) Error!Compiled {
     // f16 is now lowered here via F16C (held as its f32 widening in an xmm register, all
@@ -239,10 +330,36 @@ pub fn compile(allocator: std.mem.Allocator, func: *const Function) Error!Compil
     defer ctx.relocs.deinit(allocator);
     defer ctx.lines.deinit(allocator);
     defer ctx.alloca_off.deinit(allocator);
+    defer {
+        var seg_it = ctx.segments.valueIterator();
+        while (seg_it.next()) |s| allocator.free(s.*);
+        ctx.segments.deinit(allocator);
+    }
+    defer ctx.actions.deinit(allocator);
+    // `def_pos` is always a heap-owned dupe (the `&.{}` sentinel is a zero-length slice with no
+    // backing allocation, so freeing it is a no-op), so an unconditional free is safe.
+    defer allocator.free(ctx.def_pos);
     var num_slots: u32 = 0;
-    try assignRegs(allocator, func, &ctx.loc_of, &num_slots);
+    try assignRegs(allocator, func, &ctx.loc_of, &num_slots, &ctx.def_pos, &ctx.segments, &ctx.actions);
     var xmm_slots: u32 = 0;
     try assignXmm(allocator, func, &ctx.loc_of, &xmm_slots);
+    // Split-boundary actions are appended in monotonic `at` order already. Sort defensively so the
+    // per-instruction drain below can advance a single cursor. At the SAME position a `.reload` must
+    // precede a `.store`: a value can be reloaded slot->reg and then immediately re-spilled reg->slot
+    // at one use position, and the reload has to run first or the store would save a stale register.
+    // `std.mem.sort` is not stable, so the comparator breaks `at` ties on kind (reload before store).
+    std.mem.sort(SplitAction, ctx.actions.items, {}, struct {
+        fn order(k: @TypeOf(@as(SplitAction, undefined).kind)) u8 {
+            return switch (k) {
+                .reload => 0,
+                .store => 1,
+            };
+        }
+        fn f(_: void, a: SplitAction, b: SplitAction) bool {
+            if (a.at != b.at) return a.at < b.at;
+            return order(a.kind) < order(b.kind);
+        }
+    }.f);
     // Frame layout: general spills (8 bytes each), then the xmm spill area (32-byte slots
     // at a 16-aligned base, sized for a whole 256-bit ymm. A scalar/128-bit value uses the
     // low half), then the alloca region (each alloca offset relative to its 16-aligned base).
@@ -323,11 +440,23 @@ pub fn compile(allocator: std.mem.Allocator, func: *const Function) Error!Compil
     }
     try parallelMove(allocator, &ctx, &arg_moves);
 
+    // `pos_base` is the current block's param-row position. It mirrors computeLocalLiveness's
+    // numbering EXACTLY (param row, then one slot per instruction, then one terminator slot), so
+    // `ctx.pos` set per instruction below equals the position each value's def was numbered at. With
+    // `segments` empty the pos is otherwise unobservable, so the pos-coupling assert is how a
+    // threading bug is caught in this task.
+    var pos_base: u32 = 0;
+    var action_cursor: usize = 0;
     for (0..nblocks) |bi| {
         const block: Block = @enumFromInt(bi);
         block_start[bi] = ctx.code.items.len;
         var terminated = false;
-        for (func.blockInsts(block)) |inst| {
+        const insts = func.blockInsts(block);
+        for (insts, 0..) |inst, inst_idx| {
+            // Continue-safe: derive the position from the block base plus the instruction index so any
+            // early exit cannot desync it. This equals computeLocalLiveness's numbering for this inst
+            // (param row at `pos_base`, then one position per instruction).
+            ctx.pos = pos_base + 1 + @as(u32, @intCast(inst_idx));
             // Record a source-line row when this instruction starts a new line (byte offset = the
             // current code length, since x86 code is already a byte stream).
             if (lineOf(func, inst)) |line| {
@@ -336,12 +465,53 @@ pub fn compile(allocator: std.mem.Allocator, func: *const Function) Error!Compil
                     ctx.last_line = line;
                 }
             }
+            // An instruction with a result must be emitted at exactly that result's def position. This
+            // pins the emission numbering to computeLocalLiveness's numbering and must never trip.
+            if (func.instResult(inst)) |r| std.debug.assert(ctx.pos == ctx.def_pos[@intFromEnum(r)]);
+            // Drain split-boundary stores landing at this position BEFORE emitting the instruction.
+            // A tail-split store writes the victim's register to its slot before the taker (the
+            // instruction defined at `p`) computes its result into that same register. The victim's
+            // value still occupies the register here (its last prefix use is before `p`, and nothing
+            // reused the register before `p`), so the store captures the correct bits.
+            while (action_cursor < ctx.actions.items.len and ctx.actions.items[action_cursor].at <= ctx.pos) {
+                const act = ctx.actions.items[action_cursor];
+                std.debug.assert(act.at == ctx.pos); // stores land on instruction positions only
+                switch (act.kind) {
+                    .store => try ctx.put(allocator, encode.movToStack(slotDisp(act.slot), act.reg)),
+                    .reload => {
+                        // Second-chance reload: bring `act.value` back from its slot into `act.reg`
+                        // just before its next use, mirroring `use`'s slot path. From here on its
+                        // `.reg` re-home segment makes `loc` read the register directly.
+                        try ctx.put(allocator, encode.movFromStack(act.reg, slotDisp(act.slot)));
+                    },
+                }
+                action_cursor += 1;
+            }
             if (func.opcode(inst) == .@"if") {
                 try emitIf(allocator, &ctx, func.opcode(inst).@"if");
                 terminated = true;
             } else {
                 try lowerInst(allocator, &ctx, inst);
             }
+        }
+        // The terminator shares the block-end position. An `.@"if"` terminator is one of the
+        // instructions above (it set `terminated`), so this only positions a ret/jump, but the
+        // numbering still reserves a terminator slot whether or not one is emitted here.
+        ctx.pos = pos_base + 1 + @as(u32, @intCast(insts.len));
+        // Drain any split-boundary actions recorded AT the terminator position BEFORE emitting the
+        // terminator. `secondChance` can re-home a value used only by `ret` (a non-edge-arg operand,
+        // hence `is_intra`) at its next use, which is the terminator position (`block_end`), recording
+        // a `.reload` there. The per-instruction drain above only reaches `term_pos - 1`, so without
+        // this drain the reload is never emitted and `ret` reads a register that was never loaded. When
+        // no action lands on a terminator (the normal case) this drains nothing and is byte-identical.
+        while (action_cursor < ctx.actions.items.len and ctx.actions.items[action_cursor].at <= ctx.pos) {
+            const act = ctx.actions.items[action_cursor];
+            std.debug.assert(act.at == ctx.pos); // only terminator-position actions remain here
+            switch (act.kind) {
+                .store => try ctx.put(allocator, encode.movToStack(slotDisp(act.slot), act.reg)),
+                .reload => try ctx.put(allocator, encode.movFromStack(act.reg, slotDisp(act.slot))),
+            }
+            action_cursor += 1;
         }
         if (!terminated) switch (func.terminator(block) orelse ir.function.Terminator{ .ret = null }) {
             .ret => |v| {
@@ -359,7 +529,14 @@ pub fn compile(allocator: std.mem.Allocator, func: *const Function) Error!Compil
             },
             .jump => |j| try emitJump(allocator, &ctx, j),
         };
+        // Advance to the next block's param row: param row (1) + one slot per instruction + one
+        // terminator slot (reserved unconditionally, matching computeLocalLiveness's per-block
+        // final increment).
+        pos_base = pos_base + 2 + @as(u32, @intCast(insts.len));
     }
+    // Every store must have drained. A tail-split store lands at the taker's def position, which is
+    // always an instruction position visited by the loop above, so no store can outlive it.
+    std.debug.assert(action_cursor == ctx.actions.items.len);
 
     for (ctx.fixups.items) |f| {
         const rel: i32 = @intCast(@as(i64, @intCast(block_start[f.target])) - @as(i64, @intCast(f.at + 4)));
@@ -1305,10 +1482,331 @@ fn callPositions(allocator: std.mem.Allocator, func: *const Function) Error![]u3
     return positions.toOwnedSlice(allocator);
 }
 
+/// Visit every operand VALUE read by `inst`, calling `f(ctx, value, is_edge_arg)`. The block
+/// arguments of an `if` are edge args (they move along a control edge), every other operand is an
+/// ordinary use. Mirrors the shared `regalloc.forEachUse` operand set, adding the edge-arg flag the
+/// split-liveness `is_intra` predicate needs. Kept local so `regalloc.zig` stays untouched.
+fn forEachOperand(func: *const Function, inst: ir.function.Inst, ctx: anytype, comptime f: fn (@TypeOf(ctx), Value, bool) void) void {
+    switch (func.opcode(inst)) {
+        .iconst, .fconst, .alloca, .global_addr => {},
+        .arith => |a| {
+            f(ctx, a.lhs, false);
+            f(ctx, a.rhs, false);
+        },
+        .arith_imm => |a| f(ctx, a.lhs, false),
+        .icmp => |c| {
+            f(ctx, c.lhs, false);
+            f(ctx, c.rhs, false);
+        },
+        .select => |s| {
+            f(ctx, s.cond, false);
+            f(ctx, s.then, false);
+            f(ctx, s.@"else", false);
+        },
+        .extract => |e| f(ctx, e.aggregate, false),
+        .convert => |cv| f(ctx, cv.value, false),
+        .unary => |u| f(ctx, u.value, false),
+        .load => |l| f(ctx, l.ptr, false),
+        .store => |st| {
+            f(ctx, st.value, false);
+            f(ctx, st.ptr, false);
+        },
+        .prefetch => |pf| f(ctx, pf.ptr, false),
+        .dot => |d| {
+            f(ctx, d.acc, false);
+            f(ctx, d.a, false);
+            f(ctx, d.b, false);
+        },
+        .matmul => |mmv| {
+            f(ctx, mmv.a, false);
+            f(ctx, mmv.b, false);
+            f(ctx, mmv.c, false);
+        },
+        .struct_new => |sn| for (func.valueList(sn.fields)) |fld| f(ctx, fld, false),
+        .call => |c| for (func.valueList(c.args)) |a| f(ctx, a, false),
+        .call_indirect => |c| {
+            f(ctx, c.target, false);
+            for (func.valueList(c.args)) |a| f(ctx, a, false);
+        },
+        .@"if" => |cf| {
+            f(ctx, cf.cond, false);
+            for (func.blockArgs(cf.then)) |a| f(ctx, a, true);
+            for (func.blockArgs(cf.@"else")) |a| f(ctx, a, true);
+        },
+    }
+}
+
+/// Terminator analogue of `forEachOperand`. The `jump` arguments are edge args, the `ret` value is
+/// an ordinary operand.
+fn forEachTermOperand(func: *const Function, term: ir.function.Terminator, ctx: anytype, comptime f: fn (@TypeOf(ctx), Value, bool) void) void {
+    switch (term) {
+        .ret => |v| if (v) |vv| f(ctx, vv, false),
+        .jump => |j| for (func.blockArgs(j)) |a| f(ctx, a, true),
+    }
+}
+
+/// Per-value split-liveness data for the eviction heuristic, built locally so `regalloc.zig` stays
+/// the sole owner of the start/end intervals. `use_positions` and `is_intra`/`def_pos` are computed
+/// together (the later live-range-splitting tasks consume all three), but for now only the victim
+/// selection reads `use_positions`. The position numbering is exactly the one
+/// `regalloc.computeLiveIntervals` uses (block params share the block-start position, then one per
+/// instruction and one per terminator), so a position from here indexes the same timeline as an
+/// interval's start/end.
+const LocalLiveness = struct {
+    def_pos: []u32, // per value: position of its definition
+    is_intra: []bool, // per value: true iff NOT a param, NEVER an edge arg, and every use is in its def block
+    use_positions: [][]u32, // per value: ascending positions where the value is an OPERAND use (edge args at the terminator position)
+
+    fn deinit(self: *LocalLiveness, allocator: std.mem.Allocator) void {
+        allocator.free(self.def_pos);
+        allocator.free(self.is_intra);
+        for (self.use_positions) |u| allocator.free(u);
+        allocator.free(self.use_positions);
+    }
+};
+
+/// Build the local split-liveness data over `func`, mirroring `regalloc.computeLiveIntervals`'s
+/// position numbering. Caller owns the returned `LocalLiveness`.
+fn computeLocalLiveness(allocator: std.mem.Allocator, func: *const Function) Error!LocalLiveness {
+    const nval = func.valueCount();
+
+    const def_pos = try allocator.alloc(u32, nval);
+    errdefer allocator.free(def_pos);
+    const is_intra = try allocator.alloc(bool, nval);
+    errdefer allocator.free(is_intra);
+
+    // def_block is a scratch row (which block defined each value), used only to decide is_intra.
+    const def_block = try allocator.alloc(u32, nval);
+    defer allocator.free(def_block);
+
+    @memset(def_pos, 0);
+    @memset(def_block, 0);
+    // A value starts intra-splittable; the walk clears it for params, any edge-argument use, and any
+    // use outside its def block.
+    @memset(is_intra, true);
+
+    // Per-value operand-use positions are gathered into temporary lists, then transferred into the
+    // owned `use_positions` slices below.
+    const use_lists = try allocator.alloc(std.ArrayList(u32), nval);
+    defer allocator.free(use_lists);
+    for (use_lists) |*u| u.* = .empty;
+    errdefer for (use_lists) |*u| u.deinit(allocator);
+
+    const Collector = struct {
+        is_intra: []bool,
+        def_block: []const u32,
+        use_lists: []std.ArrayList(u32),
+        allocator: std.mem.Allocator,
+        pos: u32,
+        bi: u32,
+        err: ?Error = null,
+
+        fn visit(self: *@This(), v: Value, is_edge_arg: bool) void {
+            const vi = @intFromEnum(v);
+            if (is_edge_arg) {
+                self.is_intra[vi] = false;
+            } else if (self.def_block[vi] != self.bi) {
+                self.is_intra[vi] = false;
+            }
+            self.use_lists[vi].append(self.allocator, self.pos) catch |e| {
+                self.err = e;
+            };
+        }
+    };
+
+    var pos: u32 = 0;
+    for (0..func.blockCount()) |bi| {
+        const block: Block = @enumFromInt(bi);
+        for (func.blockParams(block)) |p| {
+            def_pos[@intFromEnum(p)] = pos;
+            is_intra[@intFromEnum(p)] = false;
+            def_block[@intFromEnum(p)] = @intCast(bi);
+        }
+        pos += 1;
+        for (func.blockInsts(block)) |inst| {
+            var col = Collector{
+                .is_intra = is_intra,
+                .def_block = def_block,
+                .use_lists = use_lists,
+                .allocator = allocator,
+                .pos = pos,
+                .bi = @intCast(bi),
+            };
+            forEachOperand(func, inst, &col, Collector.visit);
+            if (col.err) |e| return e;
+            if (func.instResult(inst)) |r| {
+                def_pos[@intFromEnum(r)] = pos;
+                def_block[@intFromEnum(r)] = @intCast(bi);
+            }
+            pos += 1;
+        }
+        if (func.terminator(block)) |term| {
+            var col = Collector{
+                .is_intra = is_intra,
+                .def_block = def_block,
+                .use_lists = use_lists,
+                .allocator = allocator,
+                .pos = pos,
+                .bi = @intCast(bi),
+            };
+            forEachTermOperand(func, term, &col, Collector.visit);
+            if (col.err) |e| return e;
+        }
+        pos += 1;
+    }
+
+    // Transfer the temporary use lists into owned slices. Blocks were walked in order with
+    // increasing positions, so each list is already ascending.
+    const use_positions = try allocator.alloc([]u32, nval);
+    errdefer allocator.free(use_positions);
+    var converted: usize = 0;
+    errdefer for (use_positions[0..converted]) |u| allocator.free(u);
+    for (use_lists, 0..) |*u, idx| {
+        use_positions[idx] = try u.toOwnedSlice(allocator);
+        converted = idx + 1;
+    }
+
+    return .{ .def_pos = def_pos, .is_intra = is_intra, .use_positions = use_positions };
+}
+
+/// The position of `value`'s next use strictly after `p`, or `end` (its interval end) if it has no
+/// further use. This is the Belady/MIN spill key: prefer to spill the value that will not be needed
+/// for the longest.
+fn nextUseOrEnd(use_positions: []const []const u32, value: Value, end: u32, p: u32) u32 {
+    return nextUseAfter(use_positions[@intFromEnum(value)], p) orelse end;
+}
+
+/// Return the first element of ascending `uses` that is strictly greater than `p`, else null.
+fn nextUseAfter(uses: []const u32, p: u32) ?u32 {
+    var lo: usize = 0;
+    var hi: usize = uses.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (uses[mid] <= p) lo = mid + 1 else hi = mid;
+    }
+    return if (lo < uses.len) uses[lo] else null;
+}
+
+/// A GPR value currently resident in a register during linear scan, with the position its live
+/// range ends. Hoisted to file scope (from a local in `assignRegs`) so `secondChance` can name the
+/// type when it re-adds a re-homed value to the active set. (`assignXmm` keeps its own local
+/// `Active` over `Xmm`, which this does not touch.)
+const GprActive = struct { end: u32, value: Value, reg: Reg };
+
+/// Append `seg` to `value`'s segment list (growing the owned slice). Segments must be appended in
+/// ascending `from` order by the caller, so a re-spill after a re-home lands at or after the re-home
+/// position (asserted). Creates a single-element list if the value has none yet.
+fn appendSegment(allocator: std.mem.Allocator, segments: *std.AutoHashMapUnmanaged(Value, []Segment), value: Value, seg: Segment) Error!void {
+    const gop = try segments.getOrPut(allocator, value);
+    if (!gop.found_existing) {
+        const s = try allocator.alloc(Segment, 1);
+        s[0] = seg;
+        gop.value_ptr.* = s;
+        return;
+    }
+    const old = gop.value_ptr.*;
+    // Ascending-`from` is the representation invariant `loc` relies on (it scans until the first
+    // segment past `pos`). A caller that appends out of order is a programmer error and would
+    // silently miscompile, so assert it rather than trust it.
+    std.debug.assert(seg.from >= old[old.len - 1].from);
+    const grown = try allocator.alloc(Segment, old.len + 1);
+    @memcpy(grown[0..old.len], old);
+    grown[old.len] = seg;
+    allocator.free(old);
+    gop.value_ptr.* = grown;
+}
+
+/// Undo a still-PENDING second-chance re-home of `value`: drop its trailing `.reg` segment and the
+/// matching reload action, so the value stays in its previous slot and the re-home register frees.
+/// Used when pressure reclaims that register before its reload fires (the value never actually
+/// re-entered a register). Leaving the reload in place would clobber the taker's register at the old
+/// re-home position, and leaving the segment would break the ascending-`from` order `loc` relies on,
+/// so both must go.
+fn cancelReHome(allocator: std.mem.Allocator, segments: *std.AutoHashMapUnmanaged(Value, []Segment), actions: *std.ArrayList(SplitAction), value: Value) Error!void {
+    const old = segments.get(value).?;
+    std.debug.assert(old.len >= 2 and old[old.len - 1].loc == .reg);
+    const rehome = old[old.len - 1];
+    const rehome_reg = rehome.loc.reg;
+    // Remove the pending reload action for this re-home. The (value, position, register) triple is
+    // unique (each re-home pops a distinct register), so exactly one action matches. Actions are not
+    // sorted until emission, so a `swapRemove` is safe here.
+    var found = false;
+    var i: usize = 0;
+    while (i < actions.items.len) : (i += 1) {
+        const act = actions.items[i];
+        if (act.kind == .reload and act.value == value and act.at == rehome.from and act.reg == rehome_reg) {
+            _ = actions.swapRemove(i);
+            found = true;
+            break;
+        }
+    }
+    std.debug.assert(found);
+    // Shrink the owned segment slice by one (drop the trailing `.reg`). The key already exists, so the
+    // `getPtr` update never allocates and cannot fail after the new slice is built.
+    const shrunk = try allocator.alloc(Segment, old.len - 1);
+    @memcpy(shrunk, old[0 .. old.len - 1]);
+    allocator.free(old);
+    segments.getPtr(value).?.* = shrunk;
+}
+
+/// After the current interval is placed at `pos`, re-home split GPR values that presently live in a
+/// slot and still have an upcoming use into any LEFTOVER free register, so their remaining tail uses
+/// read a register instead of reloading from the slot on every use. The reload lands at the value's
+/// next use position. Most-urgent (nearest next use) first, so a scarce free register goes to the
+/// value that reloads soonest. The re-homed value is added back to `active` so its register is
+/// tracked and it can be spilled AGAIN (via the append-aware split path) if pressure returns.
+///
+/// Runs AFTER the current interval was placed, so that interval already claimed whatever register it
+/// needed and `secondChance` only pops registers that are genuinely free. It therefore can never
+/// dispossess a live value. A split value provably never crosses a call (across-call values are
+/// force-whole-spilled and never enter `active`, so they are never a split victim), so its whole
+/// tail is call-free and re-homing into a caller-saved register is call-safe with no extra gate.
+fn secondChance(
+    allocator: std.mem.Allocator,
+    lin: *const LocalLiveness,
+    free: *std.ArrayList(Reg),
+    active: *std.ArrayList(GprActive),
+    segments: *std.AutoHashMapUnmanaged(Value, []Segment),
+    actions: *std.ArrayList(SplitAction),
+    pos: u32,
+) Error!void {
+    const Cand = struct { value: Value, next: u32, slot: u32, end: u32 };
+    var cands: std.ArrayList(Cand) = .empty;
+    defer cands.deinit(allocator);
+    var it = segments.iterator();
+    while (it.next()) |e| {
+        const segs = e.value_ptr.*;
+        const last = segs[segs.len - 1];
+        switch (last.loc) {
+            .spill => |slot| {
+                const v = e.key_ptr.*;
+                const uses = lin.use_positions[@intFromEnum(v)];
+                const nu = nextUseAfter(uses, pos) orelse continue;
+                // A split value is `is_intra` (only intra values are ever tail-split), so its live
+                // range ends at its last use. That is the register's expiry point in `active`.
+                try cands.append(allocator, .{ .value = v, .next = nu, .slot = slot, .end = uses[uses.len - 1] });
+            },
+            .reg => {}, // already in a register, nothing pending
+            .xmm, .xmm_spill => unreachable, // GPR segments only
+        }
+    }
+    std.mem.sort(Cand, cands.items, {}, struct {
+        fn f(_: void, a: Cand, b: Cand) bool {
+            return a.next < b.next;
+        }
+    }.f);
+    for (cands.items) |c| {
+        const r2 = free.pop() orelse continue;
+        try appendSegment(allocator, segments, c.value, .{ .from = c.next, .loc = .{ .reg = r2 } });
+        try actions.append(allocator, .{ .at = c.next, .kind = .reload, .value = c.value, .reg = r2, .slot = c.slot });
+        try active.append(allocator, .{ .end = c.end, .value = c.value, .reg = r2 });
+    }
+}
+
 /// Linear-scan register allocation with reuse and spilling. Entry parameters are not pinned,
 /// the prologue moves arguments into their assigned locations. R10/R11 are reserved as
 /// spill/move scratch. RAX/RDX/RCX are reserved for division/shifts.
-fn assignRegs(allocator: std.mem.Allocator, func: *const Function, loc_of: *std.AutoHashMapUnmanaged(Value, Loc), num_slots: *u32) Error!void {
+fn assignRegs(allocator: std.mem.Allocator, func: *const Function, loc_of: *std.AutoHashMapUnmanaged(Value, Loc), num_slots: *u32, def_pos_out: *[]u32, segments: *std.AutoHashMapUnmanaged(Value, []Segment), actions: *std.ArrayList(SplitAction)) Error!void {
     { // general args must fit the gpr ABI registers; fp args beyond xmm0..7 are loaded from the stack
         // by the prologue (System V callee-side stack args). Gpr stack args are not handled yet.
         var gpr_params: usize = 0;
@@ -1331,14 +1829,23 @@ fn assignRegs(allocator: std.mem.Allocator, func: *const Function, loc_of: *std.
     const ivals = try regalloc.computeLiveIntervals(allocator, func);
     defer allocator.free(ivals);
 
+    // Local split-liveness (use positions, is_intra, def positions) over the same position timeline
+    // as the intervals. The victim heuristic below reads `use_positions` for the Belady/MIN key; the
+    // rest is kept for the later live-range-splitting tasks.
+    var lin = try computeLocalLiveness(allocator, func);
+    defer lin.deinit(allocator);
+    // Surface the per-value def positions to the caller (compile stores them on Ctx for the
+    // pos-coupling assert). Dupe because `lin` is freed when assignRegs returns. Ownership passes to
+    // the caller immediately via the out-param, so a later failure here is freed by the caller.
+    def_pos_out.* = try allocator.dupe(u32, lin.def_pos);
+
     // A `call` clobbers every caller-saved register, so a value live across a call (defined
     // before it, used after it) cannot stay in a register, force it to a spill slot. Its call
     // arguments and the call result are not "across".
     const calls = try callPositions(allocator, func);
     defer allocator.free(calls);
 
-    const Active = struct { end: u32, value: Value, reg: Reg };
-    var active: std.ArrayList(Active) = .empty;
+    var active: std.ArrayList(GprActive) = .empty;
     defer active.deinit(allocator);
     var free = try pool.clone(allocator);
     defer free.deinit(allocator);
@@ -1367,15 +1874,76 @@ fn assignRegs(allocator: std.mem.Allocator, func: *const Function, loc_of: *std.
             try loc_of.put(allocator, iv.value, .{ .reg = r });
             try active.append(allocator, .{ .end = iv.end, .value = iv.value, .reg = r });
         } else {
-            // Spill the longest-living of {this interval, the active intervals}.
+            // Out of registers: pick the active value whose NEXT USE after this point is furthest
+            // ahead (Belady/MIN), ties broken by the larger interval end. `p` is where the pool is
+            // exhausted, this interval's definition position. Reaching here means `free` was empty,
+            // so the whole (non-empty) GPR pool is resident in `active`.
+            std.debug.assert(active.items.len > 0);
+            const p = iv.start;
             var victim: usize = 0;
-            for (active.items, 0..) |act, i| if (act.end > active.items[victim].end) {
-                victim = i;
-            };
-            if (active.items.len > 0 and active.items[victim].end > iv.end) {
+            for (active.items, 0..) |act, i| {
+                const act_nu = nextUseOrEnd(lin.use_positions, act.value, act.end, p);
+                const best = active.items[victim];
+                const best_nu = nextUseOrEnd(lin.use_positions, best.value, best.end, p);
+                if (act_nu > best_nu or (act_nu == best_nu and act.end > best.end)) victim = i;
+            }
+            // Evict the victim (whole-spill) and give its register to `iv` only when the victim's
+            // next use is strictly further than `iv`'s own, else whole-spill `iv` instead.
+            const vic_nu = nextUseOrEnd(lin.use_positions, active.items[victim].value, active.items[victim].end, p);
+            const iv_nu = nextUseOrEnd(lin.use_positions, iv.value, iv.end, p);
+            if (vic_nu > iv_nu) {
                 const v = active.items[victim];
-                try loc_of.put(allocator, v.value, .{ .spill = num_slots.* });
-                num_slots.* += 1;
+                const vidx = @intFromEnum(v.value);
+                // TAIL-SPLIT the victim when it is intra with a register prefix: keep its register
+                // for the hot prefix `[def, p)`, move to a fresh slot for the cold tail `[p, end)`,
+                // and record a store at `p`. Its old whole-life `.reg` entry (if any) is shadowed by
+                // the segments (loc() checks segments first), so removing it is cosmetic but cleaner.
+                // The `across` branch force-whole-spills before we ever reach here, so an active
+                // victim is never a cross-call value, and every GPR use is reloadable, so splitting
+                // is fully general. Cross-block and param victims (`!is_intra`) whole-spill.
+                if (lin.is_intra[vidx] and lin.def_pos[vidx] < p) {
+                    if (segments.get(v.value)) |segs| {
+                        // Already tail-split then SECOND-CHANCE RE-HOMED into `v.reg`, so its last
+                        // segment is a `.reg`. Two sub-cases by whether that re-home's reload has fired
+                        // yet at `p`:
+                        const last = segs[segs.len - 1];
+                        std.debug.assert(last.loc == .reg);
+                        if (last.from > p) {
+                            // PENDING re-home: pressure reclaims `v.reg` BEFORE the reload at
+                            // `last.from` runs, so the value is still physically in its previous slot
+                            // here and never re-enters a register. Cancel the re-home (drop the trailing
+                            // `.reg` segment and its reload action) rather than append an out-of-order
+                            // slot. The value stays in that prior slot (no store, its bits are there)
+                            // and `v.reg` frees for the taker.
+                            try cancelReHome(allocator, segments, actions, v.value);
+                        } else {
+                            // ACTIVE re-home (`last.from <= p`): the value truly lives in `v.reg` at
+                            // `p`. Spill that register's live part from `p` onward. The append lands at
+                            // or after the re-home position, so segment order is preserved.
+                            const slot = num_slots.*;
+                            num_slots.* += 1;
+                            try appendSegment(allocator, segments, v.value, .{ .from = p, .loc = .{ .spill = slot } });
+                            try actions.append(allocator, .{ .at = p, .kind = .store, .value = v.value, .reg = v.reg, .slot = slot });
+                        }
+                    } else {
+                        // FIRST split: keep its register for the hot prefix `[def, p)`, move to a fresh
+                        // slot for the cold tail `[p, end)`, and record a store at `p`.
+                        const slot = num_slots.*;
+                        num_slots.* += 1;
+                        const segs = try allocator.alloc(Segment, 2);
+                        segs[0] = .{ .from = lin.def_pos[vidx], .loc = .{ .reg = v.reg } };
+                        segs[1] = .{ .from = p, .loc = .{ .spill = slot } };
+                        segments.put(allocator, v.value, segs) catch |e| {
+                            allocator.free(segs);
+                            return e;
+                        };
+                        try actions.append(allocator, .{ .at = p, .kind = .store, .value = v.value, .reg = v.reg, .slot = slot });
+                        _ = loc_of.remove(v.value);
+                    }
+                } else {
+                    try loc_of.put(allocator, v.value, .{ .spill = num_slots.* });
+                    num_slots.* += 1;
+                }
                 try loc_of.put(allocator, iv.value, .{ .reg = v.reg });
                 active.items[victim] = .{ .end = iv.end, .value = iv.value, .reg = v.reg };
             } else {
@@ -1383,6 +1951,11 @@ fn assignRegs(allocator: std.mem.Allocator, func: *const Function, loc_of: *std.
                 num_slots.* += 1;
             }
         }
+
+        // `iv` is now placed. Offer any leftover free registers to slot-resident split values whose
+        // tail is still ahead, re-homing them so their remaining uses read a register. Runs after
+        // placement so it can only ever hand out registers `iv` did not need.
+        try secondChance(allocator, &lin, &free, &active, segments, actions, iv.start);
     }
 }
 
@@ -1547,6 +2120,174 @@ test "selects a straight-line arithmetic function" {
     const code = try selectFunction(allocator, &func);
     defer allocator.free(code);
     try std.testing.expectEqual(@as(u8, 0xC3), code[code.len - 1]); // ends in ret
+}
+
+test "x86-64 eviction spills the furthest-next-use value, not the furthest-end one" {
+    // Belady/MIN spill selection: when the GPR pool is exhausted the allocator must spill the
+    // active value whose NEXT USE lies furthest ahead, not the one whose interval merely ENDS
+    // furthest. The function below is crafted so the two heuristics disagree on exactly one
+    // forced spill. Seven i32 constants fill the seven-register GPR pool, then an eighth
+    // definition (`trig`) forces one spill:
+    //   far_end is used once soon (its next use is close) but again very late, so its interval
+    //           END is the furthest of all candidates. The old furthest-end rule spills it.
+    //   far_use is used exactly once, further ahead than far_end's soon use, so its NEXT USE is
+    //           the furthest of all candidates. The new Belady rule spills it.
+    // The assertions hold only for the next-use rule and both fail for the furthest-end rule.
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const b = try func.appendBlock();
+
+    const far_use = try func.appendInst(b, t, .{ .iconst = 300 });
+    const far_end = try func.appendInst(b, t, .{ .iconst = 400 });
+    var fillers: [5]Value = undefined;
+    for (&fillers, 0..) |*fv, i| fv.* = try func.appendInst(b, t, .{ .iconst = @intCast(i + 1) });
+    // The eighth live value: exhausts the seven-register pool and forces the single spill. It
+    // consumes two fillers so their intervals end exactly here (they are the smallest next-use
+    // candidates and are never chosen as the victim).
+    const trig = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = fillers[0], .rhs = fillers[1] } });
+
+    // Tail accumulator: each add sets a candidate's next-use / interval-end. far_end is used
+    // once soon (here) and once at the very end; far_use exactly once, further ahead than
+    // far_end's soon use; the remaining fillers drain between them so pressure only falls.
+    var acc = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = trig, .rhs = far_end } });
+    acc = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = fillers[2] } });
+    acc = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = fillers[3] } });
+    acc = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = fillers[4] } });
+    // far_use's sole use, the furthest NEXT use of any candidate at the spill point.
+    acc = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = far_use } });
+    // far_end's final use, the furthest interval END of any candidate.
+    acc = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = far_end } });
+    func.setTerminator(b, .{ .ret = acc });
+
+    var loc_of: std.AutoHashMapUnmanaged(Value, Loc) = .{};
+    defer loc_of.deinit(allocator);
+    var num_slots: u32 = 0;
+    var def_pos: []u32 = &.{};
+    defer allocator.free(def_pos);
+    var segments: std.AutoHashMapUnmanaged(Value, []Segment) = .{};
+    defer {
+        var it = segments.valueIterator();
+        while (it.next()) |s| allocator.free(s.*);
+        segments.deinit(allocator);
+    }
+    var actions: std.ArrayList(SplitAction) = .empty;
+    defer actions.deinit(allocator);
+    try assignRegs(allocator, &func, &loc_of, &num_slots, &def_pos, &segments, &actions);
+
+    // Exactly the next-use victim is evicted: far_use (furthest next use), not far_end (furthest
+    // end). far_use is intra with a register prefix, so eviction TAIL-SPLITS it (register prefix,
+    // spill tail) rather than whole-spilling, and its whole-life `loc_of` entry is removed. far_end
+    // stays whole in a register. The old furthest-end heuristic would evict far_end instead, so
+    // neither the split-of-far_use nor the register-for-far_end assertion would hold. After the split
+    // the fillers drain and pressure falls, so SECOND-CHANCE (Task 7d) re-homes far_use into a freed
+    // register at its sole tail use, appending a trailing `.reg` segment: the split shape is
+    // `.reg` (hot prefix) -> `.spill` (cold tail) -> `.reg` (re-home).
+    try std.testing.expect(loc_of.get(far_use) == null);
+    const far_use_segs = segments.get(far_use).?;
+    try std.testing.expectEqual(@as(usize, 3), far_use_segs.len);
+    try std.testing.expect(far_use_segs[0].loc == .reg);
+    try std.testing.expect(far_use_segs[1].loc == .spill);
+    try std.testing.expect(far_use_segs[2].loc == .reg);
+    try std.testing.expect(segments.get(far_end) == null);
+    try std.testing.expect(loc_of.get(far_end).? == .reg);
+}
+
+test "x86-64 loc returns the whole-life location for an unsplit value" {
+    // A tiny no-spill int function: every value stays in one register for its whole life, so
+    // `segments` is empty. The segment-aware `loc` must return exactly the `loc_of` location at
+    // every position, proving the fallback path is byte-identical while nothing is split (Task 7c
+    // fills `segments`).
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const b = try func.appendBlock();
+    const a = try func.appendBlockParam(b, t);
+    const bp = try func.appendBlockParam(b, t);
+    const sum = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = a, .rhs = bp } });
+    const prod = try func.appendInst(b, t, .{ .arith = .{ .op = .mul, .lhs = sum, .rhs = bp } });
+    func.setTerminator(b, .{ .ret = prod });
+
+    var ctx = Ctx{ .func = &func };
+    defer ctx.loc_of.deinit(allocator);
+    defer {
+        var seg_it = ctx.segments.valueIterator();
+        while (seg_it.next()) |s| allocator.free(s.*);
+        ctx.segments.deinit(allocator);
+    }
+    defer allocator.free(ctx.def_pos);
+    defer ctx.actions.deinit(allocator);
+    var num_slots: u32 = 0;
+    try assignRegs(allocator, &func, &ctx.loc_of, &num_slots, &ctx.def_pos, &ctx.segments, &ctx.actions);
+
+    // Nothing was split.
+    try std.testing.expectEqual(@as(usize, 0), ctx.segments.count());
+
+    // At several positions the segment-aware loc equals the whole-life loc_of location.
+    const values = [_]Value{ a, bp, sum, prod };
+    const positions = [_]u32{ 0, 1, 2, 3, 4, 5 };
+    for (positions) |p| {
+        ctx.pos = p;
+        for (values) |v| {
+            try std.testing.expectEqual(ctx.loc_of.get(v).?, ctx.loc(v));
+        }
+    }
+}
+
+test "nextUseAfter finds the first strictly-greater use" {
+    try std.testing.expectEqual(@as(?u32, 9), nextUseAfter(&.{ 2, 5, 9 }, 5));
+    try std.testing.expectEqual(@as(?u32, 5), nextUseAfter(&.{ 2, 5, 9 }, 2));
+    try std.testing.expectEqual(@as(?u32, 2), nextUseAfter(&.{ 2, 5, 9 }, 0));
+    try std.testing.expectEqual(@as(?u32, null), nextUseAfter(&.{ 2, 5, 9 }, 9));
+    try std.testing.expectEqual(@as(?u32, null), nextUseAfter(&.{}, 0));
+}
+
+test "x86-64 local liveness records intra predicate and ascending use positions" {
+    // V is defined and used ONLY in its def block (intra-splittable). W is defined in the entry
+    // block and passed as an edge argument to a successor (not intra). X is defined in the entry
+    // block but used by a normal instruction in a DIFFERENT block (not intra). Params are never
+    // intra. This exercises the local split-liveness the eviction heuristic and later splitting
+    // tasks read.
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+
+    const b0 = try func.appendBlock();
+    const b1 = try func.appendBlock();
+    const a = try func.appendBlockParam(b0, t);
+    const bp = try func.appendBlockParam(b0, t);
+    const pparam = try func.appendBlockParam(b1, t);
+
+    const v = try func.appendInst(b0, t, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = bp } });
+    _ = try func.appendInst(b0, t, .{ .arith = .{ .op = .add, .lhs = v, .rhs = bp } }); // V's sole use, in its def block
+    const w = try func.appendInst(b0, t, .{ .arith = .{ .op = .add, .lhs = a, .rhs = bp } });
+    const x = try func.appendInst(b0, t, .{ .arith = .{ .op = .mul, .lhs = bp, .rhs = bp } });
+    const cond = try func.appendInst(b0, bool_t, .{ .icmp = .{ .op = .le, .lhs = a, .rhs = bp } });
+    try func.appendIf(b0, cond, .{ .target = b1, .args = &.{w} }, .{ .target = b1, .args = &.{w} }); // W flows as an edge arg
+
+    const xuse = try func.appendInst(b1, t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = pparam } }); // X used in b1, a different block
+    func.setTerminator(b1, .{ .ret = xuse });
+
+    var lin = try computeLocalLiveness(allocator, &func);
+    defer lin.deinit(allocator);
+
+    try std.testing.expect(lin.is_intra[@intFromEnum(v)]);
+    try std.testing.expect(!lin.is_intra[@intFromEnum(w)]);
+    try std.testing.expect(!lin.is_intra[@intFromEnum(x)]);
+    try std.testing.expect(!lin.is_intra[@intFromEnum(a)]);
+    try std.testing.expect(!lin.is_intra[@intFromEnum(bp)]);
+    try std.testing.expect(!lin.is_intra[@intFromEnum(pparam)]);
+
+    // V's use positions are non-empty and strictly ascending, and def_pos precedes the first use.
+    const vuses = lin.use_positions[@intFromEnum(v)];
+    try std.testing.expect(vuses.len > 0);
+    try std.testing.expect(lin.def_pos[@intFromEnum(v)] < vuses[0]);
+    var i: usize = 1;
+    while (i < vuses.len) : (i += 1) try std.testing.expect(vuses[i] > vuses[i - 1]);
 }
 
 test "a call keeps RSP 16-aligned at the call site (movaps-safe host calls)" {

@@ -146,10 +146,40 @@ pub const Compiled = struct {
     }
 };
 
+/// Where a value lives at a given program point: a register or a stack spill slot. A whole-life
+/// value has one location for its entire range (today's `reg`/`spill`); a split value has several,
+/// selected by position through `segments`.
+const Location = union(enum) { reg: Reg, slot: u32 };
+
+/// One piece of a split value's life: the value lives in `loc` from position `from` until the next
+/// segment (or, for the last one, to the end of its range). `segments[0].from` is the value's def
+/// position, so a lookup at any position at or after the def resolves to some segment.
+const Segment = struct { from: u32, loc: Location };
+
+/// A store or reload the emitter must insert at a split boundary. `at` is the instruction position
+/// the action lands before (the position at which the pool was exhausted for a tail split). `store`
+/// writes the victim's register to its new slot before the taker overwrites the register at `at`.
+/// `reload` (Task 5) brings a value back into a register. `value` selects the ldr/str form
+/// (vector vs fp vs gpr).
+const SplitAction = struct {
+    at: u32,
+    kind: enum { store, reload },
+    value: Value,
+    reg: Reg,
+    slot: u32,
+};
+
 /// The result of register allocation.
 const Allocation = struct {
     reg: RegMap = .empty, // value -> register (index, class implied by the value type)
     spill: std.AutoHashMapUnmanaged(Value, u32) = .empty, // value -> spill slot index
+    // Split values only: value -> ascending-by-`from` segment list. Empty means no value was split,
+    // so `locationAt` falls back to `reg`/`spill` and emission is byte-identical to before splitting.
+    segments: std.AutoHashMapUnmanaged(Value, []Segment) = .empty,
+    // Stores/reloads to emit at split boundaries, appended in monotonically-ascending `at` order.
+    // Empty means no value was split, so emission is byte-identical to before splitting.
+    actions: std.ArrayList(SplitAction) = .empty,
+    def_pos: []u32 = &.{}, // per value: its definition position (copied from Liveness, and the emission assert reads it)
     saved_gpr: std.ArrayList(Reg) = .empty, // callee-saved x-registers used (non-leaf)
     saved_fpr: std.ArrayList(Reg) = .empty, // callee-saved v-registers used (non-leaf)
     spill_count: u32 = 0,
@@ -157,6 +187,13 @@ const Allocation = struct {
     fn deinit(self: *Allocation, allocator: std.mem.Allocator) void {
         self.reg.deinit(allocator);
         self.spill.deinit(allocator);
+        var seg_it = self.segments.valueIterator();
+        while (seg_it.next()) |segs| allocator.free(segs.*);
+        self.segments.deinit(allocator);
+        self.actions.deinit(allocator);
+        // `def_pos` is always a heap-owned dupe (the `&.{}` sentinel is a zero-length slice with no
+        // backing allocation, and freeing that is a no-op), so an unconditional free is safe.
+        allocator.free(self.def_pos);
         self.saved_gpr.deinit(allocator);
         self.saved_fpr.deinit(allocator);
     }
@@ -310,6 +347,24 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
     var alloc = try allocate(allocator, func, leaf);
     defer alloc.deinit(allocator);
 
+    // Split-boundary actions are appended in monotonic `at` order already; sort defensively so the
+    // per-instruction drain below can advance a single cursor. At the SAME position a `.reload` must
+    // precede a `.store`: a value can be reloaded slot->reg and then immediately re-spilled reg->slot
+    // at one use position, and the reload has to run first or the store would save a stale register.
+    // `std.mem.sort` is not stable, so the comparator breaks `at` ties on kind (reload before store).
+    std.mem.sort(SplitAction, alloc.actions.items, {}, struct {
+        fn order(k: @TypeOf(@as(SplitAction, undefined).kind)) u8 {
+            return switch (k) {
+                .reload => 0,
+                .store => 1,
+            };
+        }
+        fn f(_: void, a: SplitAction, b: SplitAction) bool {
+            if (a.at != b.at) return a.at < b.at;
+            return order(a.kind) < order(b.kind);
+        }
+    }.f);
+
     // Frame, from sp upward: [outgoing stack args][saved lr][callee-saved x-regs]
     // [callee-saved v-regs][alloca slots][spill slots]. The outgoing-arg area sits at
     // the bottom, exactly where a callee reads its incoming stack arguments. lr is
@@ -413,8 +468,22 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
         }
     }
 
-    const ctx = Ctx{ .func = func, .alloc = &alloc, .spill_base = spill_base, .alloca_base = alloca_base, .alloca_off = &alloca_off, .fp16 = fp16 };
+    var ctx = Ctx{
+        .func = func,
+        .alloc = &alloc,
+        .spill_base = spill_base,
+        .alloca_base = alloca_base,
+        .alloca_off = &alloca_off,
+        .fp16 = fp16,
+        .pos = 0,
+    };
 
+    // `pos` mirrors `linearize`'s position counter EXACTLY so `ctx.pos` (set per instruction below)
+    // matches the position each value's location was computed for. Per block: the block-parameter row
+    // occupies one position, then each instruction one position, and the terminator shares the
+    // block-end position (`block_end[bi]`), after which one final increment lands on the next block.
+    var pos: u32 = 0;
+    var action_cursor: usize = 0;
     for (0..nblocks) |bi| {
         const block: Block = @enumFromInt(bi);
         if (fetch_align > 4 and is_loop_header[bi]) {
@@ -424,8 +493,13 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
         block_start[bi] = code.items.len;
         var terminated = false;
 
+        pos += 1; // the block-parameter row. `pos` is now the first instruction's position
         const insts = func.blockInsts(block);
         for (insts, 0..) |inst, inst_idx| {
+            // Set the current position from the block base plus the instruction index (robust to the
+            // `continue`s below, which a trailing increment would skip). This equals what `linearize`
+            // numbered this instruction, so the assert below pins the two numberings together.
+            ctx.pos = pos + @as(u32, @intCast(inst_idx));
             // Record a source-line row when this instruction begins a new line (its
             // `debug.line` attribute differs from the previous instruction's).
             if (lineOf(func, inst)) |line| {
@@ -434,10 +508,48 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                     last_line = line;
                 }
             }
+            // The pos coupling is otherwise unobservable while `segments` is empty, so assert it now:
+            // an instruction with a result must be emitted at exactly that result's def position.
+            if (func.instResult(inst)) |r| std.debug.assert(ctx.pos == alloc.def_pos[@intFromEnum(r)]);
+            // Drain split-boundary actions landing at this position BEFORE emitting the instruction.
+            // A tail-split store writes the victim's register to its slot before the taker `iv` (the
+            // instruction defined at `p`) computes its result into that same register. The victim's
+            // value is still in the register here (its last prefix use is before `p`, and nothing
+            // reused the register before `p`), so the store captures the correct bits.
+            while (action_cursor < alloc.actions.items.len and alloc.actions.items[action_cursor].at <= ctx.pos) {
+                const act = alloc.actions.items[action_cursor];
+                std.debug.assert(act.at == ctx.pos); // actions land on instruction positions only
+                switch (act.kind) {
+                    .store => {
+                        const off: u15 = @intCast(spill_base + act.slot * 16);
+                        if (isVector(func, act.value)) {
+                            try code.append(allocator, encode.strQ(act.reg, sp, off));
+                        } else if (regClass(func, act.value) == .fpr) {
+                            try code.append(allocator, encode.strFp(act.reg, sp, off, true));
+                        } else {
+                            try code.append(allocator, encode.strOff(act.reg, sp, off));
+                        }
+                    },
+                    .reload => {
+                        // Second-chance reload: bring `act.value` back from its slot into `act.reg`
+                        // just before its next use, mirroring `loadOp`'s slot path. From here on its
+                        // `.reg` re-home segment makes `locationAt` read the register directly.
+                        const off: u15 = @intCast(spill_base + act.slot * 16);
+                        if (isVector(func, act.value)) {
+                            try code.append(allocator, encode.ldrQ(act.reg, sp, off));
+                        } else if (regClass(func, act.value) == .fpr) {
+                            try code.append(allocator, encode.ldrFp(act.reg, sp, off, true));
+                        } else {
+                            try code.append(allocator, encode.ldrOff(act.reg, sp, off));
+                        }
+                    },
+                }
+                action_cursor += 1;
+            }
             switch (func.opcode(inst)) {
                 .iconst => |c| {
                     const result = func.instResult(inst).?;
-                    const rd = resultReg(&alloc, func, result);
+                    const rd = ctx.resultReg(result);
                     if (regClass(func, result) == .fpr) {
                         // A float-typed integer constant (the frontend zero-inits float
                         // locals this way). The result lives in an fp register, so the
@@ -460,7 +572,7 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                 },
                 .fconst => |val| {
                     const result = func.instResult(inst).?;
-                    const rd = resultReg(&alloc, func, result);
+                    const rd = ctx.resultReg(result);
                     const d = isDouble(func, result);
                     if (fp16 and isHalf(func, result)) {
                         // Native (fp16): materialize the raw 16-bit IEEE-half pattern of the
@@ -507,7 +619,7 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                     const result = func.instResult(inst).?;
                     const rl = try ctx.loadOp(allocator, &code, a.lhs, spill_op[0]);
                     try loadConst(allocator, &code, spill_op[1], a.imm); // imm in x14, x16 stays free for rem
-                    const rd = resultReg(&alloc, func, result);
+                    const rd = ctx.resultReg(result);
                     try emitBinary(allocator, &code, a.op, rd, rl, spill_op[1], isSignedInt(func, a.lhs), isWide(func, result));
                     try storeResult(allocator, &code, ctx, result, rd);
                 },
@@ -526,7 +638,7 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                         // != is the bitwise complement of ==.
                         const rl = try ctx.loadOp(allocator, &code, cmp.lhs, fp_spill_op[0]);
                         const rr = try ctx.loadOp(allocator, &code, cmp.rhs, fp_spill_op[1]);
-                        const rd = resultReg(&alloc, func, result);
+                        const rd = ctx.resultReg(result);
                         switch (cmp.op) {
                             .eq => try code.append(allocator, encode.fcmeqVec(rd, rl, rr)),
                             .ne => {
@@ -544,7 +656,7 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                     if (regClass(func, cmp.lhs) == .fpr) {
                         const rl = try ctx.loadOp(allocator, &code, cmp.lhs, fp_spill_op[0]);
                         const rr = try ctx.loadOp(allocator, &code, cmp.rhs, fp_spill_op[1]);
-                        const rd = resultReg(&alloc, func, result);
+                        const rd = ctx.resultReg(result);
                         // Native f16 (fp16) compares in the H form; emulation compares the S-held
                         // f32 widening (fkindOf yields `.single`, byte-identical to before).
                         try code.append(allocator, encode.fcmp(rl, rr, fkindOf(func, cmp.lhs, fp16)));
@@ -553,7 +665,7 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                     } else {
                         const rl = try ctx.loadOp(allocator, &code, cmp.lhs, spill_op[0]);
                         const rr = try ctx.loadOp(allocator, &code, cmp.rhs, spill_op[1]);
-                        const rd = resultReg(&alloc, func, result);
+                        const rd = ctx.resultReg(result);
                         try code.append(allocator, encode.cmp(rl, rr));
                         try code.append(allocator, encode.cset(rd, condFor(cmp.op, isSignedInt(func, cmp.lhs))));
                         try storeResult(allocator, &code, ctx, result, rd);
@@ -574,7 +686,7 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                         // every allocation pool) so it never aliases then/else/the result.
                         try code.append(allocator, encode.movVec(fp_move, cm));
                         try code.append(allocator, encode.bslVec(fp_move, tr, el));
-                        const rd = resultReg(&alloc, func, result);
+                        const rd = ctx.resultReg(result);
                         if (@intFromEnum(rd) != @intFromEnum(fp_move)) try code.append(allocator, encode.movVec(rd, fp_move));
                         try storeResult(allocator, &code, ctx, result, rd);
                         continue;
@@ -583,7 +695,7 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                     if (regClass(func, result) == .fpr) {
                         const tr = try ctx.loadOp(allocator, &code, s.then, fp_spill_op[0]);
                         const el = try ctx.loadOp(allocator, &code, s.@"else", fp_spill_op[1]);
-                        const rd = resultReg(&alloc, func, result);
+                        const rd = ctx.resultReg(result);
                         try code.append(allocator, encode.cmp(c, .zr));
                         // Native f16 (fp16) selects in the H form; emulation selects the S-held
                         // f32 widening (fkindOf yields `.single`, byte-identical to before).
@@ -592,7 +704,7 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                     } else {
                         const tr = try ctx.loadOp(allocator, &code, s.then, spill_op[1]);
                         const el = try ctx.loadOp(allocator, &code, s.@"else", scratch_imm);
-                        const rd = resultReg(&alloc, func, result);
+                        const rd = ctx.resultReg(result);
                         try code.append(allocator, encode.cmp(c, .zr));
                         try code.append(allocator, encode.csel(rd, tr, el, .ne));
                         try storeResult(allocator, &code, ctx, result, rd);
@@ -603,7 +715,7 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                     const sc = regClass(func, cv.value);
                     const dc = regClass(func, result);
                     const src = try ctx.loadOp(allocator, &code, cv.value, if (sc == .fpr) fp_spill_op[0] else spill_op[0]);
-                    const rd = resultReg(&alloc, func, result);
+                    const rd = ctx.resultReg(result);
                     if (sc == .gpr and dc == .fpr) {
                         // int -> float: scvtf/ucvtf. NATIVE (fp16) converts straight into the H
                         // view (single-rounded, no fixup). EMULATION lands an int->f16 in the S
@@ -679,7 +791,7 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                     // Vectorized unary (a widened FS lane-op over <4 x f32>): NEON sqrt.
                     const result = func.instResult(inst).?;
                     const src = try ctx.loadOp(allocator, &code, u.value, fp_spill_op[0]);
-                    const rd = resultReg(&alloc, func, result);
+                    const rd = ctx.resultReg(result);
                     try code.append(allocator, switch (u.op) {
                         .sqrt => encode.fsqrtVec(rd, src),
                         else => return error.Unsupported,
@@ -690,7 +802,7 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                     const sc = regClass(func, u.value);
                     const dc = regClass(func, result);
                     const src = try ctx.loadOp(allocator, &code, u.value, if (sc == .fpr) fp_spill_op[0] else spill_op[0]);
-                    const rd = resultReg(&alloc, func, result);
+                    const rd = ctx.resultReg(result);
                     if (u.op == .reinterpret) {
                         if (sc == .gpr and dc == .fpr) {
                             try code.append(allocator, encode.fmovFromGpr(rd, src, isDouble(func, result)));
@@ -721,14 +833,14 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                 .alloca => {
                     const result = func.instResult(inst).?;
                     const off = alloca_base + alloca_off.get(result).?;
-                    const rd = resultReg(&alloc, func, result);
+                    const rd = ctx.resultReg(result);
                     try emitFrameImm(allocator, &code, false, rd, sp, off);
                     try storeResult(allocator, &code, ctx, result, rd);
                 },
                 .load => |l| {
                     const result = func.instResult(inst).?;
                     const base = try ctx.loadOp(allocator, &code, l.ptr, spill_op[0]); // ptr is a gpr
-                    const rd = resultReg(&alloc, func, result);
+                    const rd = ctx.resultReg(result);
                     try emitLoad(allocator, &code, func, result, rd, base, fp16);
                     try storeResult(allocator, &code, ctx, result, rd);
                 },
@@ -749,7 +861,7 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                     if (!isVector(func, e.aggregate)) return error.Unsupported;
                     const result = func.instResult(inst).?;
                     const src = try ctx.loadOp(allocator, &code, e.aggregate, fp_spill_op[0]);
-                    const rd = resultReg(&alloc, func, result);
+                    const rd = ctx.resultReg(result);
                     try code.append(allocator, encode.dupLane(rd, src, @intCast(e.index)));
                     try storeResult(allocator, &code, ctx, result, rd);
                 },
@@ -761,7 +873,7 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                     if (!isVector(func, result)) return error.Unsupported;
                     const fields = func.valueList(sn.fields);
                     if (fields.len != 4) return error.Unsupported; // <4 x f32> only for now
-                    const rd = resultReg(&alloc, func, result);
+                    const rd = ctx.resultReg(result);
                     // A splat (every lane the same scalar) is one `dup` from that scalar's lane 0,
                     // not four inserts. This is what makes the vectorizer's invariant operand (e.g.
                     // the SAXPY multiplier) cheap enough to fuse on a wide core.
@@ -802,7 +914,7 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                     try relocs.append(allocator, .{ .offset = code.items.len, .symbol = func.symbolName(c.symbol) });
                     try code.append(allocator, encode.bl(0));
                     if (func.instResult(inst)) |result| {
-                        const rd = resultReg(&alloc, func, result);
+                        const rd = ctx.resultReg(result);
                         try code.append(allocator, if (regClass(func, result) == .fpr) encode.fmovReg(rd, @enumFromInt(0)) else encode.mov(rd, .x0));
                         try storeResult(allocator, &code, ctx, result, rd);
                     }
@@ -833,7 +945,7 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                     }
                     try code.append(allocator, encode.blr(scratch_imm));
                     if (func.instResult(inst)) |result| {
-                        const rd = resultReg(&alloc, func, result);
+                        const rd = ctx.resultReg(result);
                         try code.append(allocator, if (regClass(func, result) == .fpr) encode.fmovReg(rd, @enumFromInt(0)) else encode.mov(rd, .x0));
                         try storeResult(allocator, &code, ctx, result, rd);
                     }
@@ -856,7 +968,7 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                     const rb = try ctx.loadOp(allocator, &code, d.b, fp_spill_res);
                     try code.append(allocator, encode.movVec(fp_move, racc));
                     try code.append(allocator, if (dotSigned(func, d.a)) encode.sdot(fp_move, ra, rb) else encode.udot(fp_move, ra, rb));
-                    const rd = resultReg(&alloc, func, result);
+                    const rd = ctx.resultReg(result);
                     if (@intFromEnum(rd) != @intFromEnum(fp_move)) try code.append(allocator, encode.movVec(rd, fp_move));
                     try storeResult(allocator, &code, ctx, result, rd);
                 },
@@ -864,24 +976,63 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
             }
         }
 
+        // After the instruction loop `pos` is the block-end (terminator) position, exactly where
+        // `linearize` numbers a jump/ret terminator's operands. An `if` terminator is one of the
+        // instructions above (it set `terminated`), so this only positions ret/jump.
+        pos += @intCast(insts.len);
+        ctx.pos = pos;
+        // Drain any split-boundary actions recorded AT the terminator position BEFORE emitting the
+        // terminator. `secondChance` can re-home a value used only by `ret` (a non-edge-arg operand,
+        // hence `is_intra`) at its next use, which is the terminator position (`block_end`), recording
+        // a `.reload` there. The per-instruction drain above only reaches `term_pos - 1`, so without
+        // this drain the reload is never emitted and `ret` reads a register that was never loaded. When
+        // no action lands on a terminator (the normal case) this drains nothing and is byte-identical.
+        while (action_cursor < alloc.actions.items.len and alloc.actions.items[action_cursor].at <= ctx.pos) {
+            const act = alloc.actions.items[action_cursor];
+            std.debug.assert(act.at == ctx.pos); // only terminator-position actions remain here
+            switch (act.kind) {
+                .store => {
+                    const off: u15 = @intCast(spill_base + act.slot * 16);
+                    if (isVector(func, act.value)) {
+                        try code.append(allocator, encode.strQ(act.reg, sp, off));
+                    } else if (regClass(func, act.value) == .fpr) {
+                        try code.append(allocator, encode.strFp(act.reg, sp, off, true));
+                    } else {
+                        try code.append(allocator, encode.strOff(act.reg, sp, off));
+                    }
+                },
+                .reload => {
+                    const off: u15 = @intCast(spill_base + act.slot * 16);
+                    if (isVector(func, act.value)) {
+                        try code.append(allocator, encode.ldrQ(act.reg, sp, off));
+                    } else if (regClass(func, act.value) == .fpr) {
+                        try code.append(allocator, encode.ldrFp(act.reg, sp, off, true));
+                    } else {
+                        try code.append(allocator, encode.ldrOff(act.reg, sp, off));
+                    }
+                },
+            }
+            action_cursor += 1;
+        }
         if (!terminated) {
             switch (func.terminator(block) orelse Terminator{ .ret = null }) {
                 .ret => |v| {
                     if (v) |value| {
+                        // The return value is a non-param value, so its location is read through
+                        // `locationAt` at the terminator position (ctx.pos == block_end here). With no
+                        // splits this is byte-identical to today's direct `reg`/`spill` reads.
                         if (regClass(func, value) == .fpr) {
                             const vec = isVector(func, value);
-                            if (alloc.spill.get(value)) |slot| {
-                                const off: u15 = @intCast(spill_base + slot * 16);
-                                try code.append(allocator, if (vec) encode.ldrQ(@enumFromInt(0), sp, off) else encode.ldrFp(@enumFromInt(0), sp, off, true));
-                            } else {
-                                const src = alloc.reg.get(value).?;
-                                if (@intFromEnum(src) != 0) try code.append(allocator, if (vec) encode.movVec(@enumFromInt(0), src) else encode.fmovReg(@enumFromInt(0), src));
+                            switch (ctx.locationAt(value)) {
+                                .slot => |slot| {
+                                    const off: u15 = @intCast(spill_base + slot * 16);
+                                    try code.append(allocator, if (vec) encode.ldrQ(@enumFromInt(0), sp, off) else encode.ldrFp(@enumFromInt(0), sp, off, true));
+                                },
+                                .reg => |src| if (@intFromEnum(src) != 0) try code.append(allocator, if (vec) encode.movVec(@enumFromInt(0), src) else encode.fmovReg(@enumFromInt(0), src)),
                             }
-                        } else if (alloc.spill.get(value)) |slot| {
-                            try code.append(allocator, encode.ldrOff(.x0, sp, @intCast(spill_base + slot * 16)));
-                        } else {
-                            const src = alloc.reg.get(value).?;
-                            if (src != .x0) try code.append(allocator, encode.mov(.x0, src));
+                        } else switch (ctx.locationAt(value)) {
+                            .slot => |slot| try code.append(allocator, encode.ldrOff(.x0, sp, @intCast(spill_base + slot * 16))),
+                            .reg => |src| if (src != .x0) try code.append(allocator, encode.mov(.x0, src)),
                         }
                     }
                     if (!leaf) {
@@ -895,14 +1046,24 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                 .jump => |j| try ctx.emitJump(allocator, &code, &fixups, j),
             }
         }
+        pos += 1; // the terminator's own position slot (mirrors linearize's per-block final increment)
     }
+
+    // Every recorded split-boundary action must have been drained by a per-instruction or the
+    // terminator-position drain above. A leftover action means an `at` no emission position reached: a
+    // numbering bug that would silently drop a store/reload. Fail loudly instead of miscompiling.
+    std.debug.assert(action_cursor == alloc.actions.items.len);
 
     for (fixups.items) |f| {
         const off: i28 = @intCast((@as(i64, @intCast(block_start[f.target])) - @as(i64, @intCast(f.at))) * 4);
         code.items[f.at] = encode.b(off);
     }
 
-    return .{ .code = try code.toOwnedSlice(allocator), .relocs = try relocs.toOwnedSlice(allocator), .lines = try lines.toOwnedSlice(allocator) };
+    return .{
+        .code = try code.toOwnedSlice(allocator),
+        .relocs = try relocs.toOwnedSlice(allocator),
+        .lines = try lines.toOwnedSlice(allocator),
+    };
 }
 
 const Terminator = ir.function.Terminator;
@@ -918,20 +1079,55 @@ const Ctx = struct {
     /// Whether to lower f16 with NATIVE FEAT_FP16 H-form ops instead of the emulation. Threaded
     /// from `compileFunction`'s `caps.fp16`; false for every non-model caller (byte-identical).
     fp16: bool = false,
+    /// The current instruction position, mirrored from the allocator's `linearize` numbering and
+    /// advanced by the emission loop. `locationAt` reads it to pick a split value's active segment.
+    pos: u32 = 0,
 
-    /// The register holding `v`: its assigned register, or reload a spilled value into
-    /// `scratch` (a register of `v`'s class). A SIMD vector reloads all 128 bits.
-    fn loadOp(self: Ctx, allocator: std.mem.Allocator, code: *std.ArrayList(u32), v: Value, scratch: Reg) Error!Reg {
-        if (self.alloc.reg.get(v)) |r| return r;
-        const off: u15 = @intCast(self.spill_base + self.alloc.spill.get(v).? * 16);
-        if (isVector(self.func, v)) {
-            try code.append(allocator, encode.ldrQ(scratch, sp, off));
-        } else if (regClass(self.func, v) == .fpr) {
-            try code.append(allocator, encode.ldrFp(scratch, sp, off, true));
-        } else {
-            try code.append(allocator, encode.ldrOff(scratch, sp, off));
+    /// The location of `v` at the current instruction position (`self.pos`): its active segment if
+    /// `v` was split, otherwise its whole-life register or spill slot. With no splits (segments
+    /// empty) this is exactly today's `reg`/`spill` lookup.
+    fn locationAt(self: Ctx, v: Value) Location {
+        if (self.alloc.segments.get(v)) |segs| {
+            // `segs` is non-empty and ascending by `from`, with `segs[0].from` == v's def position,
+            // so the last segment whose `from` is at or before `pos` is the active one.
+            var chosen = segs[0];
+            for (segs) |s| {
+                if (s.from <= self.pos) chosen = s else break;
+            }
+            return chosen.loc;
         }
-        return scratch;
+        if (self.alloc.reg.get(v)) |r| return .{ .reg = r };
+        return .{ .slot = self.alloc.spill.get(v).? };
+    }
+
+    /// The register holding `v` at the current position: its assigned register, or reload a
+    /// spilled value into `scratch` (a register of `v`'s class). A SIMD vector reloads all 128 bits.
+    fn loadOp(self: Ctx, allocator: std.mem.Allocator, code: *std.ArrayList(u32), v: Value, scratch: Reg) Error!Reg {
+        switch (self.locationAt(v)) {
+            .reg => |r| return r,
+            .slot => |slot| {
+                const off: u15 = @intCast(self.spill_base + slot * 16);
+                if (isVector(self.func, v)) {
+                    try code.append(allocator, encode.ldrQ(scratch, sp, off));
+                } else if (regClass(self.func, v) == .fpr) {
+                    try code.append(allocator, encode.ldrFp(scratch, sp, off, true));
+                } else {
+                    try code.append(allocator, encode.ldrOff(scratch, sp, off));
+                }
+                return scratch;
+            },
+        }
+    }
+
+    /// The register to compute `result` into at its def position: its assigned register, or the
+    /// class spill scratch when it is (wholly) spilled there (the caller then stores it with
+    /// `storeResult`). At a def position a split value's first segment is always `.reg`, so `.slot`
+    /// here means a wholly-spilled value, identical to today's behavior.
+    fn resultReg(self: Ctx, result: Value) Reg {
+        return switch (self.locationAt(result)) {
+            .reg => |r| r,
+            .slot => if (regClass(self.func, result) == .fpr) fp_spill_res else spill_res,
+        };
     }
 
     /// Emit the fused multiply-add/sub for a float `add`/`sub` (`op`, `lhs`, `rhs`) whose
@@ -962,12 +1158,22 @@ const Ctx = struct {
     /// Nothing runs between the (skipped) mul and this add/sub, so the mul's operand
     /// registers still hold their values here exactly as `fusesIntoNextIf` relies on for
     /// the fused compare-and-branch.
-    fn emitFusedArith(self: Ctx, allocator: std.mem.Allocator, code: *std.ArrayList(u32), result: Value, op: ir.function.BinOp, lhs: Value, rhs: Value, mul: ir.function.Arith, mul_result: Value) Error!void {
+    fn emitFusedArith(
+        self: Ctx,
+        allocator: std.mem.Allocator,
+        code: *std.ArrayList(u32),
+        result: Value,
+        op: ir.function.BinOp,
+        lhs: Value,
+        rhs: Value,
+        mul: ir.function.Arith,
+        mul_result: Value,
+    ) Error!void {
         const ra_val = if (lhs == mul_result) rhs else lhs; // the add/sub's non-mul operand
         const a = try self.loadOp(allocator, code, mul.lhs, fp_spill_op[0]);
         const b = try self.loadOp(allocator, code, mul.rhs, fp_spill_op[1]);
         const c = try self.loadOp(allocator, code, ra_val, fp_spill_res);
-        const rd = resultReg(self.alloc, self.func, result);
+        const rd = self.resultReg(result);
         if (isVector(self.func, result)) {
             // `op == .sub` here only ever means `sub(c, mul)` (`fusesIntoNextArith` rejects
             // `sub(mul, c)` for a vector), so fmls's `Vd - Vn*Vm` is always the right shape.
@@ -990,12 +1196,20 @@ const Ctx = struct {
         try storeResult(allocator, code, self, result, rd);
     }
 
-    fn binary(self: Ctx, allocator: std.mem.Allocator, code: *std.ArrayList(u32), result: Value, op: ir.function.BinOp, lhs: Value, rhs: Value) Error!void {
+    fn binary(
+        self: Ctx,
+        allocator: std.mem.Allocator,
+        code: *std.ArrayList(u32),
+        result: Value,
+        op: ir.function.BinOp,
+        lhs: Value,
+        rhs: Value,
+    ) Error!void {
         if (isVector(self.func, result)) {
             // NEON lane-wise arithmetic over a packed vector (currently <4 x f32> only).
             const rl = try self.loadOp(allocator, code, lhs, fp_spill_op[0]);
             const rr = try self.loadOp(allocator, code, rhs, fp_spill_op[1]);
-            const rd = resultReg(self.alloc, self.func, result);
+            const rd = self.resultReg(result);
             try code.append(allocator, switch (op) {
                 .add => encode.faddVec(rd, rl, rr),
                 .sub => encode.fsubVec(rd, rl, rr),
@@ -1009,7 +1223,7 @@ const Ctx = struct {
         if (regClass(self.func, result) == .fpr) {
             const rl = try self.loadOp(allocator, code, lhs, fp_spill_op[0]);
             const rr = try self.loadOp(allocator, code, rhs, fp_spill_op[1]);
-            const rd = resultReg(self.alloc, self.func, result);
+            const rd = self.resultReg(result);
             const kind = fkindOf(self.func, result, self.fp16);
             try code.append(allocator, switch (op) {
                 .add => encode.fadd(rd, rl, rr, kind),
@@ -1028,13 +1242,21 @@ const Ctx = struct {
         } else {
             const rl = try self.loadOp(allocator, code, lhs, spill_op[0]);
             const rr = try self.loadOp(allocator, code, rhs, spill_op[1]);
-            const rd = resultReg(self.alloc, self.func, result);
+            const rd = self.resultReg(result);
             try emitBinary(allocator, code, op, rd, rl, rr, isSignedInt(self.func, lhs), isWide(self.func, result));
             try storeResult(allocator, code, self, result, rd);
         }
     }
 
-    fn emitIf(self: Ctx, allocator: std.mem.Allocator, code: *std.ArrayList(u32), fixups: *std.ArrayList(Fixup), cf: ir.function.If, insts: []const ir.function.Inst, if_idx: usize) Error!void {
+    fn emitIf(
+        self: Ctx,
+        allocator: std.mem.Allocator,
+        code: *std.ArrayList(u32),
+        fixups: *std.ArrayList(Fixup),
+        cf: ir.function.If,
+        insts: []const ir.function.Inst,
+        if_idx: usize,
+    ) Error!void {
         // Fused compare-and-branch: when the immediately-preceding instruction is a
         // single-use integer icmp that is exactly this if's condition (the SAME predicate
         // the icmp case used to skip its materialization), load the icmp's operands, set
@@ -1074,7 +1296,13 @@ const Ctx = struct {
         try code.append(allocator, encode.b(0));
     }
 
-    fn emitJump(self: Ctx, allocator: std.mem.Allocator, code: *std.ArrayList(u32), fixups: *std.ArrayList(Fixup), jump: ir.function.Jump) Error!void {
+    fn emitJump(
+        self: Ctx,
+        allocator: std.mem.Allocator,
+        code: *std.ArrayList(u32),
+        fixups: *std.ArrayList(Fixup),
+        jump: ir.function.Jump,
+    ) Error!void {
         try self.emitMoves(allocator, code, jump);
         try fixups.append(allocator, .{ .at = code.items.len, .target = @intFromEnum(jump.target) });
         try code.append(allocator, encode.b(0));
@@ -1093,10 +1321,16 @@ const Ctx = struct {
         var fpr_moves: std.ArrayList(Move) = .empty;
         defer fpr_moves.deinit(allocator);
         for (args, params) |arg, param| {
-            const dst = self.alloc.reg.get(param).?; // params are never spilled
-            if (self.alloc.reg.get(arg)) |src| {
-                const m = Move{ .src = src, .dst = dst };
-                if (regClass(self.func, param) == .fpr) try fpr_moves.append(allocator, m) else try gpr_moves.append(allocator, m);
+            const dst = self.alloc.reg.get(param).?; // params are never split, so a whole-life register
+            // A register-resident edge argument moves; a spilled one is reloaded below. The argument's
+            // location is read at the current (terminator) position so a split argument uses its active
+            // segment. With no splits this is exactly today's `reg`/`spill` reads.
+            switch (self.locationAt(arg)) {
+                .reg => |src| {
+                    const m = Move{ .src = src, .dst = dst };
+                    if (regClass(self.func, param) == .fpr) try fpr_moves.append(allocator, m) else try gpr_moves.append(allocator, m);
+                },
+                .slot => {}, // reloaded straight into its parameter register below
             }
         }
         try parallelMove(allocator, code, gpr_moves.items, encode.mov, scratch_move);
@@ -1104,63 +1338,131 @@ const Ctx = struct {
         // parameters, harmless (a few extra bits) for scalar floats.
         try parallelMove(allocator, code, fpr_moves.items, encode.movVec, fp_move);
         for (args, params) |arg, param| {
-            if (self.alloc.spill.get(arg)) |slot| {
-                const pr = self.alloc.reg.get(param).?;
-                const off: u15 = @intCast(self.spill_base + slot * 16);
-                if (isVector(self.func, param)) {
-                    try code.append(allocator, encode.ldrQ(pr, sp, off));
-                } else if (regClass(self.func, param) == .fpr) {
-                    try code.append(allocator, encode.ldrFp(pr, sp, off, true));
-                } else {
-                    try code.append(allocator, encode.ldrOff(pr, sp, off));
-                }
+            switch (self.locationAt(arg)) {
+                .slot => |slot| {
+                    const pr = self.alloc.reg.get(param).?;
+                    const off: u15 = @intCast(self.spill_base + slot * 16);
+                    if (isVector(self.func, param)) {
+                        try code.append(allocator, encode.ldrQ(pr, sp, off));
+                    } else if (regClass(self.func, param) == .fpr) {
+                        try code.append(allocator, encode.ldrFp(pr, sp, off, true));
+                    } else {
+                        try code.append(allocator, encode.ldrOff(pr, sp, off));
+                    }
+                },
+                .reg => {}, // already handled by the parallel move above
             }
         }
     }
 };
 
-/// The register to compute `result` into: its assigned register, or the spilled
-/// result scratch for its class (the caller then stores it with `storeResult`).
-fn resultReg(alloc: *const Allocation, func: *const Function, result: Value) Reg {
-    return alloc.reg.get(result) orelse (if (regClass(func, result) == .fpr) fp_spill_res else spill_res);
-}
-
+/// Store `result` (held in `reg`) to its spill slot iff its location at its def position is a
+/// slot. A value that stays in a register at its def emits nothing (a later split, if any, would
+/// store at the split point). With no splits this is exactly today's spill-if-spilled behavior.
 fn storeResult(allocator: std.mem.Allocator, code: *std.ArrayList(u32), ctx: Ctx, result: Value, reg: Reg) Error!void {
-    if (ctx.alloc.spill.get(result)) |slot| {
-        const off: u15 = @intCast(ctx.spill_base + slot * 16);
-        if (isVector(ctx.func, result)) {
-            try code.append(allocator, encode.strQ(reg, sp, off));
-        } else if (regClass(ctx.func, result) == .fpr) {
-            try code.append(allocator, encode.strFp(reg, sp, off, true));
-        } else {
-            try code.append(allocator, encode.strOff(reg, sp, off));
-        }
+    switch (ctx.locationAt(result)) {
+        .reg => {},
+        .slot => |slot| {
+            const off: u15 = @intCast(ctx.spill_base + slot * 16);
+            if (isVector(ctx.func, result)) {
+                try code.append(allocator, encode.strQ(reg, sp, off));
+            } else if (regClass(ctx.func, result) == .fpr) {
+                try code.append(allocator, encode.strFp(reg, sp, off, true));
+            } else {
+                try code.append(allocator, encode.strOff(reg, sp, off));
+            }
+        },
     }
 }
 
 const Interval = struct { value: Value, start: u32, end: u32, is_param: bool };
 
-/// Linear-scan register allocation with spilling. Block parameters are pinned to
-/// registers. Instruction results spill when the pool is exhausted.
-fn allocate(allocator: std.mem.Allocator, func: *const Function, leaf: bool) Error!Allocation {
-    const nval = func.valueCount();
-    var alloc = Allocation{};
-    errdefer alloc.deinit(allocator);
+/// One active allocation during the linear scan: a value currently holding `reg` until `end`. Hoisted
+/// to file scope (from a local in `allocate`) so `secondChance` can name the type when it re-adds a
+/// re-homed value to the active set.
+const Active = struct { end: u32, value: Value, reg: Reg, is_param: bool };
 
-    // Linearize: assign each instruction a position, record def positions, last
-    // uses, params, and each block's terminator position.
+/// Append `seg` to `value`'s segment list (growing the owned slice). Segments must be appended in
+/// ascending `from` order by the caller, so a re-spill after a re-home lands at or after the re-home
+/// position (asserted). Creates a single-element list if the value has none yet.
+fn appendSegment(allocator: std.mem.Allocator, alloc: *Allocation, value: Value, seg: Segment) Error!void {
+    const gop = try alloc.segments.getOrPut(allocator, value);
+    if (!gop.found_existing) {
+        const s = try allocator.alloc(Segment, 1);
+        s[0] = seg;
+        gop.value_ptr.* = s;
+        return;
+    }
+    const old = gop.value_ptr.*;
+    // Ascending-`from` is the representation invariant `locationAt` relies on (it scans until the
+    // first segment past `pos`). A caller that appends out of order is a programmer error and would
+    // silently miscompile, so assert it rather than trust it.
+    std.debug.assert(seg.from >= old[old.len - 1].from);
+    const grown = try allocator.alloc(Segment, old.len + 1);
+    @memcpy(grown[0..old.len], old);
+    grown[old.len] = seg;
+    allocator.free(old);
+    gop.value_ptr.* = grown;
+}
+
+/// The linearization of a function: positions, per-value liveness, and the extra split-liveness
+/// data a live-range splitter needs. `use_positions` and `is_intra` are computed here but do not
+/// yet influence any allocation decision (they are consumed by later splitting work).
+const Liveness = struct {
+    def_pos: []u32, // per value: position of its definition
+    last_use: []u32, // per value: position of its last use (after extendLiveRanges)
+    is_param: []bool, // per value: is a block parameter
+    block_end: []u32, // per block: terminator position
+    call_positions: std.ArrayList(u32),
+    use_positions: [][]u32, // per value: ascending positions where the value is an OPERAND use
+    //   (includes edge-argument uses, at the terminator position)
+    is_intra: []bool, // per value: true iff the value can be split within one block:
+    //   NOT a param, NEVER used as an edge argument, and every use is in its def block
+
+    fn deinit(self: *Liveness, allocator: std.mem.Allocator) void {
+        allocator.free(self.def_pos);
+        allocator.free(self.last_use);
+        allocator.free(self.is_param);
+        allocator.free(self.block_end);
+        self.call_positions.deinit(allocator);
+        for (self.use_positions) |u| allocator.free(u);
+        allocator.free(self.use_positions);
+        allocator.free(self.is_intra);
+    }
+};
+
+/// Assign each parameter/instruction/terminator a monotonically increasing position and record,
+/// per value: its def position, its last use, whether it is a block parameter, the ascending list
+/// of positions where it is used as an operand (including edge arguments at the terminator
+/// position), and whether it is intra-block-splittable. Also records each block's terminator
+/// position and every call position, then extends live ranges. This is exactly the linearization
+/// `allocate` used to do inline, plus the split-liveness data (`use_positions`, `is_intra`).
+fn linearize(allocator: std.mem.Allocator, func: *const Function) Error!Liveness {
+    const nval = func.valueCount();
     const nblocks = func.blockCount();
+
     const def_pos = try allocator.alloc(u32, nval);
-    defer allocator.free(def_pos);
+    errdefer allocator.free(def_pos);
     const last_use = try allocator.alloc(u32, nval);
-    defer allocator.free(last_use);
+    errdefer allocator.free(last_use);
     const is_param = try allocator.alloc(bool, nval);
-    defer allocator.free(is_param);
+    errdefer allocator.free(is_param);
     const block_end = try allocator.alloc(u32, nblocks);
-    defer allocator.free(block_end);
+    errdefer allocator.free(block_end);
+    const is_intra = try allocator.alloc(bool, nval);
+    errdefer allocator.free(is_intra);
+
+    // def_block is a scratch row (which block defined each value), used only to decide is_intra.
+    const def_block = try allocator.alloc(u32, nval);
+    defer allocator.free(def_block);
+
     @memset(def_pos, 0);
     @memset(is_param, false);
     for (last_use) |*l| l.* = 0;
+    @memset(def_block, 0);
+    // A value starts intra-splittable iff it is not a parameter; the walk below clears it on any
+    // edge-argument use or any use outside its def block.
+    for (is_intra, 0..) |*flag, i| flag.* = !is_param[i];
 
     // Positions at which a call clobbers caller-saved registers. AAPCS only preserves the
     // LOW 64 bits of the callee-saved FP registers v8..v15 across a call, so a 128-bit SIMD
@@ -1169,7 +1471,38 @@ fn allocate(allocator: std.mem.Allocator, func: *const Function, leaf: bool) Err
     // stack (16-byte slots are fully preserved), keeping the widened (quad) FS correct when it
     // gathers through a sampler_fn / math_fn call.
     var call_positions = std.ArrayList(u32).empty;
-    defer call_positions.deinit(allocator);
+    errdefer call_positions.deinit(allocator);
+
+    // Per-value operand-use positions are gathered into temporary lists, then transferred into the
+    // owned `use_positions` slices below.
+    const use_lists = try allocator.alloc(std.ArrayList(u32), nval);
+    defer allocator.free(use_lists);
+    for (use_lists) |*u| u.* = .empty;
+    errdefer for (use_lists) |*u| u.deinit(allocator);
+
+    const Collector = struct {
+        is_intra: []bool,
+        def_block: []const u32,
+        use_lists: []std.ArrayList(u32),
+        allocator: std.mem.Allocator,
+        last_use: []u32,
+        pos: u32,
+        bi: u32,
+        err: ?Error = null,
+
+        fn visit(self: *@This(), v: Value, is_edge_arg: bool) void {
+            const vi = @intFromEnum(v);
+            markUse(self.last_use, v, self.pos);
+            if (is_edge_arg) {
+                self.is_intra[vi] = false;
+            } else if (self.def_block[vi] != self.bi) {
+                self.is_intra[vi] = false;
+            }
+            self.use_lists[vi].append(self.allocator, self.pos) catch |e| {
+                self.err = e;
+            };
+        }
+    };
 
     var pos: u32 = 0;
     for (0..nblocks) |bi| {
@@ -1178,11 +1511,26 @@ fn allocate(allocator: std.mem.Allocator, func: *const Function, leaf: bool) Err
             def_pos[@intFromEnum(p)] = pos;
             last_use[@intFromEnum(p)] = pos;
             is_param[@intFromEnum(p)] = true;
+            is_intra[@intFromEnum(p)] = false;
+            def_block[@intFromEnum(p)] = @intCast(bi);
         }
         pos += 1;
         for (func.blockInsts(block)) |inst| {
-            forEachUse(func, inst, last_use, pos);
-            if (func.instResult(inst)) |r| def_pos[@intFromEnum(r)] = pos;
+            var col = Collector{
+                .is_intra = is_intra,
+                .def_block = def_block,
+                .use_lists = use_lists,
+                .allocator = allocator,
+                .last_use = last_use,
+                .pos = pos,
+                .bi = @intCast(bi),
+            };
+            forEachOperand(func, inst, &col, Collector.visit);
+            if (col.err) |e| return e;
+            if (func.instResult(inst)) |r| {
+                def_pos[@intFromEnum(r)] = pos;
+                def_block[@intFromEnum(r)] = @intCast(bi);
+            }
             switch (func.opcode(inst)) {
                 .call, .call_indirect => try call_positions.append(allocator, pos),
                 else => {},
@@ -1190,14 +1538,86 @@ fn allocate(allocator: std.mem.Allocator, func: *const Function, leaf: bool) Err
             pos += 1;
         }
         block_end[bi] = pos;
-        if (func.terminator(block)) |term| forEachTermUse(func, term, last_use, pos);
+        if (func.terminator(block)) |term| {
+            var col = Collector{
+                .is_intra = is_intra,
+                .def_block = def_block,
+                .use_lists = use_lists,
+                .allocator = allocator,
+                .last_use = last_use,
+                .pos = pos,
+                .bi = @intCast(bi),
+            };
+            forEachTermOperand(func, term, &col, Collector.visit);
+            if (col.err) |e| return e;
+        }
         pos += 1;
     }
 
-    // Liveness: a value live-out of a block stays live to that block's end. A loop
-    // back-edge makes the header's live-in flow into the body's live-out, extending
-    // loop-carried values across the body so their registers are not reused inside it.
+    // Liveness: a value live-out of a block stays live to that block's end. A loop back-edge makes
+    // the header's live-in flow into the body's live-out, extending loop-carried values across the
+    // body so their registers are not reused inside it.
     try extendLiveRanges(allocator, func, last_use, block_end);
+
+    // Transfer the temporary use lists into owned slices. Blocks were walked in order with
+    // increasing positions, so each list is already ascending.
+    const use_positions = try allocator.alloc([]u32, nval);
+    errdefer allocator.free(use_positions);
+    var converted: usize = 0;
+    errdefer for (use_positions[0..converted]) |u| allocator.free(u);
+    for (use_lists, 0..) |*u, idx| {
+        use_positions[idx] = try u.toOwnedSlice(allocator);
+        converted = idx + 1;
+    }
+
+    return .{
+        .def_pos = def_pos,
+        .last_use = last_use,
+        .is_param = is_param,
+        .block_end = block_end,
+        .call_positions = call_positions,
+        .use_positions = use_positions,
+        .is_intra = is_intra,
+    };
+}
+
+/// The position of `value`'s next use strictly after `p`, or `end` (its interval end) if it has no
+/// further use. This is the Belady/MIN spill key: prefer to spill the value that will not be needed
+/// for the longest.
+fn nextUseOrEnd(use_positions: []const []const u32, value: Value, end: u32, p: u32) u32 {
+    return nextUseAfter(use_positions[@intFromEnum(value)], p) orelse end;
+}
+
+/// Return the first element of ascending `uses` that is strictly greater than `p`, else null.
+fn nextUseAfter(uses: []const u32, p: u32) ?u32 {
+    var lo: usize = 0;
+    var hi: usize = uses.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (uses[mid] <= p) lo = mid + 1 else hi = mid;
+    }
+    return if (lo < uses.len) uses[lo] else null;
+}
+
+/// Linear-scan register allocation with spilling. Block parameters are pinned to
+/// registers. Instruction results spill when the pool is exhausted.
+fn allocate(allocator: std.mem.Allocator, func: *const Function, leaf: bool) Error!Allocation {
+    const nval = func.valueCount();
+    var alloc = Allocation{};
+    errdefer alloc.deinit(allocator);
+
+    // Linearize the function into positions and per-value liveness (def/last-use/param rows, call
+    // positions, and the split-liveness data), then extend live ranges. This is the single source
+    // of truth for what each instruction reads and where each value is live. See `linearize`.
+    var lin = try linearize(allocator, func);
+    defer lin.deinit(allocator);
+    const def_pos = lin.def_pos;
+    const last_use = lin.last_use;
+    const is_param = lin.is_param;
+
+    // `lin` is deinited when this function returns, so keep an owned copy of the def positions for
+    // the emission-time position-coupling assert (and for any future splitter that reads them).
+    alloc.def_pos = try allocator.dupe(u32, lin.def_pos);
 
     // Per-class register pools. GPR: caller-saved temporaries + unused integer arg
     // registers (leaf) or callee-saved x19..x28 (non-leaf). FPR: caller-saved
@@ -1242,71 +1662,91 @@ fn allocate(allocator: std.mem.Allocator, func: *const Function, leaf: bool) Err
     for (pools[0].items) |r| try frees[0].append(allocator, r);
     for (pools[1].items) |r| try frees[1].append(allocator, r);
 
-    const Active = struct { end: u32, value: Value, reg: Reg, is_param: bool };
     var actives = [_]std.ArrayList(Active){ .empty, .empty };
     defer for (&actives) |*a| a.deinit(allocator);
 
     for (ivals) |iv| {
         const cls: usize = @intFromEnum(regClass(func, iv.value));
-        const free = &frees[cls];
-        const active = &actives[cls];
+        // Placement of `iv` itself. A labeled block (rather than `continue`) so every branch that
+        // places `iv` falls through to the `secondChance` call below: second-chance must run AFTER
+        // `iv` is placed, on EVERY iteration, so it only ever hands out leftover free registers.
+        placement: {
+            const free = &frees[cls];
+            const active = &actives[cls];
 
-        // An entry parameter pinned by a leaf just occupies its register.
-        if (alloc.reg.get(iv.value)) |r| {
-            try active.append(allocator, .{ .end = iv.end, .value = iv.value, .reg = r, .is_param = iv.is_param });
-            continue;
-        }
-
-        // Expire intervals that ended before this one starts.
-        var w: usize = 0;
-        for (active.items) |a| {
-            if (a.end < iv.start) {
-                try free.append(allocator, a.reg);
-            } else {
-                active.items[w] = a;
-                w += 1;
+            // An entry parameter pinned by a leaf just occupies its register.
+            if (alloc.reg.get(iv.value)) |r| {
+                try active.append(allocator, .{ .end = iv.end, .value = iv.value, .reg = r, .is_param = iv.is_param });
+                break :placement;
             }
-        }
-        active.shrinkRetainingCapacity(w);
 
-        // A non-parameter VECTOR value that is live across a call must live on the stack: the
-        // callee-saved FP registers only preserve their low 64 bits, so a 128-bit lane vector
-        // in v8..v15 would be corrupted by the call. (Params are pinned/handled separately.
-        // A vector param crossing a call is spilled too, below.)
-        if (isVector(func, iv.value) and spansCall(call_positions.items, iv.start, iv.end)) {
-            try spillValue(allocator, &alloc, iv.value);
-            continue;
-        }
+            // Expire intervals that ended before this one starts.
+            var w: usize = 0;
+            for (active.items) |a| {
+                if (a.end < iv.start) {
+                    try free.append(allocator, a.reg);
+                } else {
+                    active.items[w] = a;
+                    w += 1;
+                }
+            }
+            active.shrinkRetainingCapacity(w);
 
-        if (free.pop()) |r| {
-            try alloc.reg.put(allocator, iv.value, r);
-            try active.append(allocator, .{ .end = iv.end, .value = iv.value, .reg = r, .is_param = iv.is_param });
-            continue;
-        }
+            // A non-parameter VECTOR value that is live across a call must live on the stack: the
+            // callee-saved FP registers only preserve their low 64 bits, so a 128-bit lane vector
+            // in v8..v15 would be corrupted by the call. (Params are pinned/handled separately.
+            // A vector param crossing a call is spilled too, below.)
+            if (isVector(func, iv.value) and spansCall(lin.call_positions.items, iv.start, iv.end)) {
+                try spillValue(allocator, &alloc, iv.value);
+                break :placement;
+            }
 
-        // Out of registers: pick the spillable (non-parameter) active interval with
-        // the furthest end in this class.
-        var victim: ?usize = null;
-        for (active.items, 0..) |a, i| {
-            if (a.is_param) continue;
-            if (victim == null or a.end > active.items[victim.?].end) victim = i;
-        }
-        if (iv.is_param) {
-            const vi = victim orelse return error.Unsupported; // too many live params
-            try spillValue(allocator, &alloc, active.items[vi].value);
-            try alloc.reg.put(allocator, iv.value, active.items[vi].reg);
-            active.items[vi] = .{ .end = iv.end, .value = iv.value, .reg = active.items[vi].reg, .is_param = true };
-        } else if (victim) |vi| {
-            if (active.items[vi].end > iv.end) {
-                try spillValue(allocator, &alloc, active.items[vi].value);
+            if (free.pop()) |r| {
+                try alloc.reg.put(allocator, iv.value, r);
+                try active.append(allocator, .{ .end = iv.end, .value = iv.value, .reg = r, .is_param = iv.is_param });
+                break :placement;
+            }
+
+            // Out of registers: pick the spillable (non-parameter) active value whose NEXT USE after
+            // this position is furthest away (Belady/MIN). `p` is where the pool is exhausted, this
+            // interval's definition position.
+            const p = iv.start;
+            var victim: ?usize = null;
+            for (active.items, 0..) |a, i| {
+                if (a.is_param) continue;
+                if (victim == null) {
+                    victim = i;
+                    continue;
+                }
+                const a_nu = nextUseOrEnd(lin.use_positions, a.value, a.end, p);
+                const best = active.items[victim.?];
+                const best_nu = nextUseOrEnd(lin.use_positions, best.value, best.end, p);
+                if (a_nu > best_nu or (a_nu == best_nu and a.end > best.end)) victim = i;
+            }
+            if (iv.is_param) {
+                const vi = victim orelse return error.Unsupported; // too many live params
+                try spillOrSplit(allocator, &alloc, &lin, active.items[vi].value, active.items[vi].reg, p);
                 try alloc.reg.put(allocator, iv.value, active.items[vi].reg);
-                active.items[vi] = .{ .end = iv.end, .value = iv.value, .reg = active.items[vi].reg, .is_param = false };
+                active.items[vi] = .{ .end = iv.end, .value = iv.value, .reg = active.items[vi].reg, .is_param = true };
+            } else if (victim) |vi| {
+                const vic_nu = nextUseOrEnd(lin.use_positions, active.items[vi].value, active.items[vi].end, p);
+                const iv_nu = nextUseOrEnd(lin.use_positions, iv.value, iv.end, p);
+                if (vic_nu > iv_nu) {
+                    try spillOrSplit(allocator, &alloc, &lin, active.items[vi].value, active.items[vi].reg, p);
+                    try alloc.reg.put(allocator, iv.value, active.items[vi].reg);
+                    active.items[vi] = .{ .end = iv.end, .value = iv.value, .reg = active.items[vi].reg, .is_param = false };
+                } else {
+                    try spillValue(allocator, &alloc, iv.value);
+                }
             } else {
                 try spillValue(allocator, &alloc, iv.value);
             }
-        } else {
-            try spillValue(allocator, &alloc, iv.value);
         }
+
+        // `iv` is now placed. Offer any leftover free registers to slot-resident split values whose
+        // tail is still ahead, re-homing them so their remaining uses read a register. Runs after
+        // placement so it can only ever hand out registers `iv` did not need.
+        try secondChance(allocator, &alloc, func, &lin, &frees, &actives, iv.start);
     }
 
     // The callee-saved registers actually used (non-leaf), per class, ascending.
@@ -1329,6 +1769,16 @@ fn collectSaved(alloc: *Allocation, lo: u6, hi: u6, out: *std.ArrayList(Reg), al
         while (it.next()) |v| if (v.* == reg) {
             used = true;
         };
+        // A split value is removed from `alloc.reg`; its register is normally re-held by the taker
+        // (so still seen above), but scan the split prefixes too so a callee-saved register held
+        // only by a prefix segment is still recorded as used (and thus saved in the prologue).
+        var sit = alloc.segments.valueIterator();
+        while (sit.next()) |segs| for (segs.*) |s| switch (s.loc) {
+            .reg => |rr| if (rr == reg) {
+                used = true;
+            },
+            .slot => {},
+        };
         if (used) try out.append(allocator, reg);
     }
 }
@@ -1338,6 +1788,150 @@ fn spillValue(allocator: std.mem.Allocator, alloc: *Allocation, v: Value) Error!
     _ = alloc.reg.remove(v);
     try alloc.spill.put(allocator, v, alloc.spill_count);
     alloc.spill_count += 1;
+}
+
+/// Spill `value` (currently in `reg`) to free its register. If `value`'s whole live range is inside one
+/// block (`is_intra`) and it has a non-empty register prefix (`def < p`), TAIL-SPLIT it: keep `reg` for
+/// `[def, p)` and a fresh slot for `[p, end)`, recording a store at `p`. Otherwise whole-spill (today's
+/// behavior, used for cross-block values that Phase 1 does not split).
+fn spillOrSplit(
+    allocator: std.mem.Allocator,
+    alloc: *Allocation,
+    lin: *const Liveness,
+    value: Value,
+    reg: Reg,
+    p: u32,
+) Error!void {
+    const idx = @intFromEnum(value);
+    if (lin.is_intra[idx] and lin.def_pos[idx] < p) {
+        if (alloc.segments.get(value)) |segs| {
+            // This value was already tail-split then SECOND-CHANCE RE-HOMED into `reg`, so its last
+            // segment is a `.reg`. Two sub-cases by whether that re-home's reload has fired yet at `p`:
+            const last = segs[segs.len - 1];
+            std.debug.assert(last.loc == .reg);
+            if (last.from > p) {
+                // PENDING re-home: pressure reclaimed `reg` BEFORE the reload at `last.from` runs, so
+                // the value is still physically in its previous slot here and never actually re-enters
+                // a register. Cancel the re-home (drop the trailing `.reg` segment and its reload
+                // action) rather than append an out-of-order slot. The value stays in that prior slot
+                // (no store needed, its bits are already there) and `reg` frees for the taker.
+                try cancelReHome(allocator, alloc, value);
+                return;
+            }
+            // ACTIVE re-home (`last.from <= p`): the value truly lives in `reg` at `p`. Spill that
+            // register's live part from `p` onward. The append lands at or after the re-home position,
+            // so segment order is preserved.
+            const slot = alloc.spill_count;
+            alloc.spill_count += 1;
+            try appendSegment(allocator, alloc, value, .{ .from = p, .loc = .{ .slot = slot } });
+            try alloc.actions.append(allocator, .{ .at = p, .kind = .store, .value = value, .reg = reg, .slot = slot });
+        } else {
+            const slot = alloc.spill_count;
+            alloc.spill_count += 1;
+            _ = alloc.reg.remove(value); // the split value is now represented entirely by its segments
+            const new_segs = try allocator.alloc(Segment, 2);
+            new_segs[0] = .{ .from = lin.def_pos[idx], .loc = .{ .reg = reg } };
+            new_segs[1] = .{ .from = p, .loc = .{ .slot = slot } };
+            // Free `new_segs` only if `put` itself fails. Once `put` succeeds, `segments` owns it and
+            // `deinit` frees it exactly once, so a later `append` failure must NOT also free it (that
+            // would double-free during the allocator's `errdefer alloc.deinit`).
+            alloc.segments.put(allocator, value, new_segs) catch |e| {
+                allocator.free(new_segs);
+                return e;
+            };
+            try alloc.actions.append(allocator, .{ .at = p, .kind = .store, .value = value, .reg = reg, .slot = slot });
+        }
+    } else {
+        try spillValue(allocator, alloc, value);
+    }
+}
+
+/// Undo a still-PENDING second-chance re-home of `value`: drop its trailing `.reg` segment and the
+/// matching reload action, so the value stays in its previous slot and the re-home register frees.
+/// Used when pressure reclaims that register before its reload fires (the value never actually
+/// re-entered a register). Leaving the reload in place would clobber the taker's register at the old
+/// re-home position, and leaving the segment would break the ascending-`from` order `locationAt`
+/// relies on, so both must go.
+fn cancelReHome(allocator: std.mem.Allocator, alloc: *Allocation, value: Value) Error!void {
+    const old = alloc.segments.get(value).?;
+    std.debug.assert(old.len >= 2 and old[old.len - 1].loc == .reg);
+    const rehome = old[old.len - 1];
+    const rehome_reg = rehome.loc.reg;
+    // Remove the pending reload action for this re-home. The (value, position, register) triple is
+    // unique (each re-home pops a distinct register), so exactly one action matches. Actions are not
+    // sorted until emission, so a `swapRemove` is safe here.
+    var found = false;
+    var i: usize = 0;
+    while (i < alloc.actions.items.len) : (i += 1) {
+        const act = alloc.actions.items[i];
+        if (act.kind == .reload and act.value == value and act.at == rehome.from and act.reg == rehome_reg) {
+            _ = alloc.actions.swapRemove(i);
+            found = true;
+            break;
+        }
+    }
+    std.debug.assert(found);
+    // Shrink the owned segment slice by one (drop the trailing `.reg`). `getPtr` update never
+    // allocates (the key already exists), so this cannot fail after the new slice is built.
+    const shrunk = try allocator.alloc(Segment, old.len - 1);
+    @memcpy(shrunk, old[0 .. old.len - 1]);
+    allocator.free(old);
+    alloc.segments.getPtr(value).?.* = shrunk;
+}
+
+/// After the current interval is placed at `pos`, re-home split values that presently live in a slot
+/// and still have an upcoming use into any LEFTOVER free register of their class, so their remaining
+/// tail uses read a register instead of reloading from the slot on every use. The reload lands at the
+/// value's next use position. Most-urgent (nearest next use) first, so a scarce free register goes to
+/// the value that reloads soonest. The re-homed value is added back to `actives` so its register is
+/// tracked and it can be spilled AGAIN (via `spillOrSplit`'s append path) if pressure returns.
+///
+/// Runs AFTER the current interval was placed, so that interval already claimed whatever register it
+/// needed and `secondChance` only pops registers that are genuinely free. It therefore can never
+/// dispossess a live value.
+fn secondChance(
+    allocator: std.mem.Allocator,
+    alloc: *Allocation,
+    func: *const Function,
+    lin: *const Liveness,
+    frees: *[2]std.ArrayList(Reg),
+    actives: *[2]std.ArrayList(Active),
+    pos: u32,
+) Error!void {
+    const Cand = struct { value: Value, next: u32, slot: u32, cls: usize, end: u32 };
+    var cands: std.ArrayList(Cand) = .empty;
+    defer cands.deinit(allocator);
+    var it = alloc.segments.iterator();
+    while (it.next()) |e| {
+        const segs = e.value_ptr.*;
+        const last = segs[segs.len - 1];
+        switch (last.loc) {
+            .reg => {}, // already in a register, nothing pending
+            .slot => |slot| {
+                const v = e.key_ptr.*;
+                const nu = nextUseAfter(lin.use_positions[@intFromEnum(v)], pos) orelse continue;
+                try cands.append(allocator, .{
+                    .value = v,
+                    .next = nu,
+                    .slot = slot,
+                    .cls = @intFromEnum(regClass(func, v)),
+                    .end = lin.last_use[@intFromEnum(v)],
+                });
+            },
+        }
+    }
+    std.mem.sort(Cand, cands.items, {}, struct {
+        fn f(_: void, a: Cand, b: Cand) bool {
+            return a.next < b.next;
+        }
+    }.f);
+    for (cands.items) |c| {
+        if (frees[c.cls].items.len == 0) continue;
+        const r2 = frees[c.cls].pop().?;
+        try appendSegment(allocator, alloc, c.value, .{ .from = c.next, .loc = .{ .reg = r2 } });
+        try alloc.actions.append(allocator, .{ .at = c.next, .kind = .reload, .value = c.value, .reg = r2, .slot = c.slot });
+        try actives[c.cls].append(allocator, .{ .end = c.end, .value = c.value, .reg = r2, .is_param = false });
+    }
 }
 
 fn lessByStart(_: void, a: Interval, b: Interval) bool {
@@ -1357,61 +1951,94 @@ fn markUse(last_use: []u32, v: Value, pos: u32) void {
     if (pos > last_use[@intFromEnum(v)]) last_use[@intFromEnum(v)] = pos;
 }
 
-fn forEachUse(func: *const Function, inst: ir.function.Inst, last_use: []u32, pos: u32) void {
+/// Visit every operand VALUE used by `inst`, calling `f(ctx, value, is_edge_arg)`. `is_edge_arg` is
+/// true for values passed to a successor block (the `.@"if"` branch args), false for ordinary
+/// operands. This is the single source of truth for "what does this instruction read".
+fn forEachOperand(
+    func: *const Function,
+    inst: ir.function.Inst,
+    ctx: anytype,
+    comptime f: fn (@TypeOf(ctx), Value, bool) void,
+) void {
     switch (func.opcode(inst)) {
         .iconst, .fconst, .alloca, .global_addr => {},
         .arith => |a| {
-            markUse(last_use, a.lhs, pos);
-            markUse(last_use, a.rhs, pos);
+            f(ctx, a.lhs, false);
+            f(ctx, a.rhs, false);
         },
-        .arith_imm => |a| markUse(last_use, a.lhs, pos),
+        .arith_imm => |a| f(ctx, a.lhs, false),
         .icmp => |c| {
-            markUse(last_use, c.lhs, pos);
-            markUse(last_use, c.rhs, pos);
+            f(ctx, c.lhs, false);
+            f(ctx, c.rhs, false);
         },
         .select => |s| {
-            markUse(last_use, s.cond, pos);
-            markUse(last_use, s.then, pos);
-            markUse(last_use, s.@"else", pos);
+            f(ctx, s.cond, false);
+            f(ctx, s.then, false);
+            f(ctx, s.@"else", false);
         },
-        .extract => |e| markUse(last_use, e.aggregate, pos),
-        .convert => |cv| markUse(last_use, cv.value, pos),
-        .unary => |u| markUse(last_use, u.value, pos),
-        .load => |l| markUse(last_use, l.ptr, pos),
+        .extract => |e| f(ctx, e.aggregate, false),
+        .convert => |cv| f(ctx, cv.value, false),
+        .unary => |u| f(ctx, u.value, false),
+        .load => |l| f(ctx, l.ptr, false),
         .store => |st| {
-            markUse(last_use, st.value, pos);
-            markUse(last_use, st.ptr, pos);
+            f(ctx, st.value, false);
+            f(ctx, st.ptr, false);
         },
-        .prefetch => |pf| markUse(last_use, pf.ptr, pos),
+        .prefetch => |pf| f(ctx, pf.ptr, false),
         .dot => |d| {
-            markUse(last_use, d.acc, pos);
-            markUse(last_use, d.a, pos);
-            markUse(last_use, d.b, pos);
+            f(ctx, d.acc, false);
+            f(ctx, d.a, false);
+            f(ctx, d.b, false);
         },
         .matmul => |mmv| {
-            markUse(last_use, mmv.a, pos);
-            markUse(last_use, mmv.b, pos);
-            markUse(last_use, mmv.c, pos);
+            f(ctx, mmv.a, false);
+            f(ctx, mmv.b, false);
+            f(ctx, mmv.c, false);
         },
-        .struct_new => |sn| for (func.valueList(sn.fields)) |f| markUse(last_use, f, pos),
-        .call => |c| for (func.valueList(c.args)) |a| markUse(last_use, a, pos),
+        .struct_new => |sn| for (func.valueList(sn.fields)) |fld| f(ctx, fld, false),
+        .call => |c| for (func.valueList(c.args)) |a| f(ctx, a, false),
         .call_indirect => |c| {
-            markUse(last_use, c.target, pos);
-            for (func.valueList(c.args)) |a| markUse(last_use, a, pos);
+            f(ctx, c.target, false);
+            for (func.valueList(c.args)) |a| f(ctx, a, false);
         },
         .@"if" => |cf| {
-            markUse(last_use, cf.cond, pos);
-            for (func.blockArgs(cf.then)) |a| markUse(last_use, a, pos);
-            for (func.blockArgs(cf.@"else")) |a| markUse(last_use, a, pos);
+            f(ctx, cf.cond, false);
+            for (func.blockArgs(cf.then)) |a| f(ctx, a, true);
+            for (func.blockArgs(cf.@"else")) |a| f(ctx, a, true);
         },
     }
 }
 
-fn forEachTermUse(func: *const Function, term: Terminator, last_use: []u32, pos: u32) void {
+/// Visit every operand VALUE used by a terminator, calling `f(ctx, value, is_edge_arg)`. The
+/// `.jump` arguments are edge args; the `.ret` value is an ordinary operand. Terminator analogue of
+/// `forEachOperand`.
+fn forEachTermOperand(
+    func: *const Function,
+    term: Terminator,
+    ctx: anytype,
+    comptime f: fn (@TypeOf(ctx), Value, bool) void,
+) void {
     switch (term) {
-        .ret => |v| if (v) |vv| markUse(last_use, vv, pos),
-        .jump => |j| for (func.blockArgs(j)) |a| markUse(last_use, a, pos),
+        .ret => |v| if (v) |vv| f(ctx, vv, false),
+        .jump => |j| for (func.blockArgs(j)) |a| f(ctx, a, true),
     }
+}
+
+const MarkCtx = struct { last_use: []u32, pos: u32 };
+
+fn markOperand(ctx: MarkCtx, v: Value, is_edge_arg: bool) void {
+    _ = is_edge_arg;
+    markUse(ctx.last_use, v, ctx.pos);
+}
+
+/// Thin wrapper over `forEachOperand` that only extends `last_use`. Kept so callers that need
+/// nothing but the last-use marking read clearly.
+fn forEachUse(func: *const Function, inst: ir.function.Inst, last_use: []u32, pos: u32) void {
+    forEachOperand(func, inst, MarkCtx{ .last_use = last_use, .pos = pos }, markOperand);
+}
+
+fn forEachTermUse(func: *const Function, term: Terminator, last_use: []u32, pos: u32) void {
+    forEachTermOperand(func, term, MarkCtx{ .last_use = last_use, .pos = pos }, markOperand);
 }
 
 /// Whether the integer `icmp` at `insts[idx]` fuses into an immediately-following
@@ -1749,7 +2376,13 @@ fn extendLiveRanges(allocator: std.mem.Allocator, func: *const Function, last_us
 
 /// Sequence a set of parallel register moves (within one register class), using
 /// `movFn` to emit a move and `scratch` to break cycles.
-fn parallelMove(allocator: std.mem.Allocator, code: *std.ArrayList(u32), moves_in: []const Move, movFn: *const fn (Reg, Reg) u32, scratch: Reg) Error!void {
+fn parallelMove(
+    allocator: std.mem.Allocator,
+    code: *std.ArrayList(u32),
+    moves_in: []const Move,
+    movFn: *const fn (Reg, Reg) u32,
+    scratch: Reg,
+) Error!void {
     var list: std.ArrayList(Move) = .empty;
     defer list.deinit(allocator);
     for (moves_in) |m| if (m.src != m.dst) try list.append(allocator, m);
@@ -1826,7 +2459,15 @@ fn computeAllocaSlots(allocator: std.mem.Allocator, func: *const Function, map: 
     return alignUp(cur, 16);
 }
 
-fn emitLoad(allocator: std.mem.Allocator, code: *std.ArrayList(u32), func: *const Function, result: Value, rd: Reg, base: Reg, fp16: bool) Error!void {
+fn emitLoad(
+    allocator: std.mem.Allocator,
+    code: *std.ArrayList(u32),
+    func: *const Function,
+    result: Value,
+    rd: Reg,
+    base: Reg,
+    fp16: bool,
+) Error!void {
     if (isVector(func, result)) {
         try code.append(allocator, encode.ldrQ(rd, base, 0)); // 128-bit NEON load
         return;
@@ -1856,7 +2497,15 @@ fn emitLoad(allocator: std.mem.Allocator, code: *std.ArrayList(u32), func: *cons
     }
 }
 
-fn emitStore(allocator: std.mem.Allocator, code: *std.ArrayList(u32), func: *const Function, value: Value, val: Reg, base: Reg, fp16: bool) Error!void {
+fn emitStore(
+    allocator: std.mem.Allocator,
+    code: *std.ArrayList(u32),
+    func: *const Function,
+    value: Value,
+    val: Reg,
+    base: Reg,
+    fp16: bool,
+) Error!void {
     if (isVector(func, value)) {
         try code.append(allocator, encode.strQ(val, base, 0)); // 128-bit NEON store
         return;
@@ -1938,7 +2587,16 @@ fn condForFloat(op: ir.function.CmpOp) encode.Cond {
 /// through a quotient scratch. `wide` selects the 64-bit (x-register) form for
 /// pointer/address arithmetic. The `sf` bit (31) is uniform across these A64
 /// data-processing encodings, so it composes with the 32-bit base.
-fn emitBinary(allocator: std.mem.Allocator, code: *std.ArrayList(u32), op: ir.function.BinOp, rd: Reg, rn: Reg, rm: Reg, signed: bool, wide: bool) Error!void {
+fn emitBinary(
+    allocator: std.mem.Allocator,
+    code: *std.ArrayList(u32),
+    op: ir.function.BinOp,
+    rd: Reg,
+    rn: Reg,
+    rm: Reg,
+    signed: bool,
+    wide: bool,
+) Error!void {
     const sf: u32 = if (wide) @as(u32, 1) << 31 else 0;
     const word = switch (op) {
         .add => encode.add(rd, rn, rm),
@@ -1996,6 +2654,55 @@ fn loadConst64(allocator: std.mem.Allocator, code: *std.ArrayList(u32), rd: Reg,
         const part: u16 = @truncate(bits >> (16 * i));
         if (part != 0) try code.append(allocator, encode.movk64(rd, part, i));
     }
+}
+
+/// Test/measurement hook only: runs register allocation on `func` and returns how many values
+/// were spilled. Exists so a test (or the uarch-bench tool) can confirm a register-pressure-heavy
+/// kernel actually spills without threading `Allocation` through `compileFunction`'s public API.
+pub fn debugSpillCount(allocator: std.mem.Allocator, func: *const Function) Error!u32 {
+    var alloc = try allocate(allocator, func, isLeaf(func));
+    defer alloc.deinit(allocator);
+    return alloc.spill_count;
+}
+
+/// Test/measurement hook only: runs register allocation on `func` and returns how many values were
+/// tail-split (given a segment list). Exists so an execution test can confirm its pressure kernel
+/// actually forces a live-range split, making the differential meaningful (a whole-spill would still
+/// return the right value, so the count is the only observable proof a split happened).
+pub fn debugSegmentCount(allocator: std.mem.Allocator, func: *const Function) Error!u32 {
+    var alloc = try allocate(allocator, func, isLeaf(func));
+    defer alloc.deinit(allocator);
+    return @intCast(alloc.segments.count());
+}
+
+/// Test/measurement hook only: runs register allocation on `func` and returns how many values were
+/// SECOND-CHANCE RE-HOMED: a value whose segment list holds a `.reg` segment after a `.slot` segment
+/// (spilled, then brought back into a register for its remaining tail uses). Exists so a Task 5
+/// execution test can prove second-chance reload actually fired, not merely that a tail split
+/// happened (which a plain per-use reload would also satisfy).
+pub fn debugReHomeCount(allocator: std.mem.Allocator, func: *const Function) Error!u32 {
+    var alloc = try allocate(allocator, func, isLeaf(func));
+    defer alloc.deinit(allocator);
+    var count: u32 = 0;
+    var it = alloc.segments.valueIterator();
+    while (it.next()) |segs| {
+        var saw_slot = false;
+        for (segs.*) |s| switch (s.loc) {
+            .slot => saw_slot = true,
+            .reg => if (saw_slot) {
+                count += 1;
+            },
+        };
+    }
+    return count;
+}
+
+/// Test/measurement hook only: runs the linearization on `func` and returns its `Liveness` so a
+/// test can inspect the computed split-liveness data (`use_positions`, `is_intra`). The caller owns
+/// the returned `Liveness` and must `deinit` it. Exists so tests can assert the liveness data
+/// without threading it through the allocator's public API.
+pub fn debugLiveness(allocator: std.mem.Allocator, func: *const Function) Error!Liveness {
+    return linearize(allocator, func);
 }
 
 test "selects a straight-line arithmetic function" {
@@ -2056,4 +2763,180 @@ test "alignPadWords computes the nop count to reach a fetch-align boundary" {
     // fetch_align <= 4 (one word or less, or disabled): always a no-op.
     try std.testing.expectEqual(@as(usize, 0), alignPadWords(3, 4));
     try std.testing.expectEqual(@as(usize, 0), alignPadWords(3, 0));
+}
+
+test "a 20-term register-pressure kernel spills under whole-interval linear scan" {
+    // fn(a, b) = sum over k in 1..=20 of (a*k + b): all 20 products are live simultaneously until
+    // the final sum, far past the ~12-entry GPR pool. This confirms (task 0 of the regalloc
+    // upgrade) that the current whole-interval allocator actually spills on pressure, before any
+    // live-range splitting is built to reduce it.
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const b = try func.appendBlock();
+    const a = try func.appendBlockParam(b, t);
+    const bp = try func.appendBlockParam(b, t);
+    var terms: [20]Value = undefined;
+    var k: i64 = 1;
+    while (k <= 20) : (k += 1) {
+        const kc = try func.appendInst(b, t, .{ .iconst = k });
+        const ak = try func.appendInst(b, t, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = kc } });
+        terms[@intCast(k - 1)] = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = ak, .rhs = bp } });
+    }
+    var acc = terms[0];
+    var j: usize = 1;
+    while (j < terms.len) : (j += 1) {
+        acc = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = terms[j] } });
+    }
+    func.setTerminator(b, .{ .ret = acc });
+
+    try std.testing.expect(try debugSpillCount(allocator, &func) > 0);
+}
+
+test "intra-block predicate and use positions" {
+    // V is defined and used ONLY in its def block (intra-splittable). W is defined in the entry
+    // block and passed as an edge argument to a successor (not intra). X is defined in the entry
+    // block but used by a normal instruction in a DIFFERENT block (not intra). This exercises the
+    // liveness data the splitter needs, without changing any allocation decision.
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+
+    const b0 = try func.appendBlock();
+    const b1 = try func.appendBlock();
+    const a = try func.appendBlockParam(b0, t);
+    const bp = try func.appendBlockParam(b0, t);
+    const p = try func.appendBlockParam(b1, t);
+
+    const v = try func.appendInst(b0, t, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = bp } });
+    // V's sole use, in its own def block.
+    _ = try func.appendInst(b0, t, .{ .arith = .{ .op = .add, .lhs = v, .rhs = bp } });
+    const w = try func.appendInst(b0, t, .{ .arith = .{ .op = .add, .lhs = a, .rhs = bp } });
+    const x = try func.appendInst(b0, t, .{ .arith = .{ .op = .mul, .lhs = bp, .rhs = bp } });
+    const cond = try func.appendInst(b0, bool_t, .{ .icmp = .{ .op = .le, .lhs = a, .rhs = bp } });
+    // W flows to the successor as an edge argument on both branches.
+    try func.appendIf(b0, cond, .{ .target = b1, .args = &.{w} }, .{ .target = b1, .args = &.{w} });
+
+    // X is used by a normal instruction in b1, a different block than its def.
+    const xuse = try func.appendInst(b1, t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = p } });
+    func.setTerminator(b1, .{ .ret = xuse });
+
+    var lin = try debugLiveness(allocator, &func);
+    defer lin.deinit(allocator);
+
+    try std.testing.expect(lin.is_intra[@intFromEnum(v)]);
+    try std.testing.expect(!lin.is_intra[@intFromEnum(w)]);
+    try std.testing.expect(!lin.is_intra[@intFromEnum(x)]);
+    // Params are never intra-splittable.
+    try std.testing.expect(!lin.is_intra[@intFromEnum(a)]);
+    try std.testing.expect(!lin.is_intra[@intFromEnum(bp)]);
+    try std.testing.expect(!lin.is_intra[@intFromEnum(p)]);
+
+    // V's use positions are non-empty and strictly ascending.
+    const vuses = lin.use_positions[@intFromEnum(v)];
+    try std.testing.expect(vuses.len > 0);
+    var i: usize = 1;
+    while (i < vuses.len) : (i += 1) try std.testing.expect(vuses[i] > vuses[i - 1]);
+}
+
+test "locationAt returns the whole-life register for an unsplit value" {
+    // A small no-spill function: a*b + a. The multiply's result gets a whole-life register and is
+    // never split (segments stays empty), so locationAt must return that same register at every
+    // position. With the map empty, locationAt is exactly today's `reg` lookup.
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const b = try func.appendBlock();
+    const x = try func.appendBlockParam(b, t);
+    const y = try func.appendBlockParam(b, t);
+    const prod = try func.appendInst(b, t, .{ .arith = .{ .op = .mul, .lhs = x, .rhs = y } });
+    const sum = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = prod, .rhs = x } });
+    func.setTerminator(b, .{ .ret = sum });
+
+    var alloc = try allocate(allocator, &func, isLeaf(&func));
+    defer alloc.deinit(allocator);
+
+    // No value was split: the segment map is empty and every lookup falls back to reg/spill.
+    try std.testing.expectEqual(@as(usize, 0), alloc.segments.count());
+
+    const reg = alloc.reg.get(prod).?;
+    var alloca_off: std.AutoHashMapUnmanaged(Value, u32) = .empty;
+    defer alloca_off.deinit(allocator);
+    var ctx = Ctx{ .func = &func, .alloc = &alloc, .spill_base = 0, .alloca_base = 0, .alloca_off = &alloca_off };
+    // Before its def, at its def, and long after: the whole-life register is returned every time.
+    for ([_]u32{ 0, alloc.def_pos[@intFromEnum(prod)], 100 }) |p| {
+        ctx.pos = p;
+        try std.testing.expectEqual(Location{ .reg = reg }, ctx.locationAt(prod));
+    }
+}
+
+test "nextUseAfter finds the first strictly-greater use" {
+    try std.testing.expectEqual(@as(?u32, 9), nextUseAfter(&.{ 2, 5, 9 }, 5));
+    try std.testing.expectEqual(@as(?u32, 5), nextUseAfter(&.{ 2, 5, 9 }, 2));
+    try std.testing.expectEqual(@as(?u32, 2), nextUseAfter(&.{ 2, 5, 9 }, 0));
+    try std.testing.expectEqual(@as(?u32, null), nextUseAfter(&.{ 2, 5, 9 }, 9));
+    try std.testing.expectEqual(@as(?u32, null), nextUseAfter(&.{}, 0));
+}
+
+test "spill victim is the value whose next use is furthest, not whose interval ends furthest" {
+    // Belady/MIN spill selection: when the GPR pool is exhausted the allocator must spill the
+    // active value whose NEXT USE lies furthest ahead, not the one whose interval merely ENDS
+    // furthest. This function is crafted so the two heuristics disagree on exactly one forced
+    // spill. Eight i32 parameters pin x0..x7 and shrink the leaf GPR pool to {x9,x10,x11,x12}
+    // (four registers). Four values then fill that pool and a fifth definition forces one spill:
+    //   far_end is used soon (its next use is close) but again very late, so its interval END is
+    //           the furthest of all candidates. The old furthest-end rule spills it (wrong).
+    //   far_use is used exactly once, further ahead than far_end's soon use, so its NEXT USE is
+    //           the furthest of all candidates. The new Belady rule spills it (right).
+    // The assertions below hold only for the next-use rule and both fail for the furthest-end rule.
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const b = try func.appendBlock();
+
+    // Eight parameters occupy x0..x7 so the leaf GPR pool is only x9..x12.
+    var params: [8]Value = undefined;
+    for (&params) |*p| p.* = try func.appendBlockParam(b, t);
+
+    const f1 = try func.appendInst(b, t, .{ .iconst = 100 });
+    const f2 = try func.appendInst(b, t, .{ .iconst = 200 });
+    const far_use = try func.appendInst(b, t, .{ .iconst = 300 });
+    const far_end = try func.appendInst(b, t, .{ .iconst = 400 });
+    // The fifth live value: exhausts the four-register pool and forces the single spill.
+    const trig = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = f1, .rhs = f2 } });
+
+    // Tail: each add sets a candidate's next-use / interval-end. far_end is used once soon (here)
+    // and once far below, far_use exactly once (further ahead than far_end's soon use). The eight
+    // parameters are consumed here so they stay live across the spill point and keep the pool small.
+    var acc = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = trig, .rhs = far_end } });
+    acc = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = params[0] } });
+    acc = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = params[1] } });
+    acc = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = params[2] } });
+    // far_use's sole use, the furthest NEXT use of any candidate at the spill point.
+    acc = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = far_use } });
+    acc = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = params[3] } });
+    acc = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = params[4] } });
+    acc = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = params[5] } });
+    acc = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = params[6] } });
+    acc = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = params[7] } });
+    // far_end's final use, the furthest interval END of any candidate.
+    acc = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = far_end } });
+    func.setTerminator(b, .{ .ret = acc });
+
+    var alloc = try allocate(allocator, &func, isLeaf(&func));
+    defer alloc.deinit(allocator);
+
+    // Exactly the next-use victim is chosen: far_use (furthest next use), not far_end (furthest
+    // end). The old furthest-end heuristic would pick far_end and leave far_use resident, failing
+    // both assertions. far_use is an intra value with a register prefix, so it now TAIL-SPLITS
+    // (recorded in `segments`) rather than whole-spilling into `spill`; far_end keeps its register.
+    try std.testing.expect(alloc.segments.contains(far_use));
+    try std.testing.expect(!alloc.spill.contains(far_use));
+    try std.testing.expect(!alloc.segments.contains(far_end));
+    try std.testing.expect(!alloc.spill.contains(far_end));
 }
