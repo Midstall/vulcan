@@ -658,7 +658,20 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                             try code.append(allocator, encode.fcvt(rd, src, dst_d));
                         }
                     } else {
-                        try code.append(allocator, encode.mov(rd, src)); // int <-> int: low bits
+                        // int <-> int. Widening sign/zero-extends by the SOURCE signedness (sbfm for a
+                        // signed source, ubfm for unsigned); same-width or narrowing keeps the low
+                        // bits, byte-identical to the previous unconditional mov for those cases.
+                        const src_bits = intBitsOf(func, cv.value);
+                        const dst_bits = intBitsOf(func, result);
+                        if (dst_bits > src_bits and src_bits < 64) {
+                            const imms: u6 = @intCast(src_bits - 1);
+                            try code.append(allocator, if (isSignedInt(func, cv.value))
+                                encode.sbfm(rd, src, 0, imms)
+                            else
+                                encode.ubfm(rd, src, 0, imms));
+                        } else {
+                            try code.append(allocator, encode.mov(rd, src)); // same width / narrowing
+                        }
                     }
                     try storeResult(allocator, &code, ctx, result, rd);
                 },
@@ -1937,6 +1950,14 @@ fn emitBinary(allocator: std.mem.Allocator, code: *std.ArrayList(u32), op: ir.fu
         },
     };
     try code.append(allocator, sf | word);
+}
+
+/// The bit width of an integer value (its type is assumed to be an int, as at an int<->int convert).
+fn intBitsOf(func: *const Function, v: Value) u16 {
+    return switch (func.types.type_kind(func.valueType(v))) {
+        .int => |x| x.bits,
+        else => 64,
+    };
 }
 
 /// Whether a value occupies a full 64-bit register (a pointer or a 64-bit int),

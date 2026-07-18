@@ -83,6 +83,18 @@ pub fn umulh(rd: Reg, rn: Reg, rm: Reg) u32 {
     return 0x9BC07C00 | (n(rm) << 16) | (n(rn) << 5) | n(rd);
 }
 
+/// `sbfm xd, xn, #immr, #imms` (64-bit signed bitfield move). `sxtb`/`sxth`/`sxtw` are the aliases
+/// `sbfm xd, xn, #0, #{7,15,31}`, used here to sign-extend a narrower value held in an x register.
+pub fn sbfm(rd: Reg, rn: Reg, immr: u6, imms: u6) u32 {
+    return 0x93400000 | (@as(u32, immr) << 16) | (@as(u32, imms) << 10) | (n(rn) << 5) | n(rd);
+}
+
+/// `ubfm xd, xn, #immr, #imms` (64-bit unsigned bitfield move). `ubfm xd, xn, #0, #k` zero-extends
+/// the low `k+1` bits, the zero-extend counterpart of `sbfm`.
+pub fn ubfm(rd: Reg, rn: Reg, immr: u6, imms: u6) u32 {
+    return 0xD3400000 | (@as(u32, immr) << 16) | (@as(u32, imms) << 10) | (n(rn) << 5) | n(rd);
+}
+
 /// `and wd, wn, wm` (32-bit register bitwise and).
 pub fn andr(rd: Reg, rn: Reg, rm: Reg) u32 {
     return 0x0A000000 | (n(rm) << 16) | (n(rn) << 5) | n(rd);
@@ -717,6 +729,13 @@ test "known A64 encodings" {
 test "smulh / umulh encoding (high half of a 64x64 product)" {
     try std.testing.expectEqual(@as(u32, 0x9b4a7d28), smulh(.x8, .x9, .x10));
     try std.testing.expectEqual(@as(u32, 0x9bca7d28), umulh(.x8, .x9, .x10));
+}
+
+test "sbfm / ubfm encoding (sign/zero-extend a narrower value)" {
+    // sbfm x8, x9, #0, #31 is the `sxtw x8, w9` alias (sign-extend a word); ubfm the zero-extend.
+    try std.testing.expectEqual(@as(u32, 0x93407d28), sbfm(.x8, .x9, 0, 31));
+    try std.testing.expectEqual(@as(u32, 0xd3407d28), ubfm(.x8, .x9, 0, 31));
+    try std.testing.expectEqual(@as(u32, 0x93401d28), sbfm(.x8, .x9, 0, 7)); // sxtb
 }
 
 test "nop encoding" {

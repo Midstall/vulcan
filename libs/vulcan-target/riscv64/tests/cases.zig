@@ -18,6 +18,7 @@ const i32k = ir.types.TypeKind{ .int = .{ .signedness = .signed, .bits = 32 } };
 /// Run every execution case on `backend`.
 pub fn runAll(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {
     try arithmetic(io, allocator, backend);
+    try conversions(io, allocator, backend);
     try controlFlow(io, allocator, backend);
     try memory(io, allocator, backend);
     try calls(io, allocator, backend);
@@ -94,6 +95,34 @@ fn arithmetic(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !voi
         const c = try f.appendInst(e, bool_t, .{ .icmp = .{ .op = .lt, .lhs = a, .rhs = b } });
         f.setTerminator(e, .{ .ret = c });
         try h.expectRun(io, allocator, &f, &.{ 3, 7 }, 1, backend);
+    }
+}
+
+fn conversions(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {
+    const i64k = ir.types.TypeKind{ .int = .{ .signedness = .signed, .bits = 64 } };
+    const u32k = ir.types.TypeKind{ .int = .{ .signedness = .unsigned, .bits = 32 } };
+    const u64k = ir.types.TypeKind{ .int = .{ .signedness = .unsigned, .bits = 64 } };
+    { // widen a negative i32 to i64: sign-extend (the arg's low 32 bits are -5, upper bits 0)
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const src = try f.types.intern(i32k);
+        const dst = try f.types.intern(i64k);
+        const e = try f.appendBlock();
+        const x = try f.appendBlockParam(e, src);
+        const w = try f.appendInst(e, dst, .{ .convert = .{ .value = x } });
+        f.setTerminator(e, .{ .ret = w });
+        try h.expectRun(io, allocator, &f, &.{0xFFFFFFFB}, -5, backend); // sign fill, not 0x00000000FFFFFFFB
+    }
+    { // widen an unsigned u32 to u64: zero-extend
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const src = try f.types.intern(u32k);
+        const dst = try f.types.intern(u64k);
+        const e = try f.appendBlock();
+        const x = try f.appendBlockParam(e, src);
+        const w = try f.appendInst(e, dst, .{ .convert = .{ .value = x } });
+        f.setTerminator(e, .{ .ret = w });
+        try h.expectRun(io, allocator, &f, &.{0xFFFFFFFB}, 0xFFFFFFFB, backend); // zero fill
     }
 }
 
@@ -366,6 +395,56 @@ fn optimized(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void
         f.setTerminator(b, .{ .ret = r });
         try std.testing.expect(try opt.optimize(allocator, &f));
         try h.expectRun(io, allocator, &f, &.{-100}, -2, backend); // -100 = -14*7 - 2
+    }
+    { // 32-bit magic division: widen to 64, magic multiply, narrow (exercises the widening convert)
+        const u32k = ir.types.TypeKind{ .int = .{ .signedness = .unsigned, .bits = 32 } };
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const t = try f.types.intern(u32k);
+        const b = try f.appendBlock();
+        const x = try f.appendBlockParam(b, t);
+        const ten = try f.appendInst(b, t, .{ .iconst = 10 });
+        const q = try f.appendInst(b, t, .{ .arith = .{ .op = .div, .lhs = x, .rhs = ten } });
+        f.setTerminator(b, .{ .ret = q });
+        try std.testing.expect(try opt.optimize(allocator, &f));
+        try h.expectRun(io, allocator, &f, &.{123456789}, 12345678, backend);
+    }
+    { // 32-bit unsigned remainder by a constant
+        const u32k = ir.types.TypeKind{ .int = .{ .signedness = .unsigned, .bits = 32 } };
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const t = try f.types.intern(u32k);
+        const b = try f.appendBlock();
+        const x = try f.appendBlockParam(b, t);
+        const ten = try f.appendInst(b, t, .{ .iconst = 10 });
+        const r = try f.appendInst(b, t, .{ .arith = .{ .op = .rem, .lhs = x, .rhs = ten } });
+        f.setTerminator(b, .{ .ret = r });
+        try std.testing.expect(try opt.optimize(allocator, &f));
+        try h.expectRun(io, allocator, &f, &.{123456789}, 9, backend);
+    }
+    { // 32-bit signed division by a constant, negative dividend (truncates toward zero)
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const t = try f.types.intern(i32k);
+        const b = try f.appendBlock();
+        const x = try f.appendBlockParam(b, t);
+        const seven = try f.appendInst(b, t, .{ .iconst = 7 });
+        const q = try f.appendInst(b, t, .{ .arith = .{ .op = .div, .lhs = x, .rhs = seven } });
+        f.setTerminator(b, .{ .ret = q });
+        try std.testing.expect(try opt.optimize(allocator, &f));
+        try h.expectRun(io, allocator, &f, &.{-100}, -14, backend);
+    }
+    { // 32-bit signed remainder by a constant, negative dividend
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const t = try f.types.intern(i32k);
+        const b = try f.appendBlock();
+        const x = try f.appendBlockParam(b, t);
+        const seven = try f.appendInst(b, t, .{ .iconst = 7 });
+        const r = try f.appendInst(b, t, .{ .arith = .{ .op = .rem, .lhs = x, .rhs = seven } });
+        f.setTerminator(b, .{ .ret = r });
+        try std.testing.expect(try opt.optimize(allocator, &f));
+        try h.expectRun(io, allocator, &f, &.{-100}, -2, backend);
     }
 }
 

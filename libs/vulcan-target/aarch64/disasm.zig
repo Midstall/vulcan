@@ -1170,6 +1170,7 @@ test "decodes bitfield, movn, mulh, and SIMD unscaled loads (verified against ob
     try expectOne(0x12800aa1, "mov w1, #0xffffffaa");
     try expectOne(0x9bca7d28, "umulh x8, x9, x10");
     try expectOne(0x9b4a7d28, "smulh x8, x9, x10");
+    try expectOne(0x93407d28, "sxtw x8, w9"); // sbfm x8, x9, #0, #31 alias, cross-checks the encoder
     try expectOne(0x3cdf03a0, "ldur q0, [x29, #-16]");
     try expectOne(0x3c9e03a0, "stur q0, [x29, #-32]");
     try expectOne(0xfc5f03a0, "ldur d0, [x29, #-16]");
