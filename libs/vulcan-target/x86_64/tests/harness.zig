@@ -35,12 +35,12 @@ fn buildStub(allocator: std.mem.Allocator, args: []const i64) std.mem.Allocator.
     const arg_regs = [_]Reg{ .rdi, .rsi, .rdx, .rcx, .r8, .r9 };
     var s: std.ArrayList(u8) = .empty;
     errdefer s.deinit(allocator);
-    for (args, 0..) |a, i| try s.appendSlice(allocator, encode.movImm(arg_regs[i], @intCast(a)).slice());
+    for (args, 0..) |a, i| try s.appendSlice(allocator, encode.movImm(arg_regs[i], @intCast(a), true).slice());
 
     var exitseq: std.ArrayList(u8) = .empty;
     defer exitseq.deinit(allocator);
     try exitseq.appendSlice(allocator, encode.movReg(.rdi, .rax).slice());
-    try exitseq.appendSlice(allocator, encode.movImm(.rax, 60).slice());
+    try exitseq.appendSlice(allocator, encode.movImm(.rax, 60, true).slice());
     try exitseq.appendSlice(allocator, encode.syscall().slice());
 
     try s.appendSlice(allocator, encode.callRel(@intCast(exitseq.items.len)).slice());
@@ -140,14 +140,14 @@ fn buildFloatStub(allocator: std.mem.Allocator, fargs: []const f32) std.mem.Allo
     var s: std.ArrayList(u8) = .empty;
     errdefer s.deinit(allocator);
     for (fargs, 0..) |fa, i| {
-        try s.appendSlice(allocator, encode.movImm(.rax, @bitCast(@as(u32, @bitCast(fa)))).slice());
+        try s.appendSlice(allocator, encode.movImm(.rax, @bitCast(@as(u32, @bitCast(fa))), true).slice());
         try s.appendSlice(allocator, encode.movdToXmm(xmm_args[i], .rax).slice());
     }
     var exitseq: std.ArrayList(u8) = .empty;
     defer exitseq.deinit(allocator);
     try exitseq.appendSlice(allocator, encode.movdFromXmm(.rax, .xmm0).slice()); // f32 result bits -> eax
     try exitseq.appendSlice(allocator, encode.movReg(.rdi, .rax).slice());
-    try exitseq.appendSlice(allocator, encode.movImm(.rax, 60).slice());
+    try exitseq.appendSlice(allocator, encode.movImm(.rax, 60, true).slice());
     try exitseq.appendSlice(allocator, encode.syscall().slice());
     try s.appendSlice(allocator, encode.callRel(@intCast(exitseq.items.len)).slice());
     try s.appendSlice(allocator, exitseq.items);
@@ -185,7 +185,7 @@ fn buildDoubleStub(allocator: std.mem.Allocator, dargs: []const f64) std.mem.All
     defer exitseq.deinit(allocator);
     try exitseq.appendSlice(allocator, encode.movqFromXmm(.rax, .xmm0).slice()); // f64 result bits -> rax
     try exitseq.appendSlice(allocator, encode.movReg(.rdi, .rax).slice());
-    try exitseq.appendSlice(allocator, encode.movImm(.rax, 60).slice());
+    try exitseq.appendSlice(allocator, encode.movImm(.rax, 60, true).slice());
     try exitseq.appendSlice(allocator, encode.syscall().slice());
     try s.appendSlice(allocator, encode.callRel(@intCast(exitseq.items.len)).slice());
     try s.appendSlice(allocator, exitseq.items);
