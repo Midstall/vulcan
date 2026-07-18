@@ -159,10 +159,50 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
                     changed = true;
                 }
             },
+            // Redundant sign/zero-extension: a widen of a narrow of `s` recovers `s` when `s` already
+            // fits the narrower width (its extended bits are known), so the round-trip is dropped.
+            .convert => if (redundantExtend(func, bits, inst)) |s| {
+                func.replaceAllUses(result, s);
+                changed = true;
+            },
             else => {},
         }
     }
     return changed;
+}
+
+/// If `inst` is a widening convert `widen(narrow(s))` that recovers `s` unchanged, return `s`. The
+/// round-trip is the identity when the intermediate narrow lost nothing: the bits `s` holds above the
+/// narrow width already match what the widen re-fills (zero for an unsigned intermediate, the sign for
+/// a signed one), which known-bits can prove. Requires `s` to have the same type as the result so
+/// forwarding it does not change any downstream signedness interpretation.
+fn redundantExtend(func: *const Function, bits: []const Bits, inst: Inst) ?Value {
+    const cv = func.opcode(inst).convert;
+    const result = func.instResult(inst).?;
+    const dst_w = intWidth(func, result) orelse return null;
+    const mid = cv.value;
+    const mid_w = intWidth(func, mid) orelse return null;
+    if (dst_w <= mid_w) return null; // must be a widening convert
+
+    const mid_inst = func.definingInst(mid) orelse return null;
+    const inner = switch (func.opcode(mid_inst)) {
+        .convert => |c| c,
+        else => return null,
+    };
+    const s = inner.value;
+    const s_w = intWidth(func, s) orelse return null;
+    if (s_w != dst_w) return null; // the narrow's source must be exactly the width we widen back to
+    if (isUnsigned(func, s) != isUnsigned(func, result)) return null; // same type as the result
+
+    const high = widthMask(dst_w) & ~widthMask(mid_w); // the bits above the narrow width
+    const sz = bits[@intFromEnum(s)].zeros;
+    if (isUnsigned(func, mid)) {
+        if (sz & high == high) return s; // zero-extend recovers s iff those bits are known 0
+    } else {
+        const sign: u64 = @as(u64, 1) << @intCast(mid_w - 1);
+        if (sz & high == high and sz & sign != 0) return s; // sign-extend of a known-nonnegative s
+    }
+    return null;
 }
 
 /// True when `x & c == x`: the bits `c` clears (within x's width) are all known 0 in x already.
@@ -199,6 +239,55 @@ test "a mask that clears only already-zero bits is removed" {
     try testing.expect(try runOnce(allocator, &func));
     // The redundant `& 0xFFFF` now forwards `lo` directly.
     try testing.expectEqual(lo, func.terminator(b).?.ret.?);
+}
+
+test "a zero-extend of a truncation of an already-narrow value is eliminated" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const u64t = try uintTy(&func, 64);
+    const u32t = try uintTy(&func, 32);
+    const b = try func.appendBlock();
+    const p = try func.appendBlockParam(b, u64t);
+    const s = try func.appendArithImm(b, u64t, .bit_and, p, 0xFFFFFFFF); // high 32 known 0
+    const n = try func.appendInst(b, u32t, .{ .convert = .{ .value = s } }); // narrow to u32
+    const w = try func.appendInst(b, u64t, .{ .convert = .{ .value = n } }); // widen back to u64
+    func.setTerminator(b, .{ .ret = w });
+
+    try testing.expect(try runOnce(allocator, &func));
+    try testing.expectEqual(s, func.terminator(b).?.ret.?); // round-trip recovered s
+}
+
+test "a sign-extend round-trip of a known-nonnegative value is eliminated" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i64t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
+    const i32t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const b = try func.appendBlock();
+    const p = try func.appendBlockParam(b, i64t);
+    const s = try func.appendArithImm(b, i64t, .bit_and, p, 0x7FFFFFFF); // nonnegative, fits i32
+    const n = try func.appendInst(b, i32t, .{ .convert = .{ .value = s } });
+    const w = try func.appendInst(b, i64t, .{ .convert = .{ .value = n } });
+    func.setTerminator(b, .{ .ret = w });
+
+    try testing.expect(try runOnce(allocator, &func));
+    try testing.expectEqual(s, func.terminator(b).?.ret.?);
+}
+
+test "a widen of a truncation is kept when the high bits are not known" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const u64t = try uintTy(&func, 64);
+    const u32t = try uintTy(&func, 32);
+    const b = try func.appendBlock();
+    const s = try func.appendBlockParam(b, u64t); // unknown high bits
+    const n = try func.appendInst(b, u32t, .{ .convert = .{ .value = s } });
+    const w = try func.appendInst(b, u64t, .{ .convert = .{ .value = n } });
+    func.setTerminator(b, .{ .ret = w });
+
+    try testing.expect(!try runOnce(allocator, &func)); // truncation may lose bits, keep the round-trip
 }
 
 test "a mask that clears a possibly-set bit is kept" {
