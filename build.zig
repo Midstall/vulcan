@@ -150,6 +150,26 @@ pub fn build(b: *std.Build) void {
             if (b.args) |a| run_disasm.addArgs(a);
             const run_disasm_step = b.step("run-disasm", "Disassemble an ELF or SPIR-V binary to text assembly: -- <file>");
             run_disasm_step.dependOn(&run_disasm.step);
+
+            // The microarch benchmark harness: JIT-compiles a fixed kernel set with and without
+            // the microarch optimizer and measures the cycle gains for a chosen (or detected)
+            // model. Builds for any hosted target; the non-host-arch and no-perf paths handle
+            // non-aarch64/non-linux gracefully at runtime (see tools/uarch-bench.zig).
+            const uarch_bench_cli = b.addExecutable(.{ .name = "vulcan-uarch-bench", .root_module = b.createModule(.{
+                .root_source_file = b.path("tools/uarch-bench.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "vulcan-ir", .module = vulcan_ir },
+                    .{ .name = "vulcan-opt", .module = vulcan_opt },
+                    .{ .name = "vulcan-target", .module = vulcan_target },
+                },
+            }) });
+            b.installArtifact(uarch_bench_cli);
+            const run_uarch_bench = b.addRunArtifact(uarch_bench_cli);
+            if (b.args) |a| run_uarch_bench.addArgs(a);
+            const run_uarch_bench_step = b.step("run-uarch-bench", "Benchmark the microarch optimizer: -- [--model <tag> | --list | --custom]");
+            run_uarch_bench_step.dependOn(&run_uarch_bench.step);
         }
     }
 
@@ -231,6 +251,86 @@ pub fn build(b: *std.Build) void {
         },
     }) });
     test_step.dependOn(&b.addRunArtifact(differential).step);
+
+    // Loop-unroll differential oracle: build a loop, unroll one copy under a wide
+    // model, JIT both the original and the unrolled function on the host, and
+    // require identical results for every input. Runs where the native JIT has a
+    // backend (aarch64/x86_64/riscv64/x86).
+    const unroll_diff = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("libs/vulcan-target/tests/unroll_differential.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "vulcan-ir", .module = vulcan_ir },
+            .{ .name = "vulcan-opt", .module = vulcan_opt },
+            .{ .name = "vulcan-target", .module = vulcan_target },
+        },
+    }) });
+    test_step.dependOn(&b.addRunArtifact(unroll_diff).step);
+
+    // Prefetch differential oracle: build a function twice, hand-insert a `prefetch`
+    // hint in one copy, JIT both on the host, and require identical results for every
+    // input. Proves the PRFM (aarch64) / dropped-hint (elsewhere) lowering has no
+    // observable effect. Runs where the native JIT has a backend.
+    const prefetch_diff = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("libs/vulcan-target/tests/prefetch_differential.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "vulcan-ir", .module = vulcan_ir },
+            .{ .name = "vulcan-opt", .module = vulcan_opt },
+            .{ .name = "vulcan-target", .module = vulcan_target },
+        },
+    }) });
+    test_step.dependOn(&b.addRunArtifact(prefetch_diff).step);
+
+    // Vector memory coalescing differential oracle: build a scalar elementwise memory kernel twice,
+    // run one copy through microarch.optimize (which coalesces contiguous scalar loads/stores into
+    // wide vector loads/stores), JIT both on the host, and require identical per-element results,
+    // including the safety case where a store between the loads makes coalescing decline. Runs where
+    // the native JIT has a backend.
+    const vector_mem_diff = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("libs/vulcan-target/tests/vector_mem_differential.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "vulcan-ir", .module = vulcan_ir },
+            .{ .name = "vulcan-opt", .module = vulcan_opt },
+            .{ .name = "vulcan-target", .module = vulcan_target },
+        },
+    }) });
+    test_step.dependOn(&b.addRunArtifact(vector_mem_diff).step);
+
+    // INT8 dot-product differential oracle: build a scalar `sum a[i]*b[i]` int8 reduction twice,
+    // vectorize one copy to SDOT/UDOT under the ampere-altra model, JIT both on the host, and require
+    // identical results across lengths including non-multiples of 16 (exercising the remainder loop),
+    // for both signed (SDOT) and unsigned (UDOT). Aarch64-only; skips elsewhere.
+    const dotprod_diff = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("libs/vulcan-target/tests/dotprod_differential.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "vulcan-ir", .module = vulcan_ir },
+            .{ .name = "vulcan-opt", .module = vulcan_opt },
+            .{ .name = "vulcan-target", .module = vulcan_target },
+        },
+    }) });
+    test_step.dependOn(&b.addRunArtifact(dotprod_diff).step);
+
+    // Microarch optimizer end-to-end harness (spec chunk 10 capstone): three kernels compiled both
+    // plainly and through the full pipeline (microarch.optimize + the model-aware backend compile),
+    // JIT'd on the host, results required identical, cycles logged. Aarch64-only; skips elsewhere.
+    const microarch_e2e = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("libs/vulcan-target/tests/microarch_e2e.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "vulcan-ir", .module = vulcan_ir },
+            .{ .name = "vulcan-opt", .module = vulcan_opt },
+            .{ .name = "vulcan-target", .module = vulcan_target },
+        },
+    }) });
+    test_step.dependOn(&b.addRunArtifact(microarch_e2e).step);
 
     // GLSL frontend tests: parsing/lowering (IR only), plus execution (GLSL -> IR ->
     // host JIT -> run) for scalar functions.

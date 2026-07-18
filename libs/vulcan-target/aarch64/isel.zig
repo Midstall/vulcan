@@ -12,6 +12,8 @@
 const std = @import("std");
 const ir = @import("vulcan-ir");
 const encode = @import("encode.zig");
+const loops = @import("vulcan-opt").loops;
+const mm = @import("vulcan-opt").microarch;
 
 const Function = ir.function.Function;
 const Value = ir.function.Value;
@@ -73,6 +75,36 @@ fn isDouble(func: *const Function, v: Value) bool {
     };
 }
 
+/// Whether `v` is an f16 (half). f16 is emulated: it lives in an S register as its f32
+/// widening (so `isDouble(f16)` is false and every in-register op uses the S-form naturally),
+/// and the boundaries widen/narrow with `fcvt`. `isHalf` marks the sites that must add that
+/// widening/narrowing: memory load/store, narrowing converts, and arithmetic results.
+fn isHalf(func: *const Function, v: Value) bool {
+    return switch (func.types.type_kind(func.valueType(v))) {
+        .float => |f| f == .f16,
+        else => false,
+    };
+}
+
+/// The scalar-FP `ftype` selector for `v`'s register view. Under `fp16` (native FEAT_FP16), an
+/// f16 lives in an H register and selects `.half`. Otherwise (the emulation, where an f16 lives
+/// as its exact f32 widening in an S register) an f16 selects `.single` exactly as f32 does, so
+/// the encoding is byte-identical to the pre-FEAT_FP16 output. f64 always selects `.double`.
+fn fkindOf(func: *const Function, v: Value, fp16: bool) encode.FKind {
+    if (fp16 and isHalf(func, v)) return .half;
+    return if (isDouble(func, v)) .double else .single;
+}
+
+/// Round the f16 value held in the S view of `reg` to nearest-even half and re-widen it, in
+/// place. This is the per-op IEEE rounding of the f16 emulation: an f16 arithmetic result or
+/// f32->f16 convert is first computed in f32, then this narrows it to half and widens back so
+/// the S register again holds an exact half value. Skipping it would keep f32 precision, which
+/// is WRONG for f16 semantics (each op must round to nearest-even half).
+fn roundToHalf(allocator: std.mem.Allocator, code: *std.ArrayList(u32), reg: Reg) Error!void {
+    try code.append(allocator, encode.fcvtHfromS(reg, reg));
+    try code.append(allocator, encode.fcvtSfromH(reg, reg));
+}
+
 /// Where an argument/parameter is passed: which file, and its index within that
 /// file (registers x0..x7 / v0..v7, or a stack slot when the index is >= 8).
 const ArgLoc = struct { class: Class, idx: usize };
@@ -130,9 +162,56 @@ const Allocation = struct {
     }
 };
 
+/// Capabilities a model-aware call site threads into `compileFunction`. Grouped into one struct
+/// (rather than growing `compileFunction`'s parameter list one flag per model feature) so adding
+/// the next capability never touches every existing call site. Every field defaults off, so `.{}`
+/// is exactly today's behavior for every non-model caller (`selectFunction`,
+/// `selectFunctionWithLines`, and the direct `compileFunction` callers in `link.zig`/`object.zig`):
+/// no loop-header alignment padding, and the base-ISA f16 EMULATION (an f16 held as its f32
+/// widening in an S register, rounded per-op with `fcvt`).
+pub const ModelCaps = struct {
+    /// Loop-header alignment in bytes (0 disables it). See `compileFunction`'s doc comment.
+    fetch_align: u16 = 0,
+    /// Use NATIVE half-precision arithmetic (H-form ops, an f16 held in an H register, single-
+    /// rounded, no per-op widen/narrow) instead of the emulation. Set only when the target model's
+    /// `features.aarch64.fp16` (FEAT_FP16) is true (see `selectFunctionForModel`). When false the
+    /// f16 lowering is byte-identical to the pre-FEAT_FP16 emulation.
+    fp16: bool = false,
+};
+
 /// Select A64 words for `func`, discarding relocations. The caller owns the slice.
 pub fn selectFunction(allocator: std.mem.Allocator, func: *const Function) Error![]u32 {
-    const compiled = try compileFunction(allocator, func);
+    const compiled = try compileFunction(allocator, func, .{});
+    allocator.free(compiled.relocs);
+    allocator.free(compiled.lines);
+    return compiled.code;
+}
+
+/// Like `selectFunction`, but pads loop-header blocks with nops so they land on a
+/// `fetch_align`-byte boundary (a performance hint from the microarch model; 0
+/// disables it). Never changes the function's result, only where headers fall.
+pub fn selectFunctionAligned(allocator: std.mem.Allocator, func: *const Function, fetch_align: u16) Error![]u32 {
+    const compiled = try compileFunction(allocator, func, .{ .fetch_align = fetch_align });
+    allocator.free(compiled.relocs);
+    allocator.free(compiled.lines);
+    return compiled.code;
+}
+
+/// Compile `func` tuned to `model`: the machine-level hooks read the model's `fetch_align`
+/// (loop-header alignment) and `features.aarch64.fp16` (whether to use native FEAT_FP16 half
+/// arithmetic instead of the emulation). Fusion is already unconditional, so these are the
+/// model-aware seams a caller needs. An inert model (fetch_align 0, fp16 false) makes this
+/// byte-identical to `selectFunction`. Builds the full `ModelCaps` and calls `compileFunction`
+/// directly rather than through `selectFunctionAligned`, since that narrower entry point only
+/// ever carries `fetch_align`.
+pub fn selectFunctionForModel(allocator: std.mem.Allocator, func: *const Function, model: *const mm.Model) Error![]u32 {
+    // Passing a foreign-arch model here is a caller bug, not a runtime fault.
+    std.debug.assert(model.arch == .aarch64);
+    const caps: ModelCaps = .{
+        .fetch_align = model.fetch_align,
+        .fp16 = model.arch == .aarch64 and model.features.aarch64.fp16,
+    };
+    const compiled = try compileFunction(allocator, func, caps);
     allocator.free(compiled.relocs);
     allocator.free(compiled.lines);
     return compiled.code;
@@ -144,7 +223,7 @@ pub const CodeWithLines = struct { code: []u32, lines: []LineEntry };
 /// Like `selectFunction`, but also returns the source-line table for DWARF `.debug_line`.
 /// Caller owns both slices.
 pub fn selectFunctionWithLines(allocator: std.mem.Allocator, func: *const Function) Error!CodeWithLines {
-    const compiled = try compileFunction(allocator, func);
+    const compiled = try compileFunction(allocator, func, .{});
     allocator.free(compiled.relocs);
     return .{ .code = compiled.code, .lines = compiled.lines };
 }
@@ -190,8 +269,40 @@ fn alignUp(v: usize, a: usize) usize {
     return (v + a - 1) & ~(a - 1);
 }
 
+/// Number of nop words to insert so a block starting at `words` (current code length in
+/// 4-byte words) lands on a `fetch_align`-byte boundary. Zero when fetch_align is at most
+/// one word (already aligned) or the block is already on a boundary.
+fn alignPadWords(words: usize, fetch_align: u16) usize {
+    if (fetch_align <= 4) return 0;
+    const per: usize = fetch_align / 4; // words per alignment boundary
+    const rem = words % per;
+    return if (rem == 0) 0 else per - rem;
+}
+
 /// Compile `func` to A64 words and call relocations. The caller owns the result.
-pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function) Error!Compiled {
+/// `fetch_align` is the microarch model's fetch granularity in bytes (0 disables loop-header
+/// alignment, the behavior of every existing caller). When greater than one instruction word,
+/// each loop-header block is padded with nops up to a `fetch_align` boundary before its code is
+/// emitted, so a hot loop's fetch groups pack efficiently. This is purely a placement hint: the
+/// padding falls straight through into the header and every branch fixup is patched from
+/// `block_start` (recorded after padding), so it can never change what the function computes.
+pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps: ModelCaps) Error!Compiled {
+    const fetch_align = caps.fetch_align;
+    // Native half arithmetic (FEAT_FP16) vs the base-ISA emulation, gated on the model feature.
+    // `fp16 == false` (every non-model caller) keeps the emulation, byte-identical to before this
+    // capability existed; only `selectFunctionForModel` under a FEAT_FP16 model sets it true.
+    const fp16 = caps.fp16;
+    // aarch64 is the reference f16 backend (f16 roadmap Task 3). By default f16 is EMULATED: an
+    // f16 value lives in an S register as its f32 WIDENING (a value exactly representable in
+    // half). The boundaries do the rounding via base-ISA `fcvt` (no FEAT_FP16): a memory
+    // load is `ldr h; fcvt s,h`, a store is `fcvt h,s; str h`, every arithmetic result and
+    // narrowing convert rounds to nearest-even half with `fcvt h,s; fcvt s,h`. Under `fp16` the
+    // Native path holds the f16 in an H register and uses the single-rounded H-form ops directly
+    // (no widen/narrow). The other backends still reject f16 via `functionUsesF16` (kept for
+    // them); aarch64 no longer does.
+    // Only SCALAR f16 is handled; f16 nested in a vector/aggregate would fall through to the
+    // raw-vector path and miscompile the half lanes, so reject that composite case cleanly.
+    if (ir.function.functionUsesCompositeF16(func)) return error.Unsupported;
     const nblocks = func.blockCount();
     if (nblocks == 0) return error.Unsupported;
     const leaf = isLeaf(func);
@@ -234,6 +345,17 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function) Erro
     defer fixups.deinit(allocator);
     var block_start = try allocator.alloc(usize, nblocks);
     defer allocator.free(block_start);
+
+    // Loop-header alignment (a placement hint only, see the doc comment above): computed once,
+    // up front, so the per-block loop below just checks a bit per block.
+    var is_loop_header = try allocator.alloc(bool, nblocks);
+    defer allocator.free(is_loop_header);
+    @memset(is_loop_header, false);
+    if (fetch_align > 4) {
+        var li = try loops.analyze(allocator, func);
+        defer li.deinit(allocator);
+        for (li.loops) |l| is_loop_header[l.header] = true;
+    }
 
     if (frame > 0) try emitFrameImm(allocator, &code, true, sp, sp, frame);
     if (!leaf) {
@@ -291,14 +413,19 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function) Erro
         }
     }
 
-    const ctx = Ctx{ .func = func, .alloc = &alloc, .spill_base = spill_base, .alloca_base = alloca_base, .alloca_off = &alloca_off };
+    const ctx = Ctx{ .func = func, .alloc = &alloc, .spill_base = spill_base, .alloca_base = alloca_base, .alloca_off = &alloca_off, .fp16 = fp16 };
 
     for (0..nblocks) |bi| {
         const block: Block = @enumFromInt(bi);
+        if (fetch_align > 4 and is_loop_header[bi]) {
+            var pad = alignPadWords(code.items.len, fetch_align);
+            while (pad > 0) : (pad -= 1) try code.append(allocator, encode.nop());
+        }
         block_start[bi] = code.items.len;
         var terminated = false;
 
-        for (func.blockInsts(block)) |inst| {
+        const insts = func.blockInsts(block);
+        for (insts, 0..) |inst, inst_idx| {
             // Record a source-line row when this instruction begins a new line (its
             // `debug.line` attribute differs from the previous instruction's).
             if (lineOf(func, inst)) |line| {
@@ -335,16 +462,47 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function) Erro
                     const result = func.instResult(inst).?;
                     const rd = resultReg(&alloc, func, result);
                     const d = isDouble(func, result);
-                    if (d) {
-                        try loadConst64(allocator, &code, scratch_imm, @bitCast(val));
-                    } else {
-                        const bits: u32 = @bitCast(@as(f32, @floatCast(val)));
+                    if (fp16 and isHalf(func, result)) {
+                        // Native (fp16): materialize the raw 16-bit IEEE-half pattern of the
+                        // half-rounded value in a GPR, then `fmov h, w` into the H register. The
+                        // half lives natively (no f32 widening), so no `fcvt` is needed.
+                        const h: f16 = @floatCast(val);
+                        const bits: u16 = @bitCast(h);
                         try loadConst(allocator, &code, scratch_imm, @intCast(bits));
+                        try code.append(allocator, encode.fmovHfromGpr(rd, scratch_imm));
+                    } else {
+                        if (d) {
+                            try loadConst64(allocator, &code, scratch_imm, @bitCast(val));
+                        } else {
+                            // In the emulation path an f16 constant is materialized as its f32 widening (round
+                            // the value to half first, `@as(f32, @as(f16, val))`), keeping the
+                            // invariant that an f16 in a register is its exact-half f32 form. f32
+                            // keeps full value.
+                            const rounded: f32 = if (isHalf(func, result)) @as(f16, @floatCast(val)) else @floatCast(val);
+                            const bits: u32 = @bitCast(rounded);
+                            try loadConst(allocator, &code, scratch_imm, @intCast(bits));
+                        }
+                        try code.append(allocator, encode.fmovFromGpr(rd, scratch_imm, d));
                     }
-                    try code.append(allocator, encode.fmovFromGpr(rd, scratch_imm, d));
                     try storeResult(allocator, &code, ctx, result, rd);
                 },
-                .arith => |a| try ctx.binary(allocator, &code, func.instResult(inst).?, a.op, a.lhs, a.rhs),
+                .arith => |a| {
+                    // Fused multiply-add/sub: when this is a float `mul` that is the
+                    // single-use, immediately-preceding operand of the next add/sub, skip
+                    // its materialization entirely. `emitFusedArith` re-checks the SAME
+                    // predicate and emits the fused fmadd/fmsub/fnmsub on these operands,
+                    // so the multiply is emitted exactly once (mirrors the icmp/if fusion
+                    // above).
+                    if (a.op == .mul and fusesIntoNextArith(func, insts, inst_idx)) continue;
+                    const result = func.instResult(inst).?;
+                    if ((a.op == .add or a.op == .sub) and inst_idx >= 1 and fusesIntoNextArith(func, insts, inst_idx - 1)) {
+                        const mul = func.opcode(insts[inst_idx - 1]).arith;
+                        const mul_result = func.instResult(insts[inst_idx - 1]).?;
+                        try ctx.emitFusedArith(allocator, &code, result, a.op, a.lhs, a.rhs, mul, mul_result);
+                        continue;
+                    }
+                    try ctx.binary(allocator, &code, result, a.op, a.lhs, a.rhs);
+                },
                 .arith_imm => |a| {
                     const result = func.instResult(inst).?;
                     const rl = try ctx.loadOp(allocator, &code, a.lhs, spill_op[0]);
@@ -354,6 +512,12 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function) Erro
                     try storeResult(allocator, &code, ctx, result, rd);
                 },
                 .icmp => |cmp| {
+                    // Fused compare-and-branch: when this integer icmp is the single-use
+                    // condition of the immediately-following if, skip its `cmp; cset`
+                    // materialization entirely. `emitIf` re-checks the SAME predicate and
+                    // emits the fused `cmp; b.cc` on these operands, so the compare is
+                    // emitted exactly once.
+                    if (fusesIntoNextIf(func, insts, inst_idx)) continue;
                     const result = func.instResult(inst).?;
                     if (isVector(func, cmp.lhs)) {
                         // Vectorized compare (widened FS): produce a per-lane MASK
@@ -381,7 +545,9 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function) Erro
                         const rl = try ctx.loadOp(allocator, &code, cmp.lhs, fp_spill_op[0]);
                         const rr = try ctx.loadOp(allocator, &code, cmp.rhs, fp_spill_op[1]);
                         const rd = resultReg(&alloc, func, result);
-                        try code.append(allocator, encode.fcmp(rl, rr, isDouble(func, cmp.lhs)));
+                        // Native f16 (fp16) compares in the H form; emulation compares the S-held
+                        // f32 widening (fkindOf yields `.single`, byte-identical to before).
+                        try code.append(allocator, encode.fcmp(rl, rr, fkindOf(func, cmp.lhs, fp16)));
                         try code.append(allocator, encode.cset(rd, condForFloat(cmp.op)));
                         try storeResult(allocator, &code, ctx, result, rd);
                     } else {
@@ -419,7 +585,9 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function) Erro
                         const el = try ctx.loadOp(allocator, &code, s.@"else", fp_spill_op[1]);
                         const rd = resultReg(&alloc, func, result);
                         try code.append(allocator, encode.cmp(c, .zr));
-                        try code.append(allocator, encode.fcsel(rd, tr, el, .ne, isDouble(func, result)));
+                        // Native f16 (fp16) selects in the H form; emulation selects the S-held
+                        // f32 widening (fkindOf yields `.single`, byte-identical to before).
+                        try code.append(allocator, encode.fcsel(rd, tr, el, .ne, fkindOf(func, result, fp16)));
                         try storeResult(allocator, &code, ctx, result, rd);
                     } else {
                         const tr = try ctx.loadOp(allocator, &code, s.then, spill_op[1]);
@@ -437,13 +605,58 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function) Erro
                     const src = try ctx.loadOp(allocator, &code, cv.value, if (sc == .fpr) fp_spill_op[0] else spill_op[0]);
                     const rd = resultReg(&alloc, func, result);
                     if (sc == .gpr and dc == .fpr) {
-                        try code.append(allocator, encode.cvtIntToFloat(rd, src, isDouble(func, result), isSignedInt(func, cv.value)));
+                        // int -> float: scvtf/ucvtf. NATIVE (fp16) converts straight into the H
+                        // view (single-rounded, no fixup). EMULATION lands an int->f16 in the S
+                        // view first (isDouble(f16) is false), then rounds to nearest-even half so
+                        // the S reg holds an exact half; fkindOf yields `.single` there, keeping
+                        // the emulation encoding byte-identical.
+                        try code.append(allocator, encode.cvtIntToFloat(rd, src, fkindOf(func, result, fp16), isSignedInt(func, cv.value)));
+                        if (isHalf(func, result) and !fp16) try roundToHalf(allocator, &code, rd);
                     } else if (sc == .fpr and dc == .gpr) {
-                        try code.append(allocator, encode.cvtFloatToInt(rd, src, isDouble(func, cv.value), isSignedInt(func, result)));
+                        // float -> int: fcvtzs/fcvtzu (round toward zero). NATIVE (fp16) reads the
+                        // f16 straight from the H view. EMULATION reads the exact f32 widening in
+                        // the S view (fkindOf yields `.single`, byte-identical to before).
+                        try code.append(allocator, encode.cvtFloatToInt(rd, src, fkindOf(func, cv.value, fp16), isSignedInt(func, result)));
                     } else if (sc == .fpr and dc == .fpr) {
-                        const sd = isDouble(func, cv.value);
-                        const dd = isDouble(func, result);
-                        try code.append(allocator, if (sd == dd) encode.fmovReg(rd, src) else encode.fcvt(rd, src, dd));
+                        const src_half = isHalf(func, cv.value);
+                        const dst_half = isHalf(func, result);
+                        const src_d = isDouble(func, cv.value);
+                        const dst_d = isDouble(func, result);
+                        if (fp16 and (src_half or dst_half)) {
+                            // In the native path an f16 lives in an H register (not an S-held f32 widening),
+                            // so convert directly between the H view and s/d with a SINGLE fcvt
+                            // (or a plain copy for f16 -> f16), never re-materializing an S form.
+                            if (dst_half and src_half) {
+                                try code.append(allocator, encode.fmovReg(rd, src)); // f16 -> f16: copy the H view
+                            } else if (dst_half) {
+                                // f32/f64 -> f16: one round to native half (fcvt h,d rounds once
+                                // directly from double, avoiding a double-rounding d->s->h path).
+                                try code.append(allocator, if (src_d) encode.fcvtHfromD(rd, src) else encode.fcvtHfromS(rd, src));
+                            } else if (dst_d) {
+                                try code.append(allocator, encode.fcvtDfromH(rd, src)); // f16 -> f64 (exact widen)
+                            } else {
+                                try code.append(allocator, encode.fcvtSfromH(rd, src)); // f16 -> f32 (exact widen)
+                            }
+                        } else if (isHalf(func, result)) {
+                            // Emulation -> f16. The old 2-way isDouble split (`sd == dd -> fmov`)
+                            // is WRONG for f16: f32->f16 has isDouble false on both sides and would
+                            // emit a bare `fmov` with no rounding. Narrow to nearest-even half (a
+                            // single round from the source width) then widen back to the S-held
+                            // representation. fcvt h,d rounds once directly from double.
+                            try code.append(allocator, if (src_d) encode.fcvtHfromD(rd, src) else encode.fcvtHfromS(rd, src));
+                            try code.append(allocator, encode.fcvtSfromH(rd, rd));
+                        } else if (src_d == dst_d) {
+                            // Same register view, dest not half: a plain copy. Covers f32->f32,
+                            // f64->f64, and (emulation) f16->f32 (the S reg already holds the exact
+                            // half value as its f32 widening, so widening to f32 is the identity).
+                            try code.append(allocator, encode.fmovReg(rd, src));
+                        } else {
+                            // Different views, dest not half: the base single<->double convert,
+                            // byte-identical to the pre-f16 behavior for f32<->f64, and also the
+                            // exact (emulation) f16->f64 widen (the S-held half widens to double).
+                            // dst_d picks the direction.
+                            try code.append(allocator, encode.fcvt(rd, src, dst_d));
+                        }
                     } else {
                         try code.append(allocator, encode.mov(rd, src)); // int <-> int: low bits
                     }
@@ -474,6 +687,12 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function) Erro
                             try code.append(allocator, encode.mov(rd, src));
                         }
                     } else {
+                        // f16 float-math unary (sqrt/ceil/floor/trunc/nearest) is not lowered on
+                        // either f16 path: the emulation holds f16 as an f32 (an fsqrt.s would leave
+                        // an un-narrowed f32), and the native path holds it in an H register (an
+                        // fsqrt.s would mis-read the low 32 bits). No front-end emits it today; reject
+                        // cleanly rather than silently miscompile (mirrors the wasm backend).
+                        if (isHalf(func, result)) return error.Unsupported;
                         const d = isDouble(func, result);
                         try code.append(allocator, switch (u.op) {
                             .sqrt => encode.fsqrt(rd, src, d),
@@ -497,13 +716,19 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function) Erro
                     const result = func.instResult(inst).?;
                     const base = try ctx.loadOp(allocator, &code, l.ptr, spill_op[0]); // ptr is a gpr
                     const rd = resultReg(&alloc, func, result);
-                    try emitLoad(allocator, &code, func, result, rd, base);
+                    try emitLoad(allocator, &code, func, result, rd, base, fp16);
                     try storeResult(allocator, &code, ctx, result, rd);
                 },
                 .store => |st| {
                     const val = try ctx.loadOp(allocator, &code, st.value, if (regClass(func, st.value) == .fpr) fp_spill_op[0] else spill_op[0]);
                     const base = try ctx.loadOp(allocator, &code, st.ptr, spill_op[1]);
-                    try emitStore(allocator, &code, func, st.value, val, base);
+                    try emitStore(allocator, &code, func, st.value, val, base, fp16);
+                },
+                .prefetch => |pf| {
+                    // A software prefetch hint: bring [ptr] into L1, no result, no
+                    // observable effect on the function.
+                    const base = try ctx.loadOp(allocator, &code, pf.ptr, spill_op[0]);
+                    try code.append(allocator, encode.prfm(base));
                 },
                 .extract => |e| {
                     // Extract a SIMD lane to a scalar (the vectorizer's unpack): one NEON
@@ -590,8 +815,26 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function) Erro
                     }
                 },
                 .@"if" => |cf| {
-                    try ctx.emitIf(allocator, &code, &fixups, cf);
+                    try ctx.emitIf(allocator, &code, &fixups, cf, insts, inst_idx);
                     terminated = true;
+                },
+                .dot => |d| {
+                    // SDOT/UDOT ACCUMULATE into Vd, so `acc` must be resident in the
+                    // destination before the dot executes. Mirrors the vectorized
+                    // select's blend below: accumulate into the fixed scratch `fp_move`
+                    // (v27, outside every allocation pool) first, so it never aliases
+                    // the acc/a/b operand registers (a naive `movVec(rd, acc)` would
+                    // clobber `a` or `b` if the allocator reused either's register as
+                    // `rd`), then move into the result register only if they differ.
+                    const result = func.instResult(inst).?;
+                    const racc = try ctx.loadOp(allocator, &code, d.acc, fp_spill_op[0]);
+                    const ra = try ctx.loadOp(allocator, &code, d.a, fp_spill_op[1]);
+                    const rb = try ctx.loadOp(allocator, &code, d.b, fp_spill_res);
+                    try code.append(allocator, encode.movVec(fp_move, racc));
+                    try code.append(allocator, if (dotSigned(func, d.a)) encode.sdot(fp_move, ra, rb) else encode.udot(fp_move, ra, rb));
+                    const rd = resultReg(&alloc, func, result);
+                    if (@intFromEnum(rd) != @intFromEnum(fp_move)) try code.append(allocator, encode.movVec(rd, fp_move));
+                    try storeResult(allocator, &code, ctx, result, rd);
                 },
                 else => return error.Unsupported,
             }
@@ -648,6 +891,9 @@ const Ctx = struct {
     spill_base: usize,
     alloca_base: usize,
     alloca_off: *std.AutoHashMapUnmanaged(Value, u32),
+    /// Whether to lower f16 with NATIVE FEAT_FP16 H-form ops instead of the emulation. Threaded
+    /// from `compileFunction`'s `caps.fp16`; false for every non-model caller (byte-identical).
+    fp16: bool = false,
 
     /// The register holding `v`: its assigned register, or reload a spilled value into
     /// `scratch` (a register of `v`'s class). A SIMD vector reloads all 128 bits.
@@ -662,6 +908,62 @@ const Ctx = struct {
             try code.append(allocator, encode.ldrOff(scratch, sp, off));
         }
         return scratch;
+    }
+
+    /// Emit the fused multiply-add/sub for a float `add`/`sub` (`op`, `lhs`, `rhs`) whose
+    /// single-use, immediately-preceding operand is the float `mul` (`mul`, defining
+    /// `mul_result`) - see `fusesIntoNextArith` for the shared eligibility check. Loads the
+    /// mul's own operands directly (its materialization was skipped by the caller) plus the
+    /// add/sub's OTHER operand (the accumulator).
+    ///
+    /// Scalar picks the A64 3-source variant whose hardware semantics matches the IR shape
+    /// (confirmed against @mulAdd and by executing each variant on this aarch64 host, not
+    /// assumed from the ARM ARM alone):
+    ///   add(mul(a,b), c) = a*b+c  -> fmadd:  Rd = Ra + Rn*Rm
+    ///   sub(mul(a,b), c) = a*b-c  -> fnmsub: Rd = Rn*Rm - Ra
+    ///   sub(c, mul(a,b)) = c-a*b  -> fmsub:  Rd = Ra - Rn*Rm
+    ///
+    /// Vector NEON FMLA/FMLS ACCUMULATE into their destination register (Vd = Vd (+/-)
+    /// Vn*Vm), so `c` must be resident in the destination before either executes. Mirrors
+    /// the `dot` lowering: move `c` into the fixed scratch `fp_move` (v27, outside every
+    /// allocation pool) first, so it never aliases `a`/`b` (a naive `movVec(rd, c)` would
+    /// clobber `a` or `b` if the allocator reused either's register as `rd`), then move
+    /// the scratch into the result register only if they differ.
+    ///   add(mul(a,b), c) = a*b+c -> fmla: Vd = Vd + Vn*Vm, Vd preloaded with c
+    ///   sub(c, mul(a,b)) = c-a*b -> fmls: Vd = Vd - Vn*Vm, Vd preloaded with c
+    /// (`fusesIntoNextArith` never fuses the third vector shape, sub(mul,c) = a*b-c, since
+    /// no single NEON instruction expresses it - that shape stays on the separate
+    /// fmul+fsub path in `binary`.)
+    ///
+    /// Nothing runs between the (skipped) mul and this add/sub, so the mul's operand
+    /// registers still hold their values here exactly as `fusesIntoNextIf` relies on for
+    /// the fused compare-and-branch.
+    fn emitFusedArith(self: Ctx, allocator: std.mem.Allocator, code: *std.ArrayList(u32), result: Value, op: ir.function.BinOp, lhs: Value, rhs: Value, mul: ir.function.Arith, mul_result: Value) Error!void {
+        const ra_val = if (lhs == mul_result) rhs else lhs; // the add/sub's non-mul operand
+        const a = try self.loadOp(allocator, code, mul.lhs, fp_spill_op[0]);
+        const b = try self.loadOp(allocator, code, mul.rhs, fp_spill_op[1]);
+        const c = try self.loadOp(allocator, code, ra_val, fp_spill_res);
+        const rd = resultReg(self.alloc, self.func, result);
+        if (isVector(self.func, result)) {
+            // `op == .sub` here only ever means `sub(c, mul)` (`fusesIntoNextArith` rejects
+            // `sub(mul, c)` for a vector), so fmls's `Vd - Vn*Vm` is always the right shape.
+            try code.append(allocator, encode.movVec(fp_move, c));
+            try code.append(allocator, switch (op) {
+                .add => encode.fmlaVec(fp_move, a, b),
+                .sub => encode.fmlsVec(fp_move, a, b),
+                else => unreachable, // the caller only routes .add/.sub here (see the switch above)
+            });
+            if (@intFromEnum(rd) != @intFromEnum(fp_move)) try code.append(allocator, encode.movVec(rd, fp_move));
+            try storeResult(allocator, code, self, result, rd);
+            return;
+        }
+        const d = isDouble(self.func, result);
+        try code.append(allocator, switch (op) {
+            .add => encode.fmadd(rd, a, b, c, d),
+            .sub => if (lhs == mul_result) encode.fnmsub(rd, a, b, c, d) else encode.fmsub(rd, a, b, c, d),
+            else => unreachable, // the caller only routes .add/.sub here (see the switch above)
+        });
+        try storeResult(allocator, code, self, result, rd);
     }
 
     fn binary(self: Ctx, allocator: std.mem.Allocator, code: *std.ArrayList(u32), result: Value, op: ir.function.BinOp, lhs: Value, rhs: Value) Error!void {
@@ -684,14 +986,20 @@ const Ctx = struct {
             const rl = try self.loadOp(allocator, code, lhs, fp_spill_op[0]);
             const rr = try self.loadOp(allocator, code, rhs, fp_spill_op[1]);
             const rd = resultReg(self.alloc, self.func, result);
-            const d = isDouble(self.func, result);
+            const kind = fkindOf(self.func, result, self.fp16);
             try code.append(allocator, switch (op) {
-                .add => encode.fadd(rd, rl, rr, d),
-                .sub => encode.fsub(rd, rl, rr, d),
-                .mul => encode.fmul(rd, rl, rr, d),
-                .div => encode.fdiv(rd, rl, rr, d),
+                .add => encode.fadd(rd, rl, rr, kind),
+                .sub => encode.fsub(rd, rl, rr, kind),
+                .mul => encode.fmul(rd, rl, rr, kind),
+                .div => encode.fdiv(rd, rl, rr, kind),
                 else => return error.Unsupported,
             });
+            // In the emulation path an f16 op is done in the S (f32) form, then its result is rounded to
+            // nearest-even half so the S register again holds an exact half value (correct per-op
+            // IEEE f16 semantics; the operands were already exact halves). fp mul/add fusion is
+            // disabled for f16 in `fusesIntoNextArith`, so this rounds every op individually.
+            // Native (fp16): the H-form op is already single-rounded to half, so no re-rounding.
+            if (isHalf(self.func, result) and !self.fp16) try roundToHalf(allocator, code, rd);
             try storeResult(allocator, code, self, result, rd);
         } else {
             const rl = try self.loadOp(allocator, code, lhs, spill_op[0]);
@@ -702,7 +1010,33 @@ const Ctx = struct {
         }
     }
 
-    fn emitIf(self: Ctx, allocator: std.mem.Allocator, code: *std.ArrayList(u32), fixups: *std.ArrayList(Fixup), cf: ir.function.If) Error!void {
+    fn emitIf(self: Ctx, allocator: std.mem.Allocator, code: *std.ArrayList(u32), fixups: *std.ArrayList(Fixup), cf: ir.function.If, insts: []const ir.function.Inst, if_idx: usize) Error!void {
+        // Fused compare-and-branch: when the immediately-preceding instruction is a
+        // single-use integer icmp that is exactly this if's condition (the SAME predicate
+        // the icmp case used to skip its materialization), load the icmp's operands, set
+        // the flags with `cmp`, and branch to the then-edge with `b.cc` on the icmp's
+        // condition instead of materializing a boolean and re-testing it with `cbnz`. The
+        // edge-move / fixup structure is identical to the plain path, only the branch and
+        // its operand load differ. condFor here mirrors the icmp lowering's cset condition,
+        // so the fused branch takes the then-edge under exactly the same condition.
+        if (if_idx >= 1 and fusesIntoNextIf(self.func, insts, if_idx - 1)) {
+            const cmp = self.func.opcode(insts[if_idx - 1]).icmp;
+            const rl = try self.loadOp(allocator, code, cmp.lhs, spill_op[0]);
+            const rr = try self.loadOp(allocator, code, cmp.rhs, spill_op[1]);
+            try code.append(allocator, encode.cmp(rl, rr));
+            const cond = condFor(cmp.op, isSignedInt(self.func, cmp.lhs));
+            const bcc_at = code.items.len;
+            try code.append(allocator, encode.bcc(cond, 0));
+            try self.emitMoves(allocator, code, cf.@"else");
+            try fixups.append(allocator, .{ .at = code.items.len, .target = @intFromEnum(cf.@"else".target) });
+            try code.append(allocator, encode.b(0));
+            const then_at = code.items.len;
+            code.items[bcc_at] = encode.bcc(cond, @intCast((@as(i64, @intCast(then_at)) - @as(i64, @intCast(bcc_at))) * 4));
+            try self.emitMoves(allocator, code, cf.then);
+            try fixups.append(allocator, .{ .at = code.items.len, .target = @intFromEnum(cf.then.target) });
+            try code.append(allocator, encode.b(0));
+            return;
+        }
         const cond = try self.loadOp(allocator, code, cf.cond, spill_op[0]);
         const cbnz_at = code.items.len;
         try code.append(allocator, encode.cbnz(cond, 0));
@@ -1024,6 +1358,17 @@ fn forEachUse(func: *const Function, inst: ir.function.Inst, last_use: []u32, po
             markUse(last_use, st.value, pos);
             markUse(last_use, st.ptr, pos);
         },
+        .prefetch => |pf| markUse(last_use, pf.ptr, pos),
+        .dot => |d| {
+            markUse(last_use, d.acc, pos);
+            markUse(last_use, d.a, pos);
+            markUse(last_use, d.b, pos);
+        },
+        .matmul => |mmv| {
+            markUse(last_use, mmv.a, pos);
+            markUse(last_use, mmv.b, pos);
+            markUse(last_use, mmv.c, pos);
+        },
         .struct_new => |sn| for (func.valueList(sn.fields)) |f| markUse(last_use, f, pos),
         .call => |c| for (func.valueList(c.args)) |a| markUse(last_use, a, pos),
         .call_indirect => |c| {
@@ -1043,6 +1388,201 @@ fn forEachTermUse(func: *const Function, term: Terminator, last_use: []u32, pos:
         .ret => |v| if (v) |vv| markUse(last_use, vv, pos),
         .jump => |j| for (func.blockArgs(j)) |a| markUse(last_use, a, pos),
     }
+}
+
+/// Whether the integer `icmp` at `insts[idx]` fuses into an immediately-following
+/// `@"if"` whose condition it is and whose only use it is. When it fuses, the icmp
+/// materialization (`cmp; cset`) is skipped and the if emits a fused `cmp; b.cc` on
+/// the icmp's operands (see `emitIf`). This is the ONE eligibility predicate shared by
+/// the icmp-skip and the fused emitIf, so they never disagree (no dangling or doubled
+/// compare). It is gated to integer operands (the gpr compare path); float and vector
+/// compares keep the current materialize-then-test path. The immediately-preceding +
+/// single-use conditions make skipping the boolean register-safe: nothing runs between
+/// the icmp and the if, so the icmp's operand registers still hold their values at the
+/// if, and no other reader needs the boolean.
+fn fusesIntoNextIf(func: *const Function, insts: []const ir.function.Inst, idx: usize) bool {
+    const cmp = switch (func.opcode(insts[idx])) {
+        .icmp => |c| c,
+        else => return false,
+    };
+    // Integer operands only (the else branch of the icmp lowering). isVector and the
+    // fpr class both route float/vector compares elsewhere, so require the gpr path.
+    if (isVector(func, cmp.lhs) or regClass(func, cmp.lhs) != .gpr) return false;
+    if (idx + 1 >= insts.len) return false; // must be immediately followed by the if
+    const cf = switch (func.opcode(insts[idx + 1])) {
+        .@"if" => |c| c,
+        else => return false,
+    };
+    const result = func.instResult(insts[idx]) orelse return false;
+    if (cf.cond != result) return false; // the if must test exactly this icmp's result
+    // Single-use: the boolean is read only by this if's condition. Since the icmp
+    // immediately precedes the if and equals cf.cond, a total use-count of exactly 1
+    // means the if's cond is the sole use, so skipping the boolean harms nothing.
+    return countUses(func, result) == 1;
+}
+
+/// Whether `v`'s type is a vector over a float element (the only vector shape arith
+/// fusion ever sees today - `<4 x f32>` per `binary`'s vector path; `dot` is a separate
+/// IR op over int8 vectors and never reaches here).
+fn isFloatVector(func: *const Function, v: Value) bool {
+    return switch (func.types.type_kind(func.valueType(v))) {
+        .vector => |vec| func.types.type_kind(vec.elem) == .float,
+        else => false,
+    };
+}
+
+/// Whether the float `mul` at `insts[idx]` fuses into an immediately-following `add`/`sub`
+/// that consumes its result as a fused multiply-add/subtract (one rounding instead of
+/// two - legal because Vulcan permits fp-contraction). When it fuses, the mul's
+/// materialization is skipped and the add/sub emits fmadd/fmsub/fnmsub (scalar) or
+/// fmla/fmls (vector) on the mul's own operands (see `Ctx.emitFusedArith`). This is the ONE
+/// eligibility predicate shared by the mul-skip and the fused add/sub emission, so they
+/// never disagree (no dangling or doubled multiply) - mirrors `fusesIntoNextIf`. Gated to
+/// float operands (scalar or vector): integer `add(mul,c)` has no rounding to fuse away and
+/// is never an fma. For a vector mul, only the two shapes a single NEON instruction can
+/// express are allowed: `add(mul,c)` = a*b+c -> FMLA, and `sub(c,mul)` = c-a*b -> FMLS.
+/// `sub(mul,c)` = a*b-c has no matching NEON op (FMLA/FMLS only ever add or subtract the
+/// product, never negate the whole result), so that shape is rejected here and falls
+/// through to the separate fmul+fsub path in both the mul-skip and the add/sub emission,
+/// since both call this same function. The immediately-preceding + single-use conditions
+/// make skipping the product register-safe: nothing runs between the mul and the add/sub,
+/// so the mul's operand registers still hold their values there, and no other reader needs
+/// the standalone product.
+fn fusesIntoNextArith(func: *const Function, insts: []const ir.function.Inst, idx: usize) bool {
+    const mul = switch (func.opcode(insts[idx])) {
+        .arith => |a| a,
+        else => return false,
+    };
+    if (mul.op != .mul) return false;
+    const vector = isVector(func, mul.lhs);
+    // Float operands only: regClass != .fpr means an integer scalar mul (no rounding to
+    // fuse away); a vector mul must have a float element (see `isFloatVector`).
+    if (vector) {
+        if (!isFloatVector(func, mul.lhs)) return false;
+    } else if (regClass(func, mul.lhs) != .fpr) {
+        return false;
+    } else if (isHalf(func, mul.lhs)) {
+        // f16 arithmetic must round to nearest-even half after EACH op (the emulation holds a
+        // half as its f32 widening). A fused fmadd rounds the product-sum only once, at f32
+        // precision, skipping the intermediate half-rounding of the multiply, so it is not
+        // valid per-op f16 semantics. Both fusion call sites share this predicate, so they
+        // agree and fall back to a rounded fmul followed by a rounded fadd/fsub.
+        return false;
+    }
+    if (idx + 1 >= insts.len) return false; // must be immediately followed by the add/sub
+    const addsub = switch (func.opcode(insts[idx + 1])) {
+        .arith => |a| a,
+        else => return false,
+    };
+    if (addsub.op != .add and addsub.op != .sub) return false;
+    const result = func.instResult(insts[idx]) orelse return false;
+    if (addsub.lhs != result and addsub.rhs != result) return false; // must consume this mul's result
+    // Vector sub(mul, c) = a*b-c has no single-instruction NEON form: reject it here so
+    // both call sites (the mul-skip and the fused emit) agree and fall back to fmul+fsub.
+    if (vector and addsub.op == .sub and addsub.lhs == result) return false;
+    // Single-use: the product is read only by this add/sub. Since the mul immediately
+    // precedes it and is one of its operands, a total use-count of exactly 1 means this is
+    // the sole use, so skipping the materialization harms nothing.
+    return countUses(func, result) == 1;
+}
+
+/// Total operand uses of `v` across the whole function (instruction operands, if/jump
+/// edge args, and terminators). Used by the fusion eligibility's single-use check.
+fn countUses(func: *const Function, v: Value) usize {
+    var count: usize = 0;
+    for (0..func.blockCount()) |bi| {
+        const block: Block = @enumFromInt(bi);
+        for (func.blockInsts(block)) |inst| count += usesOfInInst(func, inst, v);
+        if (func.terminator(block)) |term| count += usesOfInTerm(func, term, v);
+    }
+    return count;
+}
+
+fn usesOfInInst(func: *const Function, inst: ir.function.Inst, v: Value) usize {
+    var c: usize = 0;
+    switch (func.opcode(inst)) {
+        .iconst, .fconst, .alloca, .global_addr => {},
+        .arith => |a| {
+            if (a.lhs == v) c += 1;
+            if (a.rhs == v) c += 1;
+        },
+        .arith_imm => |a| {
+            if (a.lhs == v) c += 1;
+        },
+        .icmp => |cc| {
+            if (cc.lhs == v) c += 1;
+            if (cc.rhs == v) c += 1;
+        },
+        .select => |s| {
+            if (s.cond == v) c += 1;
+            if (s.then == v) c += 1;
+            if (s.@"else" == v) c += 1;
+        },
+        .extract => |e| {
+            if (e.aggregate == v) c += 1;
+        },
+        .convert => |cv| {
+            if (cv.value == v) c += 1;
+        },
+        .unary => |u| {
+            if (u.value == v) c += 1;
+        },
+        .load => |l| {
+            if (l.ptr == v) c += 1;
+        },
+        .store => |st| {
+            if (st.value == v) c += 1;
+            if (st.ptr == v) c += 1;
+        },
+        .prefetch => |pf| {
+            if (pf.ptr == v) c += 1;
+        },
+        .dot => |d| {
+            if (d.acc == v) c += 1;
+            if (d.a == v) c += 1;
+            if (d.b == v) c += 1;
+        },
+        .matmul => |mmv| {
+            if (mmv.a == v) c += 1;
+            if (mmv.b == v) c += 1;
+            if (mmv.c == v) c += 1;
+        },
+        .struct_new => |sn| for (func.valueList(sn.fields)) |f| {
+            if (f == v) c += 1;
+        },
+        .call => |cl| for (func.valueList(cl.args)) |a| {
+            if (a == v) c += 1;
+        },
+        .call_indirect => |cl| {
+            if (cl.target == v) c += 1;
+            for (func.valueList(cl.args)) |a| {
+                if (a == v) c += 1;
+            }
+        },
+        .@"if" => |cf| {
+            if (cf.cond == v) c += 1;
+            for (func.blockArgs(cf.then)) |a| {
+                if (a == v) c += 1;
+            }
+            for (func.blockArgs(cf.@"else")) |a| {
+                if (a == v) c += 1;
+            }
+        },
+    }
+    return c;
+}
+
+fn usesOfInTerm(func: *const Function, term: Terminator, v: Value) usize {
+    var c: usize = 0;
+    switch (term) {
+        .ret => |x| if (x) |xx| {
+            if (xx == v) c += 1;
+        },
+        .jump => |j| for (func.blockArgs(j)) |a| {
+            if (a == v) c += 1;
+        },
+    }
+    return c;
 }
 
 fn setUsed(row: []bool, v: Value) void {
@@ -1073,6 +1613,17 @@ fn markUsedBitset(func: *const Function, inst: ir.function.Inst, row: []bool) vo
         .store => |st| {
             setUsed(row, st.value);
             setUsed(row, st.ptr);
+        },
+        .prefetch => |pf| setUsed(row, pf.ptr),
+        .dot => |d| {
+            setUsed(row, d.acc);
+            setUsed(row, d.a);
+            setUsed(row, d.b);
+        },
+        .matmul => |mmv| {
+            setUsed(row, mmv.a);
+            setUsed(row, mmv.b);
+            setUsed(row, mmv.c);
         },
         .struct_new => |sn| for (func.valueList(sn.fields)) |f| setUsed(row, f),
         .call => |c| for (func.valueList(c.args)) |a| setUsed(row, a),
@@ -1210,7 +1761,14 @@ fn typeSize(func: *const Function, ty: ir.types.Type) usize {
         .bool => 1,
         .int => |i| (@as(usize, i.bits) + 7) / 8,
         .ptr => 8,
-        .float => |f| if (f == .f32) 4 else 8,
+        // The MEMORY size of a float. f16 is a 2-byte IEEE half in memory (its in-register
+        // spill form is separate: an f16 spills as its f32 widening via the uniform 16-byte
+        // scalar-fpr spill slot, so this 2 never sizes a spill, only alloca/struct layout).
+        .float => |f| switch (f) {
+            .f16 => 2,
+            .f32 => 4,
+            .f64 => 8,
+        },
         .array => |a| @as(usize, @intCast(a.len)) * typeSize(func, a.elem),
         .vector => |v| @as(usize, v.len) * typeSize(func, v.elem),
         else => 8,
@@ -1244,12 +1802,20 @@ fn computeAllocaSlots(allocator: std.mem.Allocator, func: *const Function, map: 
     return alignUp(cur, 16);
 }
 
-fn emitLoad(allocator: std.mem.Allocator, code: *std.ArrayList(u32), func: *const Function, result: Value, rd: Reg, base: Reg) Error!void {
+fn emitLoad(allocator: std.mem.Allocator, code: *std.ArrayList(u32), func: *const Function, result: Value, rd: Reg, base: Reg, fp16: bool) Error!void {
     if (isVector(func, result)) {
         try code.append(allocator, encode.ldrQ(rd, base, 0)); // 128-bit NEON load
         return;
     }
     if (regClass(func, result) == .fpr) {
+        if (isHalf(func, result)) {
+            // Load a 16-bit IEEE-half memory object. NOT `ldr s`, which would read 32 bits from a
+            // 2-byte object. NATIVE (fp16): `ldr h` leaves the value in the H view ready to use.
+            // In the emulation path, also widen it to the S-held f32 form with `fcvt s,h`.
+            try code.append(allocator, encode.ldrHfp(rd, base, 0));
+            if (!fp16) try code.append(allocator, encode.fcvtSfromH(rd, rd));
+            return;
+        }
         try code.append(allocator, encode.ldrFp(rd, base, 0, isDouble(func, result)));
         return;
     }
@@ -1266,12 +1832,27 @@ fn emitLoad(allocator: std.mem.Allocator, code: *std.ArrayList(u32), func: *cons
     }
 }
 
-fn emitStore(allocator: std.mem.Allocator, code: *std.ArrayList(u32), func: *const Function, value: Value, val: Reg, base: Reg) Error!void {
+fn emitStore(allocator: std.mem.Allocator, code: *std.ArrayList(u32), func: *const Function, value: Value, val: Reg, base: Reg, fp16: bool) Error!void {
     if (isVector(func, value)) {
         try code.append(allocator, encode.strQ(val, base, 0)); // 128-bit NEON store
         return;
     }
     if (regClass(func, value) == .fpr) {
+        if (isHalf(func, value)) {
+            // Store a 16-bit IEEE-half memory object. NATIVE (fp16): the value is already a native
+            // half in the H view, so `str h` writes it directly. EMULATION: the value is an S-held
+            // f32 widening, so narrow it first (`fcvt h,s`) into a fixed scratch (fp_move, v27,
+            // outside every allocation pool) so `val`, which may still be live, is never clobbered
+            // (fcvt h zeroes the upper bits of its destination register); the narrow is lossless
+            // since the S value is already an exact half.
+            if (fp16) {
+                try code.append(allocator, encode.strHfp(val, base, 0));
+            } else {
+                try code.append(allocator, encode.fcvtHfromS(fp_move, val));
+                try code.append(allocator, encode.strHfp(fp_move, base, 0));
+            }
+            return;
+        }
         try code.append(allocator, encode.strFp(val, base, 0, isDouble(func, value)));
         return;
     }
@@ -1291,6 +1872,16 @@ fn isSignedInt(func: *const Function, v: Value) bool {
     return switch (func.types.type_kind(func.valueType(v))) {
         .int => |x| x.signedness == .signed,
         else => true,
+    };
+}
+
+/// Element signedness of a `dot` data operand (`a`/`b`, always `<16 x i8>` or
+/// `<16 x u8>` per verify.zig): signed picks SDOT, unsigned picks UDOT.
+fn dotSigned(func: *const Function, v: Value) bool {
+    const elem = func.types.type_kind(func.valueType(v)).vector.elem;
+    return switch (func.types.type_kind(elem)) {
+        .int => |x| x.signedness == .signed,
+        else => unreachable, // verify.zig requires an int8 element
     };
 }
 
@@ -1391,4 +1982,43 @@ test "selects a straight-line arithmetic function" {
     const rd_mask = ~@as(u32, 0x1f);
     try std.testing.expectEqual(encode.mul(.x0, .x0, .x1) & rd_mask, code[0] & rd_mask);
     try std.testing.expectEqual(encode.ret(), code[code.len - 1]);
+}
+
+test "an f16 function now compiles on aarch64 (the reference f16 backend, no reject gate)" {
+    // Task 3 replaced the Task-2 rejection gate with real f16 lowering. A function that adds
+    // two f16 values must now compile (it emits the S-form fadd plus the round-to-half
+    // narrow/widen); the executable differentials in tests/native.zig prove correctness.
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const f16_t = try func.types.intern(.{ .float = .f16 });
+    const b = try func.appendBlock();
+    const x = try func.appendBlockParam(b, f16_t);
+    const y = try func.appendBlockParam(b, f16_t);
+    const sum = try func.appendInst(b, f16_t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = y } });
+    func.setTerminator(b, .{ .ret = sum });
+
+    const code = try selectFunction(allocator, &func);
+    defer allocator.free(code);
+    // The S-form fadd is followed by the round-to-half pair (fcvt h,s; fcvt s,h): the emitted
+    // stream must contain both narrow and widen opcodes (register fields masked off).
+    const rd_mask = ~@as(u32, 0x1f);
+    var saw_narrow = false;
+    var saw_widen = false;
+    for (code) |w| {
+        if (w & 0xFFFFFC00 == encode.fcvtHfromS(.x0, .x0) & rd_mask) saw_narrow = true;
+        if (w & 0xFFFFFC00 == encode.fcvtSfromH(.x0, .x0) & rd_mask) saw_widen = true;
+    }
+    try std.testing.expect(saw_narrow);
+    try std.testing.expect(saw_widen);
+}
+
+test "alignPadWords computes the nop count to reach a fetch-align boundary" {
+    // 3 words in, 32-byte (8-word) alignment: 8 - 3 = 5 words of padding.
+    try std.testing.expectEqual(@as(usize, 5), alignPadWords(3, 32));
+    // Already on an 8-word boundary: no padding needed.
+    try std.testing.expectEqual(@as(usize, 0), alignPadWords(8, 32));
+    // fetch_align <= 4 (one word or less, or disabled): always a no-op.
+    try std.testing.expectEqual(@as(usize, 0), alignPadWords(3, 4));
+    try std.testing.expectEqual(@as(usize, 0), alignPadWords(3, 0));
 }

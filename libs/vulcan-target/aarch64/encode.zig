@@ -48,6 +48,11 @@ pub fn ret() u32 {
     return 0xD65F0000 | (30 << 5);
 }
 
+/// `nop` (no-operation, used to pad a loop header up to the fetch-alignment boundary).
+pub fn nop() u32 {
+    return 0xD503201F;
+}
+
 /// `svc #imm16` (supervisor call, a Linux syscall, the call number in x8).
 pub fn svc(imm: u16) u32 {
     return 0xD4000001 | (@as(u32, imm) << 5);
@@ -156,6 +161,15 @@ pub fn cbnz(rt: Reg, off: i21) u32 {
     return 0x35000000 | (imm19 << 5) | n(rt);
 }
 
+/// `b.cond label` (conditional branch): branch if `cond` holds. `off` is the signed
+/// byte displacement from this instruction (a multiple of 4), the same convention as
+/// `cbnz`/`b` (patched later). Bit layout: [31:24]=0x54, [23:5]=imm19 (the offset in
+/// words), [4]=0, [3:0]=cond.
+pub fn bcc(cond: Cond, off: i21) u32 {
+    const imm19: u32 = @as(u32, @bitCast(@as(i32, off) >> 2)) & 0x7FFFF;
+    return 0x54000000 | (imm19 << 5) | @as(u32, @intFromEnum(cond));
+}
+
 /// `b label` (unconditional branch). `off` is the signed byte displacement.
 pub fn b(off: i28) u32 {
     const imm26: u32 = @as(u32, @bitCast(@as(i32, off) >> 2)) & 0x3FFFFFF;
@@ -194,6 +208,14 @@ pub fn strOff(rt: Reg, rn: Reg, off: u15) u32 {
 /// `ldr xt, [xn, #off]` (64-bit unsigned offset).
 pub fn ldrOff(rt: Reg, rn: Reg, off: u15) u32 {
     return 0xF9400000 | ((@as(u32, off) >> 3) << 10) | (n(rn) << 5) | n(rt);
+}
+
+/// `prfm pldl1keep, [xn]` (prefetch hint, no architectural effect on results,
+/// only a microarchitectural hint to bring `[xn]` into L1). prfop = PLDL1KEEP
+/// (0b00000), imm12 = 0 (no offset): bits [31:22]=0b1111100110, [21:10]=imm12,
+/// [9:5]=Rn, [4:0]=Rt(=prfop).
+pub fn prfm(rn: Reg) u32 {
+    return 0xF9800000 | (n(rn) << 5);
 }
 
 /// `add xd, xn, #imm12` (64-bit add immediate). With `xn`/`xd` = `.zr` the base
@@ -330,25 +352,62 @@ pub fn csel(rd: Reg, rn: Reg, rm: Reg, cond: Cond) u32 {
     return 0x1A800000 | (n(rm) << 16) | (@as(u32, @intFromEnum(cond)) << 12) | (n(rn) << 5) | n(rd);
 }
 
-// FP register operands are also indices 0..31, naming v0..v31 (s/d views). `dbl`
-// selects the double-precision (d) form, otherwise the single-precision (s) form.
+// FP register operands are also indices 0..31, naming v0..v31 (s/d/h views). The scalar
+// FP encodings carry a 2-bit `ftype` field at bits [23:22] selecting the operand precision.
 
-fn fpType(dbl: bool) u32 {
-    return if (dbl) @as(u32, 1) << 22 else 0; // the ftype field (S=00, D=01)
+/// The scalar-FP `ftype` selector (bits [23:22]). `single`/`double` are the base-ISA S/D
+/// forms; `half` is the FEAT_FP16 H form for NATIVE 16-bit arithmetic. Callers that only ever
+/// deal with f32/f64 (the pre-f16 world) pass `.single`/`.double`, whose bits are byte-identical
+/// to the old `fpType(false)`/`fpType(true)`, so those encodings do not change. Only the native
+/// f16 path (gated on the model's FEAT_FP16) passes `.half`.
+pub const FKind = enum { single, double, half };
+
+fn ftype(kind: FKind) u32 {
+    return switch (kind) {
+        .single => 0, // ftype = 00
+        .double => @as(u32, 1) << 22, // ftype = 01
+        .half => @as(u32, 3) << 22, // ftype = 11 (FEAT_FP16). H-form words confirmed with `as` on-host.
+    };
 }
 
-/// `fadd`/`fsub`/`fmul`/`fdiv` (scalar single/double).
-pub fn fadd(rd: Reg, rn: Reg, rm: Reg, dbl: bool) u32 {
-    return 0x1E202800 | fpType(dbl) | (n(rm) << 16) | (n(rn) << 5) | n(rd);
+/// `fadd`/`fsub`/`fmul`/`fdiv` (scalar single/double/half).
+pub fn fadd(rd: Reg, rn: Reg, rm: Reg, kind: FKind) u32 {
+    return 0x1E202800 | ftype(kind) | (n(rm) << 16) | (n(rn) << 5) | n(rd);
 }
-pub fn fsub(rd: Reg, rn: Reg, rm: Reg, dbl: bool) u32 {
-    return 0x1E203800 | fpType(dbl) | (n(rm) << 16) | (n(rn) << 5) | n(rd);
+pub fn fsub(rd: Reg, rn: Reg, rm: Reg, kind: FKind) u32 {
+    return 0x1E203800 | ftype(kind) | (n(rm) << 16) | (n(rn) << 5) | n(rd);
 }
-pub fn fmul(rd: Reg, rn: Reg, rm: Reg, dbl: bool) u32 {
-    return 0x1E200800 | fpType(dbl) | (n(rm) << 16) | (n(rn) << 5) | n(rd);
+pub fn fmul(rd: Reg, rn: Reg, rm: Reg, kind: FKind) u32 {
+    return 0x1E200800 | ftype(kind) | (n(rm) << 16) | (n(rn) << 5) | n(rd);
 }
-pub fn fdiv(rd: Reg, rn: Reg, rm: Reg, dbl: bool) u32 {
-    return 0x1E201800 | fpType(dbl) | (n(rm) << 16) | (n(rn) << 5) | n(rd);
+pub fn fdiv(rd: Reg, rn: Reg, rm: Reg, kind: FKind) u32 {
+    return 0x1E201800 | ftype(kind) | (n(rm) << 16) | (n(rn) << 5) | n(rd);
+}
+
+// Floating-point data-processing (3-source), base 0x1F000000: Rd = op(Rn*Rm, Ra), fused
+// into a single instruction so the product is never separately rounded (one rounding
+// instead of two). Layout: ftype (23:22) selects single/double as above, o1 (21) and o0
+// (15) pick the variant, Rm (20:16), Ra (14:10, the accumulator), Rn (9:5), Rd (4:0).
+// Confirmed against the running aarch64 host: assembled with `as`, disassembled with
+// `objdump`, and executed to check the arithmetic (fmadd = Ra+Rn*Rm, fmsub = Ra-Rn*Rm,
+// fnmsub = Rn*Rm-Ra), not just the bit layout copied from the ARM ARM.
+
+// The fused 3-source ops are only ever emitted for f32/f64 (f16 fusion is disabled in isel, so
+// the intermediate multiply still rounds to half per-op), so they keep a plain `dbl` selector.
+
+/// `fmadd sd/dd, sn, sm, sa`: Rd = Ra + Rn*Rm (o1=0, o0=0).
+pub fn fmadd(rd: Reg, rn: Reg, rm: Reg, ra: Reg, dbl: bool) u32 {
+    return 0x1F000000 | ftype(if (dbl) .double else .single) | (n(rm) << 16) | (n(ra) << 10) | (n(rn) << 5) | n(rd);
+}
+
+/// `fmsub sd/dd, sn, sm, sa`: Rd = Ra - Rn*Rm (o1=0, o0=1).
+pub fn fmsub(rd: Reg, rn: Reg, rm: Reg, ra: Reg, dbl: bool) u32 {
+    return 0x1F008000 | ftype(if (dbl) .double else .single) | (n(rm) << 16) | (n(ra) << 10) | (n(rn) << 5) | n(rd);
+}
+
+/// `fnmsub sd/dd, sn, sm, sa`: Rd = Rn*Rm - Ra (o1=1, o0=1).
+pub fn fnmsub(rd: Reg, rn: Reg, rm: Reg, ra: Reg, dbl: bool) u32 {
+    return 0x1F208000 | ftype(if (dbl) .double else .single) | (n(rm) << 16) | (n(ra) << 10) | (n(rn) << 5) | n(rd);
 }
 
 // NEON: 128-bit vectors (the v0..v31 registers, Q view).
@@ -375,6 +434,21 @@ pub fn fmulVec(rd: Reg, rn: Reg, rm: Reg) u32 {
 }
 pub fn fdivVec(rd: Reg, rn: Reg, rm: Reg) u32 {
     return 0x6E20FC00 | (n(rm) << 16) | (n(rn) << 5) | n(rd);
+}
+
+/// NEON `fmla Vd.4S, Vn.4S, Vm.4S`: Vd = Vd + Vn*Vm (ACCUMULATES into Vd, like sdot/udot,
+/// so the caller must place the running value in `rd` before this executes). Confirmed
+/// against this aarch64 host: assembled with `as`, disassembled with `objdump` for the bit
+/// layout, and executed (lanes [2,3,4,5]*[10,10,10,10]+[1,1,1,1] -> [21,31,41,51]) to check
+/// the arithmetic, not just copied from the ARM ARM.
+pub fn fmlaVec(rd: Reg, rn: Reg, rm: Reg) u32 {
+    return 0x4E20CC00 | (n(rm) << 16) | (n(rn) << 5) | n(rd);
+}
+
+/// NEON `fmls Vd.4S, Vn.4S, Vm.4S`: Vd = Vd - Vn*Vm (ACCUMULATES into Vd). Bit 23 set over
+/// `fmlaVec`. Confirmed the same way (lanes [100]*4 - [2,3,4,5]*[10,10,10,10] -> [80,70,60,50]).
+pub fn fmlsVec(rd: Reg, rn: Reg, rm: Reg) u32 {
+    return 0x4EA0CC00 | (n(rm) << 16) | (n(rn) << 5) | n(rd);
 }
 
 /// NEON `fneg Vd.4S, Vn.4S`: lane-wise floating-point negate over 4 single floats.
@@ -462,14 +536,28 @@ pub fn movVec(rd: Reg, rn: Reg) u32 {
     return 0x4EA01C00 | (n(rn) << 16) | (n(rn) << 5) | n(rd);
 }
 
-/// `fcmp sn, sm` / `fcmp dn, dm`: set the flags from a floating-point compare.
-pub fn fcmp(rn: Reg, rm: Reg, dbl: bool) u32 {
-    return 0x1E202000 | fpType(dbl) | (n(rm) << 16) | (n(rn) << 5);
+/// NEON `sdot Vd.4S, Vn.16B, Vm.16B` (Altra: `features.aarch64.dotprod`): the 4-way
+/// signed INT8 dot-product-accumulate. For each 32-bit lane d in 0..3, Vd[d] +=
+/// sum over k in 0..3 of sext(Vn.b[4d+k]) * sext(Vm.b[4d+k]). ACCUMULATES into Vd,
+/// so the caller must place the running sum in `rd` before this executes.
+pub fn sdot(rd: Reg, rn: Reg, rm: Reg) u32 {
+    return 0x4E809400 | (n(rm) << 16) | (n(rn) << 5) | n(rd);
 }
 
-/// `fcsel dd, dn, dm, cond` (and single form): dd = cond ? dn : dm.
-pub fn fcsel(rd: Reg, rn: Reg, rm: Reg, cond: Cond, dbl: bool) u32 {
-    return 0x1E200C00 | fpType(dbl) | (n(rm) << 16) | (@as(u32, @intFromEnum(cond)) << 12) | (n(rn) << 5) | n(rd);
+/// NEON `udot Vd.4S, Vn.16B, Vm.16B`: the unsigned form of `sdot` (zero-extends each
+/// int8 lane instead of sign-extending). Bit 29 (U) is the only difference from `sdot`.
+pub fn udot(rd: Reg, rn: Reg, rm: Reg) u32 {
+    return sdot(rd, rn, rm) | (1 << 29);
+}
+
+/// `fcmp sn, sm` / `fcmp dn, dm` / `fcmp hn, hm`: set the flags from a floating-point compare.
+pub fn fcmp(rn: Reg, rm: Reg, kind: FKind) u32 {
+    return 0x1E202000 | ftype(kind) | (n(rm) << 16) | (n(rn) << 5);
+}
+
+/// `fcsel dd, dn, dm, cond` (and single/half forms): dd = cond ? dn : dm.
+pub fn fcsel(rd: Reg, rn: Reg, rm: Reg, cond: Cond, kind: FKind) u32 {
+    return 0x1E200C00 | ftype(kind) | (n(rm) << 16) | (@as(u32, @intFromEnum(cond)) << 12) | (n(rn) << 5) | n(rd);
 }
 
 /// `fmov dd, dn` (a 64-bit FP register move, copies the low 64 bits, which covers
@@ -486,6 +574,13 @@ pub fn fmovFromGpr(rd: Reg, rn: Reg, dbl: bool) u32 {
 /// `fmov wd/xd, sn/dn`: move FP-register bits into a general register (reinterpret).
 pub fn fmovToGpr(rd: Reg, rn: Reg, dbl: bool) u32 {
     return if (dbl) 0x9E660000 | (n(rn) << 5) | n(rd) else 0x1E260000 | (n(rn) << 5) | n(rd);
+}
+
+/// `fmov hd, wn` (FEAT_FP16): move the low 16 bits of a general register into the H view,
+/// materializing a NATIVE half from its raw IEEE bit pattern. ftype=11, sf=0, opcode=111.
+/// Confirmed: fmov h0,w1 -> 0x1EE70020 (`as`/`objdump` on this aarch64 host).
+pub fn fmovHfromGpr(rd: Reg, rn: Reg) u32 {
+    return 0x1EE70000 | (n(rn) << 5) | n(rd);
 }
 
 /// `fsqrt sd/dd, sn/dn`.
@@ -511,22 +606,59 @@ pub fn frintz(rd: Reg, rn: Reg, dbl: bool) u32 {
     return frint(0x1E25C000, rd, rn, dbl);
 }
 
-/// `scvtf`/`ucvtf` sd/dd, wn: convert a 32-bit integer to floating point.
-pub fn cvtIntToFloat(rd: Reg, rn: Reg, dbl: bool, signed: bool) u32 {
+/// `scvtf`/`ucvtf` sd/dd/hd, wn: convert a 32-bit integer to floating point. `kind` selects the
+/// destination precision (`.half` is the native FEAT_FP16 `scvtf hd, wn`, confirmed on-host).
+pub fn cvtIntToFloat(rd: Reg, rn: Reg, kind: FKind, signed: bool) u32 {
     const base: u32 = if (signed) 0x1E220000 else 0x1E230000;
-    return base | fpType(dbl) | (n(rn) << 5) | n(rd);
+    return base | ftype(kind) | (n(rn) << 5) | n(rd);
 }
 
-/// `fcvtzs`/`fcvtzu` wd, sn/dn: convert floating point to a 32-bit integer
-/// (round toward zero).
-pub fn cvtFloatToInt(rd: Reg, rn: Reg, dbl_src: bool, signed: bool) u32 {
+/// `fcvtzs`/`fcvtzu` wd, sn/dn/hn: convert floating point to a 32-bit integer (round toward
+/// zero). `kind` selects the SOURCE precision (`.half` is the native FEAT_FP16 `fcvtzs wd, hn`).
+pub fn cvtFloatToInt(rd: Reg, rn: Reg, kind: FKind, signed: bool) u32 {
     const base: u32 = if (signed) 0x1E380000 else 0x1E390000;
-    return base | fpType(dbl_src) | (n(rn) << 5) | n(rd);
+    return base | ftype(kind) | (n(rn) << 5) | n(rd);
 }
 
 /// `fcvt`: single<->double precision conversion. `to_double` widens s->d, else d->s.
 pub fn fcvt(rd: Reg, rn: Reg, to_double: bool) u32 {
     return if (to_double) 0x1E22C000 | (n(rn) << 5) | n(rd) else 0x1E624000 | (n(rn) << 5) | n(rd);
+}
+
+// Half-precision FCVT (float<->float). These are BASE-ISA (Armv8.0-A): only half-precision
+// *arithmetic* needs FEAT_FP16, the precision conversions do not. The f16 emulation holds a
+// half value as its f32 widening in an S register, so `fcvtSfromH` recovers that widening at
+// an f16 memory boundary and `fcvtHfromS`/`fcvtHfromD` perform the round-to-nearest-even to
+// half that every f16 result / narrowing convert must do. FCVT layout: ftype (23:22) = source
+// precision (00 single, 01 double, 11 half), opc (16:15) = destination precision (00 single,
+// 01 double, 11 half). Golden words confirmed with `as`/`objdump` on this aarch64 host.
+
+/// `fcvt sd, hn` (widen an IEEE half in the H view to single, exact). ftype=11 (half source),
+/// opc=00 (single dest). Confirmed: fcvt s0,h0 -> 0x1EE24000.
+pub fn fcvtSfromH(rd: Reg, rn: Reg) u32 {
+    return 0x1EE24000 | (n(rn) << 5) | n(rd);
+}
+
+/// `fcvt hd, sn` (narrow a single to an IEEE half, round-to-nearest-even). ftype=00 (single
+/// source), opc=11 (half dest). Confirmed: fcvt h0,s0 -> 0x1E23C000.
+pub fn fcvtHfromS(rd: Reg, rn: Reg) u32 {
+    return 0x1E23C000 | (n(rn) << 5) | n(rd);
+}
+
+/// `fcvt hd, dn` (narrow a double directly to an IEEE half, single round-to-nearest-even).
+/// Used for f64->f16 so the result rounds ONCE (matching Zig's `@as(f16, d)`), rather than
+/// double-rounding through single. ftype=01 (double source), opc=11 (half dest). Confirmed:
+/// fcvt h0,d0 -> 0x1E63C000.
+pub fn fcvtHfromD(rd: Reg, rn: Reg) u32 {
+    return 0x1E63C000 | (n(rn) << 5) | n(rd);
+}
+
+/// `fcvt dd, hn` (widen a native IEEE half in the H view directly to double, exact - a half is
+/// exactly representable in double). Used only by the native f16 path for f16->f64; the emulation
+/// path widens the S-held f32 form with the base `fcvt d,s` instead. ftype=11 (half source),
+/// opc=01 (double dest). Confirmed: fcvt d0,h1 -> 0x1EE2C020 (`as`/`objdump` on-host).
+pub fn fcvtDfromH(rd: Reg, rn: Reg) u32 {
+    return 0x1EE2C000 | (n(rn) << 5) | n(rd);
 }
 
 /// `str st/dt, [xn, #off]` (FP store).
@@ -545,12 +677,56 @@ pub fn ldrFp(rt: Reg, rn: Reg, off: u15, dbl: bool) u32 {
         0xBD400000 | ((@as(u32, off) >> 2) << 10) | (n(rn) << 5) | n(rt);
 }
 
+/// `ldr ht, [xn, #off]` (16-bit SIMD&FP load, size=01; `off` a multiple of 2). Reads a
+/// 16-bit IEEE-half memory object into the H view. This is the SIMD&FP form (target is an
+/// h-register), distinct from the GPR `ldrh` above (target is a w-register). Confirmed:
+/// ldr h0,[x0] -> 0x7D400000, ldr h1,[x2,#8] -> 0x7D401041.
+pub fn ldrHfp(rt: Reg, rn: Reg, off: u13) u32 {
+    // The immediate is scaled by the 2-byte access size, so a byte offset must be halfword
+    // aligned; an odd offset would silently lose its low bit here. Callers only pass 0 today.
+    std.debug.assert(off % 2 == 0);
+    return 0x7D400000 | ((@as(u32, off) >> 1) << 10) | (n(rn) << 5) | n(rt);
+}
+
+/// `str ht, [xn, #off]` (16-bit SIMD&FP store; `off` a multiple of 2). Writes the H view of
+/// an already-half value to a 16-bit IEEE-half memory object. Confirmed: str h0,[x0] ->
+/// 0x7D000000.
+pub fn strHfp(rt: Reg, rn: Reg, off: u13) u32 {
+    std.debug.assert(off % 2 == 0); // halfword-aligned; see ldrHfp
+    return 0x7D000000 | ((@as(u32, off) >> 1) << 10) | (n(rn) << 5) | n(rt);
+}
+
 test "known A64 encodings" {
     // Confirmed by native JIT execution: `add w0, w0, #42` and `ret`.
     try std.testing.expectEqual(@as(u32, 0x1100A800), addImm(.x0, .x0, 42));
     try std.testing.expectEqual(@as(u32, 0xD65F03C0), ret());
     // `movz w0, #42` (used as a JIT smoke-test instruction).
     try std.testing.expectEqual(@as(u32, 0x52800540), movz(.x0, 42, 0));
+}
+
+test "nop encoding" {
+    try std.testing.expectEqual(@as(u32, 0xD503201F), nop());
+}
+
+test "prfm encoding" {
+    // prfm pldl1keep, [x0]  ->  0xF9800000 | (0 << 5) = 0xF9800000
+    try std.testing.expectEqual(@as(u32, 0xF9800000), prfm(.x0));
+    // prfm pldl1keep, [x5]  ->  0xF9800000 | (5 << 5) = 0xF98000A0
+    try std.testing.expectEqual(@as(u32, 0xF98000A0), prfm(.x5));
+}
+
+test "B.cond conditional-branch encoding" {
+    // Hand-computed from the bit layout: 0x54000000 | (imm19<<5) | cond, imm19 = off/4.
+    // b.lt .+0  -> imm19=0, cond=lt(11) -> 0x5400000B
+    try std.testing.expectEqual(@as(u32, 0x5400000B), bcc(.lt, 0));
+    // b.eq .+8  -> imm19=2, cond=eq(0)  -> 0x54000000 | (2<<5) = 0x54000040
+    try std.testing.expectEqual(@as(u32, 0x54000040), bcc(.eq, 8));
+    // b.gt .+12 -> imm19=3, cond=gt(12) -> 0x54000060 | 0x0C = 0x5400006C
+    try std.testing.expectEqual(@as(u32, 0x5400006C), bcc(.gt, 12));
+    // b.ge .-4  -> imm19=-1 (0x7FFFF), cond=ge(10) -> 0x54FFFFE0 | 0x0A = 0x54FFFFEA
+    try std.testing.expectEqual(@as(u32, 0x54FFFFEA), bcc(.ge, -4));
+    // bit[4] is always 0 (distinguishes B.cond from the consistent-conditional forms).
+    try std.testing.expectEqual(@as(u32, 0), bcc(.hi, 20) & 0x10);
 }
 
 test "NEON vector op encodings" {
@@ -566,6 +742,88 @@ test "NEON vector op encodings" {
     try std.testing.expectEqual(@as(u32, 0x4E040C20), dupFromGpr(.x0, .x1)); // dup v0.4s, w1
     try std.testing.expectEqual(@as(u32, 0x4E140420), dupVecLane(.x0, .x1, 2)); // dup v0.4s, v1.s[2]
     try std.testing.expectEqual(@as(u32, 0x6E205820), mvnVec(.x0, .x1)); // mvn v0.16b, v1.16b
+}
+
+test "FMLA/FMLS vector encodings (NEON accumulate-into-Vd)" {
+    // Golden words obtained by assembling `fmla/fmls v{0,1}.4s, v{1,2}.4s, v{2,3}.4s` with
+    // `as` and disassembling with `objdump` on this aarch64 host.
+    try std.testing.expectEqual(@as(u32, 0x4E22CC20), fmlaVec(.x0, .x1, .x2)); // fmla v0.4s,v1.4s,v2.4s
+    try std.testing.expectEqual(@as(u32, 0x4E23CC41), fmlaVec(.x1, .x2, .x3)); // fmla v1.4s,v2.4s,v3.4s
+    try std.testing.expectEqual(@as(u32, 0x4EA2CC20), fmlsVec(.x0, .x1, .x2)); // fmls v0.4s,v1.4s,v2.4s
+    try std.testing.expectEqual(@as(u32, 0x4EA3CC41), fmlsVec(.x1, .x2, .x3)); // fmls v1.4s,v2.4s,v3.4s
+}
+
+test "SDOT/UDOT encodings (Altra INT8 dot-product)" {
+    // Cross-checked against the ARM A64 reference encoding (Vd.4S, Vn.16B, Vm.16B):
+    // sdot v0.4s, v0.4s, v0.4s -> 0x4E809400, the fixed base with every register field zero.
+    try std.testing.expectEqual(@as(u32, 0x4E809400), sdot(.x0, .x0, .x0));
+    // udot is sdot with bit 29 (U) set.
+    try std.testing.expectEqual(@as(u32, 0x6E809400), udot(.x0, .x0, .x0));
+    // Distinct rd/rn/rm pins the field positions: rd bits[4:0], rn bits[9:5], rm bits[20:16].
+    // sdot v1.4s, v2.4s, v3.4s -> 0x4E809400 | (3<<16) | (2<<5) | 1 = 0x4E839441
+    try std.testing.expectEqual(@as(u32, 0x4E839441), sdot(.x1, .x2, .x3));
+    // udot v1.4s, v2.4s, v3.4s -> the same fields, U set: 0x6E839441
+    try std.testing.expectEqual(@as(u32, 0x6E839441), udot(.x1, .x2, .x3));
+}
+
+test "fused multiply-add/sub encodings (fmadd/fmsub/fnmsub)" {
+    // Golden words obtained by assembling `fmadd/fmsub/fnmsub {s,d}0, {s,d}1, {s,d}2, {s,d}3`
+    // with `as` and disassembling with `objdump` on this aarch64 host, then confirmed to
+    // compute the right value by executing each variant (fmadd = Ra+Rn*Rm, fmsub = Ra-Rn*Rm,
+    // fnmsub = Rn*Rm-Ra) - not just copied from the ARM ARM bit layout.
+    try std.testing.expectEqual(@as(u32, 0x1f020c20), fmadd(.x0, .x1, .x2, .x3, false)); // fmadd s0,s1,s2,s3
+    try std.testing.expectEqual(@as(u32, 0x1f420c20), fmadd(.x0, .x1, .x2, .x3, true)); // fmadd d0,d1,d2,d3
+    try std.testing.expectEqual(@as(u32, 0x1f028c20), fmsub(.x0, .x1, .x2, .x3, false)); // fmsub s0,s1,s2,s3
+    try std.testing.expectEqual(@as(u32, 0x1f428c20), fmsub(.x0, .x1, .x2, .x3, true)); // fmsub d0,d1,d2,d3
+    try std.testing.expectEqual(@as(u32, 0x1f228c20), fnmsub(.x0, .x1, .x2, .x3, false)); // fnmsub s0,s1,s2,s3
+    try std.testing.expectEqual(@as(u32, 0x1f628c20), fnmsub(.x0, .x1, .x2, .x3, true)); // fnmsub d0,d1,d2,d3
+}
+
+test "half-precision FCVT encodings (base-ISA widen/narrow for the f16 emulation)" {
+    // Golden words obtained by assembling each `fcvt` with `as` and disassembling with
+    // `objdump` on this aarch64 host, then confirmed to widen/narrow correctly by executing
+    // the f16 differentials in tests/native.zig, not just copied from the ARM ARM bit layout.
+    try std.testing.expectEqual(@as(u32, 0x1EE24000), fcvtSfromH(.x0, .x0)); // fcvt s0, h0
+    try std.testing.expectEqual(@as(u32, 0x1EE240E5), fcvtSfromH(.x5, .x7)); // fcvt s5, h7
+    try std.testing.expectEqual(@as(u32, 0x1E23C000), fcvtHfromS(.x0, .x0)); // fcvt h0, s0
+    try std.testing.expectEqual(@as(u32, 0x1E23C0E5), fcvtHfromS(.x5, .x7)); // fcvt h5, s7
+    try std.testing.expectEqual(@as(u32, 0x1E63C000), fcvtHfromD(.x0, .x0)); // fcvt h0, d0
+    try std.testing.expectEqual(@as(u32, 0x1E63C0E5), fcvtHfromD(.x5, .x7)); // fcvt h5, d7
+}
+
+test "native half-precision (FEAT_FP16) H-form encodings" {
+    // Golden words assembled with `as -march=armv8.2-a+fp16` and disassembled with `objdump`
+    // on this aarch64 host (which has FEAT_FP16), not copied from the ARM ARM bit layout.
+    try std.testing.expectEqual(@as(u32, 0x1EE22820), fadd(.x0, .x1, .x2, .half)); // fadd h0, h1, h2
+    try std.testing.expectEqual(@as(u32, 0x1EE23820), fsub(.x0, .x1, .x2, .half)); // fsub h0, h1, h2
+    try std.testing.expectEqual(@as(u32, 0x1EE20820), fmul(.x0, .x1, .x2, .half)); // fmul h0, h1, h2
+    try std.testing.expectEqual(@as(u32, 0x1EE21820), fdiv(.x0, .x1, .x2, .half)); // fdiv h0, h1, h2
+    try std.testing.expectEqual(@as(u32, 0x1EE22020), fcmp(.x1, .x2, .half)); // fcmp h1, h2
+    try std.testing.expectEqual(@as(u32, 0x1EE21C20), fcsel(.x0, .x1, .x2, .ne, .half)); // fcsel h0, h1, h2, ne
+    try std.testing.expectEqual(@as(u32, 0x1EE20020), cvtIntToFloat(.x0, .x1, .half, true)); // scvtf h0, w1
+    try std.testing.expectEqual(@as(u32, 0x1EE30020), cvtIntToFloat(.x0, .x1, .half, false)); // ucvtf h0, w1
+    try std.testing.expectEqual(@as(u32, 0x1EF80020), cvtFloatToInt(.x0, .x1, .half, true)); // fcvtzs w0, h1
+    try std.testing.expectEqual(@as(u32, 0x1EF90020), cvtFloatToInt(.x0, .x1, .half, false)); // fcvtzu w0, h1
+    try std.testing.expectEqual(@as(u32, 0x1EE70020), fmovHfromGpr(.x0, .x1)); // fmov h0, w1
+    try std.testing.expectEqual(@as(u32, 0x1EE2C020), fcvtDfromH(.x0, .x1)); // fcvt d0, h1
+    // The `.single`/`.double` selectors are byte-identical to the old `fpType(false)`/`(true)`,
+    // so the base-ISA f32/f64 forms do not change (the guardrail for the emulation path).
+    try std.testing.expectEqual(@as(u32, 0x1E222820), fadd(.x0, .x1, .x2, .single)); // fadd s0, s1, s2
+    try std.testing.expectEqual(@as(u32, 0x1E622820), fadd(.x0, .x1, .x2, .double)); // fadd d0, d1, d2
+}
+
+test "half-precision FP load/store encodings (SIMD&FP h-form, not the GPR ldrh/strh)" {
+    // Golden words from `as`/`objdump` on this aarch64 host.
+    try std.testing.expectEqual(@as(u32, 0x7D400000), ldrHfp(.x0, .x0, 0)); // ldr h0, [x0]
+    try std.testing.expectEqual(@as(u32, 0x7D400065), ldrHfp(.x5, .x3, 0)); // ldr h5, [x3]
+    try std.testing.expectEqual(@as(u32, 0x7D000000), strHfp(.x0, .x0, 0)); // str h0, [x0]
+    try std.testing.expectEqual(@as(u32, 0x7D000065), strHfp(.x5, .x3, 0)); // str h5, [x3]
+    // The 12-bit immediate offset is scaled by 2 (a halfword): #8 -> field 4.
+    try std.testing.expectEqual(@as(u32, 0x7D401041), ldrHfp(.x1, .x2, 8)); // ldr h1, [x2, #8]
+    try std.testing.expectEqual(@as(u32, 0x7D002082), strHfp(.x2, .x4, 16)); // str h2, [x4, #16]
+    // The h-form is distinct from the GPR halfword ops (different opcode, FP target).
+    try std.testing.expect(ldrHfp(.x0, .x0, 0) != ldrh(.x0, .x0));
+    try std.testing.expect(strHfp(.x0, .x0, 0) != strh(.x0, .x0));
 }
 
 test "64-bit ALU sets the sf bit (bit 31) over the 32-bit form" {

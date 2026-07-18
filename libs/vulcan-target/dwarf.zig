@@ -360,17 +360,21 @@ const Cursor = struct {
     fn u32le(c: *Cursor) u32 {
         return @as(u32, c.u16le()) | (@as(u32, c.u16le()) << 16);
     }
-    fn fixed(c: *Cursor, n: usize) u64 { // n little-endian bytes
+    fn fixed(c: *Cursor, n: usize) u64 { // up to 8 little-endian bytes; the caller repositions the cursor
         var v: u64 = 0;
-        for (0..n) |k| v |= @as(u64, c.byte()) << @intCast(k * 8);
+        // Clamp to 8: a u64 holds no more, and a hostile DW_LNE_set_address length
+        // would otherwise drive `k * 8` past the u6 shift width and panic.
+        for (0..@min(n, 8)) |k| v |= @as(u64, c.byte()) << @intCast(k * 8);
         return v;
     }
     fn uleb(c: *Cursor) u64 {
         var result: u64 = 0;
-        var shift: u6 = 0;
-        while (true) {
+        // u7 so the += 7 cannot overflow the way a u6 counter does on an over-long
+        // (malformed) encoding; stop once the shift would exceed the u64 width.
+        var shift: u7 = 0;
+        while (shift < 64) {
             const b = c.byte();
-            result |= @as(u64, b & 0x7f) << shift;
+            result |= @as(u64, b & 0x7f) << @intCast(shift);
             if (b & 0x80 == 0) break;
             shift += 7;
         }
@@ -378,15 +382,15 @@ const Cursor = struct {
     }
     fn sleb(c: *Cursor) i64 {
         var result: i64 = 0;
-        var shift: u6 = 0;
+        var shift: u7 = 0;
         var b: u8 = 0;
-        while (true) {
+        while (shift < 64) {
             b = c.byte();
-            result |= @as(i64, @intCast(b & 0x7f)) << shift;
+            result |= @as(i64, @intCast(b & 0x7f)) << @intCast(shift);
             shift += 7;
             if (b & 0x80 == 0) break;
         }
-        if (shift < 64 and (b & 0x40) != 0) result |= @as(i64, -1) << shift; // sign-extend
+        if (shift < 64 and (b & 0x40) != 0) result |= @as(i64, -1) << @intCast(shift); // sign-extend
         return result;
     }
 };
@@ -452,21 +456,23 @@ pub fn decodeLine(allocator: std.mem.Allocator, data: []const u8) std.mem.Alloca
             } else if (op >= opcode_base) { // special opcode: bump address + line, emit a row
                 const adj: u32 = op - opcode_base;
                 if (line_range != 0) {
-                    address += @as(u64, min_inst_len) * (adj / line_range);
-                    line += @as(i64, line_base) + @as(i64, adj % line_range);
+                    // Wrapping arithmetic on values derived from untrusted input: a
+                    // malformed program must produce a wrong row, never panic.
+                    address +%= @as(u64, min_inst_len) *% (adj / line_range);
+                    line +%= @as(i64, line_base) + @as(i64, adj % line_range);
                 }
                 try emit(&rows, allocator, address, line, file, false);
             } else switch (op) {
                 DW_LNS_copy => try emit(&rows, allocator, address, line, file, false),
-                DW_LNS_advance_pc => address += c.uleb() * min_inst_len,
-                DW_LNS_advance_line => line += c.sleb(),
-                DW_LNS_set_file => file = @intCast(c.uleb()),
+                DW_LNS_advance_pc => address +%= c.uleb() *% min_inst_len,
+                DW_LNS_advance_line => line +%= c.sleb(),
+                DW_LNS_set_file => file = std.math.cast(u32, c.uleb()) orelse std.math.maxInt(u32),
                 DW_LNS_set_column => _ = c.uleb(),
                 DW_LNS_negate_stmt, DW_LNS_set_basic_block => {},
                 DW_LNS_const_add_pc => if (line_range != 0) {
-                    address += @as(u64, min_inst_len) * ((255 - opcode_base) / line_range);
+                    address +%= @as(u64, min_inst_len) *% ((255 - opcode_base) / line_range);
                 },
-                DW_LNS_fixed_advance_pc => address += c.u16le(), // raw (not scaled by min_inst_len)
+                DW_LNS_fixed_advance_pc => address +%= c.u16le(), // raw (not scaled by min_inst_len)
                 else => { // unknown standard opcode: skip its uleb operands per the header
                     const nargs = if (op - 1 < std_lengths.len) std_lengths[op - 1] else 0;
                     for (0..nargs) |_| _ = c.uleb();

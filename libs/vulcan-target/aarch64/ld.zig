@@ -25,12 +25,27 @@ const SHN_UNDEF: u16 = 0;
 const EM_AARCH64: u16 = 183;
 
 fn alignUp(v: u64, a: u64) u64 {
-    return (v + a - 1) & ~(a - 1);
+    return std.mem.alignForward(u64, v, a);
+}
+
+/// `base + index*stride`, rejecting the overflow that would otherwise wrap a bounds
+/// check on attacker-controlled ELF offset/size fields into an out-of-bounds access.
+fn tableOffset(base: u64, index: u64, stride: u64) Error!u64 {
+    const scaled = std.math.mul(u64, index, stride) catch return error.MalformedObject;
+    return std.math.add(u64, base, scaled) catch return error.MalformedObject;
+}
+
+/// The `[off, off+size)` slice of `buf`, bounds-checked without overflowing.
+fn secSlice(buf: []const u8, off: u64, size: u64) Error![]const u8 {
+    const o = std.math.cast(usize, off) orelse return error.MalformedObject;
+    const s = std.math.cast(usize, size) orelse return error.MalformedObject;
+    if (o > buf.len or s > buf.len - o) return error.MalformedObject;
+    return buf[o..][0..s];
 }
 
 fn rdInt(comptime T: type, buf: []const u8, off: u64) Error!T {
-    const o: usize = @intCast(off);
-    if (o + @sizeOf(T) > buf.len) return error.MalformedObject;
+    const o = std.math.cast(usize, off) orelse return error.MalformedObject;
+    if (o > buf.len or @sizeOf(T) > buf.len - o) return error.MalformedObject;
     return std.mem.readInt(T, buf[o..][0..@sizeOf(T)], .little);
 }
 
@@ -71,36 +86,34 @@ fn parseObject(allocator: std.mem.Allocator, buf: []const u8) Error!ParsedObject
 
     var i: u16 = 0;
     while (i < shnum) : (i += 1) {
-        const hdr = shoff + @as(u64, i) * shentsize;
+        const hdr = try tableOffset(shoff, i, shentsize);
         const typ = try rdInt(u32, buf, hdr + 4);
         const flags = try rdInt(u64, buf, hdr + 8);
         const sh_off = try rdInt(u64, buf, hdr + 24);
         const sh_size = try rdInt(u64, buf, hdr + 32);
         if (typ == SHT_PROGBITS and (flags & SHF_EXECINSTR) != 0) {
-            if (@as(usize, @intCast(sh_off + sh_size)) > buf.len) return error.MalformedObject;
-            text = buf[@intCast(sh_off)..@intCast(sh_off + sh_size)];
+            text = try secSlice(buf, sh_off, sh_size);
         }
         if (typ == SHT_SYMTAB) symtab_ndx = i;
         if (typ == SHT_RELA) rela_ndx = i;
     }
     const si = symtab_ndx orelse return error.MalformedObject;
 
-    const sym_hdr = shoff + @as(u64, si) * shentsize;
+    const sym_hdr = try tableOffset(shoff, si, shentsize);
     const sym_off = try rdInt(u64, buf, sym_hdr + 24);
     const sym_size = try rdInt(u64, buf, sym_hdr + 32);
     const sym_link = try rdInt(u32, buf, sym_hdr + 40);
-    const str_hdr = shoff + @as(u64, sym_link) * shentsize;
+    const str_hdr = try tableOffset(shoff, sym_link, shentsize);
     const str_off = try rdInt(u64, buf, str_hdr + 24);
     const str_size = try rdInt(u64, buf, str_hdr + 32);
-    if (@as(usize, @intCast(str_off + str_size)) > buf.len) return error.MalformedObject;
-    const strtab = buf[@intCast(str_off)..@intCast(str_off + str_size)];
+    const strtab = try secSlice(buf, str_off, str_size);
 
     const sym_count: usize = @intCast(sym_size / 24);
     var symbols = try allocator.alloc(ObjSymbol, sym_count);
     errdefer allocator.free(symbols);
     var k: usize = 0;
     while (k < sym_count) : (k += 1) {
-        const e = sym_off + @as(u64, k) * 24;
+        const e = try tableOffset(sym_off, k, 24);
         const st_name = try rdInt(u32, buf, e + 0);
         const st_info = try rdInt(u8, buf, e + 4);
         const st_shndx = try rdInt(u16, buf, e + 6);
@@ -115,7 +128,7 @@ fn parseObject(allocator: std.mem.Allocator, buf: []const u8) Error!ParsedObject
 
     var relocs: []object.Reloc = &.{};
     if (rela_ndx) |ri| {
-        const rela_hdr = shoff + @as(u64, ri) * shentsize;
+        const rela_hdr = try tableOffset(shoff, ri, shentsize);
         const rela_off = try rdInt(u64, buf, rela_hdr + 24);
         const rela_size = try rdInt(u64, buf, rela_hdr + 32);
         const rela_count: usize = @intCast(rela_size / 24);
@@ -123,7 +136,7 @@ fn parseObject(allocator: std.mem.Allocator, buf: []const u8) Error!ParsedObject
         errdefer allocator.free(relocs);
         var r: usize = 0;
         while (r < rela_count) : (r += 1) {
-            const e = rela_off + @as(u64, r) * 24;
+            const e = try tableOffset(rela_off, r, 24);
             const r_offset = try rdInt(u64, buf, e + 0);
             const r_info = try rdInt(u64, buf, e + 8);
             const r_addend = try rdInt(i64, buf, e + 16);
@@ -212,7 +225,7 @@ pub fn linkObjects(allocator: std.mem.Allocator, objs: []const []const u8, base:
             if (r.symbol >= parsed[oi].symbols.len) return error.MalformedObject;
             const name = parsed[oi].symbols[r.symbol].name;
             const target = findAddress(symbols.items, name) orelse return error.UndefinedSymbol;
-            const site = text_at[oi] + r.offset;
+            const site = std.math.add(u64, text_at[oi], r.offset) catch return error.MalformedObject;
             const delta = (@as(i64, @intCast(target)) - @as(i64, @intCast(base))) - @as(i64, @intCast(site)) + r.addend;
             try applyCall26(code, site, delta);
         }
@@ -224,8 +237,8 @@ pub fn linkObjects(allocator: std.mem.Allocator, objs: []const []const u8, base:
 /// Patch a `bl`/`b` (R_AARCH64_CALL26) at image offset `site` with the byte
 /// displacement `delta` (+/-128MiB, multiple of 4).
 fn applyCall26(code: []u8, site: u64, delta: i64) Error!void {
-    const s: usize = @intCast(site);
-    if (s + 4 > code.len) return error.MalformedObject;
+    const s = std.math.cast(usize, site) orelse return error.MalformedObject;
+    if (s > code.len or 4 > code.len - s) return error.MalformedObject;
     if (delta < -(1 << 27) or delta >= (1 << 27) or (delta & 3) != 0) return error.RelocationOutOfRange;
     const word = std.mem.readInt(u32, code[s..][0..4], .little);
     const is_bl = (word & 0xFC000000) == 0x94000000; // BL vs B share the encoding but bit 31

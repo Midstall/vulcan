@@ -284,7 +284,7 @@ pub fn writeModule(allocator: std.mem.Allocator, module: *const link.Module) Err
 
     for (module.functions.items) |entry| {
         const start: u64 = text.items.len;
-        var compiled = try isel.compileFunction(allocator, entry.func);
+        var compiled = try isel.compileFunction(allocator, entry.func, .{});
         defer compiled.deinit(allocator);
         for (compiled.code) |word| {
             var w: [4]u8 = undefined;
@@ -337,7 +337,7 @@ pub fn writeModuleWithDebug(allocator: std.mem.Allocator, module: *const link.Mo
 
     for (module.functions.items) |entry| {
         const start: u64 = text.items.len;
-        var compiled = try isel.compileFunction(allocator, entry.func);
+        var compiled = try isel.compileFunction(allocator, entry.func, .{});
         defer compiled.deinit(allocator);
         for (compiled.code) |word| {
             var w: [4]u8 = undefined;
@@ -416,6 +416,8 @@ fn returnBaseType(func: *const Function) ?dwarf.BaseType {
         .float => |f| switch (f) {
             .f32 => .{ .name = "float", .encoding = .float, .byte_size = 4 },
             .f64 => .{ .name = "double", .encoding = .float, .byte_size = 8 },
+            // Debug-info naming only, not lowering: aarch64 f16 codegen is Task 2.
+            .f16 => .{ .name = "half", .encoding = .float, .byte_size = 2 },
         },
         .int => |i| blk: {
             const bytes: u8 = @intCast((i.bits + 7) / 8);

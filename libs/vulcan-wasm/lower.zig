@@ -18,6 +18,12 @@ const Cursor = reader.Cursor;
 
 pub const Error = reader.Error || error{Unsupported} || std.mem.Allocator.Error;
 
+/// Upper bound on function-table entries a module may declare. An element segment's
+/// init offset is untrusted; without a cap a tiny module could name a near-maxInt(u32)
+/// slot and force the table-growth loop into a multi-GB allocation. 1M funcref entries
+/// is already far beyond any real module we JIT.
+const max_table_entries: u32 = 1 << 20;
+
 pub const LoweredFunction = struct {
     name: []u8,
     func: Function,
@@ -228,11 +234,18 @@ pub fn module(allocator: std.mem.Allocator, bytes: []const u8) Error!Module {
                 for (0..n) |_| {
                     const flag = try s.byte();
                     if (flag != 0x00) return error.Unsupported;
-                    const offset: u32 = @intCast(try constExpr(&s));
+                    // The init offset is an untrusted sleb: reject negative / >u32 rather
+                    // than panicking in @intCast.
+                    const offset = std.math.cast(u32, try constExpr(&s)) orelse return error.InvalidWasm;
                     const cnt = try s.u32leb();
                     for (0..cnt) |j| {
                         const fi = try s.u32leb();
-                        const slot = offset + @as(u32, @intCast(j));
+                        // `offset` is untrusted: compute the slot with checked add, then cap
+                        // the resulting table size so a near-maxInt(u32) offset cannot drive
+                        // the growth loop below into a multi-GB allocation.
+                        const jj = std.math.cast(u32, j) orelse return error.InvalidWasm;
+                        const slot = std.math.add(u32, offset, jj) catch return error.InvalidWasm;
+                        if (slot >= max_table_entries) return error.InvalidWasm;
                         while (table_idx.items.len <= slot) try table_idx.append(allocator, 0);
                         table_idx.items[slot] = fi;
                     }
@@ -259,9 +272,10 @@ pub fn module(allocator: std.mem.Allocator, bytes: []const u8) Error!Module {
                 for (0..n) |_| {
                     const flag = try s.byte();
                     if (flag != 0x00) return error.Unsupported; // only active, memory 0
-                    const offset = try constExpr(&s);
+                    // The init offset is an untrusted sleb: reject negative / >u32.
+                    const offset = std.math.cast(u32, try constExpr(&s)) orelse return error.InvalidWasm;
                     const len = try s.u32leb();
-                    try data_segs.append(allocator, .{ .offset = @intCast(offset), .bytes = try s.take(len) });
+                    try data_segs.append(allocator, .{ .offset = offset, .bytes = try s.take(len) });
                 }
             },
             else => {}, // skip unhandled sections
@@ -386,9 +400,10 @@ fn lowerFunction(allocator: std.mem.Allocator, ctx: Ctx, ft: FuncType, body: []c
     const entry = try func.appendBlock();
 
     // A module with any hidden state (memory/globals/table/imports) gives every
-    // function a single hidden leading "context" pointer to a struct of four base
-    // pointers at fixed offsets (mem 0, globals 8, table 16, imports 24). The bases
-    // are loaded from it at entry. Calls thread the context through.
+    // function a single hidden leading "context" pointer to a struct of base pointers
+    // at fixed offsets (mem 0, globals 8, table 16, imports 24, import-context 32). The
+    // bases are loaded from it at entry. Calls thread the context through; a host-import
+    // call also forwards the import-context pointer as the callee's hidden first argument.
     const ptr_t = try func.types.intern(.ptr);
     const needs_ctx = ctx.has_memory or ctx.global_types.len > 0 or ctx.has_table or ctx.has_imports;
     const context: ?Value = if (needs_ctx) try func.appendBlockParam(entry, ptr_t) else null;
@@ -402,6 +417,8 @@ fn lowerFunction(allocator: std.mem.Allocator, ctx: Ctx, ft: FuncType, body: []c
     const globals_base: ?Value = if (ctx.global_types.len > 0) try loadBase(&func, entry, ptr_t, context.?, 8) else null;
     const table_base: ?Value = if (ctx.has_table) try loadBase(&func, entry, ptr_t, context.?, 16) else null;
     const imports_base: ?Value = if (ctx.has_imports) try loadBase(&func, entry, ptr_t, context.?, 24) else null;
+    // The opaque import-context pointer host imports receive as their hidden first arg.
+    const import_ctx: ?Value = if (ctx.has_imports) try loadBase(&func, entry, ptr_t, context.?, 32) else null;
     var locals: std.ArrayList(Local) = .empty;
     defer locals.deinit(allocator);
     var pvals: std.ArrayList(Value) = .empty;
@@ -440,7 +457,7 @@ fn lowerFunction(allocator: std.mem.Allocator, ctx: Ctx, ft: FuncType, body: []c
     var stack: std.ArrayList(Value) = .empty;
     defer stack.deinit(allocator);
 
-    var l = L{ .func = &func, .block = entry, .stack = &stack, .allocator = allocator, .bool_as = i32s, .ptr_t = ptr_t, .i32_t = i32s, .mem_base = mem_base, .min_pages = ctx.min_pages, .globals_base = globals_base, .global_types = ctx.global_types, .table_base = table_base, .imports_base = imports_base, .n_imports = ctx.n_imports, .context = context };
+    var l = L{ .func = &func, .block = entry, .stack = &stack, .allocator = allocator, .bool_as = i32s, .ptr_t = ptr_t, .i32_t = i32s, .mem_base = mem_base, .min_pages = ctx.min_pages, .globals_base = globals_base, .global_types = ctx.global_types, .table_base = table_base, .imports_base = imports_base, .import_ctx = import_ctx, .n_imports = ctx.n_imports, .context = context };
 
     // Structured control flow. Each block/loop/if pushes a `Frame`. `reachable` tracks
     // whether the current point is live. Dead code after an unconditional branch is not
@@ -913,6 +930,9 @@ const L = struct {
     table_base: ?Value = null,
     /// The imports base (a hidden parameter after the table base): host addresses.
     imports_base: ?Value = null,
+    /// The opaque import-context pointer, forwarded to host imports as their hidden
+    /// first argument so they can reach per-instance host state.
+    import_ctx: ?Value = null,
     n_imports: u32 = 0,
     /// The hidden context pointer (threaded to defined-function calls), if any.
     context: ?Value = null,
@@ -1357,18 +1377,22 @@ fn call(l: *L, ctx: Ctx, allocator: std.mem.Allocator, idx: u32) Error!void {
     const nargs = sig.params.len;
     if (l.stack.items.len < nargs) return error.InvalidWasm;
 
-    // A call to an imported function dispatches through the imports-base buffer of
-    // host addresses (the host function takes no hidden parameters).
+    // A call to an imported function dispatches through the imports-base buffer of host
+    // addresses. The host function receives the instance's import-context pointer as a
+    // hidden first argument (so it can reach per-instance host state without a global),
+    // followed by the Wasm arguments.
     if (idx < ctx.n_imports) {
         const base = l.imports_base orelse return error.InvalidWasm;
         const slot = try l.func.appendArithImm(l.block, l.ptr_t, .add, base, @as(i64, idx) * 8);
         const target = try l.func.appendInst(l.block, l.ptr_t, .{ .load = .{ .ptr = slot } });
-        const args = try allocator.alloc(Value, nargs);
+        const host_ctx = l.import_ctx orelse return error.InvalidWasm;
+        const args = try allocator.alloc(Value, nargs + 1);
         defer allocator.free(args);
+        args[0] = host_ctx;
         var ki = nargs;
         while (ki > 0) {
             ki -= 1;
-            args[ki] = try l.pop();
+            args[1 + ki] = try l.pop();
         }
         const rty = if (sig.results.len == 0) l.i32_t else try irType(l.func, sig.results[0]);
         const r = try l.func.appendCallIndirect(l.block, rty, target, args);
@@ -1396,4 +1420,26 @@ fn call(l: *L, ctx: Ctx, allocator: std.mem.Allocator, idx: u32) Error!void {
         const rty = try irType(l.func, sig.results[0]);
         try l.push(try l.func.appendCall(l.block, rty, name, args));
     }
+}
+
+/// Wrap `content` (a single section body) in a minimal valid module header + section
+/// header so `module()` reaches the section-parsing code under test.
+fn oneSectionModule(comptime id: u8, comptime content: []const u8) [8 + 2 + content.len]u8 {
+    return reader.magic ++ reader.version ++ [_]u8{ id, content.len } ++ content[0..content.len].*;
+}
+
+test "element segment with negative init offset is rejected, not a panic" {
+    // Element section (id 9): n=1, flag=0x00, init expr `i32.const -1` (0x41 0x7F 0x0B),
+    // cnt=1, funcidx=0. The -1 offset must be rejected by the u32 cast, not @intCast-panic.
+    const content = [_]u8{ 0x01, 0x00, 0x41, 0x7F, 0x0B, 0x01, 0x00 };
+    const bytes = oneSectionModule(9, &content);
+    try std.testing.expectError(error.InvalidWasm, module(std.testing.allocator, &bytes));
+}
+
+test "element segment with over-cap init offset is rejected, not an OOM" {
+    // Same shape but init expr `i32.const 2097152` (> max_table_entries): the slot cap must
+    // reject it before the table-growth loop attempts a multi-MB/GB allocation.
+    const content = [_]u8{ 0x01, 0x00, 0x41, 0x80, 0x80, 0x80, 0x01, 0x0B, 0x01, 0x00 };
+    const bytes = oneSectionModule(9, &content);
+    try std.testing.expectError(error.InvalidWasm, module(std.testing.allocator, &bytes));
 }

@@ -79,8 +79,17 @@ const tests = struct {
     pub const qemu = @import("riscv64/tests/qemu.zig");
     pub const qemu_user = @import("riscv64/tests/qemu_user.zig");
     pub const qemu_user_rvc = @import("riscv64/tests/qemu_user_rvc.zig");
+    pub const zicbop_differential = @import("riscv64/tests/zicbop_differential.zig");
     pub const compressed = @import("riscv64/tests/compressed.zig");
     pub const native = @import("riscv64/tests/native.zig");
+    pub const fma = @import("riscv64/tests/fma.zig");
+    pub const parallel_move = @import("riscv64/tests/parallel_move.zig");
+    pub const fma_vector = @import("riscv64/tests/fma_vector.zig");
+    pub const etsoc_sysemu = @import("riscv64/tests/etsoc_sysemu.zig");
+    pub const float_spill = @import("riscv64/tests/float_spill.zig");
+    pub const int_spill = @import("riscv64/tests/int_spill.zig");
+    pub const f16_emulation = @import("riscv64/tests/f16.zig");
+    pub const f16_native = @import("riscv64/tests/f16_native.zig");
 };
 
 test {

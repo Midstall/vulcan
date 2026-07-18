@@ -343,6 +343,11 @@ pub fn compileKernel(allocator: std.mem.Allocator, func: *Function) Error!Kernel
 
 /// Lower `func` to a SASS shader for `stage`. The caller owns the result.
 pub fn compileShader(allocator: std.mem.Allocator, func: *Function, stage: Stage) Error!Kernel {
+    // f16 not yet lowered on this backend (f16 roadmap Pn); reject cleanly rather than
+    // silently treat as f64. Covers both this direct entry and compileKernel, which
+    // delegates here.
+    if (ir.function.functionUsesF16(func)) return error.Unsupported;
+
     const nblocks = func.blockCount();
     if (nblocks == 0) return error.Unsupported;
 
@@ -1722,7 +1727,7 @@ fn lowerInst(allocator: std.mem.Allocator, func: *const Function, loc: *std.Auto
                 const pd = predOf(loc.*, result);
                 const pa = predOf(loc.*, a.lhs);
                 const pb = predOf(loc.*, a.rhs);
-                try code.append(allocator, encode.plop3(pd, pa, pb, lutOf(a.op), .{}));
+                try code.append(allocator, encode.plop3(pd, pa, pb, try lutOf(a.op), .{}));
             } else if (a.op == .div and isFloat(func, a.lhs)) {
                 // Float divide a/b = a * (1/b): the GPU has no FDIV, so reciprocate b on
                 // the multifunction unit (MUFU.RCP) then multiply. `normalize` rides this
@@ -1844,6 +1849,7 @@ fn lowerInst(allocator: std.mem.Allocator, func: *const Function, loc: *std.Auto
                 try code.append(allocator, encode.stgU32(gprOf(loc.*, st.ptr), gprOf(loc.*, st.value), .{}));
             }
         },
+        .prefetch => {}, // a hint, no CPU-style prefetch on this GPU target, dropped
         .arith_imm => |a| {
             const result = func.instResult(inst).?;
             // Logical NOT lowers to `bool ^ -1` (bit_xor against all-ones). A boolean
@@ -2129,12 +2135,15 @@ fn arith(func: *const Function, op: ir.function.BinOp, rd: u8, ra: u8, rb: u8, l
 /// The 3-input logic-op LUT (src0=0xF0, src1=0xCC, src2=0xAA truth table) for a
 /// two-input bitwise op - shared by LOP3 (integer) and PLOP3 (predicate). Only the
 /// bitwise ops are valid here (a logical predicate combine is always one of these).
-fn lutOf(op: ir.function.BinOp) u8 {
+fn lutOf(op: ir.function.BinOp) error{Unsupported}!u8 {
     return switch (op) {
         .bit_and => encode.LUT_AND,
         .bit_or => encode.LUT_OR,
         .bit_xor => encode.LUT_XOR,
-        else => unreachable, // only bitwise ops produce a bool / reach a predicate combine
+        // Only bitwise ops produce a bool that reaches a predicate combine; any other
+        // op here is an unsupported IR shape, surfaced as an error rather than a panic
+        // (matching isel's no-panic policy) since the convention is not compiler-enforced.
+        else => error.Unsupported,
     };
 }
 
@@ -2248,6 +2257,17 @@ fn forEachUse(func: *const Function, inst: ir.function.Inst, last_use: []u32, po
             markUse(last_use, st.value, pos);
             markUse(last_use, st.ptr, pos);
         },
+        .prefetch => {}, // dropped at emission, no register read here
+        .dot => |d| {
+            markUse(last_use, d.acc, pos);
+            markUse(last_use, d.a, pos);
+            markUse(last_use, d.b, pos);
+        },
+        .matmul => |mmv| {
+            markUse(last_use, mmv.a, pos);
+            markUse(last_use, mmv.b, pos);
+            markUse(last_use, mmv.c, pos);
+        },
         .struct_new => |sn| for (func.valueList(sn.fields)) |f| markUse(last_use, f, pos),
         .call => |c| for (func.valueList(c.args)) |a| markUse(last_use, a, pos),
         .call_indirect => |c| {
@@ -2297,6 +2317,17 @@ fn markUsedBitset(func: *const Function, inst: ir.function.Inst, row: []bool) vo
         .store => |st| {
             setUsed(row, st.value);
             setUsed(row, st.ptr);
+        },
+        .prefetch => {}, // dropped at emission, no register read here
+        .dot => |d| {
+            setUsed(row, d.acc);
+            setUsed(row, d.a);
+            setUsed(row, d.b);
+        },
+        .matmul => |mmv| {
+            setUsed(row, mmv.a);
+            setUsed(row, mmv.b);
+            setUsed(row, mmv.c);
         },
         .struct_new => |sn| for (func.valueList(sn.fields)) |f| setUsed(row, f),
         .call => |c| for (func.valueList(c.args)) |a| setUsed(row, a),
@@ -2584,6 +2615,20 @@ test "compiles a kernel: load params, multiply-add, store, exit" {
     try testing.expectEqual(@as(u32, 0x210), op(kernel.code, 5)); // IADD3
     try testing.expectEqual(@as(u32, 0x986), op(kernel.code, 6)); // STG
     try testing.expectEqual(@as(u32, 0x94d), op(kernel.code, 7)); // EXIT
+}
+
+test "an f16 function is rejected cleanly, not miscompiled as f64" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .float = .f16 });
+    const b = try func.appendBlock();
+    const x = try func.appendBlockParam(b, t);
+    const y = try func.appendBlockParam(b, t);
+    const sum = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = y } });
+    func.setTerminator(b, .{ .ret = sum });
+
+    try testing.expectError(error.Unsupported, compileKernel(allocator, &func));
 }
 
 test "compiles control flow: a max via if and a merge block" {

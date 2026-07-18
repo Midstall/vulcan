@@ -63,12 +63,22 @@
 
           overlayAttrs = {
             flakever = flakeverConfig;
+            erbium-hal = pkgs.callPackage ./pkgs/erbium-hal { };
+            etsoc-sysemu = pkgs.callPackage ./pkgs/etsoc-sysemu { };
             vulcan = pkgs.callPackage ./pkgs/vulcan { };
           };
 
-          packages.default = pkgs.vulcan;
+          packages = {
+            default = pkgs.vulcan;
+            inherit (pkgs) erbium-hal etsoc-sysemu;
+          };
+
           devShells.default = pkgs.vulcan.shell;
-          checks.default = pkgs.vulcan;
+
+          checks = {
+            default = pkgs.vulcan;
+            inherit (pkgs) erbium-hal etsoc-sysemu;
+          };
         };
     };
 }

@@ -879,7 +879,9 @@ test "wasm: call_indirect through a function table" {
 }
 
 const Host = struct {
-    fn addOne(x: i32) callconv(.c) i32 {
+    // Host imports now receive the instance's import-context pointer as a hidden first
+    // argument; this one ignores it (it needs no per-instance state).
+    fn addOne(_: ?*anyopaque, x: i32) callconv(.c) i32 {
         return x + 1;
     }
 };
@@ -903,6 +905,48 @@ test "wasm: imported host function" {
     try std.testing.expectEqualStrings("env.addone", inst.module.imports[0]);
     try std.testing.expectEqual(@as(i32, 6), try inst.call1(i32, i32, "run", 5)); // addone(5)
     try std.testing.expectEqual(@as(i32, 43), try inst.call1(i32, i32, "run", 42));
+}
+
+const TagCtx = struct {
+    tag: i32,
+    // A host import that reads its per-instance context: returns the instance's tag.
+    fn readTag(cptr: ?*anyopaque) callconv(.c) i32 {
+        const c: *const TagCtx = @ptrCast(@alignCast(cptr.?));
+        return c.tag;
+    }
+};
+
+test "wasm: two instances see their own import context, not a shared global" {
+    // Regression for the removed module-global WASI context: a host import must reach
+    // per-instance state through the threaded import-context pointer, so two live
+    // instances of the same module never clobber each other.
+    const allocator = std.testing.allocator;
+    // (import "env" "tag" (func (result i32)))
+    // (func $get (export "get") (result i32) (call $tag))
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    try out.appendSlice(allocator, &.{ 0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00 });
+    try section(&out, allocator, 1, &.{ 0x01, 0x60, 0x00, 0x01, 0x7F }); // type0 = ()->i32
+    try section(&out, allocator, 2, &.{ 0x01, 0x03, 'e', 'n', 'v', 0x03, 't', 'a', 'g', 0x00, 0x00 }); // import env.tag: type0
+    try section(&out, allocator, 3, &.{ 0x01, 0x00 }); // func0 (get): type0
+    try section(&out, allocator, 7, &.{ 0x01, 0x03, 'g', 'e', 't', 0x00, 0x01 }); // export get = funcidx 1
+    try section(&out, allocator, 10, &.{ 0x01, 0x04, 0x00, 0x10, 0x00, 0x0B }); // get: call 0, end
+
+    var a_ctx = TagCtx{ .tag = 111 };
+    var b_ctx = TagCtx{ .tag = 222 };
+
+    var inst_a = try wasm.Instance.instantiate(allocator, out.items, &.{@intFromPtr(&TagCtx.readTag)});
+    defer inst_a.deinit();
+    inst_a.setImportContext(&a_ctx);
+
+    var inst_b = try wasm.Instance.instantiate(allocator, out.items, &.{@intFromPtr(&TagCtx.readTag)});
+    defer inst_b.deinit();
+    inst_b.setImportContext(&b_ctx);
+
+    // Each instance's import sees only its own context.
+    try std.testing.expectEqual(@as(i32, 111), try inst_a.call0(i32, "get"));
+    try std.testing.expectEqual(@as(i32, 222), try inst_b.call0(i32, "get"));
+    try std.testing.expectEqual(@as(i32, 111), try inst_a.call0(i32, "get")); // a unaffected by b
 }
 
 test "wasm: bulk memory (memory.fill + memory.copy) under the engine" {
@@ -2258,4 +2302,238 @@ test "wasm vs aarch64: value live across a call and a memory slot" {
         .{ .name = "f", .func = &f },
     };
     for ([_]i32{ 0, 1, 7, -3, 100 }) |x_val| try diffIRModule(allocator, &funcs, "f", x_val);
+}
+
+// --- f16 software emulation on the wasm backend ---
+//
+// Wasm has no f16 value type nor f16 arithmetic, so an f16 SSA value is held as its f32
+// widening in an f32 local and every boundary converts in software (the Giesen extend and
+// truncate ported from riscv64, proven bit-exact). The engine JITs the emitted wasm, so
+// these differentials execute the emulation and check it against Zig's own f16 casts.
+
+test "wasm target: f16 extend widens raw half bits to f32, bit-exact vs @as(f32,@as(f16,x))" {
+    const allocator = std.testing.allocator;
+    // ext(bits: i16) -> f16: store the raw 16 bits, reload as f16 (load16_u + software widen).
+    // The f16 result maps to an f32 wasm result: the returned f32 is the widening.
+    var f = ir.function.Function.init(allocator);
+    defer f.deinit();
+    const i16t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 16 } });
+    const f16t = try f.types.intern(.{ .float = .f16 });
+    const ptr = try f.types.intern(.ptr);
+    const b = try f.appendBlock();
+    const x = try f.appendBlockParam(b, i16t);
+    const slot = try f.appendInst(b, ptr, .{ .alloca = .{ .elem = f16t } });
+    try f.appendStore(b, x, slot);
+    const r = try f.appendInst(b, f16t, .{ .load = .{ .ptr = slot } });
+    f.setTerminator(b, .{ .ret = r });
+
+    var m = wtarget.link.Module.init(allocator);
+    defer m.deinit();
+    try m.addFunction("ext", &f);
+    var linked = try wtarget.link.compileModule(allocator, &m);
+    defer linked.deinit(allocator);
+    var inst = try wasm.Instance.instantiate(allocator, linked.module, &.{});
+    defer inst.deinit();
+
+    // +-0, +-1, +-2, min/max subnormal, min/max normal, inf, nan, ties, arbitrary bits.
+    const patterns = [_]u16{
+        0x0000, 0x8000, 0x3C00, 0xBC00, 0x4000, 0xC000,
+        0x0001, 0x8001, 0x03FF, 0x83FF, 0x0400, 0x8400,
+        0x7BFF, 0xFBFF, 0x7C00, 0xFC00, 0x7E00, 0xFE00,
+        0x3555, 0xC900, 0x4900, 0x1234, 0x9ABC,
+    };
+    for (patterns) |p| {
+        const got = try inst.call1(f32, i32, "ext", @as(i32, @intCast(p)));
+        const want = @as(f32, @as(f16, @bitCast(p)));
+        try std.testing.expectEqual(@as(u32, @bitCast(want)), @as(u32, @bitCast(got)));
+    }
+}
+
+test "wasm target: f16 truncate rounds f32 to half bits (RNE), bit-exact vs @as(f16,x)" {
+    const allocator = std.testing.allocator;
+    // trunc(x: f32) -> u16: round x to half (convert), store it (store16 = software truncate),
+    // reload the raw 16 bits (load16_u, zero-extended into the i32 result).
+    var f = ir.function.Function.init(allocator);
+    defer f.deinit();
+    const f32t = try f.types.intern(.{ .float = .f32 });
+    const f16t = try f.types.intern(.{ .float = .f16 });
+    const u16t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 16 } });
+    const ptr = try f.types.intern(.ptr);
+    const b = try f.appendBlock();
+    const x = try f.appendBlockParam(b, f32t);
+    const c = try f.appendInst(b, f16t, .{ .convert = .{ .value = x } });
+    const slot = try f.appendInst(b, ptr, .{ .alloca = .{ .elem = f16t } });
+    try f.appendStore(b, c, slot);
+    const r = try f.appendInst(b, u16t, .{ .load = .{ .ptr = slot } });
+    f.setTerminator(b, .{ .ret = r });
+
+    var m = wtarget.link.Module.init(allocator);
+    defer m.deinit();
+    try m.addFunction("trunc", &f);
+    var linked = try wtarget.link.compileModule(allocator, &m);
+    defer linked.deinit(allocator);
+    var inst = try wasm.Instance.instantiate(allocator, linked.module, &.{});
+    defer inst.deinit();
+
+    const inputs = [_]f32{
+        0.0, -0.0, 1.0, -1.0, 0.5,
+        3.14159, 65504.0, -65504.0, 65520.0, // ties to inf under RNE
+        65536.0, -65536.0, // overflow to +-inf
+        6.103515625e-5, // 2^-14, min normal
+        3.0517578125e-5, // subnormal
+        5.9604645e-8, // 2^-24, ties to zero (underflow)
+        1.0e-7, // underflows to zero
+        1.0 + 1.0 / 2048.0, // exactly halfway at 1.0 -> ties to even (1.0)
+        1.0009765625 + 1.0 / 2048.0, // halfway one ULP up -> ties to even
+        std.math.inf(f32),
+        -std.math.inf(f32),
+        std.math.nan(f32),
+    };
+    for (inputs) |xf| {
+        const raw: u32 = @bitCast(try inst.call1(i32, f32, "trunc", xf));
+        const got: u16 = @intCast(raw & 0xFFFF);
+        const want: u16 = @bitCast(@as(f16, @floatCast(xf)));
+        try std.testing.expectEqual(want, got);
+    }
+}
+
+test "wasm target: f16 add rounds per-op, bit-exact vs @as(f16, af+bf)" {
+    const allocator = std.testing.allocator;
+    // hadd(a: f16, b: f16) -> f16: operands and result are the f32 widenings.
+    var f = ir.function.Function.init(allocator);
+    defer f.deinit();
+    const f16t = try f.types.intern(.{ .float = .f16 });
+    const b = try f.appendBlock();
+    const a = try f.appendBlockParam(b, f16t);
+    const bb = try f.appendBlockParam(b, f16t);
+    const s = try f.appendInst(b, f16t, .{ .arith = .{ .op = .add, .lhs = a, .rhs = bb } });
+    f.setTerminator(b, .{ .ret = s });
+
+    var m = wtarget.link.Module.init(allocator);
+    defer m.deinit();
+    try m.addFunction("hadd", &f);
+    var linked = try wtarget.link.compileModule(allocator, &m);
+    defer linked.deinit(allocator);
+    var inst = try wasm.Instance.instantiate(allocator, linked.module, &.{});
+    defer inst.deinit();
+
+    const pairs = [_][2]f32{
+        .{ 1.5, 2.5 }, .{ 1000.0, 0.3 }, .{ 1.0, 1.0 / 2048.0 }, .{ -3.25, 3.25 },
+        .{ 60000.0, 60000.0 }, // overflows to inf after rounding
+        .{ 0.1, 0.2 },
+    };
+    for (pairs) |pr| {
+        const af = @as(f32, @as(f16, @floatCast(pr[0])));
+        const bf = @as(f32, @as(f16, @floatCast(pr[1])));
+        const got = try inst.call2(f32, f32, f32, "hadd", af, bf);
+        const want = @as(f32, @as(f16, @floatCast(af + bf)));
+        try std.testing.expectEqual(@as(u32, @bitCast(want)), @as(u32, @bitCast(got)));
+    }
+}
+
+test "wasm target: f16 mul rounds a non-half-representable product, bit-exact vs @as(f16, af*bf)" {
+    const allocator = std.testing.allocator;
+    var f = ir.function.Function.init(allocator);
+    defer f.deinit();
+    const f16t = try f.types.intern(.{ .float = .f16 });
+    const b = try f.appendBlock();
+    const a = try f.appendBlockParam(b, f16t);
+    const bb = try f.appendBlockParam(b, f16t);
+    const s = try f.appendInst(b, f16t, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = bb } });
+    f.setTerminator(b, .{ .ret = s });
+
+    var m = wtarget.link.Module.init(allocator);
+    defer m.deinit();
+    try m.addFunction("hmul", &f);
+    var linked = try wtarget.link.compileModule(allocator, &m);
+    defer linked.deinit(allocator);
+    var inst = try wasm.Instance.instantiate(allocator, linked.module, &.{});
+    defer inst.deinit();
+
+    // 1.1 * 1.1: the f16-rounded operands multiply to a product not representable in f16, so
+    // the per-op round is what makes the result match @as(f16, af*bf).
+    const pairs = [_][2]f32{ .{ 1.1, 1.1 }, .{ 3.3, 7.7 }, .{ 0.1, 0.1 }, .{ 255.0, 255.0 } };
+    for (pairs) |pr| {
+        const af = @as(f32, @as(f16, @floatCast(pr[0])));
+        const bf = @as(f32, @as(f16, @floatCast(pr[1])));
+        const got = try inst.call2(f32, f32, f32, "hmul", af, bf);
+        const want = @as(f32, @as(f16, @floatCast(af * bf)));
+        try std.testing.expectEqual(@as(u32, @bitCast(want)), @as(u32, @bitCast(got)));
+    }
+}
+
+test "wasm target: f16 store/load round-trips a representable half through memory" {
+    const allocator = std.testing.allocator;
+    // rt(x: f16) -> f16: store the held f32 (software truncate) then reload (software widen).
+    var f = ir.function.Function.init(allocator);
+    defer f.deinit();
+    const f16t = try f.types.intern(.{ .float = .f16 });
+    const ptr = try f.types.intern(.ptr);
+    const b = try f.appendBlock();
+    const x = try f.appendBlockParam(b, f16t);
+    const slot = try f.appendInst(b, ptr, .{ .alloca = .{ .elem = f16t } });
+    try f.appendStore(b, x, slot);
+    const r = try f.appendInst(b, f16t, .{ .load = .{ .ptr = slot } });
+    f.setTerminator(b, .{ .ret = r });
+
+    var m = wtarget.link.Module.init(allocator);
+    defer m.deinit();
+    try m.addFunction("rt", &f);
+    var linked = try wtarget.link.compileModule(allocator, &m);
+    defer linked.deinit(allocator);
+    var inst = try wasm.Instance.instantiate(allocator, linked.module, &.{});
+    defer inst.deinit();
+
+    for ([_]f32{ 0.0, -0.0, 1.0, -2.5, 100.0, 0.5, 65504.0 }) |v| {
+        const hv = @as(f32, @as(f16, @floatCast(v))); // an exactly-representable half
+        const got = try inst.call1(f32, f32, "rt", hv);
+        try std.testing.expectEqual(@as(u32, @bitCast(hv)), @as(u32, @bitCast(got)));
+    }
+}
+
+test "wasm target: int<->f16 conversions go through f32, bit-exact vs Zig casts" {
+    const allocator = std.testing.allocator;
+    // i2h(x: i32) -> f16 (int widened to f32 then rounded to half).
+    var f_i2h = ir.function.Function.init(allocator);
+    defer f_i2h.deinit();
+    {
+        const i32t = try f_i2h.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+        const f16t = try f_i2h.types.intern(.{ .float = .f16 });
+        const b = try f_i2h.appendBlock();
+        const x = try f_i2h.appendBlockParam(b, i32t);
+        const r = try f_i2h.appendInst(b, f16t, .{ .convert = .{ .value = x } });
+        f_i2h.setTerminator(b, .{ .ret = r });
+    }
+    // h2i(x: f16) -> i32 (truncate the held f32 toward zero).
+    var f_h2i = ir.function.Function.init(allocator);
+    defer f_h2i.deinit();
+    {
+        const i32t = try f_h2i.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+        const f16t = try f_h2i.types.intern(.{ .float = .f16 });
+        const b = try f_h2i.appendBlock();
+        const x = try f_h2i.appendBlockParam(b, f16t);
+        const r = try f_h2i.appendInst(b, i32t, .{ .convert = .{ .value = x } });
+        f_h2i.setTerminator(b, .{ .ret = r });
+    }
+
+    var m = wtarget.link.Module.init(allocator);
+    defer m.deinit();
+    try m.addFunction("i2h", &f_i2h);
+    try m.addFunction("h2i", &f_h2i);
+    var linked = try wtarget.link.compileModule(allocator, &m);
+    defer linked.deinit(allocator);
+    var inst = try wasm.Instance.instantiate(allocator, linked.module, &.{});
+    defer inst.deinit();
+
+    for ([_]i32{ 0, 1, -1, 7, -7, 100, -100, 2048, 4095, -4095 }) |xi| {
+        const got = try inst.call1(f32, i32, "i2h", xi);
+        const want = @as(f32, @as(f16, @floatFromInt(xi)));
+        try std.testing.expectEqual(@as(u32, @bitCast(want)), @as(u32, @bitCast(got)));
+    }
+    for ([_]f32{ 0.0, 1.0, -1.0, 2.5, -2.5, 100.0, -100.0, 3.9, -3.9 }) |xf| {
+        const hv = @as(f32, @as(f16, @floatCast(xf)));
+        const got = try inst.call1(i32, f32, "h2i", hv);
+        const want = @as(i32, @intFromFloat(@as(f16, @floatCast(hv))));
+        try std.testing.expectEqual(want, got);
+    }
 }

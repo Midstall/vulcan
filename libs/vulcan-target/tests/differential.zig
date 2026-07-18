@@ -639,10 +639,19 @@ test "fuzz differential: 64 random float inputs, native == C == JS (bit-exact)" 
     // Correctly-rounded f32 ops over random finite/normal inputs. sqrt(a*a+b*b) is always a
     // non-negative finite argument. Empirically confirms the double-rounding (Figueroa) bit-
     // exactness of native (hardware) vs C (float) vs JS (fround) across a wide input space.
-    try fuzzF2("float f(float a, float b) { return a * b + a - b; }", 0x1357);
+    //
+    // `a * b + a - b` and `a * a + b * b` are each a single-use multiply feeding straight into
+    // an add/sub - since Vulcan now permits fp-contraction, the aarch64 native backend fuses
+    // exactly that shape into one fmadd (one rounding), which the unfused C/JS/Wasm references
+    // never do. That divergence is intentional (see aarch64/isel.zig's fusesIntoNextArith and
+    // its dedicated bit-exact-vs-@mulAdd tests), not a codegen bug, so it does not belong in
+    // this bit-exact cross-backend contract. `p - p` / `bb - bb` is exactly 0.0 for every finite
+    // input, so it changes no value; it exists purely to give the product a second use, which
+    // is exactly the condition that keeps `fusesIntoNextArith` from firing.
+    try fuzzF2("float f(float a, float b) { float p = a * b; return p + a - b + (p - p); }", 0x1357);
     try fuzzF2("float f(float a, float b) { return a / b; }", 0x2468);
     try fuzzF2("float f(float a, float b) { return (a + b) * (a - b); }", 0x369c);
-    try fuzzF2("float f(float a, float b) { return sqrt(a * a + b * b); }", 0x48ad);
+    try fuzzF2("float f(float a, float b) { float aa = a * a; float bb = b * b; return sqrt(aa + bb) + (bb - bb); }", 0x48ad);
 }
 
 test "differential: float builtins and conversions (bit-exact)" {

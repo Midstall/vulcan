@@ -52,7 +52,10 @@ fn hostedMain(init: std.process.Init) !void {
 
         var inst = try engine.Instance.instantiate(allocator, bytes, host_imports);
         defer inst.deinit();
-        engine.wasi.setup(inst.memory, &.{path}); // argv[0] = the module path
+        // Per-instance WASI state, injected via the import-context pointer (no global).
+        // argv[0] = the module path. `wasi_ctx` must outlive the `_start` call below.
+        var wasi_ctx = engine.wasi.Ctx{ .mem = inst.memory, .args = &.{path}, .io = io, .allocator = allocator };
+        inst.setImportContext(&wasi_ctx);
         inst.call0(void, "_start") catch |e| {
             std.debug.print("vulcan-wasm: {s}\n", .{@errorName(e)});
             return e;

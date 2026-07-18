@@ -113,14 +113,6 @@ fn debugLines(allocator: std.mem.Allocator, image: []const u8, comptime AL: type
     return out.toOwnedSlice(allocator);
 }
 
-/// Convert `.text` function symbols to a fixed-width backend's `Sym` (which indexes code by
-/// 32-bit word, so the byte offset is divided by 4).
-fn wordSyms(allocator: std.mem.Allocator, comptime Sym: type, funcs: []const target.elf_read.FuncSym) ![]Sym {
-    const out = try allocator.alloc(Sym, funcs.len);
-    for (funcs, 0..) |f, i| out[i] = .{ .name = f.name, .word = @intCast(f.offset / 4) };
-    return out;
-}
-
 /// Convert `.text` function symbols to a byte-addressed backend's `Sym` (x86).
 fn byteSyms(allocator: std.mem.Allocator, comptime Sym: type, funcs: []const target.elf_read.FuncSym) ![]Sym {
     const out = try allocator.alloc(Sym, funcs.len);

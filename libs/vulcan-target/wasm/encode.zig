@@ -194,10 +194,10 @@ pub const I32Op = struct {
     pub const wrap_i64: u8 = 0xA7;
     // These are the non-saturating i32.trunc_f* ops (they trap on NaN/overflow). The
     // saturating forms are 0xFC-prefixed. The isel uses these for in-range floats.
-    pub const trunc_sat_f32_s: u8 = 0xA8;
-    pub const trunc_sat_f32_u: u8 = 0xA9;
-    pub const trunc_sat_f64_s: u8 = 0xAA;
-    pub const trunc_sat_f64_u: u8 = 0xAB;
+    pub const trunc_f32_s: u8 = 0xA8;
+    pub const trunc_f32_u: u8 = 0xA9;
+    pub const trunc_f64_s: u8 = 0xAA;
+    pub const trunc_f64_u: u8 = 0xAB;
     pub const reinterpret_i32: u8 = 0xBC;
 };
 
@@ -235,10 +235,10 @@ pub const I64Op = struct {
     pub const extend_i32_s: u8 = 0xAC;
     pub const extend_i32_u: u8 = 0xAD;
     // Non-saturating i64.trunc_f* (the saturating forms are 0xFC-prefixed).
-    pub const trunc_sat_f32_s: u8 = 0xAE;
-    pub const trunc_sat_f32_u: u8 = 0xAF;
-    pub const trunc_sat_f64_s: u8 = 0xB0;
-    pub const trunc_sat_f64_u: u8 = 0xB1;
+    pub const trunc_f32_s: u8 = 0xAE;
+    pub const trunc_f32_u: u8 = 0xAF;
+    pub const trunc_f64_s: u8 = 0xB0;
+    pub const trunc_f64_u: u8 = 0xB1;
     pub const reinterpret_i64: u8 = 0xBD;
 };
 
@@ -383,13 +383,21 @@ pub fn irTypeToWasm(types: *const ir.types.TypeTable, ty: ir.types.Type) ?ValTyp
         .float => |kind| switch (kind) {
             .f32 => .f32,
             .f64 => .f64,
+            // Wasm has no native f16 value type, so an f16 SSA value is held as its
+            // f32 widening in an f32 local (the isel converts at every memory/round
+            // boundary in software). The value slot is therefore f32, matching the
+            // riscv64/aarch64 held-as-f32 emulation model.
+            .f16 => .f32,
         },
         else => null,
     };
 }
 
 /// Map an IR type to the Wasm memory load opcode for the given width and signedness.
-pub fn irLoadOp(types: *const ir.types.TypeTable, ty: ir.types.Type) u8 {
+/// An f16 in memory is a 2-byte IEEE half, so it loads with `i32.load16_u` (the raw 16
+/// bits, zero-extended); the isel then software-widens those bits into the f32 local. This
+/// is only the raw load opcode, not the widening (the isel `.load` case owns that).
+pub fn irLoadOp(types: *const ir.types.TypeTable, ty: ir.types.Type) error{Unsupported}!u8 {
     const kind = types.type_kind(ty);
     return switch (kind) {
         .int => |info| switch (info.bits) {
@@ -402,13 +410,17 @@ pub fn irLoadOp(types: *const ir.types.TypeTable, ty: ir.types.Type) u8 {
         .float => |f| switch (f) {
             .f32 => MemOp.load32f32,
             .f64 => MemOp.load64f64,
+            // The 16-bit half pattern; the isel widens it to the held f32 in software.
+            .f16 => MemOp.load16_u,
         },
         else => unreachable,
     };
 }
 
-/// Map an IR type to the Wasm memory store opcode for the given width.
-pub fn irStoreOp(types: *const ir.types.TypeTable, ty: ir.types.Type) u8 {
+/// Map an IR type to the Wasm memory store opcode for the given width. An f16 stores its
+/// 2-byte IEEE half with `i32.store16` (the low 16 bits); the isel software-truncates the
+/// held f32 down to those bits before the store (the isel `.store` case owns that).
+pub fn irStoreOp(types: *const ir.types.TypeTable, ty: ir.types.Type) error{Unsupported}!u8 {
     const kind = types.type_kind(ty);
     return switch (kind) {
         .int => |info| switch (info.bits) {
@@ -421,6 +433,8 @@ pub fn irStoreOp(types: *const ir.types.TypeTable, ty: ir.types.Type) u8 {
         .float => |f| switch (f) {
             .f32 => MemOp.store32f32,
             .f64 => MemOp.store64f64,
+            // The isel truncates the held f32 to the 16-bit half, then stores it.
+            .f16 => MemOp.store16,
         },
         else => unreachable,
     };

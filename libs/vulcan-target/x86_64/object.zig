@@ -204,6 +204,9 @@ fn returnBaseType(func: *const ir.function.Function) ?dwarf.BaseType {
         .float => |f| switch (f) {
             .f32 => .{ .name = "float", .encoding = .float, .byte_size = 4 },
             .f64 => .{ .name = "double", .encoding = .float, .byte_size = 8 },
+            // A 2-byte IEEE half in memory (x86_64 lowers f16 via F16C, held as its f32 widening
+            // in registers).
+            .f16 => .{ .name = "half", .encoding = .float, .byte_size = 2 },
         },
         .int => |it| blk: {
             const bytes: u8 = @intCast((it.bits + 7) / 8);

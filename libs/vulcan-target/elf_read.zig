@@ -1,13 +1,22 @@
 //! Minimal ELF reader: locate the `.text` section of an ELF object or executable and report
 //! its machine so a disassembler can be chosen, plus its `.text` function symbols. Supports
-//! both ELF32 and ELF64, little-endian (every target Vulcan emits). The complement of the ELF
+//! both ELF32 and ELF64, little-endian ELF (ELFDATA2LSB, which every target Vulcan emits),
+//! decoded correctly whether the host is little- or big-endian. The complement of the ELF
 //! writers in `object.zig` / `ld.zig`. Built on the `std.elf` header structs so there is no
 //! hand-rolled offset arithmetic: the ELF32/ELF64 split is a single comptime parameter.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const elf = std.elf;
 
 pub const Error = error{ NotElf, Unsupported, Malformed, NoText };
+
+/// `base + index*stride`, rejecting the overflow that would otherwise wrap a bounds
+/// check on attacker-controlled ELF offset/size fields into an out-of-bounds read.
+fn tableOffset(base: u64, index: u64, stride: u64) Error!u64 {
+    const scaled = std.math.mul(u64, index, stride) catch return error.Malformed;
+    return std.math.add(u64, base, scaled) catch return error.Malformed;
+}
 
 /// ELF `e_machine` values for the architectures Vulcan disassembles.
 pub const EM_386: u16 = @intFromEnum(elf.EM.@"386");
@@ -36,8 +45,8 @@ pub const FuncSym = struct { name: []const u8, offset: u64 };
 /// branch and `adrp` targets to names when disassembling.
 pub const Symbol = struct { name: []const u8, addr: u64, size: u64, is_func: bool };
 
-/// The `std.elf` header structs for a given width. `bytesToValue` decodes each straight from
-/// the mapped image (little-endian, which the callers enforce and every Vulcan host uses).
+/// The `std.elf` header structs for a given width. `peek` decodes each from the mapped image
+/// and normalizes the little-endian fields to host order, so either host byte order works.
 fn Layout(comptime is_64: bool) type {
     return if (is_64) struct {
         const Ehdr = elf.Elf64_Ehdr;
@@ -52,9 +61,13 @@ fn Layout(comptime is_64: bool) type {
 
 /// Decode a fixed-size POD header struct from `image` at byte offset `off`.
 fn peek(comptime T: type, image: []const u8, off: u64) Error!T {
-    const o: usize = @intCast(off);
-    if (o + @sizeOf(T) > image.len) return error.Malformed;
-    return std.mem.bytesToValue(T, image[o..][0..@sizeOf(T)]);
+    const o = std.math.cast(usize, off) orelse return error.Malformed;
+    if (o > image.len or @sizeOf(T) > image.len - o) return error.Malformed;
+    var v = std.mem.bytesToValue(T, image[o..][0..@sizeOf(T)]);
+    // The image is little-endian (ELFDATA2LSB); on a big-endian host swap every
+    // field into host order so the reader is correct on both endiannesses.
+    if (builtin.cpu.arch.endian() != .little) std.mem.byteSwapAllFields(T, &v);
+    return v;
 }
 
 /// Validate the ELF magic and identify the class (`true` = ELF64). Little-endian only.
@@ -70,15 +83,15 @@ fn is64(image: []const u8) Error!bool {
 
 /// The `[off, off+size)` slice of `image`, bounds-checked.
 fn slice(image: []const u8, off: u64, size: u64) Error![]const u8 {
-    const o: usize = @intCast(off);
-    const s: usize = @intCast(size);
-    if (o + s > image.len) return error.Malformed;
+    const o = std.math.cast(usize, off) orelse return error.Malformed;
+    const s = std.math.cast(usize, size) orelse return error.Malformed;
+    if (o > image.len or s > image.len - o) return error.Malformed;
     return image[o .. o + s];
 }
 
 /// Read section header `idx`.
 fn shdr(comptime L: type, image: []const u8, eh: L.Ehdr, idx: u16) Error!L.Shdr {
-    return peek(L.Shdr, image, eh.e_shoff + @as(u64, idx) * eh.e_shentsize);
+    return peek(L.Shdr, image, try tableOffset(eh.e_shoff, idx, eh.e_shentsize));
 }
 
 /// The section-name string table (section `e_shstrndx`).
@@ -168,11 +181,14 @@ fn functionsGeneric(comptime L: type, allocator: std.mem.Allocator, image: []con
     const count = sym.sh_size / sym.sh_entsize;
     var k: u64 = 0;
     while (k < count) : (k += 1) {
-        const s = try peek(L.Sym, image, sym.sh_offset + k * sym.sh_entsize);
+        const s = try peek(L.Sym, image, try tableOffset(sym.sh_offset, k, sym.sh_entsize));
         if (s.st_type() != elf.STT_FUNC or s.st_shndx != tx) continue;
         const name = nameAt(strs, s.st_name);
         if (name.len == 0) continue;
-        try list.append(allocator, .{ .name = name, .offset = s.st_value - text_addr });
+        // A .text symbol below the section base is malformed; skip it rather than
+        // underflowing the offset.
+        const offset = std.math.sub(u64, s.st_value, text_addr) catch continue;
+        try list.append(allocator, .{ .name = name, .offset = offset });
     }
     const out = try list.toOwnedSlice(allocator);
     std.mem.sort(FuncSym, out, {}, struct {
@@ -209,7 +225,7 @@ fn symbolsGeneric(comptime L: type, allocator: std.mem.Allocator, image: []const
     const count = sym.sh_size / sym.sh_entsize;
     var k: u64 = 0;
     while (k < count) : (k += 1) {
-        const s = try peek(L.Sym, image, sym.sh_offset + k * sym.sh_entsize);
+        const s = try peek(L.Sym, image, try tableOffset(sym.sh_offset, k, sym.sh_entsize));
         const t = s.st_type();
         if (t != elf.STT_FUNC and t != elf.STT_OBJECT) continue;
         if (s.st_shndx == 0 or s.st_shndx >= 0xff00) continue; // undefined / reserved section
@@ -241,6 +257,26 @@ test "finds .text and machine in a hand-built ELF64" {
 
 test "rejects non-ELF input" {
     try std.testing.expectError(error.NotElf, findText("not an elf at all, just text padding to length!!"));
+}
+
+test "decodes little-endian header fields to host order on either host endianness" {
+    // ELF files are little-endian on disk; peek must recover the same field values
+    // whether the host is little- or big-endian. Build a little-endian image of a
+    // known header and confirm peek reads it back verbatim.
+    const T = elf.Elf64_Shdr;
+    var host_val = std.mem.zeroes(T);
+    host_val.sh_name = 0x11223344;
+    host_val.sh_offset = 0x0102030405060708;
+    host_val.sh_size = 0x00000000deadbeef;
+
+    var le_val = host_val;
+    if (builtin.cpu.arch.endian() != .little) std.mem.byteSwapAllFields(T, &le_val);
+    const image = std.mem.toBytes(le_val);
+
+    const got = try peek(T, &image, 0);
+    try std.testing.expectEqual(host_val.sh_name, got.sh_name);
+    try std.testing.expectEqual(host_val.sh_offset, got.sh_offset);
+    try std.testing.expectEqual(host_val.sh_size, got.sh_size);
 }
 
 test "reads function symbols from a real cc-compiled .o" {

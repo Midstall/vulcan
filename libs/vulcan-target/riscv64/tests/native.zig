@@ -86,8 +86,11 @@ test "codegen+disasm round-trip: control flow (max via if/else)" {
     // RV64 needs the high-profile `if` legalized to flat branches before isel (unlike
     // aarch64/x86, whose isel lowers the diamond inline), so this goes through the full
     // pipeline via harness.compileFunc. It validates the disassembler's scattered B-type and
-    // J-type immediate decoding on real codegen: a `bne .+16` plus forward and BACKWARD
-    // `jal` offsets (.+20, .-12, .-20), the trickiest part of the RISC-V decoder.
+    // J-type immediate decoding on real codegen: a fused compare-and-branch `blt .+16` plus
+    // forward and BACKWARD `jal` offsets (.+20, .-12, .-20), the trickiest part of the RISC-V
+    // decoder. The `x > y` icmp is the single-use condition of the immediately-following if,
+    // so isel fuses it into a native `blt x11, x10` (branch to `then` when y < x, i.e. x > y)
+    // instead of materializing `slt x5, x11, x10; bnez x5`. Structural only (does not run).
     const a = std.testing.allocator;
     var func = Function.init(a);
     defer func.deinit();
@@ -107,17 +110,50 @@ test "codegen+disasm round-trip: control flow (max via if/else)" {
     const text = try disasm.format(a, words.items);
     defer a.free(text);
     try std.testing.expectEqualStrings(
-        \\0000: 00a5a2b3  slt x5, x11, x10
-        \\0004: 00029863  bnez x5, .+16
-        \\0008: 0140006f  j .+20
-        \\000c: 00028513  mv x10, x5
-        \\0010: 00008067  ret
-        \\0014: 00050293  mv x5, x10
-        \\0018: ff5ff06f  j .-12
-        \\001c: 00058293  mv x5, x11
-        \\0020: fedff06f  j .-20
+        \\0000: 00a5c863  blt x11, x10, .+16
+        \\0004: 0140006f  j .+20
+        \\0008: 00028513  mv x10, x5
+        \\000c: 00008067  ret
+        \\0010: 00050293  mv x5, x10
+        \\0014: ff5ff06f  j .-12
+        \\0018: 00058293  mv x5, x11
+        \\001c: fedff06f  j .-20
         \\
     , text);
+}
+
+test "codegen+disasm round-trip: fused compare-and-branch for if(icmp)" {
+    // An UNSIGNED `x < y` that is the single-use condition of the immediately-following
+    // if fuses into a native `bltu` on the two operands: no `sltu` materialization and no
+    // `bnez` re-test. This proves the fused branch is emitted (and exercises the bltu
+    // encoder path). Structural only; the qemu-user execution corpus (cases.zig) is the
+    // correctness oracle for the taken edge.
+    const a = std.testing.allocator;
+    var func = Function.init(a);
+    defer func.deinit();
+    const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const e = try func.appendBlock();
+    const x = try func.appendBlockParam(e, u32_t);
+    const y = try func.appendBlockParam(e, u32_t);
+    const tb = try func.appendBlock();
+    const eb = try func.appendBlock();
+    const c = try func.appendInst(e, bool_t, .{ .icmp = .{ .op = .lt, .lhs = x, .rhs = y } });
+    try func.appendIf(e, c, .{ .target = tb, .args = &.{} }, .{ .target = eb, .args = &.{} });
+    const one = try func.appendInst(tb, u32_t, .{ .iconst = 1 });
+    func.setTerminator(tb, .{ .ret = one });
+    const zero = try func.appendInst(eb, u32_t, .{ .iconst = 0 });
+    func.setTerminator(eb, .{ .ret = zero });
+
+    var words = try harness.compileFunc(a, &func);
+    defer words.deinit(a);
+    const text = try disasm.format(a, words.items);
+    defer a.free(text);
+    // Fusion fired: a native unsigned compare-branch on the operands (a0=x, a1=y),
+    // with no boolean materialization or re-test.
+    try std.testing.expect(std.mem.indexOf(u8, text, "bltu x10, x11") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "sltu") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "bnez") == null);
 }
 
 /// Compile `func`, map it executable, and call it natively. Skips off RISC-V.
@@ -142,6 +178,187 @@ fn runNative(allocator: std.mem.Allocator, func: *Function, args: []const i64) !
         2 => @as(*const fn (i64, i64) callconv(.c) i64, @ptrCast(ptr))(args[0], args[1]),
         else => error.Unsupported,
     };
+}
+
+test "qemu-user-riscv: a conditional branch past ±4KiB relaxes and runs both edges" {
+    // A far conditional branch is the whole point of relaxation. The `then` target is
+    // pushed > 4KiB away by padding the else block with a long dependency chain of adds
+    // (each feeds the next, so none is dead-code-eliminated and the block cannot shrink
+    // below ~1300 words). The B-type branch to `then` cannot reach that, so relaxation
+    // MUST expand it to an inverted short branch (skip +8) over a `jal` to the far
+    // target. We assert the relaxation fired structurally (the +8 skip), then execute
+    // under qemu for inputs on BOTH edges to prove control flow is correct.
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var func = Function.init(a);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+
+    // Layout order follows block-append order: entry(0), else(1, the padding), then(2).
+    // So `then` lands after the entire else chain, making the branch to it far.
+    const entry = try func.appendBlock();
+    const else_b = try func.appendBlock();
+    const then_b = try func.appendBlock();
+
+    const x = try func.appendBlockParam(entry, i32_t);
+    const seven = try func.appendInst(entry, i32_t, .{ .iconst = 7 });
+    const c = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .eq, .lhs = x, .rhs = seven } });
+    // The else edge carries `x` into the padding block so the chain below depends on a
+    // runtime value and cannot be constant-folded away (a chain of constant adds would
+    // collapse to a single `li`, defeating the padding).
+    const ex = try func.appendBlockParam(else_b, i32_t);
+    try func.appendIf(entry, c, .{ .target = then_b, .args = &.{} }, .{ .target = else_b, .args = &.{x} });
+
+    // Taken edge (x == 7): return 111.
+    const r_then = try func.appendInst(then_b, i32_t, .{ .iconst = 111 });
+    func.setTerminator(then_b, .{ .ret = r_then });
+
+    // Not-taken edge: a 1300-long add chain accumulating `x` each step (each add feeds
+    // the next, so none is dead and the running sum is opaque to a constant-folder). It
+    // pads the layout well past 4KiB and yields (1 + 1300) * x, a distinct checkable
+    // result for the else edge.
+    var acc = ex;
+    var pad: usize = 0;
+    while (pad < 1300) : (pad += 1) {
+        acc = try func.appendInst(else_b, i32_t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = ex } });
+    }
+    func.setTerminator(else_b, .{ .ret = acc });
+
+    var words = try harness.compileFunc(a, &func);
+    defer words.deinit(a);
+
+    // Relaxation fired: the far branch became an inverted short branch skipping the jal
+    // (offset +8 = the instruction after the jal). No near branch in this function has an
+    // 8-byte target, so `.+8` uniquely marks the relaxed skip.
+    const text = try disasm.format(a, words.items);
+    defer a.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, ".+8\n") != null);
+
+    // Execute under qemu on both edges (skips cleanly if qemu is absent). Taken edge
+    // (x == 7) returns 111; not-taken edge (x == 5) returns (1 + 1300) * 5 = 6505.
+    try std.testing.expectEqual(@as(i64, 111), try harness.runCode(io, a, words.items, &.{7}, harness.qemu_user));
+    try std.testing.expectEqual(@as(i64, 6505), try harness.runCode(io, a, words.items, &.{5}, harness.qemu_user));
+}
+
+test "qemu-user-riscv: a near conditional branch stays single-word (no relaxation)" {
+    // The common case: a small if whose target is well within ±4KiB emits a single-word
+    // branch unchanged by relaxation. Asserts no +8 inverted skip appears and that both
+    // edges execute correctly, so the relaxation pass is a no-op on near branches.
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var func = Function.init(a);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+
+    const entry = try func.appendBlock();
+    const else_b = try func.appendBlock();
+    const then_b = try func.appendBlock();
+
+    const x = try func.appendBlockParam(entry, i32_t);
+    const seven = try func.appendInst(entry, i32_t, .{ .iconst = 7 });
+    const c = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .eq, .lhs = x, .rhs = seven } });
+    try func.appendIf(entry, c, .{ .target = then_b, .args = &.{} }, .{ .target = else_b, .args = &.{} });
+
+    const r_then = try func.appendInst(then_b, i32_t, .{ .iconst = 111 });
+    func.setTerminator(then_b, .{ .ret = r_then });
+    const r_else = try func.appendInst(else_b, i32_t, .{ .iconst = 222 });
+    func.setTerminator(else_b, .{ .ret = r_else });
+
+    var words = try harness.compileFunc(a, &func);
+    defer words.deinit(a);
+
+    const text = try disasm.format(a, words.items);
+    defer a.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, ".+8\n") == null); // no inverted skip
+
+    try std.testing.expectEqual(@as(i64, 111), try harness.runCode(io, a, words.items, &.{7}, harness.qemu_user));
+    try std.testing.expectEqual(@as(i64, 222), try harness.runCode(io, a, words.items, &.{5}, harness.qemu_user));
+}
+
+test "qemu-user-riscv: a loop's backward conditional branch past -4KiB relaxes and runs both edges" {
+    // The negative-offset twin of the forward far-branch test above: a do-while loop whose
+    // back-edge conditional branch targets its OWN header, which sits more than 4KiB behind it.
+    // The loop-carried state lives in two `alloca` slots (not block params) so the back edge and
+    // the exit edge both carry zero jump args; that keeps `splitCriticalEdges` a no-op, so the
+    // `if`'s `then` edge stays wired directly to the header block instead of being redirected
+    // through a trampoline landing block (which would turn the direct branch forward and hide
+    // the backward case behind an always-in-range `jal`). Each iteration pads with a 1300-long
+    // dependency chain of adds on the loaded, runtime-derived `i` (each add feeds the next, so
+    // none is dead and the chain cannot shrink below ~1300 words), pushing the loop body past
+    // 4KiB. The B-type branch back to the header cannot reach that far behind it, so relaxation
+    // MUST expand it to an inverted short branch (skip +8) over a `jal` with a NEGATIVE
+    // displacement (the far jump goes backward).
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var func = Function.init(a);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const ptr_t = try func.types.intern(.ptr);
+
+    // Layout order follows block-append order: entry(0), loop(1, the header AND the padded
+    // body, since this is a do-while shape), done(2).
+    const entry = try func.appendBlock();
+    const loop = try func.appendBlock();
+    const done = try func.appendBlock();
+
+    const n = try func.appendBlockParam(entry, i32_t);
+    const pi = try func.appendInst(entry, ptr_t, .{ .alloca = .{ .elem = i32_t } });
+    const pacc = try func.appendInst(entry, ptr_t, .{ .alloca = .{ .elem = i32_t } });
+    try func.appendStore(entry, n, pi);
+    const zero = try func.appendInst(entry, i32_t, .{ .iconst = 0 });
+    try func.appendStore(entry, zero, pacc);
+    try func.setJump(entry, loop, &.{}); // no args: loop's header carries no block params
+
+    // Header + body in one block: `pi`/`pacc` are alloca pointers defined in the dominating
+    // `entry` block, so `loop` (and its own back edge) can load/store them directly without
+    // threading them through block params.
+    const i_val = try func.appendInst(loop, i32_t, .{ .load = .{ .ptr = pi } });
+    const acc_val = try func.appendInst(loop, i32_t, .{ .load = .{ .ptr = pacc } });
+    const ni = try func.appendArithImm(loop, i32_t, .sub, i_val, 1);
+    const acc1 = try func.appendInst(loop, i32_t, .{ .arith = .{ .op = .add, .lhs = acc_val, .rhs = i_val } });
+
+    // The padding chain, exactly the forward test's technique: each add depends on the loaded
+    // (runtime) `i_val` and feeds the next, so none is dead and the chain cannot be folded away.
+    var acc_x = acc1;
+    var pad: usize = 0;
+    while (pad < 1300) : (pad += 1) {
+        acc_x = try func.appendInst(loop, i32_t, .{ .arith = .{ .op = .add, .lhs = acc_x, .rhs = i_val } });
+    }
+
+    try func.appendStore(loop, ni, pi);
+    try func.appendStore(loop, acc_x, pacc);
+    const cmp_zero = try func.appendInst(loop, i32_t, .{ .iconst = 0 });
+    const cont = try func.appendInst(loop, bool_t, .{ .icmp = .{ .op = .ne, .lhs = ni, .rhs = cmp_zero } });
+    // `then` (continue) targets `loop` itself: a genuine backward edge. `else` (exit) targets
+    // `done`, forward. Both edges pass zero args (see above), so `then` stays wired straight to
+    // `loop`'s header instead of a trampoline.
+    try func.appendIf(loop, cont, .{ .target = loop, .args = &.{} }, .{ .target = done, .args = &.{} });
+
+    const racc = try func.appendInst(done, i32_t, .{ .load = .{ .ptr = pacc } });
+    func.setTerminator(done, .{ .ret = racc });
+
+    var words = try harness.compileFunc(a, &func);
+    defer words.deinit(a);
+
+    // Relaxation fired: the far back-edge branch became an inverted short branch skipping the
+    // jal (offset +8 = the instruction after the jal), same structural marker as the forward
+    // test. And the jal it skips carries a NEGATIVE displacement, proving the relaxed jump
+    // actually goes backward (to the loop header), not forward.
+    const text = try disasm.format(a, words.items);
+    defer a.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, ".+8\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "j .-") != null);
+
+    // Execute under qemu (skips cleanly if qemu is absent). Each iteration accumulates
+    // 1301*i (the real add plus the 1300-long padding chain, all on the same `i`), so the
+    // total is 1301 * n*(n+1)/2. n=5 runs the loop 5 times: 4 back-edge continues then one
+    // exit, exercising BOTH outcomes of the same relaxed branch in a single call. n=1 runs
+    // it exactly once, exiting on the very first test without ever taking the back edge.
+    try std.testing.expectEqual(@as(i64, 19515), try harness.runCode(io, a, words.items, &.{5}, harness.qemu_user)); // 1301 * 15
+    try std.testing.expectEqual(@as(i64, 1301), try harness.runCode(io, a, words.items, &.{1}, harness.qemu_user)); // 1301 * 1
 }
 
 test "native-riscv: arithmetic runs in-process when the host is RISC-V" {

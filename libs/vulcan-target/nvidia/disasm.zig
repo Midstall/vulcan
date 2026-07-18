@@ -277,7 +277,9 @@ pub fn decode(allocator: std.mem.Allocator, code: []const u32) ![]Inst {
 
 fn regName(buf: []u8, r: u8) []const u8 {
     if (r == RZ) return "RZ";
-    return std.fmt.bufPrint(buf, "R{d}", .{r}) catch "R?";
+    // r is a u8, so the longest output is "R255" (4 bytes); callers pass a buffer
+    // that fits. A failure here is a buffer-sizing bug in our code, not input.
+    return std.fmt.bufPrint(buf, "R{d}", .{r}) catch unreachable;
 }
 
 /// Format a compiled code stream as a readable per-instruction listing. The caller

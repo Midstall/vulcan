@@ -518,7 +518,9 @@ fn formatModuleImpl(allocator: std.mem.Allocator, code: []const u8, syms: []cons
         }
         try buf.print(allocator, "{x:0>4}: ", .{pos});
         const len = try decode(allocator, &buf, code, pos);
-        if (code[pos] == 0xE8 and len == 5) { // call rel32 -> target = end + rel32
+        // `decode` reports len 5 even for a truncated call (its cursor reads past the
+        // end as 0), so guard the 4-byte read against the real buffer length.
+        if (code[pos] == 0xE8 and len == 5 and code.len - pos >= 5) { // call rel32 -> target = end + rel32
             const rel: i32 = @bitCast(std.mem.readInt(u32, code[pos + 1 ..][0..4], .little));
             const target = @as(i64, @intCast(pos)) + @as(i64, @intCast(len)) + rel;
             if (target >= 0) for (syms) |s| {

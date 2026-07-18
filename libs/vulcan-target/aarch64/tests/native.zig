@@ -11,6 +11,7 @@ const isel = @import("../isel.zig");
 const disasm = @import("../disasm.zig");
 const link = @import("../link.zig");
 const jit = @import("../jit.zig");
+const encode = @import("../encode.zig");
 
 const Function = ir.function.Function;
 
@@ -77,18 +78,20 @@ test "codegen+disasm round-trip: control flow (max via if/else)" {
     try func.appendIf(e, c, .{ .target = m, .args = &.{x} }, .{ .target = m, .args = &.{y} });
     func.setTerminator(m, .{ .ret = r });
 
-    // Exercises the disassembler on real branch offsets (cbnz/b .+N), cset, and block-edge
-    // moves. A regression in branch selection or edge lowering would change the listing.
+    // The icmp is the single-use condition of the immediately-following if, so isel fuses
+    // it into a compare-and-branch: no `cset` boolean, and the `cbnz` re-test becomes a
+    // `b.gt` on the flags `cmp` set (branching to the then-edge on the icmp's condition).
+    // Exercises the disassembler on real branch offsets (b.cc/b .+N) and block-edge moves.
+    // The native max tests below prove this fused form returns the same results.
     try expectAsm(&func,
         \\0000: 6b01001f  cmp w0, w1
-        \\0004: 1a9fd7e7  cset w7, gt
-        \\0008: 35000067  cbnz w7, .+12
-        \\000c: aa0103e7  mov x7, x1
-        \\0010: 14000003  b .+12
-        \\0014: aa0003e7  mov x7, x0
-        \\0018: 14000001  b .+4
-        \\001c: aa0703e0  mov x0, x7
-        \\0020: d65f03c0  ret
+        \\0004: 5400006c  b.gt .+12
+        \\0008: aa0103e7  mov x7, x1
+        \\000c: 14000003  b .+12
+        \\0010: aa0003e7  mov x7, x0
+        \\0014: 14000001  b .+4
+        \\0018: aa0703e0  mov x0, x7
+        \\001c: d65f03c0  ret
         \\
     );
 }
@@ -736,6 +739,549 @@ test "native: max via a merge block with parameters" {
     try expectRun(allocator, &func, &.{ 3, 4 }, 4);
 }
 
+test "fused: signed min via if(icmp lt) returns the smaller (fused compare-branch)" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const then_b = try func.appendBlock();
+    const else_b = try func.appendBlock();
+    const a = try func.appendBlockParam(entry, t);
+    const b = try func.appendBlockParam(entry, t);
+    // The icmp immediately precedes the if and is its only use, so it fuses to `cmp; b.lt`.
+    const c = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = a, .rhs = b } });
+    try func.appendIf(entry, c, .{ .target = then_b }, .{ .target = else_b });
+    func.setTerminator(then_b, .{ .ret = a }); // a < b -> a is the min
+    func.setTerminator(else_b, .{ .ret = b });
+
+    try expectRun(allocator, &func, &.{ 7, 3 }, 3);
+    try expectRun(allocator, &func, &.{ -5, 2 }, -5); // signed: -5 < 2
+    try expectRun(allocator, &func, &.{ 4, 4 }, 4); // equal -> not <, takes else (b)
+}
+
+test "fused: unsigned max via if(icmp ult) uses the unsigned condition (b.cc, not b.lt)" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    // Unsigned operands: the fused branch must pick the unsigned condition (lo/hs), so a
+    // large unsigned value (0xFFFFFFFF) compares GREATER than 1, unlike the signed reading.
+    const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const then_b = try func.appendBlock();
+    const else_b = try func.appendBlock();
+    const a = try func.appendBlockParam(entry, u32_t);
+    const b = try func.appendBlockParam(entry, u32_t);
+    const c = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = a, .rhs = b } });
+    try func.appendIf(entry, c, .{ .target = then_b }, .{ .target = else_b });
+    func.setTerminator(then_b, .{ .ret = b }); // a <u b -> b is the max
+    func.setTerminator(else_b, .{ .ret = a });
+
+    // a = -1 is 0xFFFFFFFF unsigned: NOT < 1, so the else edge returns a (0xFFFFFFFF == -1 as i32).
+    try expectRun(allocator, &func, &.{ -1, 1 }, -1);
+    try expectRun(allocator, &func, &.{ 1, 2 }, 2); // 1 <u 2 -> b = 2
+    try expectRun(allocator, &func, &.{ 9, 9 }, 9); // equal -> else -> a
+}
+
+test "fused: equality branch via if(icmp eq) selects the right arm" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const then_b = try func.appendBlock();
+    const else_b = try func.appendBlock();
+    const a = try func.appendBlockParam(entry, t);
+    const b = try func.appendBlockParam(entry, t);
+    const c = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .eq, .lhs = a, .rhs = b } });
+    try func.appendIf(entry, c, .{ .target = then_b }, .{ .target = else_b });
+    const yes = try func.appendInst(then_b, t, .{ .iconst = 100 });
+    func.setTerminator(then_b, .{ .ret = yes });
+    const no = try func.appendInst(else_b, t, .{ .iconst = 200 });
+    func.setTerminator(else_b, .{ .ret = no });
+
+    try expectRun(allocator, &func, &.{ 5, 5 }, 100); // equal
+    try expectRun(allocator, &func, &.{ 5, 6 }, 200); // not equal
+}
+
+test "fused: structural - if(icmp) emits a conditional branch and no cset boolean" {
+    // Prove fusion fired: the compiled listing has a `b.<cc>` compare-branch and no `cset`
+    // (the boolean materialization is skipped). Tolerant string checks, the point is that a
+    // single-use integer icmp feeding an if no longer produces cset;cbnz.
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const then_b = try func.appendBlock();
+    const else_b = try func.appendBlock();
+    const a = try func.appendBlockParam(entry, t);
+    const b = try func.appendBlockParam(entry, t);
+    const c = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .gt, .lhs = a, .rhs = b } });
+    try func.appendIf(entry, c, .{ .target = then_b }, .{ .target = else_b });
+    func.setTerminator(then_b, .{ .ret = a });
+    func.setTerminator(else_b, .{ .ret = b });
+
+    const code = try isel.selectFunction(allocator, &func);
+    defer allocator.free(code);
+    const text = try disasm.format(allocator, code);
+    defer allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "cmp w0, w1") != null); // the compare
+    try std.testing.expect(std.mem.indexOf(u8, text, "b.gt ") != null); // fused conditional branch
+    try std.testing.expect(std.mem.indexOf(u8, text, "cset") == null); // no boolean materialized
+    try std.testing.expect(std.mem.indexOf(u8, text, "cbnz") == null); // no re-test of a boolean
+}
+
+test "fused: a multi-use icmp does NOT fuse (boolean still materialized, correct result)" {
+    // The icmp result feeds BOTH a select and the if condition, so it is not single-use:
+    // fusion must be declined and the boolean materialized (a `cset`), or the select would
+    // read a value that was never produced. The results must match the non-fused semantics.
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const tb = try func.appendBlock();
+    const eb = try func.appendBlock();
+    const a = try func.appendBlockParam(entry, t);
+    const b = try func.appendBlockParam(entry, t);
+    const xtb = try func.appendBlockParam(tb, t);
+    const xeb = try func.appendBlockParam(eb, t);
+    const c = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = a, .rhs = b } });
+    const m = try func.appendInst(entry, t, .{ .select = .{ .cond = c, .then = a, .@"else" = b } }); // min, uses c
+    try func.appendIf(entry, c, .{ .target = tb, .args = &.{m} }, .{ .target = eb, .args = &.{m} });
+    const inc = try func.appendArithImm(tb, t, .add, xtb, 1);
+    func.setTerminator(tb, .{ .ret = inc });
+    func.setTerminator(eb, .{ .ret = xeb });
+
+    // A multi-use icmp must keep the cset, proving the eligibility gate declines fusion here.
+    const code = try isel.selectFunction(allocator, &func);
+    defer allocator.free(code);
+    const text = try disasm.format(allocator, code);
+    defer allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "cset") != null);
+
+    try expectRun(allocator, &func, &.{ 3, 7 }, 4); // c true: m=min=3, tb -> 3+1
+    try expectRun(allocator, &func, &.{ 7, 3 }, 3); // c false: m=min=3, eb -> 3
+}
+
+test "fused: an icmp not immediately before the if does NOT fuse (intervening instruction)" {
+    // An instruction sits between the icmp and the if, so the icmp is not the immediately
+    // preceding instruction: fusion is declined and the standard cset;cbnz path runs.
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const tb = try func.appendBlock();
+    const eb = try func.appendBlock();
+    const a = try func.appendBlockParam(entry, t);
+    const b = try func.appendBlockParam(entry, t);
+    const c = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .gt, .lhs = a, .rhs = b } });
+    const sum = try func.appendInst(entry, t, .{ .arith = .{ .op = .add, .lhs = a, .rhs = b } }); // intervening
+    try func.appendIf(entry, c, .{ .target = tb, .args = &.{sum} }, .{ .target = eb, .args = &.{sum} });
+    const xtb = try func.appendBlockParam(tb, t);
+    const xeb = try func.appendBlockParam(eb, t);
+    func.setTerminator(tb, .{ .ret = xtb }); // a > b -> a+b
+    func.setTerminator(eb, .{ .ret = xeb });
+
+    const code = try isel.selectFunction(allocator, &func);
+    defer allocator.free(code);
+    const text = try disasm.format(allocator, code);
+    defer allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "cset") != null); // not immediately preceding -> no fusion
+
+    try expectRun(allocator, &func, &.{ 7, 3 }, 10); // both edges return a+b here
+    try expectRun(allocator, &func, &.{ 3, 7 }, 10);
+}
+
+/// The three fused shapes `fusesIntoNextArith` recognizes: `add`: a*b+c -> fmadd. `sub`:
+/// a*b-c -> fnmsub. `csub`: c-a*b -> fmsub (see isel.zig's `Ctx.emitFusedArith`).
+const FmaShape = enum { add, sub, csub };
+
+/// `f(a, b, c)` computing `shape` in `dbl` precision (f64 if true, else f32), with the
+/// multiply immediately preceding its single consuming add/sub - exactly the shape
+/// `fusesIntoNextArith` fuses into one fmadd/fmsub/fnmsub.
+fn buildFmaFunc(allocator: std.mem.Allocator, dbl: bool, shape: FmaShape) !Function {
+    var func = Function.init(allocator);
+    errdefer func.deinit();
+    const ft = try func.types.intern(.{ .float = if (dbl) .f64 else .f32 });
+    const b = try func.appendBlock();
+    const a_p = try func.appendBlockParam(b, ft);
+    const b_p = try func.appendBlockParam(b, ft);
+    const c_p = try func.appendBlockParam(b, ft);
+    const prod = try func.appendInst(b, ft, .{ .arith = .{ .op = .mul, .lhs = a_p, .rhs = b_p } });
+    const r = switch (shape) {
+        .add => try func.appendInst(b, ft, .{ .arith = .{ .op = .add, .lhs = prod, .rhs = c_p } }),
+        .sub => try func.appendInst(b, ft, .{ .arith = .{ .op = .sub, .lhs = prod, .rhs = c_p } }),
+        .csub => try func.appendInst(b, ft, .{ .arith = .{ .op = .sub, .lhs = c_p, .rhs = prod } }),
+    };
+    func.setTerminator(b, .{ .ret = r });
+    return func;
+}
+
+/// Call a JIT-mapped `f(a, b, c) -> T` (f32 or f64, all in FP argument/return registers).
+fn callFma3(comptime T: type, buf: *const jit.CodeBuffer, a: T, b: T, c: T) T {
+    const ptr = buf.memory.ptr;
+    return @as(*const fn (T, T, T) callconv(.c) T, @ptrCast(ptr))(a, b, c);
+}
+
+/// The unsigned integer type with T's bit width, for bit-exact (not `==`) float comparison.
+fn Bits(comptime T: type) type {
+    return std.meta.Int(.unsigned, @bitSizeOf(T));
+}
+
+/// Build, JIT, and run the FMA `shape` in precision `T` on the operands given as raw bit
+/// patterns (exact - avoids any decimal-literal round-trip drift), and assert three things:
+///   1. The JIT result is bit-identical to the hardware FMA reference `@mulAdd` (proves the
+///      variant mapping and single-rounding are both correct - see the comment above each
+///      call site for which `@mulAdd` form is the correct oracle for each shape).
+///   2. That result DIFFERS from the naive separately-rounded computation. The operands were
+///      searched specifically so fused != separate; this is what proves fusion actually fired
+///      (a bug that silently fell back to separate fmul+fadd would still pass check 1 only by
+///      coincidence on generic inputs, but never on these).
+///   3. The emitted code contains `mnemonic` (the expected 3-source instruction) and no
+///      separate fmul/fadd/fsub for the fused pair.
+fn checkFma(comptime T: type, shape: FmaShape, a_bits: Bits(T), b_bits: Bits(T), c_bits: Bits(T), want: T, mnemonic: []const u8) !void {
+    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var func = try buildFmaFunc(allocator, T == f64, shape);
+    defer func.deinit();
+    const code = try isel.selectFunction(allocator, &func);
+    defer allocator.free(code);
+    var buf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(code));
+    defer buf.deinit();
+
+    const a: T = @bitCast(a_bits);
+    const b: T = @bitCast(b_bits);
+    const c: T = @bitCast(c_bits);
+    const got = callFma3(T, &buf, a, b, c);
+    try std.testing.expectEqual(@as(Bits(T), @bitCast(want)), @as(Bits(T), @bitCast(got)));
+
+    const naive = switch (shape) {
+        .add => a * b + c,
+        .sub => a * b - c,
+        .csub => c - a * b,
+    };
+    try std.testing.expect(@as(Bits(T), @bitCast(naive)) != @as(Bits(T), @bitCast(got)));
+
+    const text = try disasm.format(allocator, code);
+    defer allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, mnemonic) != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "fmul") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "fadd") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "fsub") == null);
+}
+
+// Operand triples below were found by random search specifically because the separately-
+// rounded computation (a*b then +/-c as two instructions) differs from the fused one, so
+// each test would fail if fusion did not fire, or fired with the wrong variant.
+
+test "fma: scalar f32 a*b+c matches @mulAdd bit-exactly and fuses to fmadd" {
+    const a: f32 = @bitCast(@as(u32, 0xc40ac54c));
+    const b: f32 = @bitCast(@as(u32, 0x43a8f6ea));
+    const c: f32 = @bitCast(@as(u32, 0xc28c5708));
+    try checkFma(f32, .add, 0xc40ac54c, 0x43a8f6ea, 0xc28c5708, @mulAdd(f32, a, b, c), "fmadd");
+}
+
+test "fma: scalar f32 a*b-c matches @mulAdd bit-exactly and fuses to fnmsub" {
+    const a: f32 = @bitCast(@as(u32, 0xc44a1c46));
+    const b: f32 = @bitCast(@as(u32, 0x44559447));
+    const c: f32 = @bitCast(@as(u32, 0x43b99ce8));
+    try checkFma(f32, .sub, 0xc44a1c46, 0x44559447, 0x43b99ce8, @mulAdd(f32, a, b, -c), "fnmsub");
+}
+
+test "fma: scalar f32 c-a*b matches @mulAdd bit-exactly and fuses to fmsub" {
+    const a: f32 = @bitCast(@as(u32, 0xc44a1c46));
+    const b: f32 = @bitCast(@as(u32, 0x44559447));
+    const c: f32 = @bitCast(@as(u32, 0x43b99ce8));
+    try checkFma(f32, .csub, 0xc44a1c46, 0x44559447, 0x43b99ce8, @mulAdd(f32, -a, b, c), "fmsub");
+}
+
+test "fma: scalar f64 a*b+c matches @mulAdd bit-exactly and fuses to fmadd" {
+    const a: f64 = @bitCast(@as(u64, 0x404e1b3cea04d64a));
+    const b: f64 = @bitCast(@as(u64, 0x406635dc84d3c228));
+    const c: f64 = @bitCast(@as(u64, 0xc084ec8dcc159ab8));
+    try checkFma(f64, .add, 0x404e1b3cea04d64a, 0x406635dc84d3c228, 0xc084ec8dcc159ab8, @mulAdd(f64, a, b, c), "fmadd");
+}
+
+test "fma: scalar f64 a*b-c matches @mulAdd bit-exactly and fuses to fnmsub" {
+    const a: f64 = @bitCast(@as(u64, 0x40891218249a6341));
+    const b: f64 = @bitCast(@as(u64, 0x407a4101d38c144d));
+    const c: f64 = @bitCast(@as(u64, 0xc08c85a4101e5516));
+    try checkFma(f64, .sub, 0x40891218249a6341, 0x407a4101d38c144d, 0xc08c85a4101e5516, @mulAdd(f64, a, b, -c), "fnmsub");
+}
+
+test "fma: scalar f64 c-a*b matches @mulAdd bit-exactly and fuses to fmsub" {
+    const a: f64 = @bitCast(@as(u64, 0x40891218249a6341));
+    const b: f64 = @bitCast(@as(u64, 0x407a4101d38c144d));
+    const c: f64 = @bitCast(@as(u64, 0xc08c85a4101e5516));
+    try checkFma(f64, .csub, 0x40891218249a6341, 0x407a4101d38c144d, 0xc08c85a4101e5516, @mulAdd(f64, -a, b, c), "fmsub");
+}
+
+test "fma: a multi-use mul does NOT fuse (separate fmul+fadd, correct result)" {
+    // The product feeds the fusible add AND is read again afterward, so it is not single-use:
+    // fusion must be declined for both consumers and the multiply stays materialized.
+    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ft = try func.types.intern(.{ .float = .f32 });
+    const blk = try func.appendBlock();
+    const a = try func.appendBlockParam(blk, ft);
+    const b = try func.appendBlockParam(blk, ft);
+    const c = try func.appendBlockParam(blk, ft);
+    const prod = try func.appendInst(blk, ft, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = b } });
+    const s = try func.appendInst(blk, ft, .{ .arith = .{ .op = .add, .lhs = prod, .rhs = c } }); // a*b+c, fusible shape...
+    const r = try func.appendInst(blk, ft, .{ .arith = .{ .op = .add, .lhs = s, .rhs = prod } }); // ...but prod is reused here
+    func.setTerminator(blk, .{ .ret = r });
+
+    const code = try isel.selectFunction(allocator, &func);
+    defer allocator.free(code);
+    const text = try disasm.format(allocator, code);
+    defer allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "fmul") != null); // the multiply is still materialized
+    try std.testing.expect(std.mem.indexOf(u8, text, "fadd") != null); // and added separately, twice
+    try std.testing.expect(std.mem.indexOf(u8, text, "fmadd") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "fmsub") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "fnmsub") == null);
+
+    var buf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(code));
+    defer buf.deinit();
+    const got = callFma3(f32, &buf, 2.0, 3.0, 5.0); // prod=6, s=6+5=11, r=11+6=17
+    try std.testing.expectEqual(@as(f32, 17.0), got);
+}
+
+/// The two vector shapes `fusesIntoNextArith` recognizes for NEON FMLA/FMLS: `add`:
+/// a*b+c -> fmla. `csub`: c-a*b -> fmls. The third scalar shape, a*b-c, has no single NEON
+/// instruction (FMLA/FMLS only ever add or subtract the product, never negate the whole
+/// result), so `fusesIntoNextArith` never fuses it for a vector - it stays separate
+/// fmul+fsub and is covered by its own non-fusing test below.
+const VecFmaShape = enum { add, csub };
+
+/// `f(out, pa, pb, pc)` loading three `<4 x f32>` vectors through pointers, computing
+/// `shape` a full vector at a time, and storing the result through `out` - mirrors the
+/// "neon: <4 x f32> lane-wise add/mul through pointers" test's pointer-argument style, with
+/// the multiply immediately preceding its single consuming add/sub so `fusesIntoNextArith`
+/// fuses it into one fmla/fmls.
+fn buildVecFmaFunc(allocator: std.mem.Allocator, shape: VecFmaShape) !Function {
+    var func = Function.init(allocator);
+    errdefer func.deinit();
+    const ptr_t = try func.types.intern(.ptr);
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const v4 = try func.types.intern(.{ .vector = .{ .len = 4, .elem = f32_t } });
+    const blk = try func.appendBlock();
+    const out = try func.appendBlockParam(blk, ptr_t);
+    const pa = try func.appendBlockParam(blk, ptr_t);
+    const pb = try func.appendBlockParam(blk, ptr_t);
+    const pc = try func.appendBlockParam(blk, ptr_t);
+    const va = try func.appendInst(blk, v4, .{ .load = .{ .ptr = pa } });
+    const vb = try func.appendInst(blk, v4, .{ .load = .{ .ptr = pb } });
+    const vc = try func.appendInst(blk, v4, .{ .load = .{ .ptr = pc } });
+    const prod = try func.appendInst(blk, v4, .{ .arith = .{ .op = .mul, .lhs = va, .rhs = vb } });
+    const r = switch (shape) {
+        .add => try func.appendInst(blk, v4, .{ .arith = .{ .op = .add, .lhs = prod, .rhs = vc } }),
+        .csub => try func.appendInst(blk, v4, .{ .arith = .{ .op = .sub, .lhs = vc, .rhs = prod } }),
+    };
+    try func.appendStore(blk, r, out);
+    func.setTerminator(blk, .{ .ret = null });
+    return func;
+}
+
+/// Asserts `code` contains a word matching `template`'s fixed opcode bits (rd/rn/rm masked
+/// off, since the allocator picks the actual registers) - mirrors `expectHasDot`.
+fn expectHasVecWord(code: []const u32, template: u32) !void {
+    const reg_mask: u32 = 0x001F03FF; // rd[4:0] | rn[9:5] | rm[20:16]
+    const fixed = template & ~reg_mask;
+    for (code) |w| if (w & ~reg_mask == fixed) return;
+    return error.TestExpectedEqual;
+}
+
+/// Asserts `code` contains no word matching `template`'s fixed opcode bits.
+fn expectNoVecWord(code: []const u32, template: u32) !void {
+    const reg_mask: u32 = 0x001F03FF;
+    const fixed = template & ~reg_mask;
+    for (code) |w| try std.testing.expect(w & ~reg_mask != fixed);
+}
+
+/// Build, JIT, and run the vector FMA `shape` on four `<4 x f32>`-worth of raw bit-pattern
+/// operand triples (one per lane - exact, avoids any decimal-literal round-trip drift), and
+/// assert per lane:
+///   1. The JIT result is bit-identical to the hardware FMA reference `@mulAdd` (proves the
+///      fused instruction and its operand order are both correct).
+///   2. That result DIFFERS from the naive separately-rounded computation, proving fusion
+///      actually fired (these triples are the same ones the scalar fma tests above verified
+///      diverge between fused and separate rounding).
+/// Also asserts structurally that the emitted code contains the fused instruction and NOT a
+/// separate fmul+fadd/fsub pair.
+fn checkVecFma(shape: VecFmaShape, abits: [4]u32, bbits: [4]u32, cbits: [4]u32, mnemonic_template: u32) !void {
+    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var func = try buildVecFmaFunc(allocator, shape);
+    defer func.deinit();
+    const code = try isel.selectFunction(allocator, &func);
+    defer allocator.free(code);
+
+    try expectHasVecWord(code, mnemonic_template);
+    try expectNoVecWord(code, encode.fmulVec(.x0, .x0, .x0));
+    try expectNoVecWord(code, encode.faddVec(.x0, .x0, .x0));
+    try expectNoVecWord(code, encode.fsubVec(.x0, .x0, .x0));
+
+    var buf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(code));
+    defer buf.deinit();
+    const Fn = *const fn (*[4]f32, *const [4]f32, *const [4]f32, *const [4]f32) callconv(.c) void;
+    const f: Fn = @ptrCast(buf.memory.ptr);
+
+    var a: [4]f32 align(16) = undefined;
+    var b: [4]f32 align(16) = undefined;
+    var c: [4]f32 align(16) = undefined;
+    for (0..4) |i| {
+        a[i] = @bitCast(abits[i]);
+        b[i] = @bitCast(bbits[i]);
+        c[i] = @bitCast(cbits[i]);
+    }
+    var got: [4]f32 align(16) = undefined;
+    f(&got, &a, &b, &c);
+
+    for (0..4) |i| {
+        const want = switch (shape) {
+            .add => @mulAdd(f32, a[i], b[i], c[i]),
+            .csub => @mulAdd(f32, -a[i], b[i], c[i]),
+        };
+        try std.testing.expectEqual(@as(u32, @bitCast(want)), @as(u32, @bitCast(got[i])));
+        const naive = switch (shape) {
+            .add => a[i] * b[i] + c[i],
+            .csub => c[i] - a[i] * b[i],
+        };
+        try std.testing.expect(@as(u32, @bitCast(naive)) != @as(u32, @bitCast(got[i])));
+    }
+}
+
+test "neon fma: vector f32 a*b+c matches @mulAdd bit-exactly per lane and fuses to fmla" {
+    // Same operand triple (verified to diverge between fused and separate rounding by the
+    // scalar "fma: scalar f32 a*b+c" test above) replicated across all four lanes, so every
+    // lane would fail without fusion, not just one.
+    try checkVecFma(
+        .add,
+        .{0xc40ac54c} ** 4,
+        .{0x43a8f6ea} ** 4,
+        .{0xc28c5708} ** 4,
+        encode.fmlaVec(.x0, .x0, .x0),
+    );
+}
+
+test "neon fma: vector f32 c-a*b matches @mulAdd bit-exactly per lane and fuses to fmls" {
+    // Same operand triple as the scalar "fma: scalar f32 c-a*b" test above.
+    try checkVecFma(
+        .csub,
+        .{0xc44a1c46} ** 4,
+        .{0x44559447} ** 4,
+        .{0x43b99ce8} ** 4,
+        encode.fmlsVec(.x0, .x0, .x0),
+    );
+}
+
+test "neon fma: a multi-use vector mul does NOT fuse (separate fmul+fadd, correct result)" {
+    // Mirrors "fma: a multi-use mul does NOT fuse" above but for a vector: the product feeds
+    // the fusible add AND is read again afterward, so it is not single-use and stays
+    // materialized as a separate fmul + two fadds.
+    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ptr_t = try func.types.intern(.ptr);
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const v4 = try func.types.intern(.{ .vector = .{ .len = 4, .elem = f32_t } });
+    const blk = try func.appendBlock();
+    const out = try func.appendBlockParam(blk, ptr_t);
+    const pa = try func.appendBlockParam(blk, ptr_t);
+    const pb = try func.appendBlockParam(blk, ptr_t);
+    const pc = try func.appendBlockParam(blk, ptr_t);
+    const va = try func.appendInst(blk, v4, .{ .load = .{ .ptr = pa } });
+    const vb = try func.appendInst(blk, v4, .{ .load = .{ .ptr = pb } });
+    const vc = try func.appendInst(blk, v4, .{ .load = .{ .ptr = pc } });
+    const prod = try func.appendInst(blk, v4, .{ .arith = .{ .op = .mul, .lhs = va, .rhs = vb } });
+    const s = try func.appendInst(blk, v4, .{ .arith = .{ .op = .add, .lhs = prod, .rhs = vc } }); // a*b+c, fusible shape...
+    const r = try func.appendInst(blk, v4, .{ .arith = .{ .op = .add, .lhs = s, .rhs = prod } }); // ...but prod is reused here
+    try func.appendStore(blk, r, out);
+    func.setTerminator(blk, .{ .ret = null });
+
+    const code = try isel.selectFunction(allocator, &func);
+    defer allocator.free(code);
+    try expectHasVecWord(code, encode.fmulVec(.x0, .x0, .x0)); // the multiply is still materialized
+    try expectNoVecWord(code, encode.fmlaVec(.x0, .x0, .x0));
+    try expectNoVecWord(code, encode.fmlsVec(.x0, .x0, .x0));
+
+    var buf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(code));
+    defer buf.deinit();
+    const Fn = *const fn (*[4]f32, *const [4]f32, *const [4]f32, *const [4]f32) callconv(.c) void;
+    const f: Fn = @ptrCast(buf.memory.ptr);
+    const a align(16) = [4]f32{ 2, 2, 2, 2 };
+    const b align(16) = [4]f32{ 3, 3, 3, 3 };
+    const c align(16) = [4]f32{ 5, 5, 5, 5 };
+    var got: [4]f32 align(16) = undefined;
+    f(&got, &a, &b, &c); // prod=6, s=6+5=11, r=11+6=17 per lane
+    try std.testing.expectEqual([4]f32{ 17, 17, 17, 17 }, got);
+}
+
+test "neon fma: vector a*b-c does NOT fuse (no single NEON instruction expresses it)" {
+    // fusesIntoNextArith must reject this shape for a vector (unlike scalar, which fuses it
+    // to fnmsub): NEON FMLA/FMLS only ever add or subtract the product, never negate the
+    // whole result, so this must stay a separate fmul + fsub and still compute correctly.
+    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var func = try buildVecFmaFuncSub(alloc);
+    defer func.deinit();
+
+    const code = try isel.selectFunction(alloc, &func);
+    defer alloc.free(code);
+    try expectHasVecWord(code, encode.fmulVec(.x0, .x0, .x0));
+    try expectHasVecWord(code, encode.fsubVec(.x0, .x0, .x0));
+    try expectNoVecWord(code, encode.fmlaVec(.x0, .x0, .x0));
+    try expectNoVecWord(code, encode.fmlsVec(.x0, .x0, .x0));
+
+    var buf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(code));
+    defer buf.deinit();
+    const Fn = *const fn (*[4]f32, *const [4]f32, *const [4]f32, *const [4]f32) callconv(.c) void;
+    const f: Fn = @ptrCast(buf.memory.ptr);
+    const a align(16) = [4]f32{ 2, 3, 4, 5 };
+    const b align(16) = [4]f32{ 10, 10, 10, 10 };
+    const c align(16) = [4]f32{ 1, 1, 1, 1 };
+    var got: [4]f32 align(16) = undefined;
+    f(&got, &a, &b, &c); // a*b - c per lane: 19, 29, 39, 49
+    try std.testing.expectEqual([4]f32{ 19, 29, 39, 49 }, got);
+}
+
+/// `f(out, pa, pb, pc) = a*b - c`, a full vector at a time - the one shape that must never
+/// fuse for a vector (see `fusesIntoNextArith`).
+fn buildVecFmaFuncSub(allocator: std.mem.Allocator) !Function {
+    var func = Function.init(allocator);
+    errdefer func.deinit();
+    const ptr_t = try func.types.intern(.ptr);
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const v4 = try func.types.intern(.{ .vector = .{ .len = 4, .elem = f32_t } });
+    const blk = try func.appendBlock();
+    const out = try func.appendBlockParam(blk, ptr_t);
+    const pa = try func.appendBlockParam(blk, ptr_t);
+    const pb = try func.appendBlockParam(blk, ptr_t);
+    const pc = try func.appendBlockParam(blk, ptr_t);
+    const va = try func.appendInst(blk, v4, .{ .load = .{ .ptr = pa } });
+    const vb = try func.appendInst(blk, v4, .{ .load = .{ .ptr = pb } });
+    const vc = try func.appendInst(blk, v4, .{ .load = .{ .ptr = pc } });
+    const prod = try func.appendInst(blk, v4, .{ .arith = .{ .op = .mul, .lhs = va, .rhs = vb } });
+    const r = try func.appendInst(blk, v4, .{ .arith = .{ .op = .sub, .lhs = prod, .rhs = vc } }); // a*b - c
+    try func.appendStore(blk, r, out);
+    func.setTerminator(blk, .{ .ret = null });
+    return func;
+}
+
 test "native: a non-leaf function calls another and uses the result" {
     const allocator = std.testing.allocator;
     const t_kind = ir.types.TypeKind{ .int = .{ .signedness = .signed, .bits = 32 } };
@@ -831,6 +1377,108 @@ test "native: a counted loop sums 0..n (back-edge)" {
     func.setTerminator(done, .{ .ret = racc });
 
     try expectRun(allocator, &func, &.{5}, 10); // 0+1+2+3+4
+}
+
+test "native: loop-header alignment pads with nops but never changes the result" {
+    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const loop = try func.appendBlock();
+    const body = try func.appendBlock();
+    const done = try func.appendBlock();
+    const n = try func.appendBlockParam(entry, t);
+    const i = try func.appendBlockParam(loop, t);
+    const acc = try func.appendBlockParam(loop, t);
+    const bi = try func.appendBlockParam(body, t);
+    const bacc = try func.appendBlockParam(body, t);
+    const racc = try func.appendBlockParam(done, t);
+
+    const zero = try func.appendInst(entry, t, .{ .iconst = 0 });
+    try func.setJump(entry, loop, &.{ zero, zero });
+    const cmp = try func.appendInst(loop, bool_t, .{ .icmp = .{ .op = .lt, .lhs = i, .rhs = n } });
+    try func.appendIf(loop, cmp, .{ .target = body, .args = &.{ i, acc } }, .{ .target = done, .args = &.{acc} });
+    const ni = try func.appendArithImm(body, t, .add, bi, 1);
+    const nacc = try func.appendInst(body, t, .{ .arith = .{ .op = .add, .lhs = bacc, .rhs = bi } });
+    try func.setJump(body, loop, &.{ ni, nacc });
+    func.setTerminator(done, .{ .ret = racc });
+
+    const unaligned = try isel.selectFunction(allocator, &func);
+    defer allocator.free(unaligned);
+    const aligned = try isel.selectFunctionAligned(allocator, &func, 32);
+    defer allocator.free(aligned);
+
+    // The loop header (`loop`, with a real back-edge from `body`) gets padded to a
+    // 32-byte boundary, so the aligned build is strictly longer than the unaligned one.
+    try std.testing.expect(aligned.len > unaligned.len);
+
+    var unaligned_buf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(unaligned));
+    defer unaligned_buf.deinit();
+    var aligned_buf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(aligned));
+    defer aligned_buf.deinit();
+
+    // Alignment is a placement hint only: every input must produce the identical result
+    // whether the loop header was padded or not.
+    for ([_]i32{ 0, 1, 5, 20 }) |input| {
+        const want = try callI32(&unaligned_buf, &.{input});
+        const got = try callI32(&aligned_buf, &.{input});
+        try std.testing.expectEqual(want, got);
+    }
+}
+
+test "native: selectFunctionForModel fires the alignment hook from ampere-altra without changing results" {
+    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const loop = try func.appendBlock();
+    const body = try func.appendBlock();
+    const done = try func.appendBlock();
+    const n = try func.appendBlockParam(entry, t);
+    const i = try func.appendBlockParam(loop, t);
+    const acc = try func.appendBlockParam(loop, t);
+    const bi = try func.appendBlockParam(body, t);
+    const bacc = try func.appendBlockParam(body, t);
+    const racc = try func.appendBlockParam(done, t);
+
+    const zero = try func.appendInst(entry, t, .{ .iconst = 0 });
+    try func.setJump(entry, loop, &.{ zero, zero });
+    const cmp = try func.appendInst(loop, bool_t, .{ .icmp = .{ .op = .lt, .lhs = i, .rhs = n } });
+    try func.appendIf(loop, cmp, .{ .target = body, .args = &.{ i, acc } }, .{ .target = done, .args = &.{acc} });
+    const ni = try func.appendArithImm(body, t, .add, bi, 1);
+    const nacc = try func.appendInst(body, t, .{ .arith = .{ .op = .add, .lhs = bacc, .rhs = bi } });
+    try func.setJump(body, loop, &.{ ni, nacc });
+    func.setTerminator(done, .{ .ret = racc });
+
+    const plain = try isel.selectFunction(allocator, &func);
+    defer allocator.free(plain);
+    const model = opt.microarch.modelFor(.@"ampere-altra");
+    const tuned = try isel.selectFunctionForModel(allocator, &func, model);
+    defer allocator.free(tuned);
+
+    // ampere-altra's fetch_align (32) is above the 4-byte no-op threshold, so the model
+    // seam pads the loop header, same as calling selectFunctionAligned directly: the
+    // model-compiled build is never shorter than the plain one.
+    try std.testing.expect(tuned.len >= plain.len);
+    try std.testing.expect(tuned.len > plain.len);
+
+    var plain_buf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(plain));
+    defer plain_buf.deinit();
+    var tuned_buf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(tuned));
+    defer tuned_buf.deinit();
+
+    // The model seam only changes where code lands, never what it computes.
+    for ([_]i32{ 0, 1, 5, 20 }) |input| {
+        const want = try callI32(&plain_buf, &.{input});
+        const got = try callI32(&tuned_buf, &.{input});
+        try std.testing.expectEqual(want, got);
+    }
 }
 
 test "native: register spilling under high pressure (leaf)" {
@@ -1071,6 +1719,241 @@ test "native: f64 compare and select" {
     const m = try func.appendInst(b, f64_t, .{ .select = .{ .cond = lt, .then = then, .@"else" = els } });
     func.setTerminator(b, .{ .ret = m });
     try std.testing.expectEqual(@as(f64, 3.5), try runF64(allocator, &func, &.{})); // 1.0 < 2.0 -> 3.5
+}
+
+//
+// This aarch64 host has FEAT_FP16 (fphp/asimdhp), so the native H-form ops execute. Each kernel
+// is JIT-run twice: once through the NATIVE path (`selectFunctionForModel` with the fp16 model,
+// which sets caps.fp16 -> ldr h / H-form arith / str h, single-rounded, no widen/narrow) and once
+// through the base-ISA EMULATION (`selectFunction`, fp16=false -> the f32 widening in an S reg
+// with per-op fcvt rounding). Both must equal `@as(f16, ...)`. The DIVISION question is resolved:
+// an exhaustive on-host sweep over every finite f16 pair showed native single-rounded `fdiv h`
+// equals the emulation's f32-then-round for ALL inputs (f16's 10-bit mantissa makes double
+// rounding through f32 always safe), and Zig's `@as(f16, a/b)` matches both, so `@as(f16, ...)`
+// is the correct reference for every op including div.
+
+/// Compile `func` to A64 words, choosing the native FEAT_FP16 path (`selectFunctionForModel` with
+/// the fp16-capable ampere-altra model) or the emulation (`selectFunction`). Caller owns the slice.
+fn selectF16(allocator: std.mem.Allocator, func: *const Function, native: bool) ![]u32 {
+    if (native) return isel.selectFunctionForModel(allocator, func, opt.microarch.modelFor(.@"ampere-altra"));
+    return isel.selectFunction(allocator, func);
+}
+
+/// JIT-run `void k(*f16 out, *const f16 a, *const f16 b): out = a <op> b`, exercising the native
+/// half load (ldr h), H-form arithmetic, and store (str h) end to end. Returns the stored half.
+fn runF16Bin(allocator: std.mem.Allocator, op: ir.function.BinOp, a: f16, b: f16, native: bool) !f16 {
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ptr_t = try func.types.intern(.ptr);
+    const f16_t = try func.types.intern(.{ .float = .f16 });
+    const blk = try func.appendBlock();
+    const out = try func.appendBlockParam(blk, ptr_t);
+    const pa = try func.appendBlockParam(blk, ptr_t);
+    const pb = try func.appendBlockParam(blk, ptr_t);
+    const va = try func.appendInst(blk, f16_t, .{ .load = .{ .ptr = pa } });
+    const vb = try func.appendInst(blk, f16_t, .{ .load = .{ .ptr = pb } });
+    const r = try func.appendInst(blk, f16_t, .{ .arith = .{ .op = op, .lhs = va, .rhs = vb } });
+    try func.appendStore(blk, r, out);
+    func.setTerminator(blk, .{ .ret = null });
+    const code = try selectF16(allocator, &func, native);
+    defer allocator.free(code);
+    var buf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(code));
+    defer buf.deinit();
+    const Fn = *const fn (*f16, *const f16, *const f16) callconv(.c) void;
+    const f: Fn = @ptrCast(buf.memory.ptr);
+    var result: f16 = 0;
+    f(&result, &a, &b);
+    return result;
+}
+
+test "native: FEAT_FP16 half add/sub/mul/div bit-exact vs @as(f16), native and emulation agree" {
+    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    // The model actually reaches the native path (a guard against a silently-inert feature bit).
+    try std.testing.expect(opt.microarch.modelFor(.@"ampere-altra").features.aarch64.fp16);
+
+    const vals = [_]f16{ 0.5, 1.5, -2.25, 3.0, 7.0, 0.1, 10.5, -0.333, 1234.0, 0.0009765625 };
+    const ops = [_]ir.function.BinOp{ .add, .sub, .mul, .div };
+    for (ops) |op| {
+        for (vals) |a| for (vals) |b| {
+            if (op == .div and b == 0) continue;
+            const ref: f16 = switch (op) {
+                .add => a + b,
+                .sub => a - b,
+                .mul => a * b,
+                .div => a / b,
+                else => unreachable, // only the four arithmetic ops are enumerated above
+            };
+            const nat = try runF16Bin(allocator, op, a, b, true);
+            const emu = try runF16Bin(allocator, op, a, b, false);
+            try std.testing.expectEqual(@as(u16, @bitCast(ref)), @as(u16, @bitCast(nat)));
+            try std.testing.expectEqual(@as(u16, @bitCast(ref)), @as(u16, @bitCast(emu)));
+        };
+    }
+
+    // The gate is real: the native path emits strictly fewer words than the emulation because it
+    // drops the per-op fcvt widen/narrow around the load, arithmetic, and store.
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ptr_t = try func.types.intern(.ptr);
+    const f16_t = try func.types.intern(.{ .float = .f16 });
+    const blk = try func.appendBlock();
+    const out = try func.appendBlockParam(blk, ptr_t);
+    const pa = try func.appendBlockParam(blk, ptr_t);
+    const pb = try func.appendBlockParam(blk, ptr_t);
+    const va = try func.appendInst(blk, f16_t, .{ .load = .{ .ptr = pa } });
+    const vb = try func.appendInst(blk, f16_t, .{ .load = .{ .ptr = pb } });
+    const r = try func.appendInst(blk, f16_t, .{ .arith = .{ .op = .add, .lhs = va, .rhs = vb } });
+    try func.appendStore(blk, r, out);
+    func.setTerminator(blk, .{ .ret = null });
+    const nat_code = try selectF16(allocator, &func, true);
+    defer allocator.free(nat_code);
+    const emu_code = try selectF16(allocator, &func, false);
+    defer allocator.free(emu_code);
+    try std.testing.expect(nat_code.len < emu_code.len);
+}
+
+test "native: FEAT_FP16 conversions, int<->f16, and fconst bit-exact vs @as(f16)" {
+    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const ptr_k = ir.types.TypeKind{ .float = .f16 };
+
+    inline for (.{ true, false }) |native| {
+        // fconst: out = @as(f16, 3.5) via native `fmov h, w` (emulation: the S-held widening).
+        {
+            var func = Function.init(allocator);
+            defer func.deinit();
+            const ptr_t = try func.types.intern(.ptr);
+            const f16_t = try func.types.intern(ptr_k);
+            const blk = try func.appendBlock();
+            const out = try func.appendBlockParam(blk, ptr_t);
+            const c = try func.appendInst(blk, f16_t, .{ .fconst = 3.5 });
+            try func.appendStore(blk, c, out);
+            func.setTerminator(blk, .{ .ret = null });
+            const code = try selectF16(allocator, &func, native);
+            defer allocator.free(code);
+            var buf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(code));
+            defer buf.deinit();
+            const f: *const fn (*f16) callconv(.c) void = @ptrCast(buf.memory.ptr);
+            var got: f16 = 0;
+            f(&got);
+            try std.testing.expectEqual(@as(u16, @bitCast(@as(f16, 3.5))), @as(u16, @bitCast(got)));
+        }
+
+        // int -> f16 (scvtf h) then f16 -> int (fcvtzs w, h), round-tripping i32 x through a half.
+        {
+            var func = Function.init(allocator);
+            defer func.deinit();
+            const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+            const f16_t = try func.types.intern(ptr_k);
+            const blk = try func.appendBlock();
+            const x = try func.appendBlockParam(blk, i32_t);
+            const fx = try func.appendInst(blk, f16_t, .{ .convert = .{ .value = x } }); // scvtf h
+            const back = try func.appendInst(blk, i32_t, .{ .convert = .{ .value = fx } }); // fcvtzs w, h
+            func.setTerminator(blk, .{ .ret = back });
+            const code = try selectF16(allocator, &func, native);
+            defer allocator.free(code);
+            var buf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(code));
+            defer buf.deinit();
+            const f: *const fn (i32) callconv(.c) i32 = @ptrCast(buf.memory.ptr);
+            for ([_]i32{ 0, 1, 7, 42, 100, 1000, -3, -37 }) |x_in| {
+                const ref: i32 = @intFromFloat(@as(f16, @floatFromInt(x_in)));
+                try std.testing.expectEqual(ref, f(x_in));
+            }
+        }
+
+        // f16 <-> f32: `f32 k(*const f16 a): return (f32) a` and `void k(*f16 out, f32 x): out = (f16) x`.
+        {
+            var widen = Function.init(allocator);
+            defer widen.deinit();
+            const ptr_t = try widen.types.intern(.ptr);
+            const f16_t = try widen.types.intern(ptr_k);
+            const f32_t = try widen.types.intern(.{ .float = .f32 });
+            const blk = try widen.appendBlock();
+            const pa = try widen.appendBlockParam(blk, ptr_t);
+            const av = try widen.appendInst(blk, f16_t, .{ .load = .{ .ptr = pa } });
+            const w = try widen.appendInst(blk, f32_t, .{ .convert = .{ .value = av } }); // fcvt s, h
+            widen.setTerminator(blk, .{ .ret = w });
+            const wcode = try selectF16(allocator, &widen, native);
+            defer allocator.free(wcode);
+            var wbuf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(wcode));
+            defer wbuf.deinit();
+            const wf: *const fn (*const f16) callconv(.c) f32 = @ptrCast(wbuf.memory.ptr);
+
+            var narrow = Function.init(allocator);
+            defer narrow.deinit();
+            const nptr_t = try narrow.types.intern(.ptr);
+            const nf16_t = try narrow.types.intern(ptr_k);
+            const nf32_t = try narrow.types.intern(.{ .float = .f32 });
+            const nblk = try narrow.appendBlock();
+            const nout = try narrow.appendBlockParam(nblk, nptr_t);
+            const nx = try narrow.appendBlockParam(nblk, nf32_t);
+            const nn = try narrow.appendInst(nblk, nf16_t, .{ .convert = .{ .value = nx } }); // fcvt h, s
+            try narrow.appendStore(nblk, nn, nout);
+            narrow.setTerminator(nblk, .{ .ret = null });
+            const ncode = try selectF16(allocator, &narrow, native);
+            defer allocator.free(ncode);
+            var nbuf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(ncode));
+            defer nbuf.deinit();
+            const nf: *const fn (*f16, f32) callconv(.c) void = @ptrCast(nbuf.memory.ptr);
+
+            const nx_in: f32 = 12345.678; // an f32 that must round to nearest-even half
+            for ([_]f16{ 0.5, -2.25, 3.0, 0.1, 65504.0 }) |a| {
+                try std.testing.expectEqual(@as(f32, a), wf(&a)); // widen is exact
+                var got: f16 = 0;
+                nf(&got, nx_in);
+                // Reference rounds the SAME f32 the kernel narrows (a single f32->f16 round).
+                const ref: f16 = @floatCast(nx_in);
+                try std.testing.expectEqual(@as(u16, @bitCast(ref)), @as(u16, @bitCast(got)));
+            }
+        }
+
+        // f16 <-> f64: `f64 k(*const f16 a): return (f64) a` and `void k(*f16 out, f64 x): out = (f16) x`.
+        {
+            var widen = Function.init(allocator);
+            defer widen.deinit();
+            const ptr_t = try widen.types.intern(.ptr);
+            const f16_t = try widen.types.intern(ptr_k);
+            const f64_t = try widen.types.intern(.{ .float = .f64 });
+            const blk = try widen.appendBlock();
+            const pa = try widen.appendBlockParam(blk, ptr_t);
+            const av = try widen.appendInst(blk, f16_t, .{ .load = .{ .ptr = pa } });
+            const w = try widen.appendInst(blk, f64_t, .{ .convert = .{ .value = av } }); // fcvt d, h
+            widen.setTerminator(blk, .{ .ret = w });
+            const wcode = try selectF16(allocator, &widen, native);
+            defer allocator.free(wcode);
+            var wbuf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(wcode));
+            defer wbuf.deinit();
+            const wf: *const fn (*const f16) callconv(.c) f64 = @ptrCast(wbuf.memory.ptr);
+
+            var narrow = Function.init(allocator);
+            defer narrow.deinit();
+            const nptr_t = try narrow.types.intern(.ptr);
+            const nf16_t = try narrow.types.intern(ptr_k);
+            const nf64_t = try narrow.types.intern(.{ .float = .f64 });
+            const nblk = try narrow.appendBlock();
+            const nout = try narrow.appendBlockParam(nblk, nptr_t);
+            const nx = try narrow.appendBlockParam(nblk, nf64_t);
+            const nn = try narrow.appendInst(nblk, nf16_t, .{ .convert = .{ .value = nx } }); // fcvt h, d
+            try narrow.appendStore(nblk, nn, nout);
+            narrow.setTerminator(nblk, .{ .ret = null });
+            const ncode = try selectF16(allocator, &narrow, native);
+            defer allocator.free(ncode);
+            var nbuf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(ncode));
+            defer nbuf.deinit();
+            const nf: *const fn (*f16, f64) callconv(.c) void = @ptrCast(nbuf.memory.ptr);
+
+            const nx_in: f64 = 0.30000000000000004; // an f64 that must round once directly d -> h
+            for ([_]f16{ 0.5, -2.25, 3.0, 0.1, 65504.0 }) |a| {
+                try std.testing.expectEqual(@as(f64, a), wf(&a)); // widen is exact
+                var got: f16 = 0;
+                nf(&got, nx_in);
+                // Reference rounds the SAME f64 the kernel narrows (a single f64->f16 round).
+                const ref: f16 = @floatCast(nx_in);
+                try std.testing.expectEqual(@as(u16, @bitCast(ref)), @as(u16, @bitCast(got)));
+            }
+        }
+    }
 }
 
 test "native: a call passing f64 arguments in v-registers" {
@@ -1760,7 +2643,6 @@ test "object+ld+exec: link two functions into a runnable ELF and execute it nati
     if (builtin.cpu.arch != .aarch64) return error.SkipZigTest; // executes the AArch64 ELF directly
     const object = @import("../object.zig");
     const ld = @import("../ld.zig");
-    const encode = @import("../encode.zig");
     const i32k = ir.types.TypeKind{ .int = .{ .signedness = .signed, .bits = 32 } };
 
     // dbl(a) = a + a, main(x) = dbl(x) + 2.  main(20) = 42.
@@ -2185,5 +3067,474 @@ test "multi-block inlining preserves semantics on aarch64 (callee has a loop)" {
         const inlined = try run(allocator, &caller1, &.{arg});
 
         try std.testing.expectEqual(reference, inlined);
+    }
+}
+
+/// Builds `out.<4 x i32> = dot(*zero_ptr, *a_ptr, *b_ptr)`: load the zero accumulator,
+/// the two `<16 x i8>`/`<16 x u8>` operands (signedness picked by `signed`), dot them,
+/// store the `<4 x i32>` result. Mirrors the existing pointer-argument NEON tests above
+/// (e.g. the block-edge and high-pressure vector tests) rather than building the int8
+/// operands through allocas + a store loop.
+fn dotFunc(allocator: std.mem.Allocator, signed: bool) !Function {
+    var func = Function.init(allocator);
+    const ptr_t = try func.types.intern(.ptr);
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const acc_t = try func.types.intern(.{ .vector = .{ .len = 4, .elem = i32_t } });
+    const i8_t = try func.types.intern(.{ .int = .{ .signedness = if (signed) .signed else .unsigned, .bits = 8 } });
+    const data_t = try func.types.intern(.{ .vector = .{ .len = 16, .elem = i8_t } });
+    const entry = try func.appendBlock();
+    const out = try func.appendBlockParam(entry, ptr_t);
+    const zero_ptr = try func.appendBlockParam(entry, ptr_t);
+    const a_ptr = try func.appendBlockParam(entry, ptr_t);
+    const b_ptr = try func.appendBlockParam(entry, ptr_t);
+    const acc = try func.appendInst(entry, acc_t, .{ .load = .{ .ptr = zero_ptr } });
+    const va = try func.appendInst(entry, data_t, .{ .load = .{ .ptr = a_ptr } });
+    const vb = try func.appendInst(entry, data_t, .{ .load = .{ .ptr = b_ptr } });
+    const result = try func.appendDot(entry, acc, va, vb);
+    try func.appendStore(entry, result, out);
+    func.setTerminator(entry, .{ .ret = null });
+    return func;
+}
+
+/// Asserts `code` contains an SDOT/UDOT word. Register fields (rd/rn/rm) vary with
+/// whatever the allocator picked, so the check masks them off and compares only the
+/// fixed opcode bits (the same field layout `sdot`/`udot` themselves encode).
+fn expectHasDot(code: []const u32, signed: bool) !void {
+    const reg_mask: u32 = 0x001F03FF; // rd[4:0] | rn[9:5] | rm[20:16]
+    const fixed = (if (signed) encode.sdot(.x0, .x0, .x0) else encode.udot(.x0, .x0, .x0)) & ~reg_mask;
+    for (code) |w| if (w & ~reg_mask == fixed) return;
+    return error.TestExpectedEqual; // no sdot/udot word found in the emitted code
+}
+
+test "neon: SDOT computes the INT8 dot-product-accumulate (signed, matches a scalar reference)" {
+    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var func = try dotFunc(allocator, true);
+    defer func.deinit();
+    const code = try isel.selectFunction(allocator, &func);
+    defer allocator.free(code);
+    try expectHasDot(code, true);
+
+    var buf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(code));
+    defer buf.deinit();
+    const Fn = *const fn (*[4]i32, *const [4]i32, *const [16]i8, *const [16]i8) callconv(.c) void;
+    const f: Fn = @ptrCast(buf.memory.ptr);
+
+    const as = [_][16]i8{
+        .{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 },
+        .{ -1, -2, -3, -4, -5, -6, -7, -8, -9, -10, -11, -12, -13, -14, -15, -16 },
+        .{ 127, -128, 127, -128, 1, -1, 0, 0, 100, -100, 50, -50, 25, -25, 10, -10 },
+        .{ -128, -128, -128, -128, -128, -128, -128, -128, -128, -128, -128, -128, -128, -128, -128, -128 },
+    };
+    const bs = [_][16]i8{
+        .{ 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1 },
+        .{ 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 },
+        .{ -128, 127, -128, 127, 1, -1, 0, 0, -100, 100, -50, 50, -25, 25, -10, 10 },
+        .{ 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127 },
+    };
+    const zero: [4]i32 align(16) = .{ 0, 0, 0, 0 };
+    for (as, bs) |a, b| {
+        var scalar_ref: i32 = 0;
+        for (0..16) |i| scalar_ref += @as(i32, a[i]) * @as(i32, b[i]);
+        const aa: [16]i8 align(16) = a;
+        const bb: [16]i8 align(16) = b;
+        var out: [4]i32 align(16) = undefined;
+        f(&out, &zero, &aa, &bb);
+        const sum = out[0] + out[1] + out[2] + out[3];
+        try std.testing.expectEqual(scalar_ref, sum);
+    }
+}
+
+test "neon: UDOT computes the INT8 dot-product-accumulate (unsigned, matches a scalar reference)" {
+    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var func = try dotFunc(allocator, false);
+    defer func.deinit();
+    const code = try isel.selectFunction(allocator, &func);
+    defer allocator.free(code);
+    try expectHasDot(code, false);
+
+    var buf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(code));
+    defer buf.deinit();
+    const Fn = *const fn (*[4]i32, *const [4]i32, *const [16]u8, *const [16]u8) callconv(.c) void;
+    const f: Fn = @ptrCast(buf.memory.ptr);
+
+    const as = [_][16]u8{
+        .{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 },
+        .{ 255, 254, 253, 252, 251, 250, 249, 248, 247, 246, 245, 244, 243, 242, 241, 240 },
+        .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+        .{ 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200 },
+    };
+    const bs = [_][16]u8{
+        .{ 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1 },
+        .{ 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 },
+        .{ 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200 },
+        .{ 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200 },
+    };
+    const zero: [4]i32 align(16) = .{ 0, 0, 0, 0 };
+    for (as, bs) |a, b| {
+        var scalar_ref: i32 = 0;
+        for (0..16) |i| scalar_ref += @as(i32, a[i]) * @as(i32, b[i]);
+        const aa: [16]u8 align(16) = a;
+        const bb: [16]u8 align(16) = b;
+        var out: [4]i32 align(16) = undefined;
+        f(&out, &zero, &aa, &bb);
+        const sum = out[0] + out[1] + out[2] + out[3];
+        try std.testing.expectEqual(scalar_ref, sum);
+    }
+}
+
+//
+// f16 is emulated: an f16 value lives in an S register as its f32 WIDENING (a value exactly
+// representable in half), and the boundaries round via base-ISA `fcvt` (no FEAT_FP16): a load
+// is `ldr h; fcvt s,h`, a store is `fcvt h,s; str h`, every arithmetic result and narrowing
+// convert rounds to nearest-even half with `fcvt`. These tests JIT the code on this aarch64
+// host and assert the result bit-matches Zig's own `@as(f16, ...)` reference (Zig lowers f16
+// ops the same way: promote to f32, operate, round back to half). f16 crosses the JIT boundary
+// only through MEMORY (the 2-byte IEEE-half layout Zig's `f16` also uses), never in an argument
+// register, so these validate the emulation itself. Vulcan's own register convention for an f16
+// is the f32 widening, consistent across calls, so this is not the C half-format ABI.
+
+fn f16Bits(x: f16) u16 {
+    return @bitCast(x);
+}
+
+/// JIT a binary f16 op done through memory (out = a <op> b, each an f16 in memory) and return
+/// the stored half so the caller compares its bits to Zig's f16 reference.
+fn runF16Binary(allocator: std.mem.Allocator, op: ir.function.BinOp, a: f16, b: f16) !f16 {
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ptr_t = try func.types.intern(.ptr);
+    const f16_t = try func.types.intern(.{ .float = .f16 });
+    const blk = try func.appendBlock();
+    const pa = try func.appendBlockParam(blk, ptr_t);
+    const pb = try func.appendBlockParam(blk, ptr_t);
+    const pout = try func.appendBlockParam(blk, ptr_t);
+    const va = try func.appendInst(blk, f16_t, .{ .load = .{ .ptr = pa } });
+    const vb = try func.appendInst(blk, f16_t, .{ .load = .{ .ptr = pb } });
+    const r = try func.appendInst(blk, f16_t, .{ .arith = .{ .op = op, .lhs = va, .rhs = vb } });
+    try func.appendStore(blk, r, pout);
+    func.setTerminator(blk, .{ .ret = null });
+
+    const code = try isel.selectFunction(allocator, &func);
+    defer allocator.free(code);
+    var buf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(code));
+    defer buf.deinit();
+    const Fn = *const fn (*const f16, *const f16, *f16) callconv(.c) void;
+    var out: f16 = 0;
+    @as(Fn, @ptrCast(buf.memory.ptr))(&a, &b, &out);
+    return out;
+}
+
+test "f16 load/store round-trips a half value bit-exact" {
+    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    // out = *in: `ldr h; fcvt s,h` on the load, `fcvt h,s; str h` on the store. The value is
+    // already an exact half, so its 16 bits must survive the round-trip unchanged.
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ptr_t = try func.types.intern(.ptr);
+    const f16_t = try func.types.intern(.{ .float = .f16 });
+    const blk = try func.appendBlock();
+    const pin = try func.appendBlockParam(blk, ptr_t);
+    const pout = try func.appendBlockParam(blk, ptr_t);
+    const v = try func.appendInst(blk, f16_t, .{ .load = .{ .ptr = pin } });
+    try func.appendStore(blk, v, pout);
+    func.setTerminator(blk, .{ .ret = null });
+
+    const code = try isel.selectFunction(allocator, &func);
+    defer allocator.free(code);
+    var buf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(code));
+    defer buf.deinit();
+    const Fn = *const fn (*const f16, *f16) callconv(.c) void;
+    // A spread of halves: normal, negative, zero, the largest finite half, a subnormal.
+    for ([_]f16{ 1.5, -2.25, 0.0, 65504.0, 0.00006103515625 }) |x| {
+        var in: f16 = x;
+        var out: f16 = 0;
+        @as(Fn, @ptrCast(buf.memory.ptr))(&in, &out);
+        try std.testing.expectEqual(f16Bits(x), f16Bits(out));
+    }
+}
+
+test "f16 add/sub/mul/div match Zig's per-op half rounding (bit-exact)" {
+    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { a: f16, b: f16 }{
+        .{ .a = 1.5, .b = 2.25 },
+        .{ .a = 3.140625, .b = 0.5 },
+        .{ .a = 100.0, .b = 7.0 },
+        .{ .a = 0.1, .b = 0.2 }, // 0.1 and 0.2 are not exact in f16, so the results round
+    };
+    for (cases) |c| {
+        // The reference (`c.a + c.b`, etc.) is Zig's own f16 arithmetic: promote to f32,
+        // operate, round to nearest-even half. The emulation must produce the same bits.
+        try std.testing.expectEqual(f16Bits(c.a + c.b), f16Bits(try runF16Binary(allocator, .add, c.a, c.b)));
+        try std.testing.expectEqual(f16Bits(c.a - c.b), f16Bits(try runF16Binary(allocator, .sub, c.a, c.b)));
+        try std.testing.expectEqual(f16Bits(c.a * c.b), f16Bits(try runF16Binary(allocator, .mul, c.a, c.b)));
+        try std.testing.expectEqual(f16Bits(c.a / c.b), f16Bits(try runF16Binary(allocator, .div, c.a, c.b)));
+    }
+}
+
+test "f16 multiply rounds its result to nearest-even half (not a raw f32 product)" {
+    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    // a*a whose exact f32 product is NOT representable in f16, so the half result must round.
+    // This proves the arith path narrows to half, rather than leaving the f32 product in place.
+    const a: f16 = 1.0009765625; // 1 + 2^-10, itself exactly representable
+    const got = try runF16Binary(allocator, .mul, a, a);
+    try std.testing.expectEqual(f16Bits(a * a), f16Bits(got)); // matches Zig's f16 multiply
+    const exact_f32: f32 = @as(f32, a) * @as(f32, a);
+    try std.testing.expect(@as(f32, got) != exact_f32); // rounding to half changed the value
+    try std.testing.expectEqual(f16Bits(@as(f16, @floatCast(exact_f32))), f16Bits(got));
+}
+
+test "f16 chained multiply rounds every intermediate to half" {
+    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    // r = (a*b)*c. Each multiply must round its result to half before the next consumes it
+    // (fp mul/add fusion is disabled for f16, and each op re-rounds). Compared against Zig's
+    // step-by-step f16 chain.
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ptr_t = try func.types.intern(.ptr);
+    const f16_t = try func.types.intern(.{ .float = .f16 });
+    const blk = try func.appendBlock();
+    const pa = try func.appendBlockParam(blk, ptr_t);
+    const pb = try func.appendBlockParam(blk, ptr_t);
+    const pc = try func.appendBlockParam(blk, ptr_t);
+    const pout = try func.appendBlockParam(blk, ptr_t);
+    const va = try func.appendInst(blk, f16_t, .{ .load = .{ .ptr = pa } });
+    const vb = try func.appendInst(blk, f16_t, .{ .load = .{ .ptr = pb } });
+    const vc = try func.appendInst(blk, f16_t, .{ .load = .{ .ptr = pc } });
+    const ab = try func.appendInst(blk, f16_t, .{ .arith = .{ .op = .mul, .lhs = va, .rhs = vb } });
+    const abc = try func.appendInst(blk, f16_t, .{ .arith = .{ .op = .mul, .lhs = ab, .rhs = vc } });
+    try func.appendStore(blk, abc, pout);
+    func.setTerminator(blk, .{ .ret = null });
+
+    const code = try isel.selectFunction(allocator, &func);
+    defer allocator.free(code);
+    var buf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(code));
+    defer buf.deinit();
+    const Fn = *const fn (*const f16, *const f16, *const f16, *f16) callconv(.c) void;
+    var a: f16 = 1.0009765625;
+    var b: f16 = 1.0029296875;
+    var c: f16 = 1.0048828125;
+    var out: f16 = 0;
+    @as(Fn, @ptrCast(buf.memory.ptr))(&a, &b, &c, &out);
+    const ref: f16 = (a * b) * c; // Zig: rounds a*b to half, then rounds (that*c) to half
+    try std.testing.expectEqual(f16Bits(ref), f16Bits(out));
+}
+
+test "convert f16 -> f32 widens exactly" {
+    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ptr_t = try func.types.intern(.ptr);
+    const f16_t = try func.types.intern(.{ .float = .f16 });
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const blk = try func.appendBlock();
+    const pin = try func.appendBlockParam(blk, ptr_t);
+    const pout = try func.appendBlockParam(blk, ptr_t);
+    const v = try func.appendInst(blk, f16_t, .{ .load = .{ .ptr = pin } });
+    const w = try func.appendInst(blk, f32_t, .{ .convert = .{ .value = v } }); // f16 -> f32
+    try func.appendStore(blk, w, pout);
+    func.setTerminator(blk, .{ .ret = null });
+
+    const code = try isel.selectFunction(allocator, &func);
+    defer allocator.free(code);
+    var buf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(code));
+    defer buf.deinit();
+    const Fn = *const fn (*const f16, *f32) callconv(.c) void;
+    for ([_]f16{ 3.140625, -0.5, 65504.0 }) |x| {
+        var in: f16 = x;
+        var out: f32 = 0;
+        @as(Fn, @ptrCast(buf.memory.ptr))(&in, &out);
+        try std.testing.expectEqual(@as(f32, x), out); // widening a half to f32 is exact
+    }
+}
+
+test "convert f32 -> f16 rounds to nearest-even half (proves it is not a bare copy)" {
+    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ptr_t = try func.types.intern(.ptr);
+    const f16_t = try func.types.intern(.{ .float = .f16 });
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const blk = try func.appendBlock();
+    const pin = try func.appendBlockParam(blk, ptr_t);
+    const pout = try func.appendBlockParam(blk, ptr_t);
+    const v = try func.appendInst(blk, f32_t, .{ .load = .{ .ptr = pin } });
+    const w = try func.appendInst(blk, f16_t, .{ .convert = .{ .value = v } }); // f32 -> f16, ROUNDS
+    try func.appendStore(blk, w, pout);
+    func.setTerminator(blk, .{ .ret = null });
+
+    const code = try isel.selectFunction(allocator, &func);
+    defer allocator.free(code);
+    var buf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(code));
+    defer buf.deinit();
+    const Fn = *const fn (*const f32, *f16) callconv(.c) void;
+    // 3.14159 is not representable in f16: it rounds to 3.140625 (bits 0x4248). Were the convert
+    // a bare `fmov` (the old `sd == dd` trap), the stored half would carry f32 bits instead.
+    var in: f32 = 3.14159;
+    var out: f16 = 0;
+    @as(Fn, @ptrCast(buf.memory.ptr))(&in, &out);
+    try std.testing.expectEqual(f16Bits(@as(f16, @floatCast(in))), f16Bits(out));
+    try std.testing.expect(@as(f32, out) != in); // rounding to half changed the value
+    try std.testing.expectEqual(@as(u16, 0x4248), f16Bits(out));
+}
+
+test "convert int <-> f16 rounds int->f16 and truncates f16->int" {
+    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    // int -> f16: 2049 is not exactly representable in f16 (the step at 2^11 is 2), so it rounds
+    // to 2048. scvtf lands in the S view, then the result rounds to nearest-even half.
+    {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const p_t = try func.types.intern(.ptr);
+        const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+        const f16_t = try func.types.intern(.{ .float = .f16 });
+        const blk = try func.appendBlock();
+        const x = try func.appendBlockParam(blk, i32_t);
+        const pout = try func.appendBlockParam(blk, p_t);
+        const w = try func.appendInst(blk, f16_t, .{ .convert = .{ .value = x } }); // i32 -> f16
+        try func.appendStore(blk, w, pout);
+        func.setTerminator(blk, .{ .ret = null });
+
+        const code = try isel.selectFunction(allocator, &func);
+        defer allocator.free(code);
+        var buf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(code));
+        defer buf.deinit();
+        const Fn = *const fn (i32, *f16) callconv(.c) void;
+        var out: f16 = 0;
+        @as(Fn, @ptrCast(buf.memory.ptr))(2049, &out);
+        try std.testing.expectEqual(f16Bits(@as(f16, @floatFromInt(@as(i32, 2049)))), f16Bits(out));
+        try std.testing.expectEqual(@as(f16, 2048.0), out); // rounded down to the even step
+        // A small value that IS exactly representable converts without change.
+        @as(Fn, @ptrCast(buf.memory.ptr))(-7, &out);
+        try std.testing.expectEqual(@as(f16, -7.0), out);
+    }
+    // f16 -> int: fcvtzs from the S-held half, round toward zero (truncate).
+    {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const p_t = try func.types.intern(.ptr);
+        const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+        const f16_t = try func.types.intern(.{ .float = .f16 });
+        const blk = try func.appendBlock();
+        const pin = try func.appendBlockParam(blk, p_t);
+        const v = try func.appendInst(blk, f16_t, .{ .load = .{ .ptr = pin } });
+        const r = try func.appendInst(blk, i32_t, .{ .convert = .{ .value = v } }); // f16 -> i32
+        func.setTerminator(blk, .{ .ret = r });
+
+        const code = try isel.selectFunction(allocator, &func);
+        defer allocator.free(code);
+        var buf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(code));
+        defer buf.deinit();
+        const Fn = *const fn (*const f16) callconv(.c) i32;
+        var in: f16 = 3.5;
+        try std.testing.expectEqual(@as(i32, 3), @as(Fn, @ptrCast(buf.memory.ptr))(&in));
+        in = -3.9;
+        try std.testing.expectEqual(@as(i32, -3), @as(Fn, @ptrCast(buf.memory.ptr))(&in));
+    }
+}
+
+test "f16 constant materializes as its half-rounded f32 widening" {
+    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ptr_t = try func.types.intern(.ptr);
+    const f16_t = try func.types.intern(.{ .float = .f16 });
+    const blk = try func.appendBlock();
+    const pout = try func.appendBlockParam(blk, ptr_t);
+    // 3.14159 rounds to the half 3.140625: the fconst must store the ROUNDED half, not the f64.
+    const k = try func.appendInst(blk, f16_t, .{ .fconst = 3.14159 });
+    try func.appendStore(blk, k, pout);
+    func.setTerminator(blk, .{ .ret = null });
+
+    const code = try isel.selectFunction(allocator, &func);
+    defer allocator.free(code);
+    var buf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(code));
+    defer buf.deinit();
+    const Fn = *const fn (*f16) callconv(.c) void;
+    var out: f16 = 0;
+    @as(Fn, @ptrCast(buf.memory.ptr))(&out);
+    try std.testing.expectEqual(f16Bits(@as(f16, @floatCast(@as(f64, 3.14159)))), f16Bits(out));
+}
+
+test "f16 survives register spilling bit-exact (held as its f32 widening in a 16-byte slot)" {
+    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    // Load N f16 values that are ALL live at once, then left-fold add them. N far exceeds the
+    // FP register pool, so many f16 values spill and reload. An f16 lives in an S register as
+    // its f32 widening and spills through the uniform scalar-fpr slot (`str d`/`ldr d`, the
+    // value in the low 32 bits), so a spilled half must reload with its exact value intact.
+    const N = 40;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ptr_t = try func.types.intern(.ptr);
+    const f16_t = try func.types.intern(.{ .float = .f16 });
+    const blk = try func.appendBlock();
+    const in = try func.appendBlockParam(blk, ptr_t);
+    const pout = try func.appendBlockParam(blk, ptr_t);
+    var v: [N]ir.function.Value = undefined;
+    for (0..N) |i| {
+        const p = if (i == 0) in else try func.appendInst(blk, ptr_t, .{ .arith_imm = .{ .op = .add, .lhs = in, .imm = @intCast(i * 2) } });
+        v[i] = try func.appendInst(blk, f16_t, .{ .load = .{ .ptr = p } });
+    }
+    var s = v[0];
+    for (1..N) |i| s = try func.appendInst(blk, f16_t, .{ .arith = .{ .op = .add, .lhs = s, .rhs = v[i] } });
+    try func.appendStore(blk, s, pout);
+    func.setTerminator(blk, .{ .ret = null });
+
+    const code = try isel.selectFunction(allocator, &func);
+    defer allocator.free(code);
+    var buf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(code));
+    defer buf.deinit();
+    const Fn = *const fn (*const [N]f16, *f16) callconv(.c) void;
+    var input: [N]f16 = undefined;
+    for (0..N) |i| input[i] = @floatCast(@as(f32, @floatFromInt(i)) * 0.1);
+    var out: f16 = 0;
+    @as(Fn, @ptrCast(buf.memory.ptr))(&input, &out);
+    // The reference folds in the SAME order with per-op half rounding (f16 add is not
+    // associative, so the order must match the IR's left fold).
+    var ref: f16 = input[0];
+    for (1..N) |i| ref = ref + input[i];
+    try std.testing.expectEqual(f16Bits(ref), f16Bits(out));
+}
+
+test "f32/f64 through the same memory paths are unchanged by the f16 work (regression)" {
+    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    // out = (*a + *b) as f32, and separately as f64: the non-f16 float load/store/arith paths
+    // must be byte-identical to before (the f16 branches never touch f32/f64).
+    inline for (.{ f32, f64 }) |T| {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const ptr_t = try func.types.intern(.ptr);
+        const ft = try func.types.intern(.{ .float = if (T == f32) .f32 else .f64 });
+        const blk = try func.appendBlock();
+        const pa = try func.appendBlockParam(blk, ptr_t);
+        const pb = try func.appendBlockParam(blk, ptr_t);
+        const pout = try func.appendBlockParam(blk, ptr_t);
+        const va = try func.appendInst(blk, ft, .{ .load = .{ .ptr = pa } });
+        const vb = try func.appendInst(blk, ft, .{ .load = .{ .ptr = pb } });
+        const r = try func.appendInst(blk, ft, .{ .arith = .{ .op = .add, .lhs = va, .rhs = vb } });
+        try func.appendStore(blk, r, pout);
+        func.setTerminator(blk, .{ .ret = null });
+
+        const code = try isel.selectFunction(allocator, &func);
+        defer allocator.free(code);
+        var buf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(code));
+        defer buf.deinit();
+        const Fn = *const fn (*const T, *const T, *T) callconv(.c) void;
+        var a: T = 1.25;
+        var b: T = 2.5;
+        var out: T = 0;
+        @as(Fn, @ptrCast(buf.memory.ptr))(&a, &b, &out);
+        try std.testing.expectEqual(@as(T, 3.75), out);
     }
 }

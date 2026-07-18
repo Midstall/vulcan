@@ -48,7 +48,11 @@ pub fn formatBody(allocator: std.mem.Allocator, body: []const u8) std.mem.Alloca
     try out.appendSlice(allocator, "locals:");
     if (groups == 0) {
         try out.appendSlice(allocator, " (none)");
-    } else for (0..groups) |_| {
+    } else
+    // Cap by body length: each group consumes at least two bytes, so a count larger
+    // than the whole body is malformed. Prevents a tiny input with a ~4G count from
+    // driving a multi-gigabyte output loop.
+    for (0..@min(groups, body.len)) |_| {
         const count = r.u32Leb();
         try out.print(allocator, " {d} x {s}", .{ count, valType(r.byte()) });
     }
@@ -85,7 +89,9 @@ const Reader = struct {
         var result: i64 = 0;
         var shift: u7 = 0;
         var b: u8 = 0;
-        while (true) {
+        // Bound the shift: an over-long (malformed) LEB must not drive `shift`
+        // past the u64 width, where `@intCast(shift)` to the u6 shift type panics.
+        while (shift < 64) {
             b = r.byte();
             result |= @as(i64, b & 0x7F) << @intCast(shift);
             shift += 7;
@@ -98,7 +104,10 @@ const Reader = struct {
         const n = @sizeOf(T);
         var bytes: [n]u8 = undefined;
         for (0..n) |i| bytes[i] = r.byte();
-        return @bitCast(bytes);
+        // wasm immediates are little-endian on the wire; assemble in that order so
+        // f32/f64 constants decode correctly on a big-endian host too.
+        const Bits = std.meta.Int(.unsigned, n * 8);
+        return @bitCast(std.mem.readInt(Bits, &bytes, .little));
     }
 };
 
@@ -121,7 +130,9 @@ fn decodeOne(a: std.mem.Allocator, out: *std.ArrayList(u8), code: []const u8, po
         0x0E => { // br_table vec(labelidx) default
             const n = r.u32Leb();
             try out.appendSlice(a, "br_table");
-            for (0..n) |_| try out.print(a, " {d}", .{r.u32Leb()});
+            // Cap by code length: each label consumes at least one byte, so a count
+            // exceeding the buffer is malformed. Bounds the loop over untrusted input.
+            for (0..@min(n, code.len)) |_| try out.print(a, " {d}", .{r.u32Leb()});
             try out.print(a, " (default {d})", .{r.u32Leb()});
         },
         0x10 => try out.print(a, "call {d}", .{r.u32Leb()}),
@@ -137,7 +148,10 @@ fn decodeOne(a: std.mem.Allocator, out: *std.ArrayList(u8), code: []const u8, po
         0x28...0x3E => { // memory load/store: align, offset
             const al = r.u32Leb();
             const off = r.u32Leb();
-            try out.print(a, "{s} offset={d} align={d}", .{ memName(op), off, @as(u32, 1) << @intCast(al) });
+            // `al` is a log2 alignment from untrusted bytes; a value >= 64 would make
+            // the shift undefined, so clamp it (0 flags the malformed alignment).
+            const align_bytes: u64 = if (al < 64) @as(u64, 1) << @intCast(al) else 0;
+            try out.print(a, "{s} offset={d} align={d}", .{ memName(op), off, align_bytes });
         },
         0x3F => {
             _ = r.byte(); // memidx (0x00)

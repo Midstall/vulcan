@@ -120,6 +120,30 @@ fn runJsF32(io: std.Io, allocator: std.mem.Allocator, func: *const Function, arg
     return @bitCast(try std.fmt.parseInt(u32, stdout, 10));
 }
 
+/// Run and return an f16-returning function's result as an f64: `wrapProgram` has no f16
+/// case, so it falls to the generic `console.log(__r.toString())` branch. A JS Number's
+/// `toString()` is defined to print the shortest decimal that parses back to the exact same
+/// double, so parsing it back here recovers the exact f16-as-double value with no precision
+/// loss, unlike the f32 path which needs the raw-bits trick to survive Number's rounding.
+fn runJsF16(io: std.Io, allocator: std.mem.Allocator, func: *const Function, args: []const Arg) !f64 {
+    const program = try wrapProgram(allocator, func, args);
+    defer allocator.free(program);
+    const stdout = try runJs(io, allocator, program);
+    defer allocator.free(stdout);
+    return std.fmt.parseFloat(f64, stdout);
+}
+
+fn expectJsF16(func: *const Function, args: []const Arg, expected: f64) !void {
+    const r = runJsF16(std.testing.io, std.testing.allocator, func, args) catch |err| switch (err) {
+        error.NoEngine => return error.SkipZigTest,
+        else => return err,
+    };
+    // Every value here is an exact f16 value widened to f64, so the comparison is exact, not
+    // approximate: a mismatch means a rounding-mode divergence between Math.f16round and Zig's
+    // f16, not a benign precision difference.
+    try std.testing.expectEqual(expected, r);
+}
+
 // GLSL-driven runners: exercise the JS backend on real frontend-produced IR.
 
 fn runGlslJsInt(io: std.Io, allocator: std.mem.Allocator, src: []const u8, nm: []const u8, args: []const Arg) !i64 {
@@ -236,6 +260,86 @@ test "JS backend: GLSL float builtins" {
 test "JS backend: GLSL int<->float conversions" {
     try expectGlslJsInt("int f(float x) { return int(x); }", "f", &.{.{ .float = 3.7 }}, 3);
     try expectGlslJsF32("float f(int a) { return float(a) * 0.5; }", "f", &.{.{ .int = 7 }}, 3.5);
+}
+
+// f16 differentials: emit an f16 kernel, run it on Node's `Math.f16round`, and require an
+// exact match against Zig's own `@as(f16, ...)` (widened to f64 for the comparison, since
+// every f16 value is exact in f64). These are the node-executed proof that removing the
+// js.zig f16 gate did not just stop rejecting f16 but actually lowers it correctly.
+
+test "JS backend: f16 multiply rounds a non-half-representable product" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+
+    const f16_t = try func.types.intern(.{ .float = .f16 });
+    const entry = try func.appendBlock();
+    // Both operands are fconst (not block params), so the exact-half rounding of the input
+    // literals happens on both the JS and the Zig side identically; only the product's
+    // rounding is under test.
+    const a = try func.appendInst(entry, f16_t, .{ .fconst = 1.1 });
+    const b = try func.appendInst(entry, f16_t, .{ .fconst = 1.1 });
+    const prod = try func.appendInst(entry, f16_t, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = b } });
+    func.setTerminator(entry, .{ .ret = prod });
+
+    const ah: f16 = 1.1;
+    const bh: f16 = 1.1;
+    const expected: f16 = ah * bh; // Zig's own f16 multiply: the oracle.
+    try expectJsF16(&func, &.{}, @as(f64, expected));
+}
+
+test "JS backend: f16 add" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+
+    const f16_t = try func.types.intern(.{ .float = .f16 });
+    const entry = try func.appendBlock();
+    const a = try func.appendInst(entry, f16_t, .{ .fconst = 0.1 });
+    const b = try func.appendInst(entry, f16_t, .{ .fconst = 0.2 });
+    const sum = try func.appendInst(entry, f16_t, .{ .arith = .{ .op = .add, .lhs = a, .rhs = b } });
+    func.setTerminator(entry, .{ .ret = sum });
+
+    const ah: f16 = 0.1;
+    const bh: f16 = 0.2;
+    const expected: f16 = ah + bh;
+    try expectJsF16(&func, &.{}, @as(f64, expected));
+}
+
+test "JS backend: f32 -> f16 convert rounds a value f16 cannot hold exactly" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+
+    const f16_t = try func.types.intern(.{ .float = .f16 });
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const entry = try func.appendBlock();
+    const x = try func.appendBlockParam(entry, f32_t);
+    const h = try func.appendInst(entry, f16_t, .{ .convert = .{ .value = x } });
+    func.setTerminator(entry, .{ .ret = h });
+
+    const pi_f32: f32 = 3.14159274; // not exactly representable in f16
+    const expected: f16 = @floatCast(pi_f32);
+    try expectJsF16(&func, &.{.{ .float = pi_f32 }}, @as(f64, expected));
+}
+
+test "JS backend: int -> f16 convert rounds a value f16 cannot hold exactly" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const f16_t = try func.types.intern(.{ .float = .f16 });
+    const entry = try func.appendBlock();
+    const n = try func.appendBlockParam(entry, i32_t);
+    const h = try func.appendInst(entry, f16_t, .{ .convert = .{ .value = n } });
+    func.setTerminator(entry, .{ .ret = h });
+
+    // 12345 needs 14 significant bits; f16 keeps only 11 (1 implicit + 10 explicit), so the
+    // conversion must round, not truncate silently.
+    const n_val: i64 = 12345;
+    const expected: f16 = @floatFromInt(n_val);
+    try expectJsF16(&func, &.{.{ .int = n_val }}, @as(f64, expected));
 }
 
 test "JS backend: alloca, store, load round-trip" {

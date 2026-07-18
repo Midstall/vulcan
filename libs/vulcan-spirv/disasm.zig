@@ -288,6 +288,7 @@ pub fn format(allocator: std.mem.Allocator, words: []const u32) (binary.Error ||
         // Result column: right-justified `%id = `, or blanks when there is no result.
         if (result_id) |r| {
             var buf: [16]u8 = undefined;
+            // "%" + a u32 is at most 11 bytes ("%4294967295"), so [16]u8 always fits.
             const s = std.fmt.bufPrint(&buf, "%{d}", .{r}) catch unreachable;
             const pad = if (s.len < col) col - s.len else 0;
             try out.appendNTimes(allocator, ' ', pad);

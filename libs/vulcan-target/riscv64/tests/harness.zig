@@ -67,6 +67,13 @@ fn qemuUserArgv(allocator: std.mem.Allocator, elf_path: []const u8) std.mem.Allo
     return allocator.dupe([]const u8, &.{ "qemu-riscv64", elf_path });
 }
 
+fn qemuUserCpuMaxArgv(allocator: std.mem.Allocator, elf_path: []const u8) std.mem.Allocator.Error![]const []const u8 {
+    // `-cpu max` turns on every optional extension qemu implements, including Zfh (native f16). The
+    // default (no `-cpu`) is RV64GC with NO Zfh, so the native half instructions would fault there;
+    // this backend is used only by the native Zfh differential tests.
+    return allocator.dupe([]const u8, &.{ "qemu-riscv64", "-cpu", "max", elf_path });
+}
+
 /// River functional emulator (Midstall's CPU): the reference backend.
 pub const river = Backend{ .name = "river-emulator", .buildArgv = riverArgv };
 
@@ -74,6 +81,10 @@ pub const river = Backend{ .name = "river-emulator", .buildArgv = riverArgv };
 /// codegen executes on any dev machine with qemu even when River/Spike are absent. Skips if qemu is
 /// not on PATH.
 pub const qemu_user = Backend{ .name = "qemu-riscv64", .user_mode = true, .buildArgv = qemuUserArgv };
+
+/// Like `qemu_user`, but adds `-cpu max` so Zfh (native f16) is enabled. Used by the native f16
+/// differential tests, which emit real half instructions that the default RV64GC CPU rejects.
+pub const qemu_user_cpumax = Backend{ .name = "qemu-riscv64 -cpu max", .user_mode = true, .buildArgv = qemuUserCpuMaxArgv };
 
 /// Like `qemu_user`, but RVC-compresses every self-contained case first, so the whole corpus doubles
 /// as an execution test of the compressor on real, diverse codegen. Skips if qemu is absent.
@@ -156,6 +167,124 @@ pub fn buildUserStub(allocator: std.mem.Allocator, args: []const i64) std.mem.Al
     return w.toOwnedSlice(allocator);
 }
 
+/// Load a 32-bit pattern into `reg` via `lui`+`addi` (RV64 sign-extends the `addi` result
+/// through bit 63; callers either want that directly, or immediately mask/shift it away).
+fn loadImm32Into(allocator: std.mem.Allocator, words: *std.ArrayList(u32), reg: encode.Reg, bits: u32) std.mem.Allocator.Error!void {
+    const hi: u20 = @truncate((bits +% 0x800) >> 12);
+    const lo: i12 = @bitCast(@as(u12, @truncate(bits)));
+    try words.append(allocator, encode.lui(reg, hi));
+    try words.append(allocator, encode.addi(reg, reg, lo));
+}
+
+/// Load an arbitrary 64-bit bit pattern into `reg` (`scratch` must differ from `reg`). Unlike
+/// `loadImmInto`, which only handles i32-range values, this carries a full 64-bit pattern -
+/// needed for f64 args' raw bits. Splits into high/low 32-bit halves, each built with the
+/// standard `lui`+`addi` sequence: the high half is shifted into place (its sign-extension
+/// artifacts land above bit 63 and are discarded by the shift), and the low half is masked back
+/// down to exactly 32 bits (clearing its own sign-extension artifacts) before the two are ORed.
+fn loadImm64Into(allocator: std.mem.Allocator, words: *std.ArrayList(u32), reg: encode.Reg, scratch: encode.Reg, bits: u64) std.mem.Allocator.Error!void {
+    try loadImm32Into(allocator, words, reg, @truncate(bits >> 32));
+    try words.append(allocator, encode.slli(reg, reg, 32));
+    try loadImm32Into(allocator, words, scratch, @truncate(bits));
+    try words.append(allocator, encode.slli(scratch, scratch, 32));
+    try words.append(allocator, encode.srli(scratch, scratch, 32));
+    try words.append(allocator, encode.or_(reg, reg, scratch));
+}
+
+/// User-mode entry stub for a SCALAR float function: loads `dbl`-precision args (given as raw
+/// bit patterns - f64 bits, or f32 bits in the low 32 bits) into fa0.., calls the function, and
+/// writes the fa0 result's bits (zero-extended to 8 bytes for an f32 result) to stdout via
+/// `write`, then `exit(0)`. Mirrors `buildUserStub`, but for the hardware float ABI (fa0.. args,
+/// fa0 result) instead of the integer one: FMA fusion needs real float args/results, which
+/// `buildUserStub`'s GPR-only ABI cannot carry. `x5`/`x6` are used as scratch (caller-saved,
+/// unused by any arg or the tail). Caller owns the result.
+pub fn buildUserStubFloat(allocator: std.mem.Allocator, dbl: bool, fargs: []const u64) std.mem.Allocator.Error![]u32 {
+    var w: std.ArrayList(u32) = .empty;
+    errdefer w.deinit(allocator);
+
+    for (fargs, 0..) |bits, i| {
+        try loadImm64Into(allocator, &w, .x5, .x6, bits);
+        const freg: encode.FReg = @enumFromInt(@as(u5, @intCast(10 + i)));
+        try w.append(allocator, if (dbl) encode.fmv_d_x(freg, .x5) else encode.fmv_w_x(freg, .x5));
+    }
+    const call_idx = w.items.len;
+    try w.append(allocator, encode.jal(.x1, 0)); // call the function (offset patched below)
+    // fa0 now holds the result. Spill it to the stack (as a double or a single) and reload as a
+    // plain 64-bit integer so the tail below - identical to buildUserStub's - can write it out.
+    // Zeroing the slot first means an f32 result's untouched upper 4 bytes read back as 0, not
+    // stack garbage.
+    try w.append(allocator, encode.addi(.x2, .x2, -16)); // sp -= 16
+    try w.append(allocator, encode.sd(.x0, .x2, 0));
+    try w.append(allocator, if (dbl) encode.fsd(.f10, .x2, 0) else encode.fsw(.f10, .x2, 0));
+    try w.append(allocator, encode.ld(.x10, .x2, 0)); // a0 = the result's bits
+    try w.append(allocator, encode.sd(.x10, .x2, 0)); // sd a0, 0(sp) (the write buffer)
+    try w.append(allocator, encode.addi(.x10, .x0, 1)); // a0 = 1 (stdout)
+    try w.append(allocator, encode.addi(.x11, .x2, 0)); // a1 = sp (buffer)
+    try w.append(allocator, encode.addi(.x12, .x0, 8)); // a2 = 8 (length)
+    try w.append(allocator, encode.addi(.x17, .x0, 64)); // a7 = 64 (write)
+    try w.append(allocator, encode.ecall());
+    try w.append(allocator, encode.addi(.x10, .x0, 0)); // a0 = 0 (status)
+    try w.append(allocator, encode.addi(.x17, .x0, 93)); // a7 = 93 (exit)
+    try w.append(allocator, encode.ecall());
+    const fn_off: i21 = @intCast((w.items.len - call_idx) * 4);
+    w.items[call_idx] = encode.jal(.x1, fn_off);
+    return w.toOwnedSlice(allocator);
+}
+
+/// Compile `func`, run it under a user-mode `backend` (e.g. `qemu_user`) with scalar float args,
+/// and return the raw bits `fa0` held on return (an f64's bits, or an f32's bits zero-extended).
+/// Mirrors `runFunc`, but for a function using the hardware float ABI (fa0.. args/result)
+/// instead of the integer one `runFunc`/`runProgram` assume - only a user-mode backend has a
+/// float-ABI stub today.
+pub fn runFuncFloat(io: std.Io, allocator: std.mem.Allocator, func: *Function, dbl: bool, fargs: []const u64, backend: Backend) !u64 {
+    var words = try compileFunc(allocator, func);
+    defer words.deinit(allocator);
+    return runCompiledFloat(io, allocator, words.items, dbl, fargs, backend);
+}
+
+/// Run pre-compiled float-ABI code (entry at word 0) under a user-mode `backend`, returning the
+/// raw bits `fa0` held on return. The run half of `runFuncFloat`, split out so a caller can supply
+/// code produced by `isel.selectFunction` alone (skipping the scheduler) when it must preserve a
+/// specific liveness shape - e.g. a scalar-float-spill stress test whose deliberately wide live
+/// range a scheduler could otherwise narrow.
+pub fn runCompiledFloat(io: std.Io, allocator: std.mem.Allocator, code: []const u32, dbl: bool, fargs: []const u64, backend: Backend) !u64 {
+    if (backend.incompatible) return error.SkipZigTest;
+    if (!backend.user_mode) return error.Unsupported; // only buildUserStubFloat exists so far
+
+    const stub = try buildUserStubFloat(allocator, dbl, fargs);
+    defer allocator.free(stub);
+    const program = try allocator.alloc(u32, stub.len + code.len);
+    defer allocator.free(program);
+    @memcpy(program[0..stub.len], stub);
+    @memcpy(program[stub.len..], code);
+
+    const bytes = try emit.emitBytes(allocator, program);
+    defer allocator.free(bytes);
+    const user_base: u64 = 0x10000;
+    const elf = try (@import("../ld.zig")).writeElfExec(allocator, bytes, bytes.len, user_base, user_base);
+    defer allocator.free(elf);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "firmware.elf", .data = elf, .flags = .{ .permissions = .executable_file } });
+
+    const argv = try backend.buildArgv(allocator, "firmware.elf");
+    defer allocator.free(argv);
+    const result = std.process.run(allocator, io, .{ .argv = argv, .cwd = .{ .dir = tmp.dir } }) catch |e| switch (e) {
+        error.FileNotFound => return error.SkipZigTest,
+        else => return e,
+    };
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    if (result.stdout.len < 8) {
+        std.debug.print("{s}: stdout too short ({d} bytes):\nstdout: {s}\nstderr: {s}\n", .{ backend.name, result.stdout.len, result.stdout, result.stderr });
+        return error.BackendFailed;
+    }
+    const tail = result.stdout[result.stdout.len - 8 ..];
+    return std.mem.readInt(u64, tail[0..8], .little);
+}
+
 /// Wrap a code image into a flat rv64 firmware ELF loaded at `entry`, entering at
 /// `entry`. Delegates to the linker's production ELF writer. Caller owns it.
 pub fn writeElf(allocator: std.mem.Allocator, code: []const u8, entry: u64) std.mem.Allocator.Error![]u8 {
@@ -169,6 +298,20 @@ pub fn compileFunc(allocator: std.mem.Allocator, func: *Function) !std.ArrayList
     try isel.splitCriticalEdges(allocator, func);
     try schedule.scheduleFunction(allocator, func);
     const code = try isel.selectFunction(allocator, func);
+    defer allocator.free(code);
+    var list: std.ArrayList(u32) = .empty;
+    try list.appendSlice(allocator, code);
+    return list;
+}
+
+/// Like `compileFunc`, but selects for a specific microarch `model` (via `selectFunctionForModel`),
+/// so a model-gated capability (e.g. Zfh native f16) reaches the backend. The pipeline is otherwise
+/// identical.
+pub fn compileFuncForModel(allocator: std.mem.Allocator, func: *Function, model: *const @import("vulcan-opt").microarch.Model) !std.ArrayList(u32) {
+    try ir.legalize.legalize(allocator, func);
+    try isel.splitCriticalEdges(allocator, func);
+    try schedule.scheduleFunction(allocator, func);
+    const code = try isel.selectFunctionForModel(allocator, func, model);
     defer allocator.free(code);
     var list: std.ArrayList(u32) = .empty;
     try list.appendSlice(allocator, code);

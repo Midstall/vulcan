@@ -427,6 +427,10 @@ const Planner = struct {
 /// dword-padded (virglrenderer reads it as a token-aligned shader blob). The
 /// caller owns the returned slice (free with `allocator`).
 pub fn lower(allocator: std.mem.Allocator, func: *const Function) Error![]u8 {
+    // f16 not yet lowered on this backend (f16 roadmap Pn); reject cleanly rather than
+    // silently treat as f64.
+    if (ir.function.functionUsesF16(func)) return error.Unsupported;
+
     const stage = stageOf(func) orelse return error.Unsupported;
 
     const entry: Block = @enumFromInt(0);
@@ -1383,6 +1387,22 @@ test "lower an arithmetic fragment shader (mul of two input components) to TGSI"
     try testing.expect(std.mem.indexOf(u8, tgsi, "MOV OUT[0].w, IN[0].w\n") != null);
     try testing.expect(std.mem.indexOf(u8, tgsi, "END\n") != null);
     try testing.expectEqual(@as(usize, 0), tgsi.len % 4);
+}
+
+test "an f16 function is rejected cleanly, not miscompiled as f64" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const f16_t = try func.types.intern(.{ .float = .f16 });
+    const b = try func.appendBlock();
+    const x = try func.appendBlockParam(b, f16_t);
+    const y = try func.appendBlockParam(b, f16_t);
+    const sum = try func.appendInst(b, f16_t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = y } });
+    func.setTerminator(b, .{ .ret = sum });
+
+    // No `stage` attr is set here on purpose: the f16 gate must fire before `stageOf`
+    // is even consulted, so this proves the gate is the very first thing `lower` does.
+    try testing.expectError(error.Unsupported, lower(allocator, &func));
 }
 
 test "lower an add-with-constant vertex shader (arith_imm + fconst pool) to TGSI" {

@@ -13,8 +13,10 @@ pub const pass_def = pass.Pass{ .name = "dce", .run = run };
 /// Whether an instruction has no side effects, so it may be dropped when unused.
 fn isPure(op: ir.function.Opcode) bool {
     return switch (op) {
-        .iconst, .fconst, .arith, .arith_imm, .icmp, .select, .struct_new, .extract, .convert, .unary, .alloca, .global_addr => true,
-        .load, .store, .@"if", .call, .call_indirect => false,
+        .iconst, .fconst, .arith, .arith_imm, .icmp, .select, .struct_new, .extract, .convert, .unary, .alloca, .global_addr, .dot => true,
+        // A prefetch hint has no result but must be kept, like a store. A
+        // matmul writes the `c` memory, likewise kept.
+        .load, .store, .prefetch, .matmul, .@"if", .call, .call_indirect => false,
     };
 }
 
@@ -47,6 +49,17 @@ fn countUses(func: *const Function, uses: []u32) void {
                 .store => |st| {
                     uses[@intFromEnum(st.value)] += 1;
                     uses[@intFromEnum(st.ptr)] += 1;
+                },
+                .prefetch => |pf| uses[@intFromEnum(pf.ptr)] += 1,
+                .dot => |d| {
+                    uses[@intFromEnum(d.acc)] += 1;
+                    uses[@intFromEnum(d.a)] += 1;
+                    uses[@intFromEnum(d.b)] += 1;
+                },
+                .matmul => |mm| {
+                    uses[@intFromEnum(mm.a)] += 1;
+                    uses[@intFromEnum(mm.b)] += 1;
+                    uses[@intFromEnum(mm.c)] += 1;
                 },
                 .struct_new => |sn| for (func.valueList(sn.fields)) |f| {
                     uses[@intFromEnum(f)] += 1;
@@ -139,6 +152,25 @@ test "keeps an impure call even if its result is unused" {
     const x = try func.appendBlockParam(b, i32_t);
     _ = try func.appendCall(b, i32_t, "sink", &.{x}); // result unused, but a call has effects
     func.setTerminator(b, .{ .ret = x });
+
+    var analyses = pass.Analyses{ .allocator = allocator, .func = &func };
+    defer analyses.deinit();
+    try std.testing.expect(!try run(allocator, &func, &analyses));
+    try std.testing.expectEqual(@as(usize, 1), func.blockInsts(b).len);
+}
+
+test "keeps a matmul even though it has no result to be used" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+
+    const ptr_t = try func.types.intern(.ptr);
+    const b = try func.appendBlock();
+    const a = try func.appendBlockParam(b, ptr_t);
+    const bp = try func.appendBlockParam(b, ptr_t);
+    const c = try func.appendBlockParam(b, ptr_t);
+    try func.appendMatmul(b, a, bp, c, 4, 4, 4, .fp32, false);
+    func.setTerminator(b, .{ .ret = null });
 
     var analyses = pass.Analyses{ .allocator = allocator, .func = &func };
     defer analyses.deinit();

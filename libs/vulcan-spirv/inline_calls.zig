@@ -27,6 +27,15 @@ const op = @import("opcodes.zig");
 
 pub const Error = binary.Error || std.mem.Allocator.Error || error{ Unsupported, MalformedModule, RecursionDetected };
 
+/// Operand `i` of a decoded instruction, or `error.MalformedModule` if the instruction is too
+/// short. `binary.Reader` only guarantees `word_count >= 1`, so a truncated instruction from the
+/// untrusted word stream carries fewer operands than its opcode needs; indexing past them would
+/// read out of bounds. `inlineCalls` is a public entry point over raw `[]const u32`.
+fn operandAt(operands: []const u32, i: usize) Error!u32 {
+    if (i >= operands.len) return error.MalformedModule;
+    return operands[i];
+}
+
 /// One instruction inside a function body: opcode + operand words (arena-owned once cloned).
 const Inst = struct {
     opcode: u16,
@@ -72,11 +81,13 @@ pub fn inlineCalls(gpa: std.mem.Allocator, words: []const u32) Error![]u32 {
         const operands = inst.operands; // borrowed from `words`, safe until return
         switch (inst.opcode) {
             op.Function => {
-                try funcs.append(a, .{ .id = operands[1], .decl = operands });
+                // [resultType, result, control, type]; the result id is used to index callees.
+                try funcs.append(a, .{ .id = try operandAt(operands, 1), .decl = operands });
                 cur_func = &funcs.items[funcs.items.len - 1];
                 cur_block = null;
             },
             op.FunctionParameter => {
+                if (operands.len < 2) return error.MalformedModule; // [type, result]; result read later
                 try (cur_func orelse return error.MalformedModule).params.append(a, .{ .opcode = inst.opcode, .operands = operands });
             },
             op.FunctionEnd => {
@@ -85,7 +96,7 @@ pub fn inlineCalls(gpa: std.mem.Allocator, words: []const u32) Error![]u32 {
             },
             op.Label => {
                 const f = cur_func orelse return error.MalformedModule;
-                try f.blocks.append(a, .{ .label = operands[0] });
+                try f.blocks.append(a, .{ .label = try operandAt(operands, 0) });
                 cur_block = &f.blocks.items[f.blocks.items.len - 1];
             },
             op.Variable => {
@@ -254,6 +265,7 @@ fn inlineFirstCall(ctx: *InlineCtx, func: *Func) Error!bool {
     const blk = func.blocks.items[loc.bi];
     const call = blk.insts.items[loc.ci];
     // [resultType, result, callee, arg0, ...]
+    if (call.operands.len < 3) return error.MalformedModule; // need at least [type, result, callee]
     const ret_id = call.operands[1];
     const callee_id = call.operands[2];
     const args = call.operands[3..];
@@ -329,6 +341,7 @@ fn cloneCallee(ctx: *InlineCtx, callee: *const Func, args: []const u32, cont_lab
     const a = ctx.a;
     var clone: Clone = .{ .entry_label = 0 };
 
+    if (callee.blocks.items.len == 0) return error.MalformedModule; // a callee with no OpLabel
     var remap = std.AutoHashMapUnmanaged(u32, u32).empty;
     for (callee.params.items, 0..) |p, i| try remap.put(a, p.operands[1], args[i]);
     for (callee.locals.items) |lv| try remap.put(a, lv.operands[1], ctx.allocId());
@@ -359,7 +372,8 @@ fn cloneCallee(ctx: *InlineCtx, callee: *const Func, args: []const u32, cont_lab
                     try nb.insts.append(a, .{ .opcode = op.Branch, .operands = try a.dupe(u32, &.{cont_label}) });
                 },
                 op.ReturnValue => {
-                    const v = remap.get(inst.operands[0]) orelse inst.operands[0];
+                    const rv = try operandAt(inst.operands, 0); // [value]
+                    const v = remap.get(rv) orelse rv;
                     try clone.return_edges.append(a, .{ .value = v, .pred_label = nb_label });
                     try nb.insts.append(a, .{ .opcode = op.Branch, .operands = try a.dupe(u32, &.{cont_label}) });
                 },
@@ -687,4 +701,14 @@ test "rejects a recursive call cycle" {
     try b.emit(a, op.FunctionEnd, &.{});
 
     try testing.expectError(error.RecursionDetected, inlineCalls(a, b.words.items));
+}
+
+test "rejects a truncated OpFunction (missing result id)" {
+    const a = testing.allocator;
+    var b = try binary.Builder.init(a, 4);
+    defer b.deinit(a);
+    // OpFunction is [resultType, result, control, type]; this one omits the result id (and
+    // more), so reading operand 1 (used as the callee id) would slice past the instruction.
+    try b.emit(a, op.Function, &.{1});
+    try testing.expectError(error.MalformedModule, inlineCalls(a, b.words.items));
 }

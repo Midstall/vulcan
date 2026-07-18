@@ -97,6 +97,7 @@ fn singleBlockWidenable(func: *const Function) bool {
             },
             .extract => if (!isF32(func, func.valueType(func.instResult(inst).?))) return false,
             .store => |st| if (!isF32(func, func.valueType(st.value))) return false,
+            .prefetch => return false, // scalar-address hint only, not lane-widenable
             else => return false,
         }
     }
@@ -350,6 +351,7 @@ fn emitArm(func: *Function, out: *std.ArrayListUnmanaged(Inst), visited: []bool,
         switch (func.opcode(inst)) {
             .@"if" => return error.NotWidenable,
             .store => return error.NotWidenable, // a predicated store needs real masking
+            .prefetch => return error.NotWidenable, // conservative: no prefetch reaches this shader path
             else => try out.append(func.allocator, inst),
         }
     }
@@ -476,6 +478,12 @@ fn widenFlattened(func: *Function) Error!void {
                 try gatherCall(func, &new_insts, &sampler_map, inst, c, vec_ty, f32_t, ptr_t, u128_t);
             },
             .store => try new_insts.append(func.allocator, inst), // tagged output store of <4 x f32>
+            .prefetch => try new_insts.append(func.allocator, inst), // scalar-address hint, passes through unchanged
+            // dot is an aarch64+dotprod-only INT8 op; a shader function never contains one. Reject
+            // conservatively rather than assume a lane-widening it has never been proven correct for.
+            .dot => return error.NotWidenable,
+            // matmul is an et-soc tensor-tile op; a shader function never contains one either.
+            .matmul => return error.NotWidenable,
             .convert, .call, .global_addr, .@"if" => return error.NotWidenable,
         }
     }

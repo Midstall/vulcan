@@ -189,6 +189,17 @@ fn rewriteUses(func: *Function, subst: std.AutoHashMapUnmanaged(Value, Value)) v
                 st.value = sub(subst, st.value);
                 st.ptr = sub(subst, st.ptr);
             },
+            .prefetch => |*pf| pf.ptr = sub(subst, pf.ptr),
+            .dot => |*d| {
+                d.acc = sub(subst, d.acc);
+                d.a = sub(subst, d.a);
+                d.b = sub(subst, d.b);
+            },
+            .matmul => |*mm| {
+                mm.a = sub(subst, mm.a);
+                mm.b = sub(subst, mm.b);
+                mm.c = sub(subst, mm.c);
+            },
             .struct_new => |sn| for (func.valueListMut(sn.fields)) |*f| {
                 f.* = sub(subst, f.*);
             },

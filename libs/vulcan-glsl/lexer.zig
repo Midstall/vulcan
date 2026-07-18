@@ -302,16 +302,16 @@ pub const Lexer = struct {
 };
 
 fn isDigit(c: u8) bool {
-    return c >= '0' and c <= '9';
+    return std.ascii.isDigit(c);
 }
 fn isHexDigit(c: u8) bool {
-    return isDigit(c) or (c | 0x20 >= 'a' and c | 0x20 <= 'f');
+    return std.ascii.isHex(c);
 }
 fn isIdentStart(c: u8) bool {
-    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_';
+    return std.ascii.isAlphabetic(c) or c == '_';
 }
 fn isIdentCont(c: u8) bool {
-    return isIdentStart(c) or isDigit(c);
+    return isIdentStart(c) or std.ascii.isDigit(c);
 }
 
 test "lexes a tiny function" {

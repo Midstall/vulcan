@@ -87,13 +87,22 @@ fn checkOperandTypes(func: *const Function, diags: *Diagnostics) std.mem.Allocat
     while (bi < func.blockCount()) : (bi += 1) {
         const block: Block = @enumFromInt(bi);
         for (func.blockInsts(block)) |inst| {
-            const mismatch = switch (func.opcode(inst)) {
-                .arith => |a| func.valueType(a.lhs) != func.valueType(a.rhs),
-                .icmp => |c| func.valueType(c.lhs) != func.valueType(c.rhs),
-                else => false,
-            };
-            if (mismatch) {
-                if (func.instResult(inst)) |result| try diags.add(.{ .operand_type_mismatch = result });
+            switch (func.opcode(inst)) {
+                .arith => |a| if (func.valueType(a.lhs) != func.valueType(a.rhs)) {
+                    if (func.instResult(inst)) |result| try diags.add(.{ .operand_type_mismatch = result });
+                },
+                .icmp => |c| if (func.valueType(c.lhs) != func.valueType(c.rhs)) {
+                    if (func.instResult(inst)) |result| try diags.add(.{ .operand_type_mismatch = result });
+                },
+                .dot => |d| if (dotOperandsMismatch(func, inst, d)) {
+                    if (func.instResult(inst)) |result| try diags.add(.{ .operand_type_mismatch = result });
+                },
+                // matmul has no result value, so a mismatch is reported against
+                // `c` (the pointer the tile is written to).
+                .matmul => |mm| if (matmulOperandsMismatch(func, mm)) {
+                    try diags.add(.{ .operand_type_mismatch = mm.c });
+                },
+                else => {},
             }
         }
     }
@@ -122,7 +131,94 @@ fn endianTargetOk(func: *const Function, target: AttrTarget) bool {
 
 fn isMemoryOp(op: Opcode) bool {
     return switch (op) {
-        .load, .store => true,
+        .load, .store, .prefetch, .matmul => true,
+        else => false,
+    };
+}
+
+/// `dot`'s accumulator (and result) must be `<4 x i32>`; `a` and `b` must be
+/// the same `<16 x i8>` (signed) or `<16 x u8>` (unsigned) type.
+fn dotOperandsMismatch(func: *const Function, inst: function.Inst, d: function.Dot) bool {
+    if (!isDotAccType(func, func.valueType(d.acc))) return true;
+    if (func.instResult(inst)) |result| {
+        if (func.valueType(result) != func.valueType(d.acc)) return true;
+    }
+    const a_ty = func.valueType(d.a);
+    const b_ty = func.valueType(d.b);
+    if (a_ty != b_ty) return true;
+    return !isDotDataType(func, a_ty);
+}
+
+/// `<4 x i32>`, the required accumulator/result type of `dot`.
+fn isDotAccType(func: *const Function, ty: Type) bool {
+    return switch (func.types.type_kind(ty)) {
+        .vector => |v| v.len == 4 and isIntOfBits(func, v.elem, 32),
+        else => false,
+    };
+}
+
+/// `<16 x i8>` or `<16 x u8>`, the required `a`/`b` type of `dot`.
+fn isDotDataType(func: *const Function, ty: Type) bool {
+    return switch (func.types.type_kind(ty)) {
+        .vector => |v| v.len == 16 and isIntOfBits(func, v.elem, 8),
+        else => false,
+    };
+}
+
+/// `matmul`'s `a`, `b`, and `c` must all be `ptr` values (`a`/`b` are read
+/// from memory, `c` is where the tile is written). A `quant` epilogue is
+/// int8-only: the et-soc requantize path (scale -> saturate -> pack) only
+/// exists for the int32 accumulator that `dtype == .int8` produces, so any
+/// other dtype paired with a non-null `quant` is rejected here too (reusing
+/// the existing "matmul mismatch reported against c" diagnostic path). A
+/// `per_column` scale is one fp32 scale per output column, so its interned
+/// length must equal `n`; a mismatched length is rejected the same way. A
+/// `bias`, when present, is one int32 per output column added to the int32
+/// accumulator before scaling, so its interned length must equal `n` too;
+/// `zero_point` is a single per-tensor constant so it has no length to check.
+/// `accumulate` (real `C += A*B`) is fp32/fp16-only, so it may not be paired
+/// with a `quant` epilogue (which requantizes an int32 accumulator); that
+/// combination is rejected here too.
+fn matmulOperandsMismatch(func: *const Function, mm: function.MatMul) bool {
+    const quant_mismatch = if (mm.quant) |q| blk: {
+        // The quant epilogue requantizes the int32 accumulator, which only int8 and uint8 inputs
+        // produce (fp32/fp16 accumulate in fp32 TenC that the transform chain cannot consume). Both
+        // signednesses are valid: asymmetric quantization uses unsigned uint8 activations, and the
+        // lowering handles either (both map to the same 8-bit tensor path, di.tt == .int8).
+        if (mm.dtype != .int8 and mm.dtype != .uint8) break :blk true;
+        if (q.bias) |bh| {
+            if (func.biasList(bh).len != mm.n) break :blk true;
+        }
+        break :blk switch (q.scale) {
+            .scalar => false,
+            .per_column => |h| func.scaleList(h).len != mm.n,
+        };
+    } else false;
+    // A per-operand signedness override is only meaningful for the 8-bit integer hardware type:
+    // fp32/fp16 have no signedness to override, and uint8 already spells "both unsigned" via
+    // dtype alone, so requiring dtype == .int8 keeps one canonical spelling per configuration
+    // (symmetric-signed = int8+null, symmetric-unsigned = uint8+null, mixed = int8+input_signs).
+    const signs_mismatch = mm.input_signs != null and mm.dtype != .int8;
+    // `accumulate` (real `C += A*B`) preloads the existing fp32 C tile into the fp32 TenC before the
+    // fma passes. The quant epilogue instead consumes an int32 TenC and writes packed bytes, so an
+    // fp32 C preload is meaningless there. Forbid the pairing uniformly at verify time (the isel
+    // lowering also guards it defensively, for IR that skipped verify).
+    const accumulate_quant_mismatch = mm.accumulate and mm.quant != null;
+    return !isPtrType(func, func.valueType(mm.a)) or
+        !isPtrType(func, func.valueType(mm.b)) or
+        !isPtrType(func, func.valueType(mm.c)) or
+        quant_mismatch or
+        signs_mismatch or
+        accumulate_quant_mismatch;
+}
+
+fn isPtrType(func: *const Function, ty: Type) bool {
+    return func.types.type_kind(ty) == .ptr;
+}
+
+fn isIntOfBits(func: *const Function, ty: Type, bits: u16) bool {
+    return switch (func.types.type_kind(ty)) {
+        .int => |i| i.bits == bits,
         else => false,
     };
 }
@@ -277,6 +373,17 @@ fn checkDominance(func: *const Function, diags: *Diagnostics) std.mem.Allocator.
                 .store => |st| {
                     try checkUse(&dominance, def_block, diags, st.value, bi);
                     try checkUse(&dominance, def_block, diags, st.ptr, bi);
+                },
+                .prefetch => |pf| try checkUse(&dominance, def_block, diags, pf.ptr, bi),
+                .dot => |d| {
+                    try checkUse(&dominance, def_block, diags, d.acc, bi);
+                    try checkUse(&dominance, def_block, diags, d.a, bi);
+                    try checkUse(&dominance, def_block, diags, d.b, bi);
+                },
+                .matmul => |mm| {
+                    try checkUse(&dominance, def_block, diags, mm.a, bi);
+                    try checkUse(&dominance, def_block, diags, mm.b, bi);
+                    try checkUse(&dominance, def_block, diags, mm.c, bi);
                 },
                 .@"if" => |cond| {
                     try checkUse(&dominance, def_block, diags, cond.cond, bi);
@@ -439,6 +546,113 @@ test "arith with mismatched operand types is reported" {
     try std.testing.expectEqual(Diagnostic{ .operand_type_mismatch = sum }, d.items()[0]);
 }
 
+test "f16 value with f16<->f32 width-changing converts verifies clean" {
+    // convert has no dedicated operand/result type check (unlike arith/icmp,
+    // which require exact operand-type equality), so a width-changing
+    // float<->float convert was never rejected in the first place; this pins
+    // that behavior now that f16 is a real FloatKind member.
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+
+    const f16_t = try func.types.intern(.{ .float = .f16 });
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const entry = try func.appendBlock();
+    const half = try func.appendBlockParam(entry, f16_t);
+    const widened = try func.appendInst(entry, f32_t, .{ .convert = .{ .value = half } }); // f16 -> f32
+    const narrowed = try func.appendInst(entry, f16_t, .{ .convert = .{ .value = widened } }); // f32 -> f16
+    const back = try func.appendInst(entry, f32_t, .{ .convert = .{ .value = narrowed } }); // f16 -> f32 again
+    func.setTerminator(entry, .{ .ret = back });
+
+    var d = try verify(std.testing.allocator, &func, .low);
+    defer d.deinit();
+    try std.testing.expect(d.ok());
+}
+
+test "f16 vs f32 operand type mismatch on arith is reported" {
+    // Float types are checked by interned-handle equality, same as any other
+    // type: f16 and f32 are distinct handles, so mixing them in a binary op
+    // is rejected the same way an i32/i64 mismatch already is.
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+
+    const f16_t = try func.types.intern(.{ .float = .f16 });
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const entry = try func.appendBlock();
+    const a = try func.appendBlockParam(entry, f16_t);
+    const b = try func.appendBlockParam(entry, f32_t);
+    const sum = try func.appendInst(entry, f32_t, .{ .arith = .{ .op = .add, .lhs = a, .rhs = b } });
+    func.setTerminator(entry, .{ .ret = sum });
+
+    var d = try verify(std.testing.allocator, &func, .high);
+    defer d.deinit();
+    try std.testing.expect(!d.ok());
+    try std.testing.expectEqual(Diagnostic{ .operand_type_mismatch = sum }, d.items()[0]);
+}
+
+test "dot with matching operand types verifies clean" {
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+
+    const i8_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 8 } });
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const v16i8 = try func.types.intern(.{ .vector = .{ .len = 16, .elem = i8_t } });
+    const v4i32 = try func.types.intern(.{ .vector = .{ .len = 4, .elem = i32_t } });
+    const entry = try func.appendBlock();
+    const acc = try func.appendBlockParam(entry, v4i32);
+    const a = try func.appendBlockParam(entry, v16i8);
+    const b = try func.appendBlockParam(entry, v16i8);
+    const result = try func.appendDot(entry, acc, a, b);
+    func.setTerminator(entry, .{ .ret = result });
+
+    var d = try verify(std.testing.allocator, &func, .low);
+    defer d.deinit();
+    try std.testing.expect(d.ok());
+}
+
+test "dot with mismatched a/b types is reported" {
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+
+    const i8_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 8 } });
+    const i16_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 16 } });
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const v16i8 = try func.types.intern(.{ .vector = .{ .len = 16, .elem = i8_t } });
+    const v16i16 = try func.types.intern(.{ .vector = .{ .len = 16, .elem = i16_t } });
+    const v4i32 = try func.types.intern(.{ .vector = .{ .len = 4, .elem = i32_t } });
+    const entry = try func.appendBlock();
+    const acc = try func.appendBlockParam(entry, v4i32);
+    const a = try func.appendBlockParam(entry, v16i8);
+    const b = try func.appendBlockParam(entry, v16i16); // wrong: does not match a's type
+    const result = try func.appendDot(entry, acc, a, b);
+    func.setTerminator(entry, .{ .ret = result });
+
+    var d = try verify(std.testing.allocator, &func, .low);
+    defer d.deinit();
+    try std.testing.expect(!d.ok());
+    try std.testing.expectEqual(Diagnostic{ .operand_type_mismatch = result }, d.items()[0]);
+}
+
+test "dot with a non-<4 x i32> accumulator is reported" {
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+
+    const i8_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 8 } });
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const v16i8 = try func.types.intern(.{ .vector = .{ .len = 16, .elem = i8_t } });
+    const v4i32 = try func.types.intern(.{ .vector = .{ .len = 4, .elem = i32_t } });
+    const entry = try func.appendBlock();
+    const acc = try func.appendBlockParam(entry, i32_t); // wrong: scalar, not <4 x i32>
+    const a = try func.appendBlockParam(entry, v16i8);
+    const b = try func.appendBlockParam(entry, v16i8);
+    const result = try func.appendInst(entry, v4i32, .{ .dot = .{ .acc = acc, .a = a, .b = b } });
+    func.setTerminator(entry, .{ .ret = result });
+
+    var d = try verify(std.testing.allocator, &func, .low);
+    defer d.deinit();
+    try std.testing.expect(!d.ok());
+    try std.testing.expectEqual(Diagnostic{ .operand_type_mismatch = result }, d.items()[0]);
+}
+
 test "a well-formed function passes verification in both profiles" {
     var func = Function.init(std.testing.allocator);
     defer func.deinit();
@@ -457,6 +671,216 @@ test "a well-formed function passes verification in both profiles" {
     var low = try verify(std.testing.allocator, &func, .low);
     defer low.deinit();
     try std.testing.expect(low.ok());
+}
+
+test "a prefetch hint verifies clean in the low profile and prints as a hint" {
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+
+    const ptr_t = try func.types.intern(.ptr);
+    const entry = try func.appendBlock();
+    const p = try func.appendBlockParam(entry, ptr_t);
+    try func.appendPrefetch(entry, p);
+    func.setTerminator(entry, .{ .ret = null });
+
+    var low = try verify(std.testing.allocator, &func, .low);
+    defer low.deinit();
+    try std.testing.expect(low.ok());
+
+    const text = try std.fmt.allocPrint(std.testing.allocator, "{f}", .{func});
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "prefetch v0") != null);
+}
+
+test "a matmul over pointer operands verifies clean and prints the tile" {
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+
+    const ptr_t = try func.types.intern(.ptr);
+    const entry = try func.appendBlock();
+    const a = try func.appendBlockParam(entry, ptr_t);
+    const b = try func.appendBlockParam(entry, ptr_t);
+    const c = try func.appendBlockParam(entry, ptr_t);
+    try func.appendMatmul(entry, a, b, c, 4, 4, 4, .fp32, false);
+    func.setTerminator(entry, .{ .ret = null });
+
+    var low = try verify(std.testing.allocator, &func, .low);
+    defer low.deinit();
+    try std.testing.expect(low.ok());
+
+    const text = try std.fmt.allocPrint(std.testing.allocator, "{f}", .{func});
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "matmul c=v2, a=v0, b=v1 [4 x 4 x 4] fp32") != null);
+}
+
+test "matmul with a non-pointer operand is reported" {
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+
+    const ptr_t = try func.types.intern(.ptr);
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const entry = try func.appendBlock();
+    const a = try func.appendBlockParam(entry, ptr_t);
+    const b = try func.appendBlockParam(entry, ptr_t);
+    const c = try func.appendBlockParam(entry, i32_t); // wrong: not a pointer
+    try func.appendMatmul(entry, a, b, c, 4, 4, 4, .fp32, false);
+    func.setTerminator(entry, .{ .ret = null });
+
+    var d = try verify(std.testing.allocator, &func, .low);
+    defer d.deinit();
+    try std.testing.expect(!d.ok());
+    try std.testing.expectEqual(Diagnostic{ .operand_type_mismatch = c }, d.items()[0]);
+}
+
+test "an int8 matmul with a mixed input_signs override verifies clean" {
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+
+    const ptr_t = try func.types.intern(.ptr);
+    const entry = try func.appendBlock();
+    const a = try func.appendBlockParam(entry, ptr_t);
+    const b = try func.appendBlockParam(entry, ptr_t);
+    const c = try func.appendBlockParam(entry, ptr_t);
+    try func.appendMatmulSigned(entry, a, b, c, 4, 4, 4, .int8, false, .{ .a_unsigned = true, .b_unsigned = false });
+    func.setTerminator(entry, .{ .ret = null });
+
+    var low = try verify(std.testing.allocator, &func, .low);
+    defer low.deinit();
+    try std.testing.expect(low.ok());
+}
+
+test "a non-int8 matmul with an input_signs override is rejected" {
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+
+    const ptr_t = try func.types.intern(.ptr);
+    const entry = try func.appendBlock();
+    const a = try func.appendBlockParam(entry, ptr_t);
+    const b = try func.appendBlockParam(entry, ptr_t);
+    const c = try func.appendBlockParam(entry, ptr_t);
+    // fp32 has no signedness to override; input_signs is only meaningful paired with .int8.
+    try func.appendMatmulSigned(entry, a, b, c, 4, 4, 4, .fp32, false, .{ .a_unsigned = true, .b_unsigned = false });
+    func.setTerminator(entry, .{ .ret = null });
+
+    var d = try verify(std.testing.allocator, &func, .low);
+    defer d.deinit();
+    try std.testing.expect(!d.ok());
+    try std.testing.expectEqual(Diagnostic{ .operand_type_mismatch = c }, d.items()[0]);
+}
+
+test "a matmul quant epilogue on int8 verifies clean" {
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+
+    const ptr_t = try func.types.intern(.ptr);
+    const entry = try func.appendBlock();
+    const a = try func.appendBlockParam(entry, ptr_t);
+    const b = try func.appendBlockParam(entry, ptr_t);
+    const c = try func.appendBlockParam(entry, ptr_t);
+    try func.appendMatmulQuant(entry, a, b, c, 4, 4, 4, .int8, false, .{ .scale = .{ .scalar = 0x3F000000 }, .relu = true });
+    func.setTerminator(entry, .{ .ret = null });
+
+    var low = try verify(std.testing.allocator, &func, .low);
+    defer low.deinit();
+    try std.testing.expect(low.ok());
+}
+
+test "a matmul quant epilogue with a per_column scale of len==n verifies clean" {
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+
+    const ptr_t = try func.types.intern(.ptr);
+    const entry = try func.appendBlock();
+    const a = try func.appendBlockParam(entry, ptr_t);
+    const b = try func.appendBlockParam(entry, ptr_t);
+    const c = try func.appendBlockParam(entry, ptr_t);
+    try func.appendMatmulQuantPerColumn(entry, a, b, c, 4, 4, 4, .int8, false, true, .i8, &.{ 0x3F800000, 0x3F000000, 0x3E800000, 0x40000000 });
+    func.setTerminator(entry, .{ .ret = null });
+
+    var low = try verify(std.testing.allocator, &func, .low);
+    defer low.deinit();
+    try std.testing.expect(low.ok());
+}
+
+test "a matmul quant epilogue with a per_column scale of len!=n is reported" {
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+
+    const ptr_t = try func.types.intern(.ptr);
+    const entry = try func.appendBlock();
+    const a = try func.appendBlockParam(entry, ptr_t);
+    const b = try func.appendBlockParam(entry, ptr_t);
+    const c = try func.appendBlockParam(entry, ptr_t);
+    try func.appendMatmulQuantPerColumn(entry, a, b, c, 4, 4, 4, .int8, false, true, .i8, &.{ 0x3F800000, 0x3F000000, 0x3E800000 });
+    func.setTerminator(entry, .{ .ret = null });
+
+    var d = try verify(std.testing.allocator, &func, .low);
+    defer d.deinit();
+    try std.testing.expect(!d.ok());
+    try std.testing.expectEqual(Diagnostic{ .operand_type_mismatch = c }, d.items()[0]);
+}
+
+test "a matmul quant epilogue on a non-int8 dtype is reported" {
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+
+    const ptr_t = try func.types.intern(.ptr);
+    const entry = try func.appendBlock();
+    const a = try func.appendBlockParam(entry, ptr_t);
+    const b = try func.appendBlockParam(entry, ptr_t);
+    const c = try func.appendBlockParam(entry, ptr_t);
+    try func.appendMatmulQuant(entry, a, b, c, 4, 4, 4, .fp32, false, .{ .scale = .{ .scalar = 0x3F000000 }, .relu = true });
+    func.setTerminator(entry, .{ .ret = null });
+
+    var d = try verify(std.testing.allocator, &func, .low);
+    defer d.deinit();
+    try std.testing.expect(!d.ok());
+    try std.testing.expectEqual(Diagnostic{ .operand_type_mismatch = c }, d.items()[0]);
+}
+
+test "a matmul quant epilogue with a per-column bias of len==n and a nonzero zero_point verifies clean" {
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+
+    const ptr_t = try func.types.intern(.ptr);
+    const entry = try func.appendBlock();
+    const a = try func.appendBlockParam(entry, ptr_t);
+    const b = try func.appendBlockParam(entry, ptr_t);
+    const c = try func.appendBlockParam(entry, ptr_t);
+    try func.appendMatmulQuantSpec(entry, a, b, c, 4, 4, 4, .int8, false, .{
+        .scale_scalar = 0x3F000000,
+        .bias = &.{ 1, -2, 3, -4 },
+        .zero_point = 17, // nonzero zero-point has no length constraint, must not be flagged
+        .relu = true,
+        .out = .u8,
+    });
+    func.setTerminator(entry, .{ .ret = null });
+
+    var low = try verify(std.testing.allocator, &func, .low);
+    defer low.deinit();
+    try std.testing.expect(low.ok());
+}
+
+test "a matmul quant epilogue with a per-column bias of len!=n is reported" {
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+
+    const ptr_t = try func.types.intern(.ptr);
+    const entry = try func.appendBlock();
+    const a = try func.appendBlockParam(entry, ptr_t);
+    const b = try func.appendBlockParam(entry, ptr_t);
+    const c = try func.appendBlockParam(entry, ptr_t);
+    try func.appendMatmulQuantSpec(entry, a, b, c, 4, 4, 4, .int8, false, .{
+        .scale_scalar = 0x3F000000,
+        .bias = &.{ 1, -2, 3 }, // len 3, n is 4: mismatch
+        .relu = true,
+    });
+    func.setTerminator(entry, .{ .ret = null });
+
+    var d = try verify(std.testing.allocator, &func, .low);
+    defer d.deinit();
+    try std.testing.expect(!d.ok());
+    try std.testing.expectEqual(Diagnostic{ .operand_type_mismatch = c }, d.items()[0]);
 }
 
 test "low profile rejects composite types, high profile allows them" {

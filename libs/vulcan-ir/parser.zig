@@ -50,15 +50,15 @@ pub fn parse(allocator: std.mem.Allocator, text: []const u8) Error!Function {
 }
 
 fn isDigit(c: u8) bool {
-    return c >= '0' and c <= '9';
+    return std.ascii.isDigit(c);
 }
 
 fn isLetter(c: u8) bool {
-    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z');
+    return std.ascii.isAlphabetic(c);
 }
 
 fn isWordChar(c: u8) bool {
-    return isLetter(c) or isDigit(c);
+    return std.ascii.isAlphanumeric(c);
 }
 
 fn allDigits(s: []const u8) bool {
@@ -126,8 +126,14 @@ const FunctionParser = struct {
 
     fn readSigned(self: *FunctionParser) Error!i64 {
         const neg = self.tryChar('-');
-        const mag: i64 = @intCast(try self.readUnsigned());
-        return if (neg) -mag else mag;
+        const mag = try self.readUnsigned();
+        if (neg) {
+            // -(2^63) is a valid i64 even though +2^63 is not, so handle the
+            // boundary explicitly; any larger magnitude is out of range.
+            if (mag == @as(u64, std.math.maxInt(i64)) + 1) return std.math.minInt(i64);
+            return -(std.math.cast(i64, mag) orelse return error.InvalidSyntax);
+        }
+        return std.math.cast(i64, mag) orelse error.InvalidSyntax;
     }
 
     /// Parse a type embedded at the cursor, advancing past it.
@@ -154,6 +160,14 @@ const FunctionParser = struct {
         const num = try self.readUnsigned();
         if (num >= self.value_names.items.len) return error.InvalidSyntax;
         return self.value_names.items[@intCast(num)];
+    }
+
+    /// Convert a parsed block number to a `Block`, rejecting an out-of-range value
+    /// that would later index the block list out of bounds (blocks are precreated
+    /// up front, so the count is final here).
+    fn checkedBlock(self: *FunctionParser, bnum: u32) Error!Block {
+        if (@as(usize, bnum) >= self.func.blockCount()) return error.InvalidSyntax;
+        return @enumFromInt(bnum);
     }
 
     fn parseFunction(self: *FunctionParser) Error!void {
@@ -200,7 +214,7 @@ const FunctionParser = struct {
             try self.eat('(');
             const n = try self.readUnsigned();
             try self.eat(')');
-            return .{ .@"align" = @intCast(n) };
+            return .{ .@"align" = std.math.cast(u32, n) orelse return error.InvalidSyntax };
         }
         if (std.mem.eql(u8, word, "endian")) {
             try self.eat('(');
@@ -252,7 +266,7 @@ const FunctionParser = struct {
         const label = self.readWord();
         if (!std.mem.startsWith(u8, label, "block")) return error.InvalidSyntax;
         const bnum = std.fmt.parseInt(u32, label["block".len..], 10) catch return error.InvalidSyntax;
-        const block: Block = @enumFromInt(bnum);
+        const block = try self.checkedBlock(bnum);
 
         try self.eat('(');
         self.skipWs();
@@ -401,7 +415,7 @@ const FunctionParser = struct {
             if (self.peek() == '.') {
                 self.pos += 1;
                 try self.eat('#');
-                const index: u32 = @intCast(try self.readUnsigned());
+                const index = std.math.cast(u32, try self.readUnsigned()) orelse return error.InvalidSyntax;
                 const field_ty = switch (self.func.types.type_kind(self.func.valueType(lhs))) {
                     .@"struct" => |flds| if (index < flds.len) flds[index] else return error.InvalidSyntax,
                     else => return error.InvalidSyntax,
@@ -660,13 +674,14 @@ const FunctionParser = struct {
         const label = self.readWord();
         if (!std.mem.startsWith(u8, label, "block")) return error.InvalidSyntax;
         const tnum = std.fmt.parseInt(u32, label["block".len..], 10) catch return error.InvalidSyntax;
+        const target = try self.checkedBlock(tnum);
         try self.parseEdgeArgs(list);
-        return @enumFromInt(tnum);
+        return target;
     }
 
     fn parseJump(self: *FunctionParser, block: Block, label: []const u8) Error!void {
         const tnum = std.fmt.parseInt(u32, label["block".len..], 10) catch return error.InvalidSyntax;
-        const target: Block = @enumFromInt(tnum);
+        const target = try self.checkedBlock(tnum);
 
         var args: std.ArrayList(Value) = .empty;
         defer args.deinit(self.allocator());
@@ -1063,4 +1078,11 @@ test "round-trips a function with iadd and a jump" {
     defer func.deinit();
 
     try std.testing.expectFmt(text, "{f}", .{func});
+}
+
+test "regression: rejects an out-of-range block label instead of OOB indexing the block list" {
+    // One block is precreated (the single label line), but it is named block7;
+    // the pre-fix code did @enumFromInt(7) then indexed blocks.items[7] OOB.
+    const text = "fn {\n  block7():\n    ret\n}";
+    try std.testing.expectError(error.InvalidSyntax, parse(std.testing.allocator, text));
 }

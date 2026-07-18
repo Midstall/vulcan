@@ -126,9 +126,104 @@ pub const Load = struct { ptr: Value };
 /// A store to memory. Produces no result.
 pub const Store = struct { value: Value, ptr: Value };
 
+/// A software prefetch hint for the address at `ptr`. Produces no result and has
+/// no observable effect on the function's result, it only hints the backend to
+/// warm the cache ahead of a later access.
+pub const Prefetch = struct { ptr: Value };
+
+/// An INT8 4-way dot-product accumulate: `result = acc + dot(a, b)`. Pure (no
+/// memory effect), like `arith`. `acc` and the result are `<4 x i32>`; `a` and
+/// `b` are the same `<16 x i8>` (signed) or `<16 x u8>` (unsigned) type.
+pub const Dot = struct { acc: Value, a: Value, b: Value };
+
+/// An et-soc fixed-tile matrix multiply: `c := a * b` (or `c += a * b` when
+/// `accumulate`), an `m x k` by `k x n` tile written to `c`. `a`, `b`, and `c`
+/// are `ptr` values; `a` and `b` are read from memory, `c` is where the result
+/// is written. Produces no result. EFFECTFUL (writes memory at `c`).
+///
+/// PRECONDITIONS (the et-soc tensor unit is cache-line addressed, so these are hard
+/// requirements, enforced only by contract in this first slice, not verified):
+///   - `a`, `b`, `c` must be 64-byte aligned. Each `a`/`b` row occupies one 64-byte
+///     cache line (a row of `k`/`n` f32 then padding); the backend builds the load
+///     descriptor by OR-ing static field bits into the low 6 (zero) bits of the pointer,
+///     so an unaligned pointer would corrupt the descriptor. `c` receives `m` rows of
+///     32 bytes each (the fsw.ps readback stride).
+///   - The et-soc backend lowering owns x31/x6 and the TenC registers f0,f2,..,f(2m-2)
+///     across the op, so a matmul must not share a function with live values in those
+///     registers (the current builders only emit it in standalone tensor kernels).
+/// A future auto-recognition pass that emits matmul from a loop nest must guarantee
+/// (or repack for) 64-byte-aligned tiles and honor the register ownership.
+/// Element dtype of a `matmul`'s A/B inputs (its output C is ALWAYS 32-bit: fp32
+/// accumulators for `fp32`/`fp16`, int32 accumulators for `int8`/`uint8`). This is the
+/// op's own metadata (A/B/C are opaque `ptr` values, so `verify` gains no new type check);
+/// it drives the et-soc tensor_fma `type` field and element packing in the backend. The
+/// et-soc tensor unit natively supports these three hardware dtypes (tensors.h `TensorType`:
+/// fp32=0, fp16->fp32=1, int8->int32=3); `int8` and `uint8` share the int8 hardware type and
+/// differ only by the fma `tena`/`tenb_unsigned` bits (uint8 sets them). Encoded as a `u3` in
+/// bitcode. Backends other than the et-soc VPU reject `matmul` regardless of dtype.
+pub const MatMulType = enum(u3) { fp32, fp16, int8, uint8 };
+
+/// The requantize scale for a `matmul` quant epilogue: either one fp32 scalar broadcast to every
+/// output column, or one fp32 scale per output column (per-channel requantization). Both cases are
+/// compile-time constant data, never an IR Value operand: `scalar` stores the fp32 bits directly,
+/// `per_column` stores a handle into the function's `scale_pool` (see `internScales`/`scaleList`).
+pub const MatMulScale = union(enum) {
+    scalar: u32, // fp32 scale reinterpreted as u32, broadcast to every output column
+    per_column: ScaleList, // n fp32-bit scales (one per output column), interned constant data
+};
+
+/// The requantized output element type of a `matmul` quant epilogue: `i8` saturates to signed
+/// int8 (`-128..127`), `u8` saturates to unsigned uint8 (`0..255`). Independent of the matmul's
+/// own `dtype` (the A/B input element type); the packed-byte store is identical either way, only
+/// the saturating transform in the requantize chain differs (see isel.zig's `.matmul` case).
+pub const MatMulQuantOut = enum { i8, u8 };
+
+/// int8-requantize epilogue fused into a `matmul`: after the int32 tile is computed, add `bias`
+/// (per-column, optional), scale it (`scale`, either a scalar or per-column), optionally relu,
+/// saturate to `out` (signed int8 or unsigned uint8), add `zero_point`, and pack. Only valid when
+/// `dtype == .int8` (verify rejects it otherwise); when set, the matmul's C output is one byte per
+/// element (n bytes per row) rather than 32-bit. `bias` and `zero_point` are compile-time constant
+/// data, never IR Value operands, mirroring `scale`'s `per_column` handle: this is what lets
+/// asymmetric-uint8 requantization (bias-correct then re-center on a non-zero output zero-point)
+/// be expressed without adding a new SSA operand that every operand-use pass would need to scan.
+pub const MatMulQuant = struct {
+    scale: MatMulScale,
+    relu: bool,
+    out: MatMulQuantOut = .i8,
+    bias: ?BiasList = null, // optional per-column int32 bias (interned), null = no bias
+    zero_point: i32 = 0, // per-tensor output zero-point, 0 = symmetric (existing behavior)
+};
+
+/// Per-operand signedness override for a `matmul`'s two int8 inputs. When a matmul's
+/// `input_signs` is null (the default), signedness comes from `dtype` (int8 -> both signed,
+/// uint8 -> both unsigned). When non-null it is AUTHORITATIVE per operand (dtype then only
+/// selects the hardware element type), enabling mixed signedness such as uint8 activations
+/// times int8 weights. verify requires `dtype == .int8` when this is set, so each config has one
+/// spelling: symmetric-signed = int8+null, symmetric-unsigned = uint8+null, mixed = int8 + this.
+pub const InputSigns = struct { a_unsigned: bool, b_unsigned: bool };
+
+/// When `embedded` is set, the matmul is NOT the whole reachable function: it sits inside a larger
+/// function with values live across it, so the backend must lower it self-contained (save every
+/// register it clobbers on entry, restore on exit, and hold a/b/c in dedicated registers so the
+/// allocator's placement of them cannot be clobbered). When false (every matmul built today, e.g.
+/// the whole-function recognizer output and every standalone kernel) the backend lowers it with the
+/// zero-overhead standalone-kernel path, byte-identical to before this field existed. Only the
+/// et-soc VPU (riscv64) backend honors `embedded`; no other backend supports matmul at all.
+pub const MatMul = struct { a: Value, b: Value, c: Value, m: u16, n: u16, k: u16, dtype: MatMulType, accumulate: bool, embedded: bool = false, quant: ?MatMulQuant = null, input_signs: ?InputSigns = null };
+
 /// A run of values in the function's value-list pool, used for variadic operands
 /// like the arguments passed across a control-flow edge.
 pub const ValueList = struct { start: u32, len: u32 };
+
+/// A run of interned fp32-bit scales in the function's scale pool, used for a `matmul` quant
+/// epilogue's `per_column` scale. Mirrors `ValueList`, but the pool holds constant data (u32),
+/// never Values, so this is not scanned by any operand-use pass.
+pub const ScaleList = struct { start: u32, len: u32 };
+
+/// A run of interned int32 biases in the function's bias pool, used for a `matmul` quant
+/// epilogue's per-column bias. Mirrors `ScaleList`, but the pool holds signed int32 constant
+/// data, never Values, so this is not scanned by any operand-use pass.
+pub const BiasList = struct { start: u32, len: u32 };
 
 /// An edge to a block, passing arguments to its parameters. Used both as an
 /// unconditional jump and as each side of a conditional branch.
@@ -215,6 +310,14 @@ pub const Opcode = union(enum) {
     load: Load,
     /// A store to memory. Produces no result.
     store: Store,
+    /// A software prefetch hint for an address. Produces no result and has no
+    /// observable effect.
+    prefetch: Prefetch,
+    /// An INT8 4-way dot-product accumulate. Pure, like `arith`.
+    dot: Dot,
+    /// An et-soc fixed-tile matrix multiply. Produces no result. EFFECTFUL
+    /// (writes memory at `c`).
+    matmul: MatMul,
     /// A non-terminating conditional. Produces no result in its statement form.
     @"if": If,
 };
@@ -254,6 +357,12 @@ pub const Function = struct {
     insts: std.ArrayList(InstData),
     values: std.ArrayList(ValueData),
     value_lists: std.ArrayList(Value),
+    /// Interned fp32-bit scales for `matmul` quant `per_column` epilogues. Constant data, not
+    /// Values, so it is never scanned by dce/licm/gvn/schedule/vectorize/remap.
+    scale_pool: std.ArrayList(u32),
+    /// Interned int32 biases for `matmul` quant per-column bias. Constant data, not Values, so
+    /// it is never scanned by dce/licm/gvn/schedule/vectorize/remap, same as `scale_pool`.
+    bias_pool: std.ArrayList(i32),
     attributes: std.ArrayList(AttrEntry),
     /// Callee names referenced by `call` instructions, owned by the function.
     symbols: std.ArrayList([]const u8),
@@ -266,6 +375,8 @@ pub const Function = struct {
             .insts = .empty,
             .values = .empty,
             .value_lists = .empty,
+            .scale_pool = .empty,
+            .bias_pool = .empty,
             .attributes = .empty,
             .symbols = .empty,
         };
@@ -280,6 +391,8 @@ pub const Function = struct {
         self.insts.deinit(self.allocator);
         self.values.deinit(self.allocator);
         self.value_lists.deinit(self.allocator);
+        self.scale_pool.deinit(self.allocator);
+        self.bias_pool.deinit(self.allocator);
         for (self.attributes.items) |entry| self.freeAttr(entry.attr);
         self.attributes.deinit(self.allocator);
         for (self.symbols.items) |s| self.allocator.free(s);
@@ -465,6 +578,84 @@ pub const Function = struct {
         try self.appendStmt(block, .{ .store = .{ .value = value, .ptr = ptr } });
     }
 
+    /// Append a software prefetch hint for `ptr` to a block. No observable effect.
+    pub fn appendPrefetch(self: *Function, block: Block, ptr: Value) std.mem.Allocator.Error!void {
+        try self.appendStmt(block, .{ .prefetch = .{ .ptr = ptr } });
+    }
+
+    /// Append an INT8 4-way dot-product accumulate: `result = acc + dot(a, b)`.
+    /// Pure, like `arith`. The result type is `acc`'s type.
+    pub fn appendDot(self: *Function, block: Block, acc: Value, a: Value, b: Value) std.mem.Allocator.Error!Value {
+        return self.appendInst(block, self.valueType(acc), .{ .dot = .{ .acc = acc, .a = a, .b = b } });
+    }
+
+    /// Append an et-soc fixed-tile matrix multiply to a block: `c := a * b`
+    /// (or `c += a * b` when `accumulate`), an `m x k` by `k x n` tile. No
+    /// result. EFFECTFUL (writes memory at `c`).
+    pub fn appendMatmul(self: *Function, block: Block, a: Value, b: Value, c: Value, m: u16, n: u16, k: u16, dtype: MatMulType, accumulate: bool) std.mem.Allocator.Error!void {
+        try self.appendStmt(block, .{ .matmul = .{ .a = a, .b = b, .c = c, .m = m, .n = n, .k = k, .dtype = dtype, .accumulate = accumulate } });
+    }
+
+    /// Append a `matmul` with an explicit per-operand signedness override (see `InputSigns`),
+    /// e.g. uint8 activations times int8 weights. Only meaningful when `dtype == .int8`; verify
+    /// rejects any other dtype paired with a non-null `input_signs`.
+    pub fn appendMatmulSigned(self: *Function, block: Block, a: Value, b: Value, c: Value, m: u16, n: u16, k: u16, dtype: MatMulType, accumulate: bool, input_signs: InputSigns) std.mem.Allocator.Error!void {
+        try self.appendStmt(block, .{ .matmul = .{ .a = a, .b = b, .c = c, .m = m, .n = n, .k = k, .dtype = dtype, .accumulate = accumulate, .input_signs = input_signs } });
+    }
+
+    /// Append a self-contained (`embedded`) `matmul`: identical to `appendMatmul`/`appendMatmulSigned`
+    /// except the op is marked `embedded`, so the backend saves/restores every register it clobbers
+    /// and holds a/b/c in dedicated registers. This is the builder a non-whole-function recognizer
+    /// uses when it raises a matmul into a function that has code (and live values) around it. Pass a
+    /// non-null `input_signs` for a mixed-signedness int8 matmul, else null (the symmetric cases).
+    pub fn appendMatmulEmbedded(self: *Function, block: Block, a: Value, b: Value, c: Value, m: u16, n: u16, k: u16, dtype: MatMulType, accumulate: bool, input_signs: ?InputSigns) std.mem.Allocator.Error!void {
+        try self.appendStmt(block, .{ .matmul = .{ .a = a, .b = b, .c = c, .m = m, .n = n, .k = k, .dtype = dtype, .accumulate = accumulate, .embedded = true, .input_signs = input_signs } });
+    }
+
+    /// Append a `matmul` with a fused int8-requantize epilogue (see `MatMulQuant`). Only meaningful
+    /// when `dtype == .int8`; verify rejects any other dtype paired with a non-null `quant`.
+    pub fn appendMatmulQuant(self: *Function, block: Block, a: Value, b: Value, c: Value, m: u16, n: u16, k: u16, dtype: MatMulType, accumulate: bool, quant: MatMulQuant) std.mem.Allocator.Error!void {
+        try self.appendStmt(block, .{ .matmul = .{ .a = a, .b = b, .c = c, .m = m, .n = n, .k = k, .dtype = dtype, .accumulate = accumulate, .quant = quant } });
+    }
+
+    /// Append a `matmul` with a fused int8-requantize epilogue using a `per_column` scale: `scales`
+    /// (fp32 bits, one per output column, `scales.len == n`) is interned as compile-time constant
+    /// data into the scale pool, not an IR Value operand. Only meaningful when `dtype == .int8`;
+    /// verify rejects any other dtype paired with a non-null `quant`, and rejects a per_column
+    /// scale whose length does not equal `n`.
+    pub fn appendMatmulQuantPerColumn(self: *Function, block: Block, a: Value, b: Value, c: Value, m: u16, n: u16, k: u16, dtype: MatMulType, accumulate: bool, relu: bool, out: MatMulQuantOut, scales: []const u32) std.mem.Allocator.Error!void {
+        const h = try self.internScales(scales);
+        try self.appendStmt(block, .{ .matmul = .{ .a = a, .b = b, .c = c, .m = m, .n = n, .k = k, .dtype = dtype, .accumulate = accumulate, .quant = .{ .scale = .{ .per_column = h }, .relu = relu, .out = out } } });
+    }
+
+    /// A `MatMulQuant` builder in un-interned, caller-friendly form: `bias`/`scale_per_column` are
+    /// plain slices, interned into this function's pools by `appendMatmulQuantSpec`. Exists to tame
+    /// the growing knob count on the quant epilogue (scale kind, bias, zero-point, relu, out) behind
+    /// one call instead of a builder-per-combination; `appendMatmulQuant`/`appendMatmulQuantPerColumn`
+    /// remain for the two original simple cases.
+    pub const MatMulQuantSpec = struct {
+        scale_scalar: ?u32 = null, // set EXACTLY one of scale_scalar / scale_per_column
+        scale_per_column: ?[]const u32 = null,
+        bias: ?[]const i32 = null, // per-column int32 bias, len must be n (verify enforces)
+        zero_point: i32 = 0,
+        relu: bool = false,
+        out: MatMulQuantOut = .i8,
+        input_signs: ?InputSigns = null, // optional per-operand signedness override, see `InputSigns`
+    };
+
+    /// Append a `matmul` with a fused quant epilogue built from a `MatMulQuantSpec`: interns
+    /// `scale_per_column`/`bias` (whichever is set) into this function's pools and appends the
+    /// resulting `MatMulQuant`. See `MatMulQuantSpec` and `MatMulQuant` for field semantics.
+    pub fn appendMatmulQuantSpec(self: *Function, block: Block, a: Value, b: Value, c: Value, m: u16, n: u16, k: u16, dtype: MatMulType, accumulate: bool, spec: MatMulQuantSpec) std.mem.Allocator.Error!void {
+        std.debug.assert((spec.scale_scalar == null) != (spec.scale_per_column == null)); // exactly one
+        const scale: MatMulScale = if (spec.scale_scalar) |sb|
+            .{ .scalar = sb }
+        else
+            .{ .per_column = try self.internScales(spec.scale_per_column.?) };
+        const bias: ?BiasList = if (spec.bias) |bb| try self.internBias(bb) else null;
+        try self.appendStmt(block, .{ .matmul = .{ .a = a, .b = b, .c = c, .m = m, .n = n, .k = k, .dtype = dtype, .accumulate = accumulate, .quant = .{ .scale = scale, .relu = spec.relu, .out = spec.out, .bias = bias, .zero_point = spec.zero_point }, .input_signs = spec.input_signs } });
+    }
+
     /// Append `lhs <op> imm`, returning the result value of type `ty`.
     pub fn appendArithImm(self: *Function, block: Block, ty: Type, op: BinOp, lhs: Value, imm: i64) std.mem.Allocator.Error!Value {
         return self.appendInst(block, ty, .{ .arith_imm = .{ .op = op, .lhs = lhs, .imm = imm } });
@@ -581,6 +772,17 @@ pub const Function = struct {
                     st.value = r(from, to, st.value);
                     st.ptr = r(from, to, st.ptr);
                 },
+                .prefetch => |*pf| pf.ptr = r(from, to, pf.ptr),
+                .dot => |*d| {
+                    d.acc = r(from, to, d.acc);
+                    d.a = r(from, to, d.a);
+                    d.b = r(from, to, d.b);
+                },
+                .matmul => |*mm| {
+                    mm.a = r(from, to, mm.a);
+                    mm.b = r(from, to, mm.b);
+                    mm.c = r(from, to, mm.c);
+                },
                 .struct_new => |sn| for (self.valueListMut(sn.fields)) |*f| {
                     f.* = r(from, to, f.*);
                 },
@@ -678,6 +880,32 @@ pub const Function = struct {
         return self.value_lists.items[list.start..][0..list.len];
     }
 
+    /// Copy fp32-bit scales into the scale pool, returning a handle to the run. Used for a
+    /// `matmul` quant epilogue's `per_column` scale: compile-time constant data, not Values.
+    pub fn internScales(self: *Function, scales: []const u32) std.mem.Allocator.Error!ScaleList {
+        const start: u32 = @intCast(self.scale_pool.items.len);
+        try self.scale_pool.appendSlice(self.allocator, scales);
+        return .{ .start = start, .len = @intCast(scales.len) };
+    }
+
+    /// Resolve a scale-list handle to its slice.
+    pub fn scaleList(self: *const Function, list: ScaleList) []const u32 {
+        return self.scale_pool.items[list.start..][0..list.len];
+    }
+
+    /// Copy int32 biases into the bias pool, returning a handle to the run. Used for a `matmul`
+    /// quant epilogue's per-column bias: compile-time constant data, not Values.
+    pub fn internBias(self: *Function, bias: []const i32) std.mem.Allocator.Error!BiasList {
+        const start: u32 = @intCast(self.bias_pool.items.len);
+        try self.bias_pool.appendSlice(self.allocator, bias);
+        return .{ .start = start, .len = @intCast(bias.len) };
+    }
+
+    /// Resolve a bias-list handle to its slice.
+    pub fn biasList(self: *const Function, list: BiasList) []const i32 {
+        return self.bias_pool.items[list.start..][0..list.len];
+    }
+
     /// The block's terminator, or null if it has not been set yet.
     pub fn terminator(self: *const Function, block: Block) ?Terminator {
         return self.blocks.items[@intFromEnum(block)].term;
@@ -755,6 +983,60 @@ pub const Function = struct {
         return false;
     }
 };
+
+/// True when `ty` is f16 itself, or a vector/array/slice/struct that contains f16 anywhere in
+/// its structure. Recursion always terminates: a composite can only reference an already-
+/// interned element type, so the type table has no cycles.
+fn typeContainsF16(table: *const TypeTable, ty: Type) bool {
+    return switch (table.type_kind(ty)) {
+        .float => |f| f == .f16,
+        .vector => |v| typeContainsF16(table, v.elem),
+        .array => |a| typeContainsF16(table, a.elem),
+        .slice => |s| typeContainsF16(table, s.elem),
+        .@"struct" => |fields| for (fields) |field| {
+            if (typeContainsF16(table, field)) break true;
+        } else false,
+        .bool, .int, .ptr => false,
+    };
+}
+
+/// True when any value in `func` (a block param or an instruction result) has a type that
+/// contains f16, at any depth. No backend lowers f16 yet, and several would silently size or
+/// treat it as f64 if it reached them (a miscompile), so every backend's compile/emit entry
+/// calls this first and returns error.Unsupported rather than risk that. Whole-function scan
+/// is conservative on purpose: rejecting an f16 value in dead code is acceptable, silently
+/// mis-lowering a live one is not.
+pub fn functionUsesF16(func: *const Function) bool {
+    var i: usize = 0;
+    while (i < func.valueCount()) : (i += 1) {
+        const value: Value = @enumFromInt(@as(u32, @intCast(i)));
+        if (typeContainsF16(&func.types, func.valueType(value))) return true;
+    }
+    return false;
+}
+
+/// True when any value has f16 nested inside a COMPOSITE (vector/array/slice/struct), as opposed to
+/// a bare scalar f16. The scalar-f16 backends (aarch64/riscv64/wasm/x86_64) lower scalar f16 (held as
+/// its f32 widening, converted at boundaries) but have NO path for f16 packed into a vector or
+/// aggregate: such a value would fall through to the raw-vector/aggregate lowering and silently
+/// miscompile the half lanes. Those backends call this after they stopped rejecting scalar f16, and
+/// reject a composite-f16 function cleanly. No frontend produces composite f16 today (the vectorizer
+/// works on f32/i32), so this never fires in practice; it is a defensive guard against a latent
+/// silent miscompile, not a live limitation.
+pub fn functionUsesCompositeF16(func: *const Function) bool {
+    var i: usize = 0;
+    while (i < func.valueCount()) : (i += 1) {
+        const value: Value = @enumFromInt(@as(u32, @intCast(i)));
+        const ty = func.valueType(value);
+        switch (func.types.type_kind(ty)) {
+            // A bare scalar float (f16/f32/f64) is handled directly; only f16 wrapped in a composite
+            // is unsupported.
+            .float => {},
+            else => if (typeContainsF16(&func.types, ty)) return true,
+        }
+    }
+    return false;
+}
 
 /// Render an attribute's body (the text inside the `#[...]`).
 fn printAttr(w: *std.Io.Writer, attr: Attribute) std.Io.Writer.Error!void {
@@ -883,6 +1165,37 @@ fn printInst(self: *const Function, w: *std.Io.Writer, inst: Inst) std.Io.Writer
             self.valueName(ld.ptr),
         }),
         .store => |st| try w.print("store v{d}, v{d}", .{ self.valueName(st.value), self.valueName(st.ptr) }),
+        .prefetch => |pf| try w.print("prefetch v{d}", .{self.valueName(pf.ptr)}),
+        .dot => |d| try w.print("let v{d} = dot v{d}, v{d}, v{d}", .{
+            self.valueName(data.result.?),
+            self.valueName(d.acc),
+            self.valueName(d.a),
+            self.valueName(d.b),
+        }),
+        .matmul => |mm| {
+            try w.print("matmul c=v{d}, a=v{d}, b=v{d} [{d} x {d} x {d}] {s}", .{
+                self.valueName(mm.c),
+                self.valueName(mm.a),
+                self.valueName(mm.b),
+                mm.m,
+                mm.n,
+                mm.k,
+                @tagName(mm.dtype),
+            });
+            if (mm.embedded) try w.writeAll(" embedded");
+            if (mm.input_signs) |s| {
+                try w.print(" a_uns={},b_uns={}", .{ s.a_unsigned, s.b_unsigned });
+            }
+            if (mm.quant) |q| {
+                switch (q.scale) {
+                    .scalar => |bits| try w.print(" quant(scalar=0x{X},relu={},{s}", .{ bits, q.relu, @tagName(q.out) }),
+                    .per_column => |h| try w.print(" quant(per_col[{d}],relu={},{s}", .{ self.scaleList(h).len, q.relu, @tagName(q.out) }),
+                }
+                if (q.bias) |bh| try w.print(",bias[{d}]", .{self.biasList(bh).len}) else try w.writeAll(",bias=none");
+                if (q.zero_point != 0) try w.print(",zp={d}", .{q.zero_point});
+                try w.writeAll(")");
+            }
+        },
         .@"if" => |cond| {
             try w.print("if v{d} ", .{self.valueName(cond.cond)});
             try w.writeAll("{ ");
@@ -1001,6 +1314,68 @@ test "store writes a value to a pointer" {
     const op = func.opcode(insts[insts.len - 1]);
     try std.testing.expectEqual(x, op.store.value);
     try std.testing.expectEqual(p, op.store.ptr);
+}
+
+test "prefetch hints an address and has no result" {
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+
+    const ptr_t = try func.types.intern(.ptr);
+    const entry = try func.appendBlock();
+    const p = try func.appendBlockParam(entry, ptr_t);
+    try func.appendPrefetch(entry, p);
+
+    const insts = func.blockInsts(entry);
+    const op = func.opcode(insts[insts.len - 1]);
+    try std.testing.expectEqual(p, op.prefetch.ptr);
+    try std.testing.expectEqual(null, func.instResult(insts[insts.len - 1]));
+}
+
+test "dot accumulates a 4-way INT8 dot-product" {
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+
+    const i8_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 8 } });
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const v16i8 = try func.types.intern(.{ .vector = .{ .len = 16, .elem = i8_t } });
+    const v4i32 = try func.types.intern(.{ .vector = .{ .len = 4, .elem = i32_t } });
+
+    const entry = try func.appendBlock();
+    const acc = try func.appendBlockParam(entry, v4i32);
+    const a = try func.appendBlockParam(entry, v16i8);
+    const b = try func.appendBlockParam(entry, v16i8);
+    const result = try func.appendDot(entry, acc, a, b);
+
+    try std.testing.expectEqual(v4i32, func.valueType(result));
+    const insts = func.blockInsts(entry);
+    const op = func.opcode(insts[insts.len - 1]);
+    try std.testing.expectEqual(acc, op.dot.acc);
+    try std.testing.expectEqual(a, op.dot.a);
+    try std.testing.expectEqual(b, op.dot.b);
+}
+
+test "matmul writes c from a and b tile and has no result" {
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+
+    const ptr_t = try func.types.intern(.ptr);
+    const entry = try func.appendBlock();
+    const a = try func.appendBlockParam(entry, ptr_t);
+    const b = try func.appendBlockParam(entry, ptr_t);
+    const c = try func.appendBlockParam(entry, ptr_t);
+    try func.appendMatmul(entry, a, b, c, 4, 4, 4, .int8, false);
+
+    const insts = func.blockInsts(entry);
+    const op = func.opcode(insts[insts.len - 1]);
+    try std.testing.expectEqual(a, op.matmul.a);
+    try std.testing.expectEqual(b, op.matmul.b);
+    try std.testing.expectEqual(c, op.matmul.c);
+    try std.testing.expectEqual(@as(u16, 4), op.matmul.m);
+    try std.testing.expectEqual(@as(u16, 4), op.matmul.n);
+    try std.testing.expectEqual(@as(u16, 4), op.matmul.k);
+    try std.testing.expectEqual(MatMulType.int8, op.matmul.dtype);
+    try std.testing.expectEqual(false, op.matmul.accumulate);
+    try std.testing.expectEqual(null, func.instResult(insts[insts.len - 1]));
 }
 
 test "struct construction prints its fields" {
@@ -1283,4 +1658,76 @@ test "printing a conditional branch" {
         \\    ret void
         \\}
     , "{f}", .{func});
+}
+
+test "functionUsesF16 is false for a function with no f16 values" {
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const block = try func.appendBlock();
+    _ = try func.appendBlockParam(block, i32_t);
+    _ = try func.appendInst(block, f32_t, .{ .iconst = 0 });
+
+    try std.testing.expect(!functionUsesF16(&func));
+}
+
+test "functionUsesF16 is true for an f16 block param" {
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+
+    const f16_t = try func.types.intern(.{ .float = .f16 });
+    const block = try func.appendBlock();
+    _ = try func.appendBlockParam(block, f16_t);
+
+    try std.testing.expect(functionUsesF16(&func));
+}
+
+test "functionUsesF16 is true for an f16 instruction result" {
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+
+    const f16_t = try func.types.intern(.{ .float = .f16 });
+    const block = try func.appendBlock();
+    _ = try func.appendInst(block, f16_t, .{ .iconst = 0 });
+
+    try std.testing.expect(functionUsesF16(&func));
+}
+
+test "functionUsesF16 sees f16 nested inside a vector" {
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+
+    const f16_t = try func.types.intern(.{ .float = .f16 });
+    const vec_t = try func.types.intern(.{ .vector = .{ .len = 4, .elem = f16_t } });
+    const block = try func.appendBlock();
+    _ = try func.appendBlockParam(block, vec_t);
+
+    try std.testing.expect(functionUsesF16(&func));
+}
+
+test "functionUsesF16 sees f16 nested inside an array" {
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+
+    const f16_t = try func.types.intern(.{ .float = .f16 });
+    const arr_t = try func.types.intern(.{ .array = .{ .len = 2, .elem = f16_t } });
+    const block = try func.appendBlock();
+    _ = try func.appendBlockParam(block, arr_t);
+
+    try std.testing.expect(functionUsesF16(&func));
+}
+
+test "functionUsesF16 sees f16 nested inside a struct field" {
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const f16_t = try func.types.intern(.{ .float = .f16 });
+    const struct_t = try func.types.intern(.{ .@"struct" = &.{ i32_t, f16_t } });
+    const block = try func.appendBlock();
+    _ = try func.appendBlockParam(block, struct_t);
+
+    try std.testing.expect(functionUsesF16(&func));
 }

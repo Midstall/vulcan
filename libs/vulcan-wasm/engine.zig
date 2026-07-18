@@ -2,9 +2,12 @@
 //! memory/globals/table/imports, and call its exports with a typed interface. Runnable
 //! layer over `lower.zig` and `vulcan-target.native` (host JIT).
 //!
-//! Lowered functions take one hidden "context" pointer to four base pointers
-//! (memory, globals, table, imports) at fixed offsets. `Instance` builds and owns that
-//! context. Callers pass only the Wasm arguments.
+//! Lowered functions take one hidden "context" pointer to five base pointers at fixed
+//! offsets: memory (0), globals (8), table (16), imports (24), and an opaque
+//! import-context (32) that host imports receive as their hidden first argument.
+//! `Instance` builds and owns that context; callers pass only the Wasm arguments. The
+//! import-context lets a host-import layer (e.g. WASI) reach per-instance state without a
+//! global, so multiple instances can run side by side. Set it with `setImportContext`.
 
 const std = @import("std");
 const lower = @import("lower.zig");
@@ -31,8 +34,10 @@ pub const Instance = struct {
     globals: []i64,
     table: []usize,
     imports: []usize,
-    /// Base pointers passed to functions: [memory, globals, table, imports].
-    context: [4]usize align(8),
+    /// Base pointers passed to functions: [memory, globals, table, imports, import_ctx].
+    /// The last slot is an opaque per-instance pointer forwarded to host imports (see
+    /// `setImportContext`); 0 until set.
+    context: [5]usize align(8),
 
     /// Load, JIT (host's default provider), and set up a module. `host_imports` gives
     /// the host address for each import in `module.imports` order. Caller owns it.
@@ -53,9 +58,17 @@ pub const Instance = struct {
         errdefer jitted.deinit();
 
         // Linear memory: declared size, grown to cover the data segments, zeroed then
-        // initialized.
-        var mem_bytes: usize = @as(usize, module.min_pages) * page_size;
-        for (module.data) |seg| mem_bytes = @max(mem_bytes, seg.offset + seg.bytes.len);
+        // initialized. `min_pages` and the data-segment offsets are untrusted, so bound the
+        // request against the Wasm architectural limit (65536 pages = 4 GiB) and do the size
+        // math checked so a tiny hostile module cannot drive an unbounded/overflowing alloc.
+        const max_pages: u32 = 65536;
+        if (module.min_pages > max_pages) return error.InvalidWasm;
+        var mem_bytes: usize = std.math.mul(usize, module.min_pages, page_size) catch return error.InvalidWasm;
+        for (module.data) |seg| {
+            const end = std.math.add(usize, seg.offset, seg.bytes.len) catch return error.InvalidWasm;
+            mem_bytes = @max(mem_bytes, end);
+        }
+        if (mem_bytes > @as(usize, max_pages) * page_size) return error.InvalidWasm;
         const memory = try allocator.alloc(u8, mem_bytes);
         errdefer allocator.free(memory);
         @memset(memory, 0);
@@ -65,11 +78,18 @@ pub const Instance = struct {
         errdefer allocator.free(globals);
         for (module.globals, 0..) |g, i| globals[i] = g.value;
 
-        // The function table holds the JITed address of each referenced function.
+        // The function table holds the JITed address of each referenced function. Element
+        // segments carry *combined* function indices (imports occupy the low indices, then
+        // defined functions), and the index is untrusted. The table can only reference
+        // defined functions we JITed, so reject an import-range or out-of-range index rather
+        // than indexing `module.functions` out of bounds.
         const table = try allocator.alloc(usize, module.table.len);
         errdefer allocator.free(table);
+        const n_imports = module.imports.len;
         for (module.table, 0..) |func_idx, t| {
-            const name = module.functions[func_idx].name;
+            const fi: usize = func_idx;
+            if (fi < n_imports or fi - n_imports >= module.functions.len) return error.InvalidWasm;
+            const name = module.functions[fi - n_imports].name;
             table[t] = @intFromPtr(jitted.entry(*const fn () callconv(.c) void, name) orelse return error.MissingExport);
         }
 
@@ -85,8 +105,16 @@ pub const Instance = struct {
             .globals = globals,
             .table = table,
             .imports = imports,
-            .context = .{ @intFromPtr(memory.ptr), @intFromPtr(globals.ptr), @intFromPtr(table.ptr), @intFromPtr(imports.ptr) },
+            .context = .{ @intFromPtr(memory.ptr), @intFromPtr(globals.ptr), @intFromPtr(table.ptr), @intFromPtr(imports.ptr), 0 },
         };
+    }
+
+    /// Bind the opaque import-context pointer that every host import receives as its
+    /// hidden first argument. A host-import layer (e.g. WASI) points this at its
+    /// per-instance state so it can reach this instance's memory/args without a global.
+    /// `ptr` must outlive any call that reaches an import. Pass null to clear it.
+    pub fn setImportContext(self: *Instance, ptr: ?*anyopaque) void {
+        self.context[4] = if (ptr) |p| @intFromPtr(p) else 0;
     }
 
     pub fn deinit(self: *Instance) void {

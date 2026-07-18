@@ -109,13 +109,15 @@ const Cursor = struct {
     data: []const u8,
     pos: usize = 0,
     fn takeU32(self: *Cursor) Error!u32 {
-        if (self.pos + 4 > self.data.len) return error.MalformedBitcode;
+        // Subtraction form: `self.pos` is invariant `<= self.data.len`, so this
+        // can't wrap on a 32-bit usize the way `self.pos + 4` could.
+        if (4 > self.data.len - self.pos) return error.MalformedBitcode;
         const v = std.mem.readInt(u32, self.data[self.pos..][0..4], .little);
         self.pos += 4;
         return v;
     }
     fn takeBytes(self: *Cursor, len: u32) Error![]const u8 {
-        if (self.pos + len > self.data.len) return error.MalformedBitcode;
+        if (len > self.data.len - self.pos) return error.MalformedBitcode;
         const s = self.data[self.pos .. self.pos + len];
         self.pos += len;
         return s;
