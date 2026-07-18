@@ -26,6 +26,7 @@ pub const detectHost = registry.detectHost;
 pub const schedule = @import("microarch/schedule.zig");
 pub const cost = @import("microarch/cost.zig");
 pub const unroll = @import("microarch/unroll.zig");
+pub const splitunroll = @import("microarch/splitunroll.zig");
 pub const prefetch = @import("microarch/prefetch.zig");
 pub const dotprod = @import("microarch/dotprod.zig");
 // Matmul-nest recognition: raises a naive fp32 triply-nested matmul loop to the et-soc tensor `matmul`
@@ -48,6 +49,11 @@ pub fn model(tag: Microarch) *const Model {
 /// changes results, only order. Not calling this function leaves today's behavior exactly as it is:
 /// the whole feature is opt-in.
 pub fn optimize(allocator: std.mem.Allocator, func: *ir.function.Function, m: *const Model) pass.Error!bool {
+    // Accumulator-splitting unroll of counted reduction loops runs FIRST: it rewrites a reduction
+    // loop into a main loop carrying K independent partial accumulators plus a remainder loop, so the
+    // loop-carried dependency is one op instead of K. The general guarded unroller then handles
+    // whatever loops this did not (non-reduction loops, and the small remainder loops it leaves).
+    const split = try splitunroll.run(allocator, func, m);
     const unrolled = try unroll.run(allocator, func, m);
     const vectorized = try vectorize.runModel(allocator, func, m);
     // INT8 dot-product recognition runs after the general vectorizer (it needs the scalar reduction
@@ -60,7 +66,7 @@ pub fn optimize(allocator: std.mem.Allocator, func: *ir.function.Function, m: *c
     const matmuled = try matmul_recog.run(allocator, func, m);
     const prefetched = try prefetch.run(allocator, func, m);
     try schedule.run(allocator, func, m);
-    return unrolled or vectorized or dotted or matmuled or prefetched;
+    return split or unrolled or vectorized or dotted or matmuled or prefetched;
 }
 
 test {

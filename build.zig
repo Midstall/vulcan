@@ -268,6 +268,21 @@ pub fn build(b: *std.Build) void {
     }) });
     test_step.dependOn(&b.addRunArtifact(unroll_diff).step);
 
+    // Accumulator-splitting unroll differential oracle: build a reduction twice, split-unroll one copy
+    // (main loop with K independent partials + remainder), JIT both on the host, and require identical
+    // results for every input (including trip counts not divisible by K, and below K).
+    const splitunroll_diff = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("libs/vulcan-target/tests/splitunroll_differential.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "vulcan-ir", .module = vulcan_ir },
+            .{ .name = "vulcan-opt", .module = vulcan_opt },
+            .{ .name = "vulcan-target", .module = vulcan_target },
+        },
+    }) });
+    test_step.dependOn(&b.addRunArtifact(splitunroll_diff).step);
+
     // Prefetch differential oracle: build a function twice, hand-insert a `prefetch`
     // hint in one copy, JIT both on the host, and require identical results for every
     // input. Proves the PRFM (aarch64) / dropped-hint (elsewhere) lowering has no
