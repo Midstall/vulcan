@@ -107,12 +107,21 @@ fn argReg(i: usize) encode.Reg {
 fn loadImmInto(allocator: std.mem.Allocator, words: *std.ArrayList(u32), reg: encode.Reg, val: i64) std.mem.Allocator.Error!void {
     if (val >= -2048 and val <= 2047) {
         try words.append(allocator, encode.addi(reg, .x0, @intCast(val)));
-    } else {
+    } else if (val >= std.math.minInt(i32) and val <= std.math.maxInt(i32)) {
         const bits: u32 = @bitCast(@as(i32, @intCast(val)));
         const hi: u20 = @truncate((bits +% 0x800) >> 12);
         const lo: i12 = @bitCast(@as(u12, @truncate(bits)));
         try words.append(allocator, encode.lui(reg, hi));
         try words.append(allocator, encode.addi(reg, reg, lo));
+    } else {
+        // Full 64-bit argument (e.g. a value with clean high bits above a negative low word): emit the
+        // top 9 bits, then five 11-bit chunks from high to low, mirroring isel's loadImm64.
+        const bits: u64 = @bitCast(val);
+        try words.append(allocator, encode.addi(reg, .x0, @intCast(bits >> 55)));
+        for ([_]u6{ 44, 33, 22, 11, 0 }) |sh| {
+            try words.append(allocator, encode.slli(reg, reg, 11));
+            try words.append(allocator, encode.ori(reg, reg, @intCast((bits >> sh) & 0x7ff)));
+        }
     }
 }
 

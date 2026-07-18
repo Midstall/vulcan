@@ -2848,7 +2848,27 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                             return error.Unsupported; // f32<->f64 (no f16) not yet lowered
                         }
                     } else if (src_float == dst_float) {
-                        return error.Unsupported; // int<->int later
+                        // int <-> int width change. Widening extends by the SOURCE signedness
+                        // (sign-extend a signed source, zero-extend an unsigned one); same-width or
+                        // narrowing keeps the low bits. Values live in 64-bit registers, so a widen
+                        // shifts the source up to its top bit then arithmetic/logically back down,
+                        // which also discards any dirty high bits above the source width.
+                        const src_bits = intBits(func, src_ty);
+                        const dst_bits = intBits(func, dst_ty);
+                        const rs = try reloadInt(allocator, &code, &alloc, spill_base, cv.value, spill_scratch1);
+                        const c_spill = alloc.int_spill.get(result);
+                        const rd = if (c_spill == null) alloc.int.get(result).? else spill_scratch0;
+                        if (dst_bits > src_bits and src_bits < 64) {
+                            const sh: u6 = @intCast(64 - src_bits);
+                            try code.append(allocator, encode.slli(rd, rs, sh));
+                            try code.append(allocator, if (isUnsignedInt(func, src_ty))
+                                encode.srli(rd, rd, sh)
+                            else
+                                encode.srai(rd, rd, sh));
+                        } else if (rd != rs) {
+                            try code.append(allocator, encode.addi(rd, rs, 0)); // mv: same width / narrowing
+                        }
+                        if (c_spill) |idx| try code.append(allocator, encode.sd(rd, .x2, @intCast(spill_base + idx * 8)));
                     } else if (dst_float) {
                         // integer -> float, only a 32-bit signed source for now.
                         if (!isWord(func, src_ty)) return error.Unsupported;

@@ -145,8 +145,9 @@ fn magicPhase(allocator: std.mem.Allocator, func: *Function, consts: []const ?i6
     return changed;
 }
 
-/// The constant divisor of `inst` if it is a 64-bit `div`/`rem` by a non-power-of-two constant of
-/// magnitude at least 3 (the case the magic lowering handles), else null.
+/// The constant divisor of `inst` if it is an 8/16/32/64-bit `div`/`rem` by a non-power-of-two
+/// constant of magnitude at least 3 (the case the magic lowering handles), else null. Widths below
+/// 64 compute the magic in a widened 64-bit multiply, so they need the int->int widening convert.
 fn magicDivisor(func: *const Function, consts: []const ?i64, inst: ir.function.Inst) ?i64 {
     const a = switch (func.opcode(inst)) {
         .arith => |ar| ar,
@@ -154,7 +155,10 @@ fn magicDivisor(func: *const Function, consts: []const ?i64, inst: ir.function.I
     };
     if (a.op != .div and a.op != .rem) return null;
     const ty = intType(func, a.lhs) orelse return null;
-    if (ty.bits != 64) return null;
+    switch (ty.bits) {
+        8, 16, 32, 64 => {},
+        else => return null,
+    }
     const d = consts[@intFromEnum(a.rhs)] orelse return null;
     const ad: u64 = @abs(d);
     if (ad < 3) return null; // 0/1 are handled elsewhere, 2 is a power of two
@@ -163,19 +167,34 @@ fn magicDivisor(func: *const Function, consts: []const ?i64, inst: ir.function.I
 }
 
 /// Emit the magic-number sequence for `x op d` (quotient, or remainder when `is_rem`) at type `ty`,
-/// appending instructions to `out`, and return the value holding the result.
+/// appending instructions to `out`, and return the value holding the result. A 64-bit divide uses the
+/// `mulh` high-multiply directly; a narrower one widens to 64 bits, does the magic multiply there, and
+/// narrows the quotient back (the high-multiply has no sub-64 form).
 fn emitMagic(func: *Function, out: *std.ArrayList(ir.function.Inst), allocator: std.mem.Allocator, x: Value, d: i64, ty: IntTy, is_rem: bool) pass.Error!Value {
-    const t = func.valueType(x);
-    const bld = Builder{ .f = func, .o = out, .a = allocator, .ty = t };
-    const q = if (ty.signedness == .signed)
-        try emitSignedQuotient(bld, x, d)
-    else
-        try emitUnsignedQuotient(bld, x, @bitCast(d));
+    const result_t = func.valueType(x);
+    const rb = Builder{ .f = func, .o = out, .a = allocator, .ty = result_t };
+    const q = if (ty.bits == 64) blk: {
+        break :blk if (ty.signedness == .signed)
+            try emitSignedQuotient(rb, x, d, 64)
+        else
+            try emitUnsignedQuotient(rb, x, @bitCast(d), 64);
+    } else blk: {
+        // Widen x to 64 bits (sign/zero-extend per signedness), run the magic there, narrow back.
+        const compute_t = try func.types.intern(.{ .int = .{ .signedness = ty.signedness, .bits = 64 } });
+        const cb = Builder{ .f = func, .o = out, .a = allocator, .ty = compute_t };
+        const xw = try rb.conv(compute_t, x);
+        const wbits: u8 = @intCast(ty.bits);
+        const qw = if (ty.signedness == .signed)
+            try emitWideSigned(cb, xw, d, wbits)
+        else
+            try emitWideUnsigned(cb, xw, @bitCast(d), wbits);
+        break :blk try rb.conv(result_t, qw);
+    };
     if (!is_rem) return q;
-    // remainder = x - q*d
-    const dc = try bld.konst(d);
-    const qd = try bld.op(.mul, q, dc);
-    return bld.op(.sub, x, qd);
+    // remainder = x - q*d, at the operand width
+    const dc = try rb.konst(d);
+    const qd = try rb.op(.mul, q, dc);
+    return rb.op(.sub, x, qd);
 }
 
 /// A small emit helper binding the function, output list, allocator, and result type.
@@ -199,10 +218,16 @@ const Builder = struct {
         try self.o.append(self.a, self.f.definingInst(v).?);
         return v;
     }
+    /// A width-changing convert of `val` to `dst`, used to widen the dividend and narrow the quotient.
+    fn conv(self: Builder, dst: ir.types.Type, val: Value) pass.Error!Value {
+        const v = try self.f.createInst(dst, .{ .convert = .{ .value = val } });
+        try self.o.append(self.a, self.f.definingInst(v).?);
+        return v;
+    }
 };
 
-fn emitSignedQuotient(b: Builder, x: Value, d: i64) pass.Error!Value {
-    const mag = signedMagic(d);
+fn emitSignedQuotient(b: Builder, x: Value, d: i64, w: u8) pass.Error!Value {
+    const mag = signedMagic(d, w);
     const mc = try b.konst(mag.m);
     var q = try b.op(.mulh, x, mc);
     if (d > 0 and mag.m < 0) q = try b.op(.add, q, x);
@@ -213,8 +238,8 @@ fn emitSignedQuotient(b: Builder, x: Value, d: i64) pass.Error!Value {
     return b.op(.sub, q, sgn);
 }
 
-fn emitUnsignedQuotient(b: Builder, x: Value, d: u64) pass.Error!Value {
-    const mag = unsignedMagic(d);
+fn emitUnsignedQuotient(b: Builder, x: Value, d: u64, w: u8) pass.Error!Value {
+    const mag = unsignedMagic(d, w);
     const mc = try b.konst(@bitCast(mag.m));
     const hi = try b.op(.mulh, x, mc); // unsigned high multiply (mulhu)
     if (!mag.add) {
@@ -227,14 +252,42 @@ fn emitUnsignedQuotient(b: Builder, x: Value, d: u64) pass.Error!Value {
     return b.opImm(.shr, sum, @as(i64, mag.s) - 1);
 }
 
+/// The sub-64 signed quotient, computed on the widened (i64) dividend `xw`. The high-multiply is the
+/// full 64-bit product shifted right by `w` (both operands fit, so a plain multiply suffices).
+fn emitWideSigned(b: Builder, xw: Value, d: i64, w: u8) pass.Error!Value {
+    const mag = signedMagic(d, w);
+    const mc = try b.konst(mag.m);
+    const prod = try b.op(.mul, xw, mc);
+    var q = try b.opImm(.shr, prod, w); // arithmetic (signed compute type): high w bits = mulhs
+    if (d > 0 and mag.m < 0) q = try b.op(.add, q, xw);
+    if (d < 0 and mag.m > 0) q = try b.op(.sub, q, xw);
+    if (mag.s > 0) q = try b.opImm(.shr, q, mag.s);
+    const sgn = try b.opImm(.shr, q, 63); // sign of the i64 quotient, 0 or -1
+    return b.op(.sub, q, sgn);
+}
+
+/// The sub-64 unsigned quotient, computed on the widened (u64) dividend `xw`.
+fn emitWideUnsigned(b: Builder, xw: Value, d: u64, w: u8) pass.Error!Value {
+    const mag = unsignedMagic(d, w);
+    const mc = try b.konst(@bitCast(mag.m));
+    const prod = try b.op(.mul, xw, mc);
+    const hi = try b.opImm(.shr, prod, w); // logical (unsigned compute type): high w bits = mulhu
+    if (!mag.add) {
+        return if (mag.s > 0) b.opImm(.shr, hi, mag.s) else hi;
+    }
+    const diff = try b.op(.sub, xw, hi);
+    const half = try b.opImm(.shr, diff, 1);
+    const sum = try b.op(.add, half, hi);
+    return b.opImm(.shr, sum, @as(i64, mag.s) - 1);
+}
+
 /// Granlund-Montgomery signed magic for a 64-bit divisor (Hacker's Delight ch.10, 64-bit form).
 /// Returns the multiplier `m` and post-shift `s` so `x / d == addBack(mulhs(x, m)) >> s` with a
 /// final "add the sign bit" correction. Computed in 128-bit to sidestep the intermediate overflows.
-fn signedMagic(d: i64) struct { m: i64, s: u6 } {
-    const w: u8 = 64;
+fn signedMagic(d: i64, w: u8) struct { m: i64, s: u6 } {
     const ad: u128 = @abs(d);
-    const two_w1: u128 = @as(u128, 1) << (w - 1); // 2^63
-    const t: u128 = two_w1 + (@as(u64, @bitCast(d)) >> 63);
+    const two_w1: u128 = @as(u128, 1) << @intCast(w - 1); // 2^(w-1)
+    const t: u128 = two_w1 + @as(u128, if (d < 0) 1 else 0); // 2^(w-1) + sign bit of d
     const anc: u128 = t - 1 - t % ad;
     var p: u8 = w - 1;
     var q1: u128 = two_w1 / anc;
@@ -260,18 +313,24 @@ fn signedMagic(d: i64) struct { m: i64, s: u6 } {
         const delta = ad - r2;
         if (!(q1 < delta or (q1 == delta and r1 == 0))) break;
     }
-    var m: i64 = @bitCast(@as(u64, @truncate(q2 + 1)));
+    var m: i64 = signExtend(@truncate(q2 + 1), w); // the magic is a signed w-bit value
     if (d < 0) m = -%m;
     return .{ .m = m, .s = @intCast(p - w) };
+}
+
+/// Sign-extend the low `w` bits of `bits` to a full i64 (identity for w == 64).
+fn signExtend(bits: u64, w: u8) i64 {
+    if (w >= 64) return @bitCast(bits);
+    const shift: u6 = @intCast(64 - w);
+    return @as(i64, @bitCast(bits << shift)) >> shift;
 }
 
 /// Granlund-Montgomery unsigned magic for a 64-bit divisor (Hacker's Delight ch.10, 64-bit form).
 /// Returns `m`, post-shift `s`, and `add` (whether the multiplier overflowed 64 bits and needs the
 /// add-back variant). Computed in 128-bit so the doublings never overflow.
-fn unsignedMagic(d: u64) struct { m: u64, s: u6, add: bool } {
-    const w: u8 = 64;
-    const two_w1: u128 = @as(u128, 1) << (w - 1); // 2^63
-    const two_w: u128 = @as(u128, 1) << w; // 2^64
+fn unsignedMagic(d: u64, w: u8) struct { m: u64, s: u6, add: bool } {
+    const two_w1: u128 = @as(u128, 1) << @intCast(w - 1); // 2^(w-1)
+    const two_w: u128 = @as(u128, 1) << @intCast(w); // 2^w
     const dd: u128 = d;
     const nc: u128 = (two_w - 1) - (two_w % dd);
     var p: u8 = w - 1;
@@ -301,7 +360,15 @@ fn unsignedMagic(d: u64) struct { m: u64, s: u6, add: bool } {
         const delta = dd - 1 - r2;
         if (!(p < 2 * w and (q1 < delta or (q1 == delta and r1 == 0)))) break;
     }
-    return .{ .m = @truncate(q2 + 1), .s = @intCast(p - w), .add = add };
+    // The multiplier is the low `w` bits of q2+1: in the add-variant it is a (w+1)-bit value whose
+    // top bit the add-back compensates for, so it must be masked to w bits (identity at w == 64).
+    const m: u64 = @as(u64, @truncate(q2 + 1)) & canonMask(w);
+    return .{ .m = m, .s = @intCast(p - w), .add = add };
+}
+
+/// The low-`bits` mask (all ones at 64), shared by the magic width reduction and the test evaluator.
+fn canonMask(bits: u16) u64 {
+    return if (bits >= 64) ~@as(u64, 0) else (@as(u64, 1) << @intCast(bits)) - 1;
 }
 
 const testing = std.testing;
@@ -372,6 +439,98 @@ test "signed 64-bit magic division matches real division across divisors and div
 
 fn intTy(func: *Function, bits: u16, signedness: std.builtin.Signedness) !ir.types.Type {
     return func.types.intern(.{ .int = .{ .signedness = signedness, .bits = bits } });
+}
+
+/// Sign/zero-extend the low `bits` of `v` to a canonical i64 (how a value of that type reads back),
+/// mirroring the backends. Used by the sub-64 magic evaluator below.
+fn canonical(v: i64, bits: u16, signedness: std.builtin.Signedness) i64 {
+    if (bits >= 64) return v;
+    const low: u64 = @as(u64, @bitCast(v)) & ((@as(u64, 1) << @intCast(bits)) - 1);
+    return switch (signedness) {
+        .unsigned => @bitCast(low),
+        .signed => blk: {
+            const sign = @as(u64, 1) << @intCast(bits - 1);
+            const mask = (@as(u64, 1) << @intCast(bits)) - 1;
+            break :blk @bitCast(if (low & sign != 0) low | ~mask else low);
+        },
+    };
+}
+
+/// Evaluate a value whose whole dataflow is constants, modelling each op at its result type's width
+/// and signedness (a `convert` widens by the SOURCE signedness, narrows to the low bits). This is the
+/// sub-64 magic oracle: constfold cannot fold the `convert`s the widened path emits, so the test
+/// interprets the emitted sequence directly and compares it to real division.
+fn evalMagic(func: *const Function, v: Value) i64 {
+    const inst = func.definingInst(v).?;
+    const info = func.types.type_kind(func.valueType(v)).int;
+    return switch (func.opcode(inst)) {
+        .iconst => |c| canonical(c, info.bits, info.signedness),
+        .convert => |cv| blk: {
+            const src = evalMagic(func, cv.value);
+            const s = func.types.type_kind(func.valueType(cv.value)).int;
+            break :blk if (info.bits > s.bits) canonical(src, s.bits, s.signedness) else canonical(src, info.bits, info.signedness);
+        },
+        .arith => |a| canonical(applyOp(a.op, evalMagic(func, a.lhs), evalMagic(func, a.rhs), info), info.bits, info.signedness),
+        .arith_imm => |a| canonical(applyOp(a.op, evalMagic(func, a.lhs), a.imm, info), info.bits, info.signedness),
+        else => unreachable, // the magic lowering only emits the ops above
+    };
+}
+
+fn applyOp(op: BinOp, l: i64, r: i64, info: anytype) i64 {
+    return switch (op) {
+        .add => l +% r,
+        .sub => l -% r,
+        .mul => l *% r,
+        .mulh => @truncate(@as(i128, l) * @as(i128, r) >> @intCast(info.bits)),
+        .shr => switch (info.signedness) {
+            .signed => l >> @intCast(@as(u64, @bitCast(r)) & 63),
+            .unsigned => @bitCast((@as(u64, @bitCast(l)) & canonMask(info.bits)) >> @intCast(@as(u64, @bitCast(r)) & 63)),
+        },
+        else => unreachable,
+    };
+}
+
+/// Lower `x op d` at `bits`/`signedness` (both operands constant) through the magic pass, then
+/// evaluate the emitted sequence. Returns the computed result, which must equal real division.
+fn magicAtWidth(allocator: std.mem.Allocator, x: i64, d: i64, bits: u16, signedness: std.builtin.Signedness, is_rem: bool) !i64 {
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try intTy(&func, bits, signedness);
+    const b = try func.appendBlock();
+    const xc = try func.appendInst(b, t, .{ .iconst = x });
+    const dc = try func.appendInst(b, t, .{ .iconst = d });
+    const r = try func.appendInst(b, t, .{ .arith = .{ .op = if (is_rem) .rem else .div, .lhs = xc, .rhs = dc } });
+    func.setTerminator(b, .{ .ret = r });
+    try testing.expect(try runOnce(allocator, &func));
+    return evalMagic(&func, func.terminator(b).?.ret.?);
+}
+
+test "unsigned 32-bit magic division matches real division across divisors and dividends" {
+    const allocator = testing.allocator;
+    const divisors = [_]u32{ 3, 5, 6, 7, 9, 10, 100, 1000, 65535, 0x80000001 };
+    const dividends = [_]u32{ 0, 1, 9, 10, 99, 100, 101, 1_000_000, 0xFFFFFFFF, 0x80000000 };
+    for (divisors) |d| {
+        for (dividends) |x| {
+            const q: u32 = @truncate(@as(u64, @bitCast(try magicAtWidth(allocator, x, d, 32, .unsigned, false))));
+            try testing.expectEqual(x / d, q);
+            const rem: u32 = @truncate(@as(u64, @bitCast(try magicAtWidth(allocator, x, d, 32, .unsigned, true))));
+            try testing.expectEqual(x % d, rem);
+        }
+    }
+}
+
+test "signed 32-bit magic division matches real division across divisors and dividends" {
+    const allocator = testing.allocator;
+    const divisors = [_]i32{ 3, 5, 7, 10, 100, -3, -7, -100 };
+    const dividends = [_]i32{ 0, 1, -1, 9, -9, 100, -100, 101, -101, std.math.maxInt(i32), std.math.minInt(i32) };
+    for (divisors) |d| {
+        for (dividends) |x| {
+            const q: i32 = @truncate(try magicAtWidth(allocator, x, d, 32, .signed, false));
+            try testing.expectEqual(@divTrunc(x, d), q);
+            const rem: i32 = @truncate(try magicAtWidth(allocator, x, d, 32, .signed, true));
+            try testing.expectEqual(@rem(x, d), rem);
+        }
+    }
 }
 
 test "x * 8 becomes x << 3" {
