@@ -81,6 +81,18 @@ pub fn verify(allocator: std.mem.Allocator, func: *const Function, profile: Prof
     return diags;
 }
 
+/// Pointer arithmetic: `add`/`sub` of a pointer and an integer offset (either order) is a valid
+/// address computation, so its operands are allowed to differ in type. Every frontend emits this for
+/// indexed loads/stores and the backends lower it directly, so it is not a type mismatch.
+fn pointerArith(func: *const Function, a: function.Arith) bool {
+    if (a.op != .add and a.op != .sub) return false;
+    const lt = func.types.type_kind(func.valueType(a.lhs));
+    const rt = func.types.type_kind(func.valueType(a.rhs));
+    const l_ptr = lt == .ptr;
+    const r_ptr = rt == .ptr;
+    return (l_ptr and rt == .int) or (r_ptr and lt == .int);
+}
+
 /// Binary arithmetic and comparison operands must have matching types.
 fn checkOperandTypes(func: *const Function, diags: *Diagnostics) std.mem.Allocator.Error!void {
     var bi: usize = 0;
@@ -88,7 +100,7 @@ fn checkOperandTypes(func: *const Function, diags: *Diagnostics) std.mem.Allocat
         const block: Block = @enumFromInt(bi);
         for (func.blockInsts(block)) |inst| {
             switch (func.opcode(inst)) {
-                .arith => |a| if (func.valueType(a.lhs) != func.valueType(a.rhs)) {
+                .arith => |a| if (func.valueType(a.lhs) != func.valueType(a.rhs) and !pointerArith(func, a)) {
                     if (func.instResult(inst)) |result| try diags.add(.{ .operand_type_mismatch = result });
                 },
                 .icmp => |c| if (func.valueType(c.lhs) != func.valueType(c.rhs)) {

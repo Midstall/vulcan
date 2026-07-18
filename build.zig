@@ -283,6 +283,21 @@ pub fn build(b: *std.Build) void {
     }) });
     test_step.dependOn(&b.addRunArtifact(splitunroll_diff).step);
 
+    // Loop-vectorizer differential oracle: build a map loop twice, run loopvec (and the full pipeline
+    // so SLP widens it) on one, JIT both, run over real arrays, require bit-identical output for every
+    // trip count (0 / below V / exactly V / multiples / non-multiples).
+    const loopvec_diff = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("libs/vulcan-target/tests/loopvec_differential.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "vulcan-ir", .module = vulcan_ir },
+            .{ .name = "vulcan-opt", .module = vulcan_opt },
+            .{ .name = "vulcan-target", .module = vulcan_target },
+        },
+    }) });
+    test_step.dependOn(&b.addRunArtifact(loopvec_diff).step);
+
     // Prefetch differential oracle: build a function twice, hand-insert a `prefetch`
     // hint in one copy, JIT both on the host, and require identical results for every
     // input. Proves the PRFM (aarch64) / dropped-hint (elsewhere) lowering has no

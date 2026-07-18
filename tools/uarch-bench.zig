@@ -187,6 +187,85 @@ fn buildSumLoop(allocator: std.mem.Allocator) anyerror!Function {
     return func;
 }
 
+/// A SAXPY map loop over real f32 arrays, writing a SEPARATE output so it is non-accumulating (the
+/// bench runs baseline and tuned over the same buffers): `for (i = 0; i < n; i += 1) out[i] = a*x[i]
+/// + y[i]; return out[0];`. Exercises the loop vectorizer (main body unrolled by the SIMD width, SLP
+/// widened to a wide load / vector fmul / vector fadd / wide store, the invariant `a` a splat `dup`).
+fn buildSaxpyLoop(allocator: std.mem.Allocator) anyerror!Function {
+    var func = Function.init(allocator);
+    errdefer func.deinit();
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr_t = try func.types.intern(.ptr);
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const loop = try func.appendBlock();
+    const body = try func.appendBlock();
+    const done = try func.appendBlock();
+    const x = try func.appendBlockParam(entry, ptr_t);
+    const y = try func.appendBlockParam(entry, ptr_t);
+    const out = try func.appendBlockParam(entry, ptr_t);
+    const a = try func.appendBlockParam(entry, f32_t);
+    const n = try func.appendBlockParam(entry, i32_t);
+    const zero = try func.appendInst(entry, i32_t, .{ .iconst = 0 });
+    try func.setJump(entry, loop, &.{zero});
+    const i = try func.appendBlockParam(loop, i32_t);
+    const cmp = try func.appendInst(loop, bool_t, .{ .icmp = .{ .op = .lt, .lhs = i, .rhs = n } });
+    try func.appendIf(loop, cmp, .{ .target = body, .args = &.{i} }, .{ .target = done });
+    const bi = try func.appendBlockParam(body, i32_t);
+    const off = try func.appendArithImm(body, i32_t, .mul, bi, 4);
+    const xaddr = try func.appendInst(body, ptr_t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = off } });
+    const xv = try func.appendInst(body, f32_t, .{ .load = .{ .ptr = xaddr } });
+    const yaddr = try func.appendInst(body, ptr_t, .{ .arith = .{ .op = .add, .lhs = y, .rhs = off } });
+    const yv = try func.appendInst(body, f32_t, .{ .load = .{ .ptr = yaddr } });
+    const ax = try func.appendInst(body, f32_t, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = xv } });
+    const res = try func.appendInst(body, f32_t, .{ .arith = .{ .op = .add, .lhs = ax, .rhs = yv } });
+    const oaddr = try func.appendInst(body, ptr_t, .{ .arith = .{ .op = .add, .lhs = out, .rhs = off } });
+    try func.appendStore(body, res, oaddr);
+    const ni = try func.appendArithImm(body, i32_t, .add, bi, 1);
+    try func.setJump(body, loop, &.{ni});
+    const r = try func.appendInst(done, f32_t, .{ .load = .{ .ptr = out } }); // out[0], data-dependent
+    func.setTerminator(done, .{ .ret = r });
+    return func;
+}
+
+/// A contiguous f32 sum reduction over a real array: `s = 0; for (i = 0; i < n; i += 1) s += a[i];
+/// return s`. Marked fast_math, so the loop vectorizer builds a vector accumulator (wide loads +
+/// vector fadd) and a horizontal reduce, like gcc -O3's vector-accumulator reduction.
+fn buildFsumLoop(allocator: std.mem.Allocator) anyerror!Function {
+    var func = Function.init(allocator);
+    errdefer func.deinit();
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr_t = try func.types.intern(.ptr);
+    const bool_t = try func.types.intern(.bool);
+    try func.addAttr(.func, .{ .custom = .{ .namespace = "vulcan", .key = "fast_math", .value = .flag } });
+    const entry = try func.appendBlock();
+    const loop = try func.appendBlock();
+    const body = try func.appendBlock();
+    const done = try func.appendBlock();
+    const a = try func.appendBlockParam(entry, ptr_t);
+    const n = try func.appendBlockParam(entry, i32_t);
+    const zero_i = try func.appendInst(entry, i32_t, .{ .iconst = 0 });
+    const zero_f = try func.appendInst(entry, f32_t, .{ .fconst = 0 });
+    try func.setJump(entry, loop, &.{ zero_i, zero_f });
+    const i = try func.appendBlockParam(loop, i32_t);
+    const s = try func.appendBlockParam(loop, f32_t);
+    const cmp = try func.appendInst(loop, bool_t, .{ .icmp = .{ .op = .lt, .lhs = i, .rhs = n } });
+    try func.appendIf(loop, cmp, .{ .target = body, .args = &.{ i, s } }, .{ .target = done, .args = &.{s} });
+    const bi = try func.appendBlockParam(body, i32_t);
+    const bs = try func.appendBlockParam(body, f32_t);
+    const off = try func.appendArithImm(body, i32_t, .mul, bi, 4);
+    const addr = try func.appendInst(body, ptr_t, .{ .arith = .{ .op = .add, .lhs = a, .rhs = off } });
+    const v = try func.appendInst(body, f32_t, .{ .load = .{ .ptr = addr } });
+    const ns = try func.appendInst(body, f32_t, .{ .arith = .{ .op = .add, .lhs = bs, .rhs = v } });
+    const ni = try func.appendArithImm(body, i32_t, .add, bi, 1);
+    try func.setJump(body, loop, &.{ ni, ns });
+    const rs = try func.appendBlockParam(done, f32_t);
+    func.setTerminator(done, .{ .ret = rs });
+    return func;
+}
+
 /// A strided pointer-walking reduction over a real backing array: `s = 0; p = arr; for (i = 0;
 /// i < n; i += 1) { s += *p; p += 8; } return s`. Exercises prefetch + unroll + schedule together
 /// over real memory.
@@ -781,5 +860,42 @@ pub fn benchModel(allocator: std.mem.Allocator, io: std.Io, model: *const Model,
         buildMemMulAdd,
         &.{.{ &mma_a, &mma_b, &mma_out }},
         .{ &mma_a, &mma_b, &mma_out },
+    );
+
+    // The SAXPY map LOOP over real f32 arrays: exercises the loop vectorizer (main body unrolled by the
+    // SIMD width, SLP-widened to wide load / vector fmul / vector fadd / wide store, `a` a splat dup).
+    var sax_x = [_]f32{0} ** 1024;
+    var sax_y = [_]f32{0} ** 1024;
+    var sax_out = [_]f32{0} ** 1024;
+    for (0..1024) |k| {
+        sax_x[k] = @floatFromInt(k + 1);
+        sax_y[k] = @floatFromInt(1024 - @as(i32, @intCast(k)));
+    }
+    try benchGeneric(
+        *const fn ([*]f32, [*]f32, [*]f32, f32, i32) callconv(.c) f32,
+        allocator,
+        io,
+        model,
+        w,
+        "saxpy-loop",
+        buildSaxpyLoop,
+        &.{.{ &sax_x, &sax_y, &sax_out, 2.5, 1024 }},
+        .{ &sax_x, &sax_y, &sax_out, 2.5, 1024 },
+    );
+
+    // The contiguous f32 sum reduction: the loop vectorizer builds a vector accumulator (wide loads +
+    // vector fadd) with a horizontal reduce at the end.
+    var fsum_a = [_]f32{0} ** 1024;
+    for (0..1024) |k| fsum_a[k] = @floatFromInt((k % 13) + 1);
+    try benchGeneric(
+        *const fn ([*]f32, i32) callconv(.c) f32,
+        allocator,
+        io,
+        model,
+        w,
+        "fsum-loop",
+        buildFsumLoop,
+        &.{.{ &fsum_a, 1024 }},
+        .{ &fsum_a, 1024 },
     );
 }
