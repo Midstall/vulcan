@@ -25,7 +25,10 @@ pub const Cursor = struct {
 
     /// Take the next `n` bytes as a sub-slice (borrowed from the input).
     pub fn take(self: *Cursor, n: usize) Error![]const u8 {
-        if (self.pos + n > self.bytes.len) return error.UnexpectedEof;
+        // `n` is an untrusted length (up to ~4G from a LEB); write the bounds check so the
+        // arithmetic cannot wrap a 32-bit usize. The `pos <= bytes.len` invariant (held by
+        // every advance) makes `bytes.len - pos` safe.
+        if (n > self.bytes.len - self.pos) return error.UnexpectedEof;
         defer self.pos += n;
         return self.bytes[self.pos .. self.pos + n];
     }

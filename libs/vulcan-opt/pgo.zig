@@ -96,19 +96,22 @@ fn putU64(a: std.mem.Allocator, l: *std.ArrayList(u8), v: u64) Error!void {
     try l.appendSlice(a, &std.mem.toBytes(std.mem.nativeToLittle(u64, v)));
 }
 fn getU32(data: []const u8, pos: *usize) Error!u32 {
-    if (pos.* + 4 > data.len) return error.MalformedProfile;
+    // Subtraction form so the bound can't wrap on a 32-bit usize: `pos.*` is an
+    // invariant `<= data.len`, so `data.len - pos.*` never underflows, whereas
+    // `pos.* + 4` could overflow past `data.len` and pass a naive `+` guard.
+    if (4 > data.len - pos.*) return error.MalformedProfile;
     const v = std.mem.readInt(u32, data[pos.*..][0..4], .little);
     pos.* += 4;
     return v;
 }
 fn getU64(data: []const u8, pos: *usize) Error!u64 {
-    if (pos.* + 8 > data.len) return error.MalformedProfile;
+    if (8 > data.len - pos.*) return error.MalformedProfile;
     const v = std.mem.readInt(u64, data[pos.*..][0..8], .little);
     pos.* += 8;
     return v;
 }
 fn takeBytes(data: []const u8, pos: *usize, len: u32) Error![]const u8 {
-    if (pos.* + len > data.len) return error.MalformedProfile;
+    if (len > data.len - pos.*) return error.MalformedProfile;
     const s = data[pos.* .. pos.* + len];
     pos.* += len;
     return s;
@@ -119,6 +122,7 @@ fn takeBytes(data: []const u8, pos: *usize, len: u32) Error![]const u8 {
 /// (= block count). The linker must provide a `.bss` array of `count * 8` bytes.
 /// The increments never feed the function's result, so it stays transparent.
 pub fn instrument(allocator: std.mem.Allocator, func: *Function, counters_symbol: []const u8) Error!usize {
+    _ = allocator; // reordering is now in place (std.mem.rotate); kept for API stability
     const ptr_t = try func.types.intern(.ptr);
     const i64_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
     const n = func.blockCount();
@@ -136,21 +140,19 @@ pub fn instrument(allocator: std.mem.Allocator, func: *Function, counters_symbol
 
         // The five new instructions were appended to the tail. Move them to the
         // front so they run on block entry, before any `if`.
-        try moveTailToFront(allocator, func, block, before);
+        moveTailToFront(func, block, before);
     }
     return n;
 }
 
 /// Reorder a block's instruction list so the instructions added after index
 /// `split` come first.
-fn moveTailToFront(allocator: std.mem.Allocator, func: *Function, block: Block, split: usize) Error!void {
-    const insts = func.blockInstsMut(block);
-    var rebuilt: std.ArrayList(Inst) = .empty;
-    defer rebuilt.deinit(allocator);
-    try rebuilt.appendSlice(allocator, insts.items[split..]); // the new counter ops
-    try rebuilt.appendSlice(allocator, insts.items[0..split]); // the original body
-    insts.clearRetainingCapacity();
-    try insts.appendSlice(allocator, rebuilt.items);
+fn moveTailToFront(func: *Function, block: Block, split: usize) void {
+    // Left-rotate by `split`: the elements at `[split..]` (the new counter ops)
+    // move to the front, the original `[0..split]` body follows. In place, no
+    // allocation. std.mem.rotate(_, items, split) does exactly items[split..] ++
+    // items[0..split].
+    std.mem.rotate(Inst, func.blockInstsMut(block).items, split);
 }
 
 const HotFilter = struct {

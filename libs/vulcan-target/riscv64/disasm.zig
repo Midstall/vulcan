@@ -343,6 +343,7 @@ fn opImm(a: std.mem.Allocator, b: *std.ArrayList(u8), w: u32) !void {
             try b.print(a, "not x{d}, x{d}", .{ rd(w), rs1(w) })
         else
             try b.print(a, "xori x{d}, x{d}, {d}", .{ rd(w), rs1(w), iimm(w) }),
+        0b010 => try b.print(a, "slti x{d}, x{d}, {d}", .{ rd(w), rs1(w), iimm(w) }),
         0b110 => try b.print(a, "ori x{d}, x{d}, {d}", .{ rd(w), rs1(w), iimm(w) }),
         0b111 => try b.print(a, "andi x{d}, x{d}, {d}", .{ rd(w), rs1(w), iimm(w) }),
         0b011 => if (iimm(w) == 1) // seqz rd, rs1
@@ -492,6 +493,11 @@ fn opV(a: std.mem.Allocator, b: *std.ArrayList(u8), w: u32) !void {
             0b100100 => try b.print(a, "vfmul.vv v{d}, v{d}, v{d}", .{ rd(w), rs2(w), rs1(w) }),
             0b100000 => try b.print(a, "vfdiv.vv v{d}, v{d}, v{d}", .{ rd(w), rs2(w), rs1(w) }),
             0b010000 => try b.print(a, "vfmv.f.s f{d}, v{d}", .{ rd(w), rs2(w) }),
+            // Fused multiply-add/sub family: accumulates into vd, so unlike the plain ops above
+            // the assembler writes the two multiplicands first (`vd, vs1, vs2`), not `vd, vs2, vs1`.
+            0b101100 => try b.print(a, "vfmacc.vv v{d}, v{d}, v{d}", .{ rd(w), rs1(w), rs2(w) }),
+            0b101110 => try b.print(a, "vfmsac.vv v{d}, v{d}, v{d}", .{ rd(w), rs1(w), rs2(w) }),
+            0b101111 => try b.print(a, "vfnmsac.vv v{d}, v{d}, v{d}", .{ rd(w), rs1(w), rs2(w) }),
             else => try b.print(a, ".word 0x{x:0>8}", .{w}),
         },
         0b101 => switch (f6(w)) { // OPFVF
@@ -807,4 +813,10 @@ test "round-trips RVV vector ops" {
     try expectOne(encode.vfslide1up_vf(.v1, .v2, .f3), "vfslide1up.vf v1, v2, f3");
     try expectOne(encode.vslidedown_vi(.v1, .v2, 3), "vslidedown.vi v1, v2, 3");
     try expectOne(encode.vmv_v_v(.v1, .v2), "vmv.v.v v1, v2");
+}
+
+test "round-trips RVV vector FMA (vfmacc/vfmsac/vfnmsac)" {
+    try expectOne(encode.vfmacc_vv(.v1, .v2, .v3), "vfmacc.vv v1, v2, v3");
+    try expectOne(encode.vfmsac_vv(.v1, .v2, .v3), "vfmsac.vv v1, v2, v3");
+    try expectOne(encode.vfnmsac_vv(.v1, .v2, .v3), "vfnmsac.vv v1, v2, v3");
 }

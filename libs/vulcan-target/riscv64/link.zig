@@ -96,7 +96,7 @@ pub fn compileModule(allocator: std.mem.Allocator, module: *const Module) Error!
     // Lay out each function, recording its start and globalizing its relocs.
     for (module.entries.items) |entry| {
         const start = code.items.len;
-        var compiled = try isel.compileFunction(allocator, entry.func);
+        var compiled = try isel.compileFunction(allocator, entry.func, .{});
         defer compiled.deinit(allocator);
         try code.appendSlice(allocator, compiled.code);
         try symbols.append(allocator, .{ .name = entry.name, .offset = start });

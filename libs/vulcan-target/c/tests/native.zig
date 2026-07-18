@@ -114,8 +114,13 @@ fn wrapProgram(allocator: std.mem.Allocator, func: *const Function, args: []cons
     if (ret == null) {
         try out.appendSlice(allocator, "    printf(\"0\\n\");\n");
     } else if (is_float) {
-        // Print the exact bit pattern so float equality is not lossy through text.
-        try out.appendSlice(allocator, "    uint32_t bits; memcpy(&bits, &r, 4); printf(\"%u\\n\", bits);\n");
+        // Print the exact bit pattern so float equality is not lossy through text. Width
+        // depends on the float kind: an f16 result is 2 bytes, f32 is 4, f64 is 8.
+        switch (func.types.type_kind(ret.?).float) {
+            .f16 => try out.appendSlice(allocator, "    uint16_t bits; memcpy(&bits, &r, 2); printf(\"%u\\n\", (unsigned)bits);\n"),
+            .f32 => try out.appendSlice(allocator, "    uint32_t bits; memcpy(&bits, &r, 4); printf(\"%u\\n\", bits);\n"),
+            .f64 => try out.appendSlice(allocator, "    uint64_t bits; memcpy(&bits, &r, 8); printf(\"%llu\\n\", (unsigned long long)bits);\n"),
+        }
     } else {
         try out.appendSlice(allocator, "    printf(\"%lld\\n\", (long long)r);\n");
     }
@@ -141,7 +146,11 @@ fn emitCType(allocator: std.mem.Allocator, out: *std.ArrayList(u8), func: *const
             const width: u16 = if (i.bits <= 8) 8 else if (i.bits <= 16) 16 else if (i.bits <= 32) 32 else 64;
             try out.print(allocator, "{s}int{d}_t", .{ if (i.signedness == .unsigned) "u" else "", width });
         },
-        .float => |f| try out.appendSlice(allocator, if (f == .f32) "float" else "double"),
+        .float => |f| try out.appendSlice(allocator, switch (f) {
+            .f16 => "_Float16",
+            .f32 => "float",
+            .f64 => "double",
+        }),
         .ptr => try out.appendSlice(allocator, "void*"),
         else => return error.Unsupported,
     }
@@ -154,6 +163,18 @@ fn runCInt(io: std.Io, allocator: std.mem.Allocator, func: *const Function, args
     const stdout = try compileAndRun(io, allocator, program);
     defer allocator.free(stdout);
     return std.fmt.parseInt(i64, stdout, 10);
+}
+
+/// Like `runCInt`, but `func` returns f16: the program prints the raw 16-bit half bit
+/// pattern (see `wrapProgram`'s per-kind bit-print), which we reinterpret so the comparison
+/// is bit-exact rather than lossy through text.
+fn runCF16(io: std.Io, allocator: std.mem.Allocator, func: *const Function, args: []const Arg) !f16 {
+    const program = try wrapProgram(allocator, func, args);
+    defer allocator.free(program);
+    const stdout = try compileAndRun(io, allocator, program);
+    defer allocator.free(stdout);
+    const bits = try std.fmt.parseInt(u16, stdout, 10);
+    return @bitCast(bits);
 }
 
 /// Compile GLSL `src`, emit its function `name` to C, compile and run it with `args`, and
@@ -538,4 +559,44 @@ test "C backend: GLSL int<->float conversions" {
     try expectGlslCInt("int f(float x) { return int(x); }", "f", &.{.{ .float = 3.7 }}, 3);
     // float(a) * 0.5 for a=7 -> 3.5
     try expectGlslCF32("float f(int a) { return float(a) * 0.5; }", "f", &.{.{ .int = 7 }}, 3.5);
+}
+
+test "C backend: f16 multiply compiled+run with cc, bit-exact against Zig's own f16 multiply" {
+    // f(a, b) = a * b, both f16. `_Float16 * _Float16` in the emitted C is what proves out the
+    // whole f16 lowering end to end: real `cc` compiles it, real hardware runs it, and the
+    // result is compared bit-for-bit (not just approximately) to Zig's own half-precision `*`,
+    // which is the ground truth for "what should this half multiply produce".
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+
+    const f16_t = try func.types.intern(.{ .float = .f16 });
+    const entry = try func.appendBlock();
+    const a = try func.appendBlockParam(entry, f16_t);
+    const b = try func.appendBlockParam(entry, f16_t);
+    const r = try func.appendInst(entry, f16_t, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = b } });
+    func.setTerminator(entry, .{ .ret = r });
+
+    const cases = [_]struct { a: f16, b: f16 }{
+        .{ .a = 1.5, .b = 2.25 }, // exact in f16: a plain sanity case, no rounding involved
+        // 1 + 2^-10: itself exact in f16, but its SQUARE is not representable in half, so the
+        // multiply's result must round to nearest-even, not just widen the raw f32 product.
+        .{ .a = 1.0009765625, .b = 1.0009765625 },
+        .{ .a = -100.0, .b = 7.0 },
+    };
+    for (cases) |case| {
+        const got = runCF16(std.testing.io, allocator, &func, &.{
+            .{ .float = case.a },
+            .{ .float = case.b },
+        }) catch |err| switch (err) {
+            error.NoCompiler => return error.SkipZigTest,
+            else => return err,
+        };
+        const want: f16 = case.a * case.b; // Zig's own half-precision multiply: the oracle
+        try std.testing.expectEqual(@as(u16, @bitCast(want)), @as(u16, @bitCast(got)));
+    }
+    // The rounding case actually rounds: the exact f32 product differs from the half result,
+    // so this is really exercising round-to-nearest-even and not silently widening to f32.
+    const exact_f32: f32 = @as(f32, cases[1].a) * @as(f32, cases[1].b);
+    try std.testing.expect(@as(f32, cases[1].a * cases[1].b) != exact_f32);
 }

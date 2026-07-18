@@ -21,6 +21,7 @@ const tests = struct {
     pub const cases = @import("x86_64/tests/cases.zig");
     pub const qemu = @import("x86_64/tests/qemu.zig");
     pub const native = @import("x86_64/tests/native.zig");
+    pub const f16_emulation = @import("x86_64/tests/f16.zig");
 };
 
 test {

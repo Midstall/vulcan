@@ -4,7 +4,8 @@
 //!   - Integers are BigInt, canonicalized to their type after each op with
 //!     `BigInt.asIntN(bits, x)` / `asUintN`, so wrapping matches any bit width including 64.
 //!   - Floats are Number; an f32 result is `Math.fround`-normalized so single precision is
-//!     exact.
+//!     exact, and an f16 result is `Math.f16round`-normalized the same way (scalar f16 only;
+//!     f16 nested in a composite is rejected, see `functionUsesCompositeF16`).
 //!   - Booleans are JS booleans; pointers are BigInt byte offsets into a shared memory.
 //!   - Aggregates (struct/vector/array/slice) are JS arrays `[f0, f1, ...]`.
 //!   - Control flow is a `while (true) switch (__blk)` state machine (blocks are cases,
@@ -42,6 +43,7 @@ pub const runtime_preamble =
     \\function __ld_u32(p){ return BigInt(__dv.getUint32(Number(p), true)); }
     \\function __ld_i64(p){ return __dv.getBigInt64(Number(p), true); }
     \\function __ld_u64(p){ return __dv.getBigUint64(Number(p), true); }
+    \\function __ld_f16(p){ return __dv.getFloat16(Number(p), true); }
     \\function __ld_f32(p){ return __dv.getFloat32(Number(p), true); }
     \\function __ld_f64(p){ return __dv.getFloat64(Number(p), true); }
     \\function __st_i8(p,v){ __dv.setInt8(Number(p), Number(v)); }
@@ -52,6 +54,7 @@ pub const runtime_preamble =
     \\function __st_u32(p,v){ __dv.setUint32(Number(p), Number(v), true); }
     \\function __st_i64(p,v){ __dv.setBigInt64(Number(p), BigInt.asIntN(64, v), true); }
     \\function __st_u64(p,v){ __dv.setBigUint64(Number(p), BigInt.asUintN(64, v), true); }
+    \\function __st_f16(p,v){ __dv.setFloat16(Number(p), v, true); }
     \\function __st_f32(p,v){ __dv.setFloat32(Number(p), v, true); }
     \\function __st_f64(p,v){ __dv.setFloat64(Number(p), v, true); }
     \\const __cvt = new DataView(new ArrayBuffer(8));
@@ -66,6 +69,13 @@ pub const runtime_preamble =
 /// Emit `func` as a single JS function named `name`. Caller owns the returned source. The
 /// output assumes `runtime_preamble` is in scope.
 pub fn emitFunction(allocator: std.mem.Allocator, func: *const Function, name: []const u8) Error![]u8 {
+    // JS has `Math.f16round` (mirrors `Math.fround` for f32), so scalar f16 lowers the same
+    // way f32 does: every fround site below gets an f16round twin. f16 nested in a
+    // vector/aggregate has no tested emission path here (the other scalar-f16 backends draw
+    // the same line), so that composite case still rejects cleanly. Covers both this direct
+    // entry and emitModule, which delegates here per function.
+    if (ir.function.functionUsesCompositeF16(func)) return error.Unsupported;
+
     var e = Emitter{ .allocator = allocator, .func = func };
     defer e.deinit();
     try e.run(name);
@@ -227,10 +237,12 @@ const Emitter = struct {
             .iconst => |val| try self.emitIconst(res.?, val, indent),
             .fconst => |val| {
                 try self.print("{s}v{d} = ", .{ indent, self.name(res.?) });
-                if (self.isF32(func.valueType(res.?))) {
-                    try self.print("Math.fround({e})", .{@as(f32, @floatCast(val))});
-                } else {
-                    try self.print("{e}", .{val});
+                // A literal prints already rounded to its own type, so the JS constant is
+                // the exact value the IR asked for, not a second re-rounding at runtime.
+                switch (self.floatKind(func.valueType(res.?))) {
+                    .f16 => try self.print("Math.f16round({e})", .{@as(f64, @as(f16, @floatCast(val)))}),
+                    .f32 => try self.print("Math.fround({e})", .{@as(f32, @floatCast(val))}),
+                    .f64 => try self.print("{e}", .{val}),
                 }
                 try self.w(";\n");
             },
@@ -259,6 +271,11 @@ const Emitter = struct {
             .alloca => |al| try self.print("{s}v{d} = __alloca({d});\n", .{ indent, self.name(res.?), self.typeSize(al.elem) }),
             .load => |ld| try self.emitLoad(res.?, ld.ptr, indent),
             .store => |st| try self.emitStore(st.value, st.ptr, indent),
+            .prefetch => {}, // a hint, JS has no prefetch, dropped
+            // dot is aarch64+dotprod-only in practice; the JS backend has no lowering for it.
+            .dot => return error.Unsupported,
+            // matmul is et-soc-only (a later task); the JS backend has no lowering for it.
+            .matmul => return error.Unsupported,
             .struct_new => |sn| {
                 try self.print("{s}v{d} = [", .{ indent, self.name(res.?) });
                 for (func.valueList(sn.fields), 0..) |field, i| {
@@ -363,12 +380,10 @@ const Emitter = struct {
         const sty = self.func.valueType(src);
         try self.print("{s}v{d} = ", .{ indent, self.name(res) });
         switch (self.kind(rty)) {
-            .float => {
-                if (self.isF32(rty)) {
-                    try self.print("Math.fround(Number(v{d}))", .{self.name(src)});
-                } else {
-                    try self.print("Number(v{d})", .{self.name(src)});
-                }
+            .float => switch (self.floatKind(rty)) {
+                .f16 => try self.print("Math.f16round(Number(v{d}))", .{self.name(src)}),
+                .f32 => try self.print("Math.fround(Number(v{d}))", .{self.name(src)}),
+                .f64 => try self.print("Number(v{d})", .{self.name(src)}),
             },
             .int => {
                 try self.wrapPre(rty);
@@ -405,10 +420,10 @@ const Emitter = struct {
             .nearest => "__rint",
             .reinterpret => unreachable,
         };
-        if (self.isF32(rty)) {
-            try self.print("Math.fround({s}(v{d}))", .{ fname, self.name(u.value) });
-        } else {
-            try self.print("{s}(v{d})", .{ fname, self.name(u.value) });
+        switch (self.floatKind(rty)) {
+            .f16 => try self.print("Math.f16round({s}(v{d}))", .{ fname, self.name(u.value) }),
+            .f32 => try self.print("Math.fround({s}(v{d}))", .{ fname, self.name(u.value) }),
+            .f64 => try self.print("{s}(v{d})", .{ fname, self.name(u.value) }),
         }
         try self.w(";\n");
     }
@@ -478,12 +493,18 @@ const Emitter = struct {
     }
 
     /// Write the prefix that canonicalizes an expression of type `ty`: `BigInt.asIntN(...)`
-    /// for integers/pointers, `Math.fround(` for f32, nothing otherwise.
+    /// for integers/pointers, `Math.fround(` for f32, `Math.f16round(` for f16 (so a plain JS
+    /// Number `+`/`*`/etc, computed at double precision, gets re-rounded to the op's actual
+    /// width once the expression closes), nothing for f64.
     fn wrapPre(self: *Emitter, ty: Type) Error!void {
         switch (self.kind(ty)) {
             .int => |i| try self.print("BigInt.as{s}N({d}, ", .{ if (i.signedness == .unsigned) "Uint" else "Int", i.bits }),
             .ptr => try self.w("BigInt.asIntN(64, "),
-            .float => |f| if (f == .f32) try self.w("Math.fround("),
+            .float => |f| switch (f) {
+                .f16 => try self.w("Math.f16round("),
+                .f32 => try self.w("Math.fround("),
+                .f64 => {},
+            },
             else => {},
         }
     }
@@ -491,16 +512,18 @@ const Emitter = struct {
     fn wrapPost(self: *Emitter, ty: Type) Error!void {
         switch (self.kind(ty)) {
             .int, .ptr => try self.w(")"),
-            .float => |f| if (f == .f32) try self.w(")"),
+            .float => |f| switch (f) {
+                .f16, .f32 => try self.w(")"),
+                .f64 => {},
+            },
             else => {},
         }
     }
 
-    fn isF32(self: *Emitter, ty: Type) bool {
-        return switch (self.kind(ty)) {
-            .float => |f| f == .f32,
-            else => false,
-        };
+    /// The IR float kind of a (known-float) type, so every f16/f32/f64 site switches
+    /// exhaustively instead of collapsing f16 into the f64 branch by omission.
+    fn floatKind(self: *Emitter, ty: Type) ir.types.FloatKind {
+        return self.kind(ty).float;
     }
 
     /// The load/store helper suffix for a scalar type (bool is handled separately).
@@ -514,7 +537,11 @@ const Emitter = struct {
                 (if (i.signedness == .unsigned) "u32" else "i32")
             else
                 (if (i.signedness == .unsigned) "u64" else "i64"),
-            .float => |f| if (f == .f32) "f32" else "f64",
+            .float => |f| switch (f) {
+                .f16 => "f16",
+                .f32 => "f32",
+                .f64 => "f64",
+            },
             .ptr => "i64",
             else => "i32",
         };
@@ -525,7 +552,11 @@ const Emitter = struct {
         return switch (self.kind(ty)) {
             .bool => 1,
             .int => |i| (i.bits + 7) / 8,
-            .float => |f| if (f == .f32) 4 else 8,
+            .float => |f| switch (f) {
+                .f16 => 2,
+                .f32 => 4,
+                .f64 => 8,
+            },
             .ptr => 8,
             .vector => |v| v.len * self.typeSize(v.elem),
             .array => |a| a.len * self.typeSize(a.elem),
@@ -561,6 +592,55 @@ test "emits a straight-line function returning a constant" {
         \\}
         \\
     , src);
+}
+
+test "an f16 add emits Math.f16round, mirroring the f32 Math.fround path" {
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+
+    const f16_t = try func.types.intern(.{ .float = .f16 });
+    const entry = try func.appendBlock();
+    const a = try func.appendBlockParam(entry, f16_t);
+    const b = try func.appendBlockParam(entry, f16_t);
+    const sum = try func.appendInst(entry, f16_t, .{ .arith = .{ .op = .add, .lhs = a, .rhs = b } });
+    func.setTerminator(entry, .{ .ret = sum });
+
+    const src = try emitFunction(std.testing.allocator, &func, "add");
+    defer std.testing.allocator.free(src);
+
+    // Same shape as the f32 add would emit, but `Math.f16round` in place of `Math.fround`:
+    // the JS engine does the `+` at double precision, then this rounds it back to the
+    // nearest half so the result matches real f16 arithmetic.
+    try std.testing.expectEqualStrings(
+        \\function add(v0, v1) {
+        \\  let v2;
+        \\  v2 = Math.f16round(v0 + v1);
+        \\  return v2;
+        \\}
+        \\
+    , src);
+
+    // A module also accepts a scalar-f16 function now; only a composite f16 rejects (below).
+    const named = [_]NamedFunc{.{ .name = "add", .func = &func }};
+    const mod_src = try emitModule(std.testing.allocator, &named);
+    defer std.testing.allocator.free(mod_src);
+    try std.testing.expect(std.mem.indexOf(u8, mod_src, "Math.f16round(v0 + v1)") != null);
+}
+
+test "composite f16 (a vector of half) is still rejected cleanly" {
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+
+    const f16_t = try func.types.intern(.{ .float = .f16 });
+    const v2 = try func.types.intern(.{ .vector = .{ .len = 2, .elem = f16_t } });
+    const entry = try func.appendBlock();
+    const a = try func.appendBlockParam(entry, v2);
+    func.setTerminator(entry, .{ .ret = a });
+
+    try std.testing.expectError(error.Unsupported, emitFunction(std.testing.allocator, &func, "vh"));
+
+    const named = [_]NamedFunc{.{ .name = "vh", .func = &func }};
+    try std.testing.expectError(error.Unsupported, emitModule(std.testing.allocator, &named));
 }
 
 test "emits a state machine for an if/else diamond" {

@@ -19,7 +19,7 @@ const Block = ir.function.Block;
 
 pub const pass_def = pass.Pass{ .name = "gvn", .run = run };
 
-const ExprKind = enum(u8) { iconst, fconst, arith, arith_imm, icmp, select, convert, unary, extract, global_addr };
+const ExprKind = enum(u8) { iconst, fconst, arith, arith_imm, icmp, select, convert, unary, extract, global_addr, dot };
 
 /// A canonical key for a pure expression: its kind, a sub-opcode (BinOp/CmpOp,
 /// result type, or field index), and up to three operand value-numbers/literals.
@@ -119,9 +119,12 @@ fn keyOf(func: *const Function, canon: []const Value, inst: Inst, result: Value)
         .unary => |x| .{ .kind = .unary, .sub = @intFromEnum(func.valueType(result)), .a = vn(canon, x.value), .b = @intFromEnum(x.op) },
         .extract => |x| .{ .kind = .extract, .sub = x.index, .a = vn(canon, x.aggregate) },
         .global_addr => |x| .{ .kind = .global_addr, .a = x.symbol },
+        // dot is pure, like arith, and keyed on all three operands (not commutative:
+        // acc is the accumulator, distinct from a/b).
+        .dot => |x| .{ .kind = .dot, .a = vn(canon, x.acc), .b = vn(canon, x.a), .c = vn(canon, x.b) },
         // alloca (distinct addresses), struct_new (variadic), and the impure
-        // load/store/call/if are not numbered.
-        .alloca, .struct_new, .load, .store, .call, .call_indirect, .@"if" => null,
+        // load/store/prefetch/matmul/call/if are not numbered.
+        .alloca, .struct_new, .load, .store, .prefetch, .matmul, .call, .call_indirect, .@"if" => null,
     };
 }
 
@@ -157,6 +160,17 @@ fn rewriteOperands(func: *Function, canon: []const Value) void {
             .store => |*st| {
                 st.value = sub(canon, st.value);
                 st.ptr = sub(canon, st.ptr);
+            },
+            .prefetch => |*pf| pf.ptr = sub(canon, pf.ptr),
+            .dot => |*d| {
+                d.acc = sub(canon, d.acc);
+                d.a = sub(canon, d.a);
+                d.b = sub(canon, d.b);
+            },
+            .matmul => |*mm| {
+                mm.a = sub(canon, mm.a);
+                mm.b = sub(canon, mm.b);
+                mm.c = sub(canon, mm.c);
             },
             .struct_new => |sn| for (func.valueListMut(sn.fields)) |*f| {
                 f.* = sub(canon, f.*);

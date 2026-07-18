@@ -319,9 +319,11 @@ fn foldArith(op: function.BinOp, lhs: i64, rhs: i64) ?i64 {
 /// Whether an instruction has no side effects, so it may be dropped when unused.
 fn isPure(op: function.Opcode) bool {
     return switch (op) {
-        .iconst, .fconst, .arith, .arith_imm, .icmp, .select, .struct_new, .extract, .convert, .unary, .alloca, .global_addr => true,
+        .iconst, .fconst, .arith, .arith_imm, .icmp, .select, .struct_new, .extract, .convert, .unary, .alloca, .global_addr, .dot => true,
         // Loads are kept conservatively. Stores, `if`, and calls have effects.
-        .load, .store, .@"if", .call, .call_indirect => false,
+        // A prefetch hint behaves like store here (effectful, not droppable).
+        // A matmul writes the `c` memory, likewise effectful.
+        .load, .store, .prefetch, .matmul, .@"if", .call, .call_indirect => false,
     };
 }
 
@@ -393,6 +395,17 @@ fn applySubst(func: *Function, subst: *const Subst) void {
             .store => |*st| {
                 st.value = sub(subst, st.value);
                 st.ptr = sub(subst, st.ptr);
+            },
+            .prefetch => |*pf| pf.ptr = sub(subst, pf.ptr),
+            .dot => |*d| {
+                d.acc = sub(subst, d.acc);
+                d.a = sub(subst, d.a);
+                d.b = sub(subst, d.b);
+            },
+            .matmul => |*mm| {
+                mm.a = sub(subst, mm.a);
+                mm.b = sub(subst, mm.b);
+                mm.c = sub(subst, mm.c);
             },
             .struct_new => |sn| substList(func, subst, sn.fields),
             .call => |c| substList(func, subst, c.args),
@@ -481,6 +494,17 @@ fn countUses(func: *const Function, uses: []u32) void {
                 .store => |st| {
                     uses[@intFromEnum(st.value)] += 1;
                     uses[@intFromEnum(st.ptr)] += 1;
+                },
+                .prefetch => |pf| uses[@intFromEnum(pf.ptr)] += 1,
+                .dot => |d| {
+                    uses[@intFromEnum(d.acc)] += 1;
+                    uses[@intFromEnum(d.a)] += 1;
+                    uses[@intFromEnum(d.b)] += 1;
+                },
+                .matmul => |mm| {
+                    uses[@intFromEnum(mm.a)] += 1;
+                    uses[@intFromEnum(mm.b)] += 1;
+                    uses[@intFromEnum(mm.c)] += 1;
                 },
                 .struct_new => |sn| for (func.valueList(sn.fields)) |f| {
                     uses[@intFromEnum(f)] += 1;

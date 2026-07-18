@@ -19,6 +19,12 @@ pub const Error = error{Unsupported} || std.mem.Allocator.Error;
 
 /// Emit `func` as a single C function named `name`. Caller owns the returned source.
 pub fn emitFunction(allocator: std.mem.Allocator, func: *const Function, name: []const u8) Error![]u8 {
+    // C has `_Float16` (GCC/Clang), so scalar f16 lowers directly: emit `_Float16`-typed
+    // locals and let the C compiler do the half-precision arithmetic and conversions. f16
+    // nested in a vector/aggregate has no tested emission path here (the aarch64/x86_64
+    // scalar-f16 backends draw the same line), so that composite case still rejects cleanly.
+    if (ir.function.functionUsesCompositeF16(func)) return error.Unsupported;
+
     var e = Emitter{ .allocator = allocator, .func = func };
     defer e.deinit();
     try e.run(name);
@@ -31,6 +37,13 @@ pub const NamedFunc = struct { name: []const u8, func: *const Function };
 /// Emit a whole module: a forward prototype for every function, then every body, so the
 /// functions may call one another in any order. Caller owns the returned source.
 pub fn emitModule(allocator: std.mem.Allocator, funcs: []const NamedFunc) Error![]u8 {
+    // Scalar f16 lowers to C `_Float16` (see emitFunction); only composite f16 (nested in a
+    // vector/aggregate) is unsupported. Checked for every function up front (before any
+    // output is built) so a module never emits a partial file when one function rejects.
+    for (funcs) |nf| {
+        if (ir.function.functionUsesCompositeF16(nf.func)) return error.Unsupported;
+    }
+
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
 
@@ -390,6 +403,11 @@ const Emitter = struct {
                 try self.emitType(func.valueType(st.value));
                 try self.print("*)v{d} = v{d};\n", .{ self.name(st.ptr), self.name(st.value) });
             },
+            .prefetch => {}, // a hint, no C equivalent emitted, dropped
+            // dot is aarch64+dotprod-only in practice; the C backend has no lowering for it.
+            .dot => return error.Unsupported,
+            // matmul is et-soc-only (a later task); the C backend has no lowering for it.
+            .matmul => return error.Unsupported,
             .struct_new => |sn| {
                 // Build the aggregate with a positional compound literal.
                 try self.print("    v{d} = (", .{self.name(res.?)});
@@ -459,33 +477,39 @@ const Emitter = struct {
             try self.print("    memcpy(&v{d}, &v{d}, sizeof(v{d}));\n", .{ self.name(res), self.name(u.value), self.name(res) });
             return;
         }
-        const is_f32 = switch (self.func.types.type_kind(self.func.valueType(res))) {
-            .float => |f| f == .f32,
-            else => false,
-        };
-        // libm has a `f`-suffixed single-precision variant of each of these.
+        // Every remaining op (sqrt/floor/ceil/trunc/nearest) is float-only, so `res` is
+        // always a float type here.
+        const kind: ir.types.FloatKind = self.func.types.type_kind(self.func.valueType(res)).float;
+        // libm has a `f`-suffixed single-precision variant of each of these but nothing for
+        // _Float16, so f16 also routes through the f32 call: compute in float, then cast the
+        // result back to _Float16, which re-rounds it to the correctly-rounded half value.
+        const use_f32_call = kind != .f64;
         const fname: []const u8 = switch (u.op) {
-            .sqrt => if (is_f32) "sqrtf" else "sqrt",
-            .floor => if (is_f32) "floorf" else "floor",
-            .ceil => if (is_f32) "ceilf" else "ceil",
-            .trunc => if (is_f32) "truncf" else "trunc",
-            .nearest => if (is_f32) "rintf" else "rint", // round to nearest, ties to even
+            .sqrt => if (use_f32_call) "sqrtf" else "sqrt",
+            .floor => if (use_f32_call) "floorf" else "floor",
+            .ceil => if (use_f32_call) "ceilf" else "ceil",
+            .trunc => if (use_f32_call) "truncf" else "trunc",
+            .nearest => if (use_f32_call) "rintf" else "rint", // round to nearest, ties to even
             .reinterpret => unreachable,
         };
-        try self.print("    v{d} = {s}(v{d});\n", .{ self.name(res), fname, self.name(u.value) });
+        if (kind == .f16) {
+            try self.print("    v{d} = (_Float16){s}((float)v{d});\n", .{ self.name(res), fname, self.name(u.value) });
+        } else {
+            try self.print("    v{d} = {s}(v{d});\n", .{ self.name(res), fname, self.name(u.value) });
+        }
     }
 
     fn emitFconst(self: *Emitter, res: Value, val: f64) Error!void {
         // Scientific notation always carries a decimal point/exponent, so it is a valid C
-        // floating constant. An f32 result takes the `f` suffix to match its type.
-        const is_f32 = switch (self.func.types.type_kind(self.func.valueType(res))) {
-            .float => |f| f == .f32,
-            else => false,
-        };
-        if (is_f32) {
-            try self.print("    v{d} = {e}f;\n", .{ self.name(res), @as(f32, @floatCast(val)) });
-        } else {
-            try self.print("    v{d} = {e};\n", .{ self.name(res), val });
+        // floating constant. An f32 result takes the `f` suffix to match its type. C has no
+        // literal suffix for `_Float16`, so an f16 result instead prints a `(_Float16)`-cast
+        // double literal; the value printed is first rounded to the nearest half in Zig
+        // (`@floatCast(f16)`) so the cast in C is exact, not a second re-rounding.
+        const kind: ir.types.FloatKind = self.func.types.type_kind(self.func.valueType(res)).float;
+        switch (kind) {
+            .f16 => try self.print("    v{d} = (_Float16){e};\n", .{ self.name(res), @as(f64, @as(f16, @floatCast(val))) }),
+            .f32 => try self.print("    v{d} = {e}f;\n", .{ self.name(res), @as(f32, @floatCast(val)) }),
+            .f64 => try self.print("    v{d} = {e};\n", .{ self.name(res), val }),
         }
     }
 
@@ -541,7 +565,11 @@ const Emitter = struct {
                 const width: u16 = if (i.bits <= 8) 8 else if (i.bits <= 16) 16 else if (i.bits <= 32) 32 else 64;
                 try self.print("{s}int{d}_t", .{ if (i.signedness == .unsigned) "u" else "", width });
             },
-            .float => |f| try self.w(if (f == .f32) "float" else "double"),
+            .float => |f| try self.w(switch (f) {
+                .f16 => "_Float16",
+                .f32 => "float",
+                .f64 => "double",
+            }),
             .ptr => try self.w("void*"),
             .@"struct", .vector, .array, .slice => try self.aggName(&self.out, t),
         }
@@ -592,6 +620,157 @@ test "emits params and arithmetic" {
         \\}
         \\
     , src);
+}
+
+test "f16 add emits _Float16 locals; C does the half arithmetic natively" {
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+
+    const f16_t = try func.types.intern(.{ .float = .f16 });
+    const entry = try func.appendBlock();
+    const a = try func.appendBlockParam(entry, f16_t);
+    const b = try func.appendBlockParam(entry, f16_t);
+    const sum = try func.appendInst(entry, f16_t, .{ .arith = .{ .op = .add, .lhs = a, .rhs = b } });
+    func.setTerminator(entry, .{ .ret = sum });
+
+    const src = try emitFunction(std.testing.allocator, &func, "add");
+    defer std.testing.allocator.free(src);
+
+    // No width hardcoded in the arith emit: `v2 = v0 + v1` is the same statement C would emit
+    // for any other numeric type, and the `_Float16` operand types are what makes the C
+    // compiler perform half-precision rounding.
+    try std.testing.expectEqualStrings(
+        \\_Float16 add(_Float16 v0, _Float16 v1) {
+        \\    _Float16 v2;
+        \\    v2 = v0 + v1;
+        \\    return v2;
+        \\}
+        \\
+    , src);
+
+    // A module also accepts a scalar-f16 function now; only a composite f16 rejects (below).
+    const named = [_]NamedFunc{.{ .name = "add", .func = &func }};
+    const mod_src = try emitModule(std.testing.allocator, &named);
+    defer std.testing.allocator.free(mod_src);
+    try std.testing.expect(std.mem.indexOf(u8, mod_src, "_Float16 add(_Float16 v0, _Float16 v1)") != null);
+}
+
+test "f16 fconst emits a (_Float16) cast of the value already rounded to the nearest half" {
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+
+    const f16_t = try func.types.intern(.{ .float = .f16 });
+    const entry = try func.appendBlock();
+    // 0.1 is not exactly representable in f16 (or in f64): the printed literal must already be
+    // Zig's own round-to-nearest-even half of it, so the C `(_Float16)` cast is exact, not a
+    // second re-rounding of a different value.
+    const v = try func.appendInst(entry, f16_t, .{ .fconst = 0.1 });
+    func.setTerminator(entry, .{ .ret = v });
+
+    const src = try emitFunction(std.testing.allocator, &func, "tenth");
+    defer std.testing.allocator.free(src);
+
+    const rounded_half: f64 = @as(f16, @floatCast(0.1));
+    const want = try std.fmt.allocPrint(std.testing.allocator,
+        \\_Float16 tenth(void) {{
+        \\    _Float16 v0;
+        \\    v0 = (_Float16){e};
+        \\    return v0;
+        \\}}
+        \\
+    , .{rounded_half});
+    defer std.testing.allocator.free(want);
+    try std.testing.expectEqualStrings(want, src);
+}
+
+test "f16 <-> f32 convert emits (_Float16)/(float) C casts" {
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+
+    const f16_t = try func.types.intern(.{ .float = .f16 });
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const entry = try func.appendBlock();
+    const x = try func.appendBlockParam(entry, f32_t);
+    const h = try func.appendInst(entry, f16_t, .{ .convert = .{ .value = x } });
+    const back = try func.appendInst(entry, f32_t, .{ .convert = .{ .value = h } });
+    func.setTerminator(entry, .{ .ret = back });
+
+    const src = try emitFunction(std.testing.allocator, &func, "roundtrip");
+    defer std.testing.allocator.free(src);
+
+    try std.testing.expectEqualStrings(
+        \\float roundtrip(float v0) {
+        \\    _Float16 v1;
+        \\    float v2;
+        \\    v1 = (_Float16)v0;
+        \\    v2 = (float)v1;
+        \\    return v2;
+        \\}
+        \\
+    , src);
+}
+
+test "f16 <-> i16 bit reinterpret reuses the width-generic memcpy path" {
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+
+    const f16_t = try func.types.intern(.{ .float = .f16 });
+    const u16_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 16 } });
+    const entry = try func.appendBlock();
+    const bits = try func.appendBlockParam(entry, u16_t);
+    const h = try func.appendInst(entry, f16_t, .{ .unary = .{ .op = .reinterpret, .value = bits } });
+    func.setTerminator(entry, .{ .ret = h });
+
+    const src = try emitFunction(std.testing.allocator, &func, "bitsToHalf");
+    defer std.testing.allocator.free(src);
+
+    try std.testing.expectEqualStrings(
+        \\_Float16 bitsToHalf(uint16_t v0) {
+        \\    _Float16 v1;
+        \\    memcpy(&v1, &v0, sizeof(v1));
+        \\    return v1;
+        \\}
+        \\
+    , src);
+}
+
+test "f16 unary (sqrt) routes through the f32 libm call and casts back to _Float16" {
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+
+    const f16_t = try func.types.intern(.{ .float = .f16 });
+    const entry = try func.appendBlock();
+    const a = try func.appendBlockParam(entry, f16_t);
+    const r = try func.appendInst(entry, f16_t, .{ .unary = .{ .op = .sqrt, .value = a } });
+    func.setTerminator(entry, .{ .ret = r });
+
+    const src = try emitFunction(std.testing.allocator, &func, "half_sqrt");
+    defer std.testing.allocator.free(src);
+
+    try std.testing.expectEqualStrings(
+        \\_Float16 half_sqrt(_Float16 v0) {
+        \\    _Float16 v1;
+        \\    v1 = (_Float16)sqrtf((float)v0);
+        \\    return v1;
+        \\}
+        \\
+    , src);
+}
+
+test "composite f16 (a vector of half) is still rejected cleanly" {
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+
+    const f16_t = try func.types.intern(.{ .float = .f16 });
+    const v2 = try func.types.intern(.{ .vector = .{ .len = 2, .elem = f16_t } });
+    const entry = try func.appendBlock();
+    const a = try func.appendBlockParam(entry, v2);
+    func.setTerminator(entry, .{ .ret = a });
+
+    try std.testing.expectError(error.Unsupported, emitFunction(std.testing.allocator, &func, "vh"));
+
+    const named = [_]NamedFunc{.{ .name = "vh", .func = &func }};
+    try std.testing.expectError(error.Unsupported, emitModule(std.testing.allocator, &named));
 }
 
 test "emits a struct typedef, construction, and extract" {

@@ -21,6 +21,7 @@ pub const lto = @import("vulcan-opt/lto.zig");
 pub const pgo = @import("vulcan-opt/pgo.zig");
 pub const lowerdiv = @import("vulcan-opt/lowerdiv.zig");
 pub const vectorize = @import("vulcan-opt/vectorize.zig");
+pub const microarch = @import("vulcan-opt/microarch.zig");
 
 /// Default pipeline: constant folding, algebraic simplification, strength reduction, GVN/CSE, LICM,
 /// then DCE, to a fixpoint.

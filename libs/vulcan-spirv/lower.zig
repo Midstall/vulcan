@@ -319,6 +319,59 @@ fn isSamplerVar(module: *const Module, id: u32) bool {
     };
 }
 
+/// Validate an id decoded from the untrusted word stream is in range `[0, bound)`, so it is
+/// safe to use as an index into the per-id arrays (all sized `bound`). SPIR-V guarantees every
+/// id is `< id_bound`, but a hostile/malformed module may carry an out-of-range id: as a write
+/// index it would corrupt memory, as a read index it would fault. `lowerModule` is a public
+/// entry point over raw `[]const u32` with no validation layer, so it must reject these.
+fn checkId(id: u32, bound: usize) Error!u32 {
+    if (id >= bound) return error.MalformedModule;
+    return id;
+}
+
+/// Operand `i` of a decoded instruction, or `error.MalformedModule` if the instruction is too
+/// short. `binary.Reader` only guarantees `word_count >= 1`, so a truncated instruction carries
+/// fewer operands than its opcode requires; indexing past them would read out of bounds.
+fn operandAt(operands: []const u32, i: usize) Error!u32 {
+    if (i >= operands.len) return error.MalformedModule;
+    return operands[i];
+}
+
+/// Operand `i` validated as an in-range id (length + id-bound checked): safe to use as an index
+/// into the per-id arrays.
+fn idOperandAt(operands: []const u32, i: usize, bound: usize) Error!u32 {
+    return checkId(try operandAt(operands, i), bound);
+}
+
+/// The operand tail starting at index `i` (`operands[i..]`), or `error.MalformedModule` if the
+/// instruction is too short to have a word there. A truncated instruction must not slice OOB.
+fn operandsFrom(operands: []const u32, i: usize) Error![]const u32 {
+    if (i > operands.len) return error.MalformedModule;
+    return operands[i..];
+}
+
+/// The scalarized vector recorded for a value id (a copy), bounds-checked against the untrusted
+/// id bound. A `len == 0` result means "not a (recorded) vector", as elsewhere.
+fn vecOf(module: *const Module, id: u32) Error!Vec {
+    if (id >= module.vec_of.len) return error.MalformedModule;
+    return module.vec_of[id];
+}
+
+/// The integer value of an `OpConstant` id (used for struct-member / component indices),
+/// bounds-checked against the untrusted id bound.
+fn constValOf(module: *const Module, id: u32) Error!i64 {
+    if (id >= module.const_val.len) return error.MalformedModule;
+    return module.const_val[id];
+}
+
+/// A value id read from the untrusted stream, mapped to its lowered Vulcan Value. Rejects an
+/// out-of-range id (OOB read of `value_of`) and an id that has no value yet (a forward/undefined
+/// reference) - both are malformed for the single-function shapes this lowering accepts.
+fn valueOf(module: *const Module, id: u32) Error!Value {
+    if (id >= module.value_of.len) return error.MalformedModule;
+    return module.value_of[id] orelse error.MalformedModule;
+}
+
 /// Lower the first function of the SPIR-V module in `words` to a fresh Vulcan IR
 /// function. Caller owns and must `deinit` it.
 pub fn lowerModule(allocator: std.mem.Allocator, words: []const u32) Error!Function {
@@ -463,38 +516,91 @@ pub fn lowerModule(allocator: std.mem.Allocator, words: []const u32) Error!Funct
 
     while (try r.next()) |inst| {
         switch (inst.opcode) {
-            op.TypeVoid => types[inst.operands[0]] = .void,
-            op.TypeBool => types[inst.operands[0]] = .{ .scalar = try func.types.intern(.bool) },
-            op.TypeInt => types[inst.operands[0]] = .{ .scalar = try func.types.intern(.{ .int = .{
-                .signedness = if (inst.operands[2] != 0) .signed else .unsigned,
-                .bits = @intCast(inst.operands[1]),
-            } }) },
-            op.TypeFloat => types[inst.operands[0]] = .{ .scalar = try func.types.intern(.{ .float = if (inst.operands[1] == 64) .f64 else .f32 }) },
-            op.TypeFunction => types[inst.operands[0]] = .{ .function = .{ .ret = inst.operands[1] } },
-            op.TypePointer => {
-                types[inst.operands[0]] = .{ .pointer = .{ .pointee = inst.operands[2] } }; // [result, storageClass, pointee]
-                module.type_image_dim[inst.operands[0]] = module.type_image_dim[inst.operands[2]]; // carry an image dim through the pointer
-                module.type_image_arrayed[inst.operands[0]] = module.type_image_arrayed[inst.operands[2]]; // and its arrayed flag
+            op.TypeVoid => types[try idOperandAt(inst.operands, 0, bound)] = .void,
+            op.TypeBool => types[try idOperandAt(inst.operands, 0, bound)] = .{ .scalar = try func.types.intern(.bool) },
+            op.TypeInt => {
+                const id = try idOperandAt(inst.operands, 0, bound);
+                const width = try operandAt(inst.operands, 1);
+                const signedness = try operandAt(inst.operands, 2);
+                types[id] = .{
+                    .scalar = try func.types.intern(.{
+                        .int = .{
+                            .signedness = if (signedness != 0) .signed else .unsigned,
+                            // A width wider than the IR's u16 bit field is a malformed type, not a truncation.
+                            .bits = std.math.cast(u16, width) orelse return error.MalformedModule,
+                        },
+                    }),
+                };
             },
-            op.TypeArray, op.TypeRuntimeArray => types[inst.operands[0]] = .{ .array = .{ .elem = inst.operands[1] } },
-            op.TypeVector => types[inst.operands[0]] = .{ .vector = .{ .elem = inst.operands[1], .len = @intCast(inst.operands[2]) } },
-            op.TypeMatrix => types[inst.operands[0]] = .{ .matrix = .{ .col_vec = inst.operands[1], .cols = @intCast(inst.operands[2]) } }, // [result, columnVecType, columnCount]
+            op.TypeFloat => {
+                const id = try idOperandAt(inst.operands, 0, bound);
+                const width = try operandAt(inst.operands, 1);
+                // Exhaustive on the widths SPIR-V can emit for this backend (16/32/64); any
+                // other width is a malformed module, not a silent fallback to f32.
+                const fk: ir.types.FloatKind = switch (width) {
+                    16 => .f16,
+                    32 => .f32,
+                    64 => .f64,
+                    else => return error.MalformedModule,
+                };
+                types[id] = .{ .scalar = try func.types.intern(.{ .float = fk }) };
+            },
+            op.TypeFunction => {
+                // Referenced type ids (here the return type, below element/member/column
+                // types) are validated so they can later index `types` without a bounds check.
+                const id = try idOperandAt(inst.operands, 0, bound);
+                types[id] = .{ .function = .{ .ret = try idOperandAt(inst.operands, 1, bound) } };
+            },
+            op.TypePointer => {
+                const id = try idOperandAt(inst.operands, 0, bound);
+                const pointee = try idOperandAt(inst.operands, 2, bound); // [result, storageClass, pointee]
+                types[id] = .{ .pointer = .{ .pointee = pointee } };
+                module.type_image_dim[id] = module.type_image_dim[pointee]; // carry an image dim through the pointer
+                module.type_image_arrayed[id] = module.type_image_arrayed[pointee]; // and its arrayed flag
+            },
+            op.TypeArray, op.TypeRuntimeArray => {
+                const id = try idOperandAt(inst.operands, 0, bound);
+                types[id] = .{ .array = .{ .elem = try idOperandAt(inst.operands, 1, bound) } };
+            },
+            op.TypeVector => {
+                const id = try idOperandAt(inst.operands, 0, bound);
+                const elem = try idOperandAt(inst.operands, 1, bound);
+                const len = try operandAt(inst.operands, 2);
+                // A scalarized vector value is held in a fixed [4]Value (`Vec.comps`); a length
+                // beyond that would overflow it as the components are materialized, so reject it.
+                if (len == 0 or len > 4) return error.MalformedModule;
+                types[id] = .{ .vector = .{ .elem = elem, .len = @intCast(len) } };
+            },
+            op.TypeMatrix => {
+                const id = try idOperandAt(inst.operands, 0, bound);
+                const col_vec = try idOperandAt(inst.operands, 1, bound);
+                const cols = try operandAt(inst.operands, 2); // [result, columnVecType, columnCount]
+                // Matrices scalarize into a fixed [16]Value (`Mat.comps`) = at most 4 columns of
+                // at most 4 rows (the column vector's length is capped by TypeVector above).
+                if (cols == 0 or cols > 4) return error.MalformedModule;
+                types[id] = .{ .matrix = .{ .col_vec = col_vec, .cols = @intCast(cols) } };
+            },
             op.TypeImage => {
-                types[inst.operands[0]] = .image; // [result, sampledType, Dim, Depth, Arrayed, MS, Sampled, Format, ...]
-                if (inst.operands.len >= 3) module.type_image_dim[inst.operands[0]] = @intCast(inst.operands[2] & 0xff); // Dim
-                if (inst.operands.len >= 5) module.type_image_arrayed[inst.operands[0]] = @intCast(inst.operands[4] & 0xff); // Arrayed
+                const id = try idOperandAt(inst.operands, 0, bound);
+                types[id] = .image; // [result, sampledType, Dim, Depth, Arrayed, MS, Sampled, Format, ...]
+                if (inst.operands.len >= 3) module.type_image_dim[id] = @intCast(inst.operands[2] & 0xff); // Dim
+                if (inst.operands.len >= 5) module.type_image_arrayed[id] = @intCast(inst.operands[4] & 0xff); // Arrayed
             },
             op.TypeSampledImage => {
-                types[inst.operands[0]] = .sampled_image; // [result, imageType]
-                module.type_image_dim[inst.operands[0]] = module.type_image_dim[inst.operands[1]];
-                module.type_image_arrayed[inst.operands[0]] = module.type_image_arrayed[inst.operands[1]];
+                const id = try idOperandAt(inst.operands, 0, bound);
+                const image = try idOperandAt(inst.operands, 1, bound); // [result, imageType]
+                types[id] = .sampled_image;
+                module.type_image_dim[id] = module.type_image_dim[image];
+                module.type_image_arrayed[id] = module.type_image_arrayed[image];
             },
             op.TypeStruct => {
                 // [result, member0Type, member1Type, ...]. The member offsets may
                 // already be present from earlier OpMemberDecorate, so preserve them.
-                types[inst.operands[0]] = .@"struct";
-                for (inst.operands[1..], 0..) |member_type, i| {
-                    const key = memberKey(inst.operands[0], @intCast(i));
+                const id = try idOperandAt(inst.operands, 0, bound);
+                types[id] = .@"struct";
+                for (inst.operands[1..], 0..) |member_type_raw, i| {
+                    const member_type = try checkId(member_type_raw, bound); // indexes `types` later
+                    const key = memberKey(id, @intCast(i));
                     if (module.members.getPtr(key)) |m| {
                         m.type_id = member_type;
                     } else {
@@ -512,21 +618,24 @@ pub fn lowerModule(allocator: std.mem.Allocator, words: []const u32) Error!Funct
                 };
             },
             op.Decorate => if (inst.operands.len >= 3 and inst.operands[1] == op.Decoration.builtin) {
-                builtin_decor[inst.operands[0]] = inst.operands[2];
-                if (inst.operands[2] == op.BuiltIn.position) is_position[inst.operands[0]] = true;
-                if (inst.operands[2] == op.BuiltIn.point_size) is_point_size[inst.operands[0]] = true;
-                if (inst.operands[2] == op.BuiltIn.frag_coord) is_frag_coord[inst.operands[0]] = true;
-                if (inst.operands[2] == op.BuiltIn.point_coord) is_point_coord[inst.operands[0]] = true;
-                if (inst.operands[2] == op.BuiltIn.front_facing) is_front_facing[inst.operands[0]] = true;
-                if (inst.operands[2] == op.BuiltIn.frag_depth) is_frag_depth[inst.operands[0]] = true;
+                const target = try checkId(inst.operands[0], bound);
+                builtin_decor[target] = inst.operands[2];
+                if (inst.operands[2] == op.BuiltIn.position) is_position[target] = true;
+                if (inst.operands[2] == op.BuiltIn.point_size) is_point_size[target] = true;
+                if (inst.operands[2] == op.BuiltIn.frag_coord) is_frag_coord[target] = true;
+                if (inst.operands[2] == op.BuiltIn.point_coord) is_point_coord[target] = true;
+                if (inst.operands[2] == op.BuiltIn.front_facing) is_front_facing[target] = true;
+                if (inst.operands[2] == op.BuiltIn.frag_depth) is_frag_depth[target] = true;
             } else if (inst.operands.len >= 3 and inst.operands[1] == op.Decoration.array_stride) {
-                array_stride[inst.operands[0]] = inst.operands[2];
+                array_stride[try checkId(inst.operands[0], bound)] = inst.operands[2];
             } else if (inst.operands.len >= 3 and inst.operands[1] == op.Decoration.location) {
-                location[inst.operands[0]] = inst.operands[2];
-                has_location[inst.operands[0]] = true;
+                const target = try checkId(inst.operands[0], bound);
+                location[target] = inst.operands[2];
+                has_location[target] = true;
             } else if (inst.operands.len >= 3 and inst.operands[1] == op.Decoration.binding) {
-                binding[inst.operands[0]] = inst.operands[2];
-                has_binding[inst.operands[0]] = true;
+                const target = try checkId(inst.operands[0], bound);
+                binding[target] = inst.operands[2];
+                has_binding[target] = true;
             },
             op.MemberDecorate => if (inst.operands.len >= 4 and inst.operands[2] == op.Decoration.offset) {
                 // [struct, member, Offset, value] (annotations come before the type).
@@ -565,28 +674,35 @@ pub fn lowerModule(allocator: std.mem.Allocator, words: []const u32) Error!Funct
                 local_size_x = inst.operands[2]; // [entryPoint, LocalSize, x, y, z]
             },
             op.Constant => {
+                const type_id = try operandAt(inst.operands, 0);
+                const result = try idOperandAt(inst.operands, 1, bound); // indexes const_val
                 const bits = constBits(inst.operands[2..]);
-                try consts.put(allocator, inst.operands[1], .{ .type_id = inst.operands[0], .bits = bits });
-                const_val[inst.operands[1]] = @bitCast(bits); // for struct member indices
+                try consts.put(allocator, result, .{ .type_id = type_id, .bits = bits });
+                const_val[result] = @bitCast(bits); // for struct member indices
             },
-            op.ConstantTrue => try consts.put(allocator, inst.operands[1], .{ .type_id = inst.operands[0], .bits = 1 }),
-            op.ConstantFalse => try consts.put(allocator, inst.operands[1], .{ .type_id = inst.operands[0], .bits = 0 }),
+            // The const result ids index value_of / vec_of when the constants are materialized.
+            op.ConstantTrue => try consts.put(allocator, try idOperandAt(inst.operands, 1, bound), .{ .type_id = try operandAt(inst.operands, 0), .bits = 1 }),
+            op.ConstantFalse => try consts.put(allocator, try idOperandAt(inst.operands, 1, bound), .{ .type_id = try operandAt(inst.operands, 0), .bits = 0 }),
             op.ConstantComposite => {
                 // [type, result, comp0, comp1, ...]: a vector constant whose components
                 // are themselves OpConstants. Record the component ids, materialized
                 // component-wise in lowerFunction.
+                const result = try idOperandAt(inst.operands, 1, bound);
                 const comps = try allocator.dupe(u32, inst.operands[2..]);
-                try composite_consts.put(allocator, inst.operands[1], comps);
+                try composite_consts.put(allocator, result, comps);
             },
             op.Variable => {
-                try pending_vars.append(allocator, .{ inst.operands[1], inst.operands[2] }); // [type, result, storageClass]
-                var_type[inst.operands[1]] = inst.operands[0]; // the variable's pointer type
-                var_storage[inst.operands[1]] = inst.operands[2];
+                const type_id = try operandAt(inst.operands, 0); // [type, result, storageClass]
+                const result = try idOperandAt(inst.operands, 1, bound); // indexes var_type / var_storage
+                const storage = try operandAt(inst.operands, 2);
+                try pending_vars.append(allocator, .{ result, storage });
+                var_type[result] = type_id; // the variable's pointer type
+                var_storage[result] = storage;
             },
             op.Function => {
                 if (in_function) return error.Unsupported; // only the first function
                 in_function = true;
-                func_ret_type = inst.operands[0];
+                func_ret_type = try operandAt(inst.operands, 0);
             },
             op.FunctionEnd => break,
             else => if (in_function) try insts.append(allocator, inst),
@@ -753,14 +869,23 @@ fn lowerFunction(allocator: std.mem.Allocator, func: *Function, module: *Module,
         switch (inst.opcode) {
             op.Label => {
                 const b = try func.appendBlock();
-                try blocks.append(allocator, .{ .block = b, .label = inst.operands[0] });
+                try blocks.append(allocator, .{ .block = b, .label = try operandAt(inst.operands, 0) });
                 cur = blocks.items.len - 1;
             },
-            op.Phi => try blocks.items[cur orelse return error.MalformedModule].phis.append(allocator, inst.operands[1]),
+            // The phi result id indexes value_of / vec_of below, so it must be in range.
+            op.Phi => try blocks.items[cur orelse return error.MalformedModule].phis.append(allocator, try idOperandAt(inst.operands, 1, bound)),
             else => {},
         }
     }
     if (blocks.items.len == 0) return error.MalformedModule;
+    // Every result-producing body instruction writes its result into the per-id arrays
+    // (value_of / vec_of / sampler_ptr_of / ...) at operand 1. Those arrays are sized to the
+    // untrusted id bound, so validate each result id up front (it exists and is in range): a
+    // later write with a missing or out-of-range id would corrupt memory. Reads are
+    // bounds-checked at their use sites.
+    for (insts) |inst| {
+        if (definesResult(inst.opcode)) _ = try idOperandAt(inst.operands, 1, bound);
+    }
     const entry = blocks.items[0].block;
 
     // Synthesized entry parameters: invocation id (if used), then each storage buffer
@@ -829,8 +954,8 @@ fn lowerFunction(allocator: std.mem.Allocator, func: *Function, module: *Module,
     }
     for (insts) |inst| {
         if (inst.opcode == op.FunctionParameter) {
-            const ty = scalarType(module.types, inst.operands[0]) orelse return error.Unsupported;
-            value_of[inst.operands[1]] = try func.appendBlockParam(entry, ty);
+            const ty = scalarType(module.types, try operandAt(inst.operands, 0)) orelse return error.Unsupported;
+            value_of[try idOperandAt(inst.operands, 1, bound)] = try func.appendBlockParam(entry, ty);
         }
     }
 
@@ -871,10 +996,16 @@ fn lowerFunction(allocator: std.mem.Allocator, func: *Function, module: *Module,
         const ty = scalarType(module.types, e.value_ptr.type_id) orelse return error.Unsupported;
         const bits = e.value_ptr.bits;
         value_of[e.key_ptr.*] = switch (func.types.type_kind(ty)) {
-            .float => |f| try func.appendInst(entry, ty, .{ .fconst = if (f == .f32)
-                @as(f64, @as(f32, @bitCast(@as(u32, @truncate(bits)))))
-            else
-                @bitCast(bits) }),
+            // `fconst` holds an f64 regardless of the value's own type (the widest common
+            // carrier); widen the decoded bits up from whatever width the literal word(s) held.
+            .float => |f| try func.appendInst(entry, ty, .{
+                .fconst = switch (f) {
+                    .f64 => @bitCast(bits),
+                    .f32 => @as(f64, @as(f32, @bitCast(@as(u32, @truncate(bits))))),
+                    // An f16 constant is packed into the low 16 bits of a single literal word.
+                    .f16 => @as(f64, @as(f16, @bitCast(@as(u16, @truncate(bits))))),
+                },
+            }),
             else => try func.appendInst(entry, ty, .{ .iconst = @bitCast(bits) }),
         };
     }
@@ -887,11 +1018,13 @@ fn lowerFunction(allocator: std.mem.Allocator, func: *Function, module: *Module,
         for (e.value_ptr.*) |comp_id| {
             if (comp_id < module.vec_of.len and module.vec_of[comp_id].len > 0) {
                 for (module.vec_of[comp_id].comps[0..module.vec_of[comp_id].len]) |c| {
+                    if (out.len >= out.comps.len) return error.MalformedModule;
                     out.comps[out.len] = c;
                     out.len += 1;
                 }
             } else {
-                out.comps[out.len] = value_of[comp_id] orelse return error.MalformedModule;
+                if (out.len >= out.comps.len) return error.MalformedModule;
+                out.comps[out.len] = try valueOf(module, comp_id);
                 out.len += 1;
             }
         }
@@ -1059,6 +1192,7 @@ fn scalarComps(module: *Module, id: u32) error{MalformedModule}![]const Value {
         @memcpy(S.buf[0..v.len], v.comps[0..v.len]);
         return S.buf[0..v.len];
     }
+    if (id >= module.value_of.len) return error.MalformedModule; // untrusted id, keep the read in bounds
     S.buf[0] = module.value_of[id] orelse return error.MalformedModule;
     return S.buf[0..1];
 }
@@ -1069,51 +1203,80 @@ fn tagAttr(func: *Function, v: Value, key: []const u8, slot: u32) Error!void {
     try func.addAttr(.{ .value = v }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = key, .value = .{ .int = @intCast(slot) } } });
 }
 
+/// Whether a body instruction defines a result id (always operand 1), as opposed to the
+/// terminators / stores / no-result ops that define none. Every result-producing arm in
+/// `lowerBodyInst` / the vector & ext helpers writes the per-id arrays at operand 1, so
+/// validating that id up front (existence + id bound) makes every later write in-bounds. Unknown
+/// opcodes count as result-defining (they are rejected by `lowerBodyInst` regardless).
+fn definesResult(opcode: u16) bool {
+    return switch (opcode) {
+        op.Label,
+        op.Store,
+        op.Branch,
+        op.BranchConditional,
+        op.Switch,
+        op.Return,
+        op.ReturnValue,
+        op.Unreachable,
+        op.Kill,
+        op.SelectionMerge,
+        op.LoopMerge,
+        op.Name,
+        op.MemberName,
+        op.Decorate,
+        op.MemberDecorate,
+        op.Nop,
+        => false,
+        else => true,
+    };
+}
+
 /// Lower a non-terminator body instruction, recording its result Value.
 fn lowerBodyInst(allocator: std.mem.Allocator, func: *Function, module: *Module, block: Block, inst: binary.Instruction) Error!void {
     const value_of = module.value_of;
+    const bound = value_of.len; // == the id bound; every per-id array is this length
     // Vectors are scalarized: composite/shuffle/vector-arith operate per component.
     if (try lowerVectorInst(allocator, func, module, block, inst)) return;
 
     if (binOpOf(inst.opcode)) |bop| {
-        const ty = scalarType(module.types, inst.operands[0]) orelse return error.Unsupported;
-        const lhs = value_of[inst.operands[2]] orelse return error.MalformedModule;
-        const rhs = value_of[inst.operands[3]] orelse return error.MalformedModule;
+        const ty = scalarType(module.types, try operandAt(inst.operands, 0)) orelse return error.Unsupported;
+        const lhs = try valueOf(module, try operandAt(inst.operands, 2));
+        const rhs = try valueOf(module, try operandAt(inst.operands, 3));
         value_of[inst.operands[1]] = try func.appendInst(block, ty, .{ .arith = .{ .op = bop, .lhs = lhs, .rhs = rhs } });
         return;
     }
     if (cmpOpOf(inst.opcode)) |cop| {
-        const ty = scalarType(module.types, inst.operands[0]) orelse return error.Unsupported;
-        const lhs = value_of[inst.operands[2]] orelse return error.MalformedModule;
-        const rhs = value_of[inst.operands[3]] orelse return error.MalformedModule;
+        const ty = scalarType(module.types, try operandAt(inst.operands, 0)) orelse return error.Unsupported;
+        const lhs = try valueOf(module, try operandAt(inst.operands, 2));
+        const rhs = try valueOf(module, try operandAt(inst.operands, 3));
         value_of[inst.operands[1]] = try func.appendInst(block, ty, .{ .icmp = .{ .op = cop, .lhs = lhs, .rhs = rhs } });
         return;
     }
     switch (inst.opcode) {
         op.Select => {
-            const ty = scalarType(module.types, inst.operands[0]) orelse return error.Unsupported;
-            const cond = value_of[inst.operands[2]] orelse return error.MalformedModule;
-            const a = value_of[inst.operands[3]] orelse return error.MalformedModule;
-            const b = value_of[inst.operands[4]] orelse return error.MalformedModule;
+            const ty = scalarType(module.types, try operandAt(inst.operands, 0)) orelse return error.Unsupported;
+            const cond = try valueOf(module, try operandAt(inst.operands, 2));
+            const a = try valueOf(module, try operandAt(inst.operands, 3));
+            const b = try valueOf(module, try operandAt(inst.operands, 4));
             value_of[inst.operands[1]] = try func.appendInst(block, ty, .{ .select = .{ .cond = cond, .then = a, .@"else" = b } });
         },
         op.ConvertFToU, op.ConvertFToS, op.ConvertSToF, op.ConvertUToF, op.UConvert, op.SConvert, op.FConvert => {
-            const ty = scalarType(module.types, inst.operands[0]) orelse return error.Unsupported;
-            const v = value_of[inst.operands[2]] orelse return error.MalformedModule;
+            const ty = scalarType(module.types, try operandAt(inst.operands, 0)) orelse return error.Unsupported;
+            const v = try valueOf(module, try operandAt(inst.operands, 2));
             value_of[inst.operands[1]] = try func.appendInst(block, ty, .{ .convert = .{ .value = v } });
         },
         op.Bitcast => {
             // Reinterpret the operand's bits as the result type (e.g. int <-> uint). Lowers
             // to the IR `reinterpret` unary op.
-            const ty = scalarType(module.types, inst.operands[0]) orelse return error.Unsupported;
-            const v = value_of[inst.operands[2]] orelse return error.MalformedModule;
+            const ty = scalarType(module.types, try operandAt(inst.operands, 0)) orelse return error.Unsupported;
+            const v = try valueOf(module, try operandAt(inst.operands, 2));
             value_of[inst.operands[1]] = try func.appendInst(block, ty, .{ .unary = .{ .op = .reinterpret, .value = v } });
         },
         op.SNegate, op.FNegate => {
             // Unary negate: 0 - x (integer `sub` for SNegate, float `sub` for FNegate,
             // dispatched by the result type in codegen).
-            const ty = scalarType(module.types, inst.operands[0]) orelse return error.Unsupported;
-            const v = value_of[inst.operands[2]] orelse return error.MalformedModule;
+            const ty = scalarType(module.types, try operandAt(inst.operands, 0)) orelse return error.Unsupported;
+            const v = try valueOf(module, try operandAt(inst.operands, 2));
             const zero = if (inst.opcode == op.FNegate)
                 try func.appendInst(block, ty, .{ .fconst = 0 })
             else
@@ -1122,19 +1285,19 @@ fn lowerBodyInst(allocator: std.mem.Allocator, func: *Function, module: *Module,
         },
         op.Not => {
             // Bitwise complement: x ^ -1 (all ones).
-            const ty = scalarType(module.types, inst.operands[0]) orelse return error.Unsupported;
-            const v = value_of[inst.operands[2]] orelse return error.MalformedModule;
+            const ty = scalarType(module.types, try operandAt(inst.operands, 0)) orelse return error.Unsupported;
+            const v = try valueOf(module, try operandAt(inst.operands, 2));
             value_of[inst.operands[1]] = try func.appendArithImm(block, ty, .bit_xor, v, -1);
         },
         op.ExtInst => try lowerExtInst(allocator, func, module, block, inst),
         op.DPdx, op.DPdy, op.Fwidth => {
             // A scalar screen-space derivative of a varying scalar.
             const axis: Axis = if (inst.opcode == op.DPdy) .y else .x;
-            value_of[inst.operands[1]] = try derivativeOf(allocator, func, module, block, value_of[inst.operands[2]] orelse return error.MalformedModule, axis, inst.opcode == op.Fwidth);
+            value_of[inst.operands[1]] = try derivativeOf(allocator, func, module, block, try valueOf(module, try operandAt(inst.operands, 2)), axis, inst.opcode == op.Fwidth);
         },
         op.Undef => {
             // A safe concrete value for an undefined: zero of the result type.
-            const ty = scalarType(module.types, inst.operands[0]) orelse return error.Unsupported;
+            const ty = scalarType(module.types, try operandAt(inst.operands, 0)) orelse return error.Unsupported;
             value_of[inst.operands[1]] = if (func.types.type_kind(ty) == .float)
                 try func.appendInst(block, ty, .{ .fconst = 0 })
             else
@@ -1144,7 +1307,7 @@ fn lowerBodyInst(allocator: std.mem.Allocator, func: *Function, module: *Module,
         op.AccessChain => try lowerAccessChain(func, module, block, inst),
         op.Load => {
             const result = inst.operands[1];
-            const ptr_id = inst.operands[2];
+            const ptr_id = try idOperandAt(inst.operands, 2, bound); // indexes many per-id arrays below
             if (ptr_id < module.local_is_vec.len and module.local_is_vec[ptr_id]) {
                 // A whole-vector load of a tracked Function-storage vector local: yield the
                 // scalarized vector last stored to it.
@@ -1212,11 +1375,12 @@ fn lowerBodyInst(allocator: std.mem.Allocator, func: *Function, module: *Module,
             }
         },
         op.Store => {
-            const ptr_id = inst.operands[0];
+            const ptr_id = try idOperandAt(inst.operands, 0, bound); // indexes per-id arrays below
+            const val_id = try operandAt(inst.operands, 1);
             // A whole-vector store to a tracked Function-storage vector local: record the
             // scalarized vector as the local's current value (subsequent loads read it).
             if (ptr_id < module.local_is_vec.len and module.local_is_vec[ptr_id]) {
-                const comps = scalarComps(module, inst.operands[1]) catch return error.MalformedModule;
+                const comps = scalarComps(module, val_id) catch return error.MalformedModule;
                 var v: Vec = .{ .len = @intCast(comps.len) };
                 for (comps, 0..) |cv, ci| v.comps[ci] = cv;
                 module.local_vec[ptr_id] = v;
@@ -1226,7 +1390,7 @@ fn lowerBodyInst(allocator: std.mem.Allocator, func: *Function, module: *Module,
             // local: update that one component of the local's current vector.
             if (ptr_id < module.local_comp_of.len and module.local_comp_of[ptr_id] != null) {
                 const lc = module.local_comp_of[ptr_id].?;
-                const sv = value_of[inst.operands[1]] orelse return error.MalformedModule;
+                const sv = try valueOf(module, val_id);
                 if (lc.comp >= module.local_vec[lc.local].len) {
                     if (lc.comp >= module.local_vec[lc.local].comps.len) return error.MalformedModule;
                     module.local_vec[lc.local].len = lc.comp + 1;
@@ -1243,27 +1407,27 @@ fn lowerBodyInst(allocator: std.mem.Allocator, func: *Function, module: *Module,
                 module.is_position[gpv] = true; // route storeOutputAttrib to ATTR_POSITION
                 // Remember the stored clip-space position so the shader can read it back
                 // (e.g. `frag_pos = gl_Position.xyz`). Scalarized into a Vec.
-                const comps = scalarComps(module, inst.operands[1]) catch return error.MalformedModule;
+                const comps = scalarComps(module, val_id) catch return error.MalformedModule;
                 var pv: Vec = .{ .len = @intCast(comps.len) };
                 for (comps, 0..) |cv, ci| pv.comps[ci] = cv;
                 module.position_vec = pv;
-                try storeOutputAttrib(func, module, block, gpv, inst.operands[1]);
+                try storeOutputAttrib(func, module, block, gpv, val_id);
                 return;
             }
             // A graphics Output variable: scalarize the stored vector and tag each
             // component store with its output attribute slot.
             if (ptr_id < module.var_kind.len and module.var_kind[ptr_id] == .output) {
-                try storeOutputAttrib(func, module, block, ptr_id, inst.operands[1]);
+                try storeOutputAttrib(func, module, block, ptr_id, val_id);
                 return;
             }
-            const ptr = value_of[ptr_id] orelse return error.MalformedModule;
-            const val = value_of[inst.operands[1]] orelse return error.MalformedModule;
+            const ptr = try valueOf(module, ptr_id);
+            const val = try valueOf(module, val_id);
             try func.appendStore(block, val, ptr);
         },
         op.SampledImage => {
             // [type, result, image, sampler]. A combined-image-sampler is already a
             // sampled image, so forward the image operand's descriptor pointer.
-            const image_id = inst.operands[2];
+            const image_id = try operandAt(inst.operands, 2);
             module.sampler_ptr_of[inst.operands[1]] = (if (image_id < module.sampler_ptr_of.len) module.sampler_ptr_of[image_id] else null) orelse return error.MalformedModule;
         },
         op.ImageSampleImplicitLod, op.ImageSampleExplicitLod => try lowerImageSample(func, module, block, inst),
@@ -1272,7 +1436,7 @@ fn lowerBodyInst(allocator: std.mem.Allocator, func: *Function, module: *Module,
         op.Image => {
             // [type, result, sampledImage]: extract the raw image (for OpImageFetch). Carry the
             // descriptor pointer + dim + arrayed through unchanged - the following fetch reads them.
-            const si = inst.operands[2];
+            const si = try operandAt(inst.operands, 2);
             module.sampler_ptr_of[inst.operands[1]] = (if (si < module.sampler_ptr_of.len) module.sampler_ptr_of[si] else null) orelse return error.MalformedModule;
             if (si < module.sampler_dim_of.len) module.sampler_dim_of[inst.operands[1]] = module.sampler_dim_of[si];
             if (si < module.sampler_arrayed_of.len) module.sampler_arrayed_of[inst.operands[1]] = module.sampler_arrayed_of[si];
@@ -1302,18 +1466,22 @@ fn vectorInfo(types: []const ?TypeInfo, type_id: u32) ?VecType {
 /// backend needs vector support.
 fn lowerVectorInst(allocator: std.mem.Allocator, func: *Function, module: *Module, block: Block, inst: binary.Instruction) Error!bool {
     const v_of = module.vec_of;
+    const bound = v_of.len; // == the id bound; every per-id array is this length
     switch (inst.opcode) {
         op.CompositeConstruct => {
-            const vi = vectorInfo(module.types, inst.operands[0]) orelse return false; // struct construct: not here
+            const vi = vectorInfo(module.types, try operandAt(inst.operands, 0)) orelse return false; // struct construct: not here
             var out: Vec = .{ .len = 0 };
-            for (inst.operands[2..]) |cid| {
+            for ((try operandsFrom(inst.operands, 2))) |cid_raw| {
+                const cid = try checkId(cid_raw, bound);
                 // A component may itself be a (sub)vector, so flatten it.
                 if (v_of[cid].len > 0) {
                     for (v_of[cid].comps[0..v_of[cid].len]) |c| {
+                        if (out.len >= out.comps.len) return error.MalformedModule;
                         out.comps[out.len] = c;
                         out.len += 1;
                     }
                 } else {
+                    if (out.len >= out.comps.len) return error.MalformedModule;
                     out.comps[out.len] = module.value_of[cid] orelse return error.MalformedModule;
                     out.len += 1;
                 }
@@ -1325,9 +1493,9 @@ fn lowerVectorInst(allocator: std.mem.Allocator, func: *Function, module: *Modul
         op.CompositeExtract => {
             // [type, result, composite, index...]. The indices are literals. A single
             // index into a vector yields the component scalar.
-            const cv = v_of[inst.operands[2]];
+            const cv = v_of[try idOperandAt(inst.operands, 2, bound)];
             if (cv.len == 0) return false; // extracting from a struct/array: not here
-            const idx = inst.operands[3];
+            const idx = try operandAt(inst.operands, 3);
             if (idx >= cv.len) return error.MalformedModule;
             module.value_of[inst.operands[1]] = cv.comps[idx];
             return true;
@@ -1335,10 +1503,13 @@ fn lowerVectorInst(allocator: std.mem.Allocator, func: *Function, module: *Modul
         op.VectorShuffle => {
             // [type, result, vec1, vec2, indices...]. An index < len(vec1) selects
             // from vec1, else from vec2 (offset by len(vec1)).
-            const v1 = v_of[inst.operands[2]];
-            const v2 = v_of[inst.operands[3]];
+            const v1 = v_of[try idOperandAt(inst.operands, 2, bound)];
+            const v2 = v_of[try idOperandAt(inst.operands, 3, bound)];
             var out: Vec = .{ .len = 0 };
-            for (inst.operands[4..]) |ix| {
+            for ((try operandsFrom(inst.operands, 4))) |ix| {
+                if (out.len >= out.comps.len) return error.MalformedModule;
+                // 0xFFFFFFFF is SPIR-V's "undefined" component; any index must land in v1|v2.
+                if (ix >= v1.len + v2.len) return error.MalformedModule;
                 out.comps[out.len] = if (ix < v1.len) v1.comps[ix] else v2.comps[ix - v1.len];
                 out.len += 1;
             }
@@ -1362,10 +1533,10 @@ fn lowerVectorInst(allocator: std.mem.Allocator, func: *Function, module: *Modul
             return true;
         },
         op.VectorTimesScalar => {
-            const vi = vectorInfo(module.types, inst.operands[0]) orelse return false;
+            const vi = vectorInfo(module.types, try operandAt(inst.operands, 0)) orelse return false;
             const elem = scalarType(module.types, vi.elem) orelse return error.Unsupported;
-            const vec = v_of[inst.operands[2]];
-            const s = module.value_of[inst.operands[3]] orelse return error.MalformedModule;
+            const vec = v_of[try idOperandAt(inst.operands, 2, bound)];
+            const s = try valueOf(module, try operandAt(inst.operands, 3));
             var out: Vec = .{ .len = vi.len };
             for (0..vi.len) |i| out.comps[i] = try func.appendInst(block, elem, .{ .arith = .{ .op = .mul, .lhs = vec.comps[i], .rhs = s } });
             v_of[inst.operands[1]] = out;
@@ -1374,7 +1545,7 @@ fn lowerVectorInst(allocator: std.mem.Allocator, func: *Function, module: *Modul
         op.DPdx, op.DPdy, op.Fwidth => {
             // A screen-space derivative of a varying. For a vector operand, scalarize:
             // each component's derivative is the gradient of that varying component.
-            const v = v_of[inst.operands[2]];
+            const v = v_of[try idOperandAt(inst.operands, 2, bound)];
             if (v.len == 0) return false; // scalar derivative: handled in lowerBodyInst
             const axis: Axis = if (inst.opcode == op.DPdy) .y else .x;
             var out: Vec = .{ .len = v.len };
@@ -1390,17 +1561,18 @@ fn lowerVectorInst(allocator: std.mem.Allocator, func: *Function, module: *Modul
             // a scalar-result select falls through to the scalar path in lowerBodyInst.
             // The condition is either a per-component bool VECTOR or (SPIR-V >= 1.4) a single
             // scalar bool broadcast across the components (e.g. `gl_FrontFacing ? a : b`).
-            const vi = vectorInfo(module.types, inst.operands[0]) orelse return false;
+            const vi = vectorInfo(module.types, try operandAt(inst.operands, 0)) orelse return false;
             const elem = scalarType(module.types, vi.elem) orelse return error.Unsupported;
-            const cond_vec = v_of[inst.operands[2]];
-            const a = v_of[inst.operands[3]];
-            const b = v_of[inst.operands[4]];
+            const cond_id = try idOperandAt(inst.operands, 2, bound);
+            const cond_vec = v_of[cond_id];
+            const a = v_of[try idOperandAt(inst.operands, 3, bound)];
+            const b = v_of[try idOperandAt(inst.operands, 4, bound)];
             var out: Vec = .{ .len = vi.len };
             for (0..vi.len) |i| {
                 const cond = if (cond_vec.len > 0)
                     cond_vec.comps[i]
                 else
-                    module.value_of[inst.operands[2]] orelse return error.MalformedModule;
+                    module.value_of[cond_id] orelse return error.MalformedModule;
                 out.comps[i] = try func.appendInst(block, elem, .{ .select = .{ .cond = cond, .then = a.comps[i], .@"else" = b.comps[i] } });
             }
             v_of[inst.operands[1]] = out;
@@ -1408,9 +1580,9 @@ fn lowerVectorInst(allocator: std.mem.Allocator, func: *Function, module: *Modul
         },
         op.Dot => {
             // A scalar result: sum of component products.
-            const elem = scalarType(module.types, inst.operands[0]) orelse return error.Unsupported;
-            const v1 = v_of[inst.operands[2]];
-            const v2 = v_of[inst.operands[3]];
+            const elem = scalarType(module.types, try operandAt(inst.operands, 0)) orelse return error.Unsupported;
+            const v1 = v_of[try idOperandAt(inst.operands, 2, bound)];
+            const v2 = v_of[try idOperandAt(inst.operands, 3, bound)];
             if (v1.len == 0) return false;
             var acc = try func.appendInst(block, elem, .{ .arith = .{ .op = .mul, .lhs = v1.comps[0], .rhs = v2.comps[0] } });
             for (1..v1.len) |i| {
@@ -1423,10 +1595,10 @@ fn lowerVectorInst(allocator: std.mem.Allocator, func: *Function, module: *Modul
         else => {
             // Component-wise arithmetic on a vector result (OpFAdd/OpIMul/...).
             if (binOpOf(inst.opcode)) |bop| {
-                if (vectorInfo(module.types, inst.operands[0])) |vi| {
+                if (vectorInfo(module.types, try operandAt(inst.operands, 0))) |vi| {
                     const elem = scalarType(module.types, vi.elem) orelse return error.Unsupported;
-                    const a = v_of[inst.operands[2]];
-                    const b = v_of[inst.operands[3]];
+                    const a = v_of[try idOperandAt(inst.operands, 2, bound)];
+                    const b = v_of[try idOperandAt(inst.operands, 3, bound)];
                     var out: Vec = .{ .len = vi.len };
                     for (0..vi.len) |i| out.comps[i] = try func.appendInst(block, elem, .{ .arith = .{ .op = bop, .lhs = a.comps[i], .rhs = b.comps[i] } });
                     v_of[inst.operands[1]] = out;
@@ -1523,49 +1695,49 @@ fn lowerMathExtInst(func: *Function, module: *Module, block: Block, which: u32, 
         // binds (a GPU backend emits a MUFU instead). `a` is the primary operand, `b` is the
         // exponent for pow (0 otherwise).
         op.Glsl.pow => {
-            const a = module.value_of[args[0]] orelse return error.MalformedModule;
-            const b = module.value_of[args[1]] orelse return error.MalformedModule;
+            const a = try valueOf(module, try operandAt(args, 0));
+            const b = try valueOf(module, try operandAt(args, 1));
             module.value_of[result] = try callMathFn(func, module, block, MATH_POW, a, b);
             return true;
         },
         op.Glsl.exp => {
-            const x = module.value_of[args[0]] orelse return error.MalformedModule;
+            const x = try valueOf(module, try operandAt(args, 0));
             module.value_of[result] = try callMathFn(func, module, block, MATH_EXP, x, null);
             return true;
         },
         op.Glsl.log => {
-            const x = module.value_of[args[0]] orelse return error.MalformedModule;
+            const x = try valueOf(module, try operandAt(args, 0));
             module.value_of[result] = try callMathFn(func, module, block, MATH_LOG, x, null);
             return true;
         },
         op.Glsl.exp2 => {
-            const x = module.value_of[args[0]] orelse return error.MalformedModule;
+            const x = try valueOf(module, try operandAt(args, 0));
             module.value_of[result] = try callMathFn(func, module, block, MATH_EXP2, x, null);
             return true;
         },
         op.Glsl.log2 => {
-            const x = module.value_of[args[0]] orelse return error.MalformedModule;
+            const x = try valueOf(module, try operandAt(args, 0));
             module.value_of[result] = try callMathFn(func, module, block, MATH_LOG2, x, null);
             return true;
         },
         op.Glsl.sin => {
-            const x = module.value_of[args[0]] orelse return error.MalformedModule;
+            const x = try valueOf(module, try operandAt(args, 0));
             module.value_of[result] = try callMathFn(func, module, block, MATH_SIN, x, null);
             return true;
         },
         op.Glsl.cos => {
-            const x = module.value_of[args[0]] orelse return error.MalformedModule;
+            const x = try valueOf(module, try operandAt(args, 0));
             module.value_of[result] = try callMathFn(func, module, block, MATH_COS, x, null);
             return true;
         },
         op.Glsl.sqrt => {
-            const x = module.value_of[args[0]] orelse return error.MalformedModule;
+            const x = try valueOf(module, try operandAt(args, 0));
             module.value_of[result] = try func.appendInst(block, f32_t, .{ .unary = .{ .op = .sqrt, .value = x } });
             return true;
         },
         op.Glsl.inverse_sqrt => {
             // 1.0 / sqrt(x).
-            const x = module.value_of[args[0]] orelse return error.MalformedModule;
+            const x = try valueOf(module, try operandAt(args, 0));
             const s = try func.appendInst(block, f32_t, .{ .unary = .{ .op = .sqrt, .value = x } });
             const one = try func.appendInst(block, f32_t, .{ .fconst = 1.0 });
             module.value_of[result] = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .div, .lhs = one, .rhs = s } });
@@ -1573,7 +1745,7 @@ fn lowerMathExtInst(func: *Function, module: *Module, block: Block, which: u32, 
         },
         op.Glsl.length => {
             // length(v) = sqrt(dot(v, v)).
-            const v = module.vec_of[args[0]];
+            const v = try vecOf(module, try operandAt(args, 0));
             if (v.len == 0) return false;
             const d2 = try dotSelf(func, block, v);
             module.value_of[result] = try func.appendInst(block, f32_t, .{ .unary = .{ .op = .sqrt, .value = d2 } });
@@ -1581,7 +1753,7 @@ fn lowerMathExtInst(func: *Function, module: *Module, block: Block, which: u32, 
         },
         op.Glsl.normalize => {
             // normalize(v) = v * inversesqrt(dot(v, v)).
-            const v = module.vec_of[args[0]];
+            const v = try vecOf(module, try operandAt(args, 0));
             if (v.len == 0) return false;
             const d2 = try dotSelf(func, block, v);
             const s = try func.appendInst(block, f32_t, .{ .unary = .{ .op = .sqrt, .value = d2 } });
@@ -1597,8 +1769,8 @@ fn lowerMathExtInst(func: *Function, module: *Module, block: Block, which: u32, 
         },
         op.Glsl.cross => {
             // cross(a, b) = (a.y*b.z - a.z*b.y, a.z*b.x - a.x*b.z, a.x*b.y - a.y*b.x).
-            const a = module.vec_of[args[0]];
-            const b = module.vec_of[args[1]];
+            const a = try vecOf(module, try operandAt(args, 0));
+            const b = try vecOf(module, try operandAt(args, 1));
             if (a.len != 3 or b.len != 3) return false;
             const c0 = try crossTerm(func, block, a.comps[1], b.comps[2], a.comps[2], b.comps[1]);
             const c1 = try crossTerm(func, block, a.comps[2], b.comps[0], a.comps[0], b.comps[2]);
@@ -1682,7 +1854,7 @@ fn lowerExtInst(allocator: std.mem.Allocator, func: *Function, module: *Module, 
 
     const arg = struct {
         fn v(m: *Module, a: []const u32, i: usize) Error!Value {
-            return m.value_of[a[i]] orelse error.MalformedModule;
+            return valueOf(m, try operandAt(a, i));
         }
     }.v;
 
@@ -1774,8 +1946,8 @@ fn lowerExtInst(allocator: std.mem.Allocator, func: *Function, module: *Module, 
 /// `index * stride`. The result is `base + offset`.
 fn lowerAccessChain(func: *Function, module: *Module, block: Block, inst: binary.Instruction) Error!void {
     const result = inst.operands[1];
-    const base = inst.operands[2];
-    const indices = inst.operands[3..];
+    const base = try operandAt(inst.operands, 2);
+    const indices = try operandsFrom(inst.operands, 3);
 
     if (base < module.var_kind.len and module.var_kind[base] == .global_id) {
         module.is_builtin_ptr[result] = true;
@@ -1785,7 +1957,7 @@ fn lowerAccessChain(func: *Function, module: *Module, block: Block, inst: binary
     // component) so the following OpLoad/OpStore reads/updates that component of the local's
     // scalarized vector.
     if (base < module.local_is_vec.len and module.local_is_vec[base] and indices.len == 1) {
-        const comp: u32 = @intCast(module.const_val[indices[0]]);
+        const comp: u32 = @intCast(try constValOf(module, indices[0]));
         module.local_comp_of[result] = .{ .local = base, .comp = @intCast(comp) };
         return;
     }
@@ -1804,13 +1976,13 @@ fn lowerAccessChain(func: *Function, module: *Module, block: Block, inst: binary
     // so resolve the chain directly to the addressed component value. The following
     // OpLoad yields it. The index is a constant component.
     if (base < module.var_kind.len and module.var_kind[base] == .input and indices.len == 1) {
-        const comp: usize = @intCast(module.const_val[indices[0]]);
+        const comp: usize = @intCast(try constValOf(module, indices[0]));
         if (module.vec_of[base].len > 0) {
             if (comp >= module.vec_of[base].len) return error.MalformedModule;
             module.input_comp_of[result] = module.vec_of[base].comps[comp];
         } else {
             // A scalar input (component 0 of a 1-wide value).
-            module.input_comp_of[result] = module.value_of[base] orelse return error.MalformedModule;
+            module.input_comp_of[result] = try valueOf(module, base);
         }
         return;
     }
@@ -1823,7 +1995,7 @@ fn lowerAccessChain(func: *Function, module: *Module, block: Block, inst: binary
     if (base < module.var_kind.len and module.var_kind[base] == .output and indices.len == 1) {
         if (module.var_pointee(base)) |struct_ty| {
             if (module.types[struct_ty]) |ti| if (ti == .@"struct") {
-                const member: u32 = @intCast(module.const_val[indices[0]]);
+                const member: u32 = @intCast(try constValOf(module, indices[0]));
                 if (module.members.get(memberKey(struct_ty, member))) |m| {
                     if (m.builtin == op.BuiltIn.position) {
                         module.pos_chain_var[result] = base;
@@ -1838,7 +2010,7 @@ fn lowerAccessChain(func: *Function, module: *Module, block: Block, inst: binary
         }
     }
 
-    const base_ptr = module.value_of[base] orelse return error.MalformedModule;
+    const base_ptr = try valueOf(module, base);
     var cur_type = module.var_pointee(base) orelse return error.Unsupported; // the pointee of the variable
     var const_off: i64 = 0; // accumulated compile-time byte offset
     var offset_val: ?Value = null; // accumulated runtime byte offset (i32)
@@ -1850,7 +2022,7 @@ fn lowerAccessChain(func: *Function, module: *Module, block: Block, inst: binary
         switch (module.types[cur_type] orelse return error.Unsupported) {
             .@"struct" => {
                 // A struct member index must be a constant. Add its byte offset.
-                const member: u32 = @intCast(module.const_val[idx_id]);
+                const member: u32 = @intCast(try constValOf(module, idx_id));
                 const m = module.members.get(memberKey(cur_type, member)) orelse return error.Unsupported;
                 const_off += m.offset;
                 if (module.types[m.type_id]) |ti| if (ti == .matrix) {
@@ -1860,7 +2032,7 @@ fn lowerAccessChain(func: *Function, module: *Module, block: Block, inst: binary
             },
             .array => |arr| {
                 const stride: u32 = if (module.array_stride[cur_type] != 0) module.array_stride[cur_type] else @intCast(vulcanScalarSize(func, scalarType(module.types, arr.elem) orelse return error.Unsupported));
-                const idx = module.value_of[idx_id] orelse return error.MalformedModule;
+                const idx = try valueOf(module, idx_id);
                 const stride_c = try func.appendInst(block, module.i32_t, .{ .iconst = stride });
                 const term = try func.appendInst(block, module.i32_t, .{ .arith = .{ .op = .mul, .lhs = idx, .rhs = stride_c } });
                 offset_val = if (offset_val) |o| try func.appendInst(block, module.i32_t, .{ .arith = .{ .op = .add, .lhs = o, .rhs = term } }) else term;
@@ -1970,9 +2142,10 @@ fn loadVector(func: *Function, module: *Module, block: Block, result: u32, vp: V
 /// the 4th call arg; implicit sampling passes 0.0 (base level). Gradient operands are not
 /// yet honored (treated as implicit / lod 0).
 fn lowerImageSample(func: *Function, module: *Module, block: Block, inst: binary.Instruction) Error!void {
+    const bound = module.vec_of.len; // == the id bound
     const result = inst.operands[1];
-    const sampled = inst.operands[2];
-    const coord = inst.operands[3];
+    const sampled = try operandAt(inst.operands, 2);
+    const coord = try idOperandAt(inst.operands, 3, bound); // indexes vec_of / value_of below
 
     const desc_ptr = (if (sampled < module.sampler_ptr_of.len) module.sampler_ptr_of[sampled] else null) orelse return error.MalformedModule;
 
@@ -2005,7 +2178,7 @@ fn lowerImageSample(func: *Function, module: *Module, block: Block, inst: binary
         if (inst.opcode == op.ImageSampleExplicitLod and inst.operands.len >= 6) {
             const image_operands = inst.operands[4];
             if (image_operands & 0x2 != 0) { // ImageOperands.Lod
-                if (module.value_of[inst.operands[5]]) |lv| break :blk lv;
+                if (module.value_of[try checkId(inst.operands[5], bound)]) |lv| break :blk lv;
             }
         }
         break :blk try func.appendInst(block, f32_t, .{ .fconst = if (is_vec3) 0 else implicit_lod_sentinel });
@@ -2074,10 +2247,11 @@ fn lowerImageSample(func: *Function, module: *Module, block: Block, inst: binary
 /// (no out-pointer, unlike the vec4 samplers). Implicit sampling passes the implicit-LOD sentinel so
 /// the CPU sampler uses the rasterizer derivative LOD (shadow maps normally sit at the base level).
 fn lowerImageSampleShadow(func: *Function, module: *Module, block: Block, inst: binary.Instruction) Error!void {
+    const bound = module.vec_of.len; // == the id bound
     const result = inst.operands[1];
-    const sampled = inst.operands[2];
-    const coord = inst.operands[3];
-    const dref_id = inst.operands[4];
+    const sampled = try operandAt(inst.operands, 2);
+    const coord = try idOperandAt(inst.operands, 3, bound); // indexes vec_of / value_of below
+    const dref_id = try idOperandAt(inst.operands, 4, bound);
 
     const desc_ptr = (if (sampled < module.sampler_ptr_of.len) module.sampler_ptr_of[sampled] else null) orelse return error.MalformedModule;
     const f32_t = try func.types.intern(.{ .float = .f32 });
@@ -2161,9 +2335,10 @@ fn lowerImageSampleShadow(func: *Function, module: *Module, block: Block, inst: 
 /// emits a TLD (OpTld). The coord is an ivec2 (its scalarized i32 components); the LOD is the Lod
 /// image operand (0 when absent). Mirrors lowerImageGather but with integer coords.
 fn lowerImageFetch(func: *Function, module: *Module, block: Block, inst: binary.Instruction) Error!void {
+    const bound = module.vec_of.len; // == the id bound
     const result = inst.operands[1];
-    const image = inst.operands[2];
-    const coord = inst.operands[3];
+    const image = try operandAt(inst.operands, 2);
+    const coord = try idOperandAt(inst.operands, 3, bound); // indexes vec_of / value_of below
     const desc_ptr = (if (image < module.sampler_ptr_of.len) module.sampler_ptr_of[image] else null) orelse return error.MalformedModule;
     const cv = module.vec_of[coord];
     const f32_t = try func.types.intern(.{ .float = .f32 });
@@ -2173,7 +2348,7 @@ fn lowerImageFetch(func: *Function, module: *Module, block: Block, inst: binary.
     // The Lod image operand: operands = [type, result, image, coord, imageOperands, lodValue].
     const lod: Value = blk: {
         if (inst.operands.len >= 6 and (inst.operands[4] & 0x2) != 0) {
-            if (module.value_of[inst.operands[5]]) |lv| break :blk lv;
+            if (module.value_of[try checkId(inst.operands[5], bound)]) |lv| break :blk lv;
         }
         break :blk try func.appendInst(block, i32_t, .{ .iconst = 0 });
     };
@@ -2243,10 +2418,11 @@ fn lowerImageFetch(func: *Function, module: *Module, block: Block, inst: binary.
 /// constant 0..3 (tracked in const_val), passed to the host as an f32. A GPU backend ignores the
 /// call and emits a TG4. Structurally mirrors lowerImageSample (2D coord).
 fn lowerImageGather(func: *Function, module: *Module, block: Block, inst: binary.Instruction) Error!void {
+    const bound = module.vec_of.len; // == the id bound
     const result = inst.operands[1];
-    const sampled = inst.operands[2];
-    const coord = inst.operands[3];
-    const comp_id = inst.operands[4];
+    const sampled = try operandAt(inst.operands, 2);
+    const coord = try idOperandAt(inst.operands, 3, bound); // indexes vec_of / value_of below
+    const comp_id = try operandAt(inst.operands, 4);
     const desc_ptr = (if (sampled < module.sampler_ptr_of.len) module.sampler_ptr_of[sampled] else null) orelse return error.MalformedModule;
     const cv = module.vec_of[coord];
     const f32_t = try func.types.intern(.{ .float = .f32 });
@@ -2283,8 +2459,9 @@ fn lowerImageGather(func: *Function, module: *Module, block: Block, inst: binary
 /// (the matrix is column-major). Produces a scalarized Vec via FMul/FAdd, so no backend
 /// needs matrix support. The matrix operand is a scalarized `Mat`, the vector a `Vec`.
 fn lowerMatrixTimesVector(func: *Function, module: *Module, block: Block, inst: binary.Instruction) Error!void {
-    const mat = module.mat_of[inst.operands[2]];
-    const vec = module.vec_of[inst.operands[3]];
+    const bound = module.mat_of.len; // == the id bound
+    const mat = module.mat_of[try idOperandAt(inst.operands, 2, bound)];
+    const vec = module.vec_of[try idOperandAt(inst.operands, 3, bound)];
     if (mat.cols == 0 or vec.len == 0) return error.MalformedModule;
     if (mat.cols != vec.len) return error.MalformedModule;
     const elem = scalarType(module.types, inst.operands[0]) orelse vectorElemType(module, inst.operands[0]) orelse return error.Unsupported;
@@ -2306,8 +2483,9 @@ fn lowerMatrixTimesVector(func: *Function, module: *Module, block: Block, inst: 
 /// Lower `OpVectorTimesMatrix`: result column j = dot(v, M[col j]) = sum_i v[i] * M[col j][row i].
 /// The result length is the matrix's column count.
 fn lowerVectorTimesMatrix(func: *Function, module: *Module, block: Block, inst: binary.Instruction) Error!void {
-    const vec = module.vec_of[inst.operands[2]];
-    const mat = module.mat_of[inst.operands[3]];
+    const bound = module.vec_of.len; // == the id bound
+    const vec = module.vec_of[try idOperandAt(inst.operands, 2, bound)];
+    const mat = module.mat_of[try idOperandAt(inst.operands, 3, bound)];
     if (mat.cols == 0 or vec.len == 0) return error.MalformedModule;
     if (mat.rows != vec.len) return error.MalformedModule;
     const elem = scalarType(module.types, inst.operands[0]) orelse vectorElemType(module, inst.operands[0]) orelse return error.Unsupported;
@@ -2328,8 +2506,9 @@ fn lowerVectorTimesMatrix(func: *Function, module: *Module, block: Block, inst: 
 /// Lower `OpMatrixTimesScalar`: scale every element of the matrix by the scalar, producing
 /// a new scalarized `Mat`.
 fn lowerMatrixTimesScalar(func: *Function, module: *Module, block: Block, inst: binary.Instruction) Error!void {
-    const mat = module.mat_of[inst.operands[2]];
-    const s = module.value_of[inst.operands[3]] orelse return error.MalformedModule;
+    const bound = module.mat_of.len; // == the id bound
+    const mat = module.mat_of[try idOperandAt(inst.operands, 2, bound)];
+    const s = try valueOf(module, try operandAt(inst.operands, 3));
     if (mat.cols == 0) return error.MalformedModule;
     const elem = matrixElemType(module, inst.operands[0]) orelse return error.Unsupported;
     var out: Mat = .{ .cols = mat.cols, .rows = mat.rows };
@@ -2341,8 +2520,9 @@ fn lowerMatrixTimesScalar(func: *Function, module: *Module, block: Block, inst: 
 /// Lower `OpMatrixTimesMatrix`: C = A * B, column-major. Column j of C is A times column j
 /// of B, i.e. C[col j][row i] = sum_k A[col k][row i] * B[col j][row k].
 fn lowerMatrixTimesMatrix(func: *Function, module: *Module, block: Block, inst: binary.Instruction) Error!void {
-    const a = module.mat_of[inst.operands[2]];
-    const b = module.mat_of[inst.operands[3]];
+    const bound = module.mat_of.len; // == the id bound
+    const a = module.mat_of[try idOperandAt(inst.operands, 2, bound)];
+    const b = module.mat_of[try idOperandAt(inst.operands, 3, bound)];
     if (a.cols == 0 or b.cols == 0) return error.MalformedModule;
     if (a.cols != b.rows) return error.MalformedModule;
     const elem = matrixElemType(module, inst.operands[0]) orelse return error.Unsupported;
@@ -2388,17 +2568,17 @@ fn lowerTerminator(allocator: std.mem.Allocator, func: *Function, module: *const
             _ = try func.appendCallIndirect(blocks[bi].block, void_t, df, &.{});
             func.setTerminator(blocks[bi].block, .{ .ret = null });
         },
-        op.ReturnValue => func.setTerminator(blocks[bi].block, .{ .ret = value_of[inst.operands[0]] orelse return error.MalformedModule }),
+        op.ReturnValue => func.setTerminator(blocks[bi].block, .{ .ret = value_of[try idOperandAt(inst.operands, 0, value_of.len)] orelse return error.MalformedModule }),
         op.Branch => {
-            const target = blockIndex(blocks, inst.operands[0]);
+            const target = blockIndex(blocks, try operandAt(inst.operands, 0));
             const args = try phiArgs(allocator, module, value_of, blocks, target, blocks[bi].label, insts);
             defer allocator.free(args);
             try func.setJump(blocks[bi].block, blocks[target].block, args);
         },
         op.BranchConditional => {
-            const cond = value_of[inst.operands[0]] orelse return error.MalformedModule;
-            const t = blockIndex(blocks, inst.operands[1]);
-            const f = blockIndex(blocks, inst.operands[2]);
+            const cond = value_of[try idOperandAt(inst.operands, 0, value_of.len)] orelse return error.MalformedModule;
+            const t = blockIndex(blocks, try operandAt(inst.operands, 1));
+            const f = blockIndex(blocks, try operandAt(inst.operands, 2));
             const t_args = try phiArgs(allocator, module, value_of, blocks, t, blocks[bi].label, insts);
             defer allocator.free(t_args);
             const f_args = try phiArgs(allocator, module, value_of, blocks, f, blocks[bi].label, insts);
@@ -2420,10 +2600,10 @@ fn lowerTerminator(allocator: std.mem.Allocator, func: *Function, module: *const
 /// a case/merge resolves correctly. A `default`-or-case literal may be 32- or 64-bit wide
 /// (SPIR-V emits the literal as one or two words sized to the selector's width).
 fn lowerSwitch(allocator: std.mem.Allocator, func: *Function, module: *const Module, value_of: []const ?Value, blocks: []const BlockInfo, bi: usize, insts: []const binary.Instruction, inst: binary.Instruction) Error!void {
-    const selector = value_of[inst.operands[0]] orelse return error.MalformedModule;
+    const selector = value_of[try idOperandAt(inst.operands, 0, value_of.len)] orelse return error.MalformedModule;
     const sel_ty = func.valueType(selector);
     const bool_t = try func.types.intern(.bool);
-    const default_label = inst.operands[1];
+    const default_label = try operandAt(inst.operands, 1);
 
     // The selector literal width (in 32-bit words) follows the selector's integer width.
     const lit_words: usize = switch (func.types.type_kind(sel_ty)) {
@@ -2433,7 +2613,7 @@ fn lowerSwitch(allocator: std.mem.Allocator, func: *Function, module: *const Mod
     const stride = lit_words + 1; // each (literal, label) pair
 
     // Count the cases.
-    const rest = inst.operands[2..];
+    const rest = try operandsFrom(inst.operands, 2);
     if (rest.len % stride != 0) return error.MalformedModule;
     const ncases = rest.len / stride;
 
@@ -2504,11 +2684,13 @@ fn phiArgs(allocator: std.mem.Allocator, module: *const Module, value_of: []cons
         // A vector phi: append each component of the incoming vector value.
         if (phi_id < module.vec_of.len and module.vec_of[phi_id].len > 0) {
             const want = module.vec_of[phi_id].len;
+            if (inc_id >= module.vec_of.len) return error.MalformedModule; // untrusted incoming id
             const iv = module.vec_of[inc_id];
             if (iv.len != want) return error.MalformedModule;
             var c: u8 = 0;
             while (c < want) : (c += 1) try args.append(allocator, iv.comps[c]);
         } else {
+            if (inc_id >= value_of.len) return error.MalformedModule; // untrusted incoming id
             try args.append(allocator, value_of[inc_id] orelse return error.MalformedModule);
         }
     }
@@ -3458,4 +3640,36 @@ test "lowers GLSL.std.450 cross + normalize + length + inversesqrt to native ari
     var func = try lowerModule(allocator, b.words.items);
     defer func.deinit();
     try testing.expect(hasFuncStage(&func, "fragment"));
+}
+
+// Hardening regression tests: `lowerModule` consumes an untrusted `[]const u32` with no
+// validation layer, so a malformed word stream must be REJECTED (error.MalformedModule),
+// never indexed out of bounds or panicked on.
+test "rejects a result id at/beyond the id bound (would OOB the per-id arrays)" {
+    const allocator = testing.allocator;
+    var b = try binary.Builder.init(allocator, 4); // valid ids are [0, 4)
+    defer b.deinit(allocator);
+    // OpTypeInt's result id 4 == id_bound: `types[4]` (sized 4) would be an out-of-bounds write.
+    try b.emit(allocator, op.TypeInt, &.{ 4, 32, 1 });
+    try testing.expectError(error.MalformedModule, lowerModule(allocator, b.words.items));
+}
+
+test "rejects a truncated instruction (fewer operands than the opcode needs)" {
+    const allocator = testing.allocator;
+    var b = try binary.Builder.init(allocator, 4);
+    defer b.deinit(allocator);
+    // OpTypeInt needs [result, width, signedness]; this one carries only the result id, so
+    // reading the width/signedness operands would slice past the instruction.
+    try b.emit(allocator, op.TypeInt, &.{1});
+    try testing.expectError(error.MalformedModule, lowerModule(allocator, b.words.items));
+}
+
+test "rejects an oversized vector length (would overflow the scalarized Vec)" {
+    const allocator = testing.allocator;
+    var b = try binary.Builder.init(allocator, 8);
+    defer b.deinit(allocator);
+    try b.emit(allocator, op.TypeFloat, &.{ 1, 32 });
+    // A vec9 cannot be held in Vec.comps ([4]Value): reject rather than overflow it later.
+    try b.emit(allocator, op.TypeVector, &.{ 2, 1, 9 });
+    try testing.expectError(error.MalformedModule, lowerModule(allocator, b.words.items));
 }

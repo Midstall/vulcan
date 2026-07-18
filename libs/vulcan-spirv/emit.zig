@@ -22,6 +22,12 @@ pub const Error = error{ UnsupportedConstruct, MultiBlockUnsupported } || std.me
 /// LinkageAttributes Export decoration (so the module validates as a linkable library
 /// without an entry point). Caller owns the result.
 pub fn emitModule(allocator: std.mem.Allocator, func: *const Function, name: []const u8) Error![]u32 {
+    // SPIR-V has a native Float16 capability, so a bare scalar f16 value is just another
+    // float type here (unlike the emulation backends). f16 packed into a vector/aggregate
+    // has no lowering path though (no frontend produces it today; this is a defensive
+    // guard against a latent miscompile of the half lanes, see functionUsesCompositeF16).
+    if (ir.function.functionUsesCompositeF16(func)) return error.UnsupportedConstruct;
+
     var e = try Emitter.init(allocator, func);
     defer e.deinit();
     try e.run(name);
@@ -110,6 +116,9 @@ fn executionModel(stage: Stage) u32 {
 
 /// Emit `func` as a SPIR-V shader entry point described by `info`. Caller owns it.
 pub fn emitShader(allocator: std.mem.Allocator, func: *const Function, info: ShaderInfo) Error![]u32 {
+    // See emitModule: scalar f16 is native SPIR-V; only composite f16 is rejected.
+    if (ir.function.functionUsesCompositeF16(func)) return error.UnsupportedConstruct;
+
     var e = try Emitter.init(allocator, func);
     defer e.deinit();
     try e.runShader(info);
@@ -219,7 +228,12 @@ const Emitter = struct {
         const id = self.fresh();
         switch (kind) {
             .int => |i| try self.emit(&self.decls, op.TypeInt, &.{ id, i.bits, if (i.signedness == .signed) 1 else 0 }),
-            .float => |f| try self.emit(&self.decls, op.TypeFloat, &.{ id, if (f == .f64) 64 else 32 }),
+            // SPIR-V's Float16 capability makes f16 a native OpTypeFloat width, same as f32/f64.
+            .float => |f| try self.emit(&self.decls, op.TypeFloat, &.{ id, switch (f) {
+                .f16 => @as(u32, 16),
+                .f32 => 32,
+                .f64 => 64,
+            } }),
             else => return error.UnsupportedConstruct,
         }
         try self.type_cache.append(self.allocator, .{ .ty = ty, .id = id });
@@ -315,6 +329,9 @@ const Emitter = struct {
     fn run(self: *Emitter, name: []const u8) Error!void {
         try self.emit(&self.caps, op.Capability, &.{1}); // Shader
         try self.emit(&self.caps, op.Capability, &.{5}); // Linkage (exported library function)
+        // Only declared when f16 is actually used, so a non-f16 module's emitted words stay
+        // byte-identical to before f16 support existed.
+        if (ir.function.functionUsesF16(self.func)) try self.emit(&self.caps, op.Capability, &.{9}); // Float16
         try self.emit(&self.preamble, op.MemoryModel, &.{ 0, 1 }); // Logical, GLSL450
 
         const n = self.func.blockCount();
@@ -567,12 +584,21 @@ const Emitter = struct {
                     const ty = self.func.valueType(result);
                     const tid = try self.typeId(ty);
                     const id = self.fresh();
-                    if (self.func.types.type_kind(ty).float == .f64) {
-                        const bits: u64 = @bitCast(v);
-                        try self.emit(&self.decls, op.Constant, &.{ tid, id, @truncate(bits), @truncate(bits >> 32) });
-                    } else {
-                        const bits: u32 = @bitCast(@as(f32, @floatCast(v)));
-                        try self.emit(&self.decls, op.Constant, &.{ tid, id, bits });
+                    switch (self.func.types.type_kind(ty).float) {
+                        .f64 => {
+                            const bits: u64 = @bitCast(v);
+                            try self.emit(&self.decls, op.Constant, &.{ tid, id, @truncate(bits), @truncate(bits >> 32) });
+                        },
+                        .f32 => {
+                            const bits: u32 = @bitCast(@as(f32, @floatCast(v)));
+                            try self.emit(&self.decls, op.Constant, &.{ tid, id, bits });
+                        },
+                        .f16 => {
+                            // SPIR-V still packs a sub-32-bit literal into one full literal word:
+                            // the f16 bits sit in the low 16 bits, upper 16 bits zero.
+                            const bits: u16 = @bitCast(@as(f16, @floatCast(v)));
+                            try self.emit(&self.decls, op.Constant, &.{ tid, id, @as(u32, bits) });
+                        },
                     }
                     self.setVal(result, id);
                 },
@@ -611,6 +637,7 @@ const Emitter = struct {
         if (total_in + info.uniform_count != params.len) return error.UnsupportedConstruct;
 
         try self.emit(&self.caps, op.Capability, &.{1}); // Shader
+        if (ir.function.functionUsesF16(self.func)) try self.emit(&self.caps, op.Capability, &.{9}); // Float16
         try self.emit(&self.preamble, op.MemoryModel, &.{ 0, 1 }); // Logical, GLSL450
 
         const void_id = try self.voidTypeId();
@@ -1226,6 +1253,9 @@ fn coreOpOf(name: []const u8) ?u16 {
 }
 
 fn convertOpcode(from: TypeKind, to: TypeKind) Error!u16 {
+    // A float<->float width change (f16<->f32, f16<->f64, f32<->f64) is a single OpFConvert;
+    // it handles both narrowing (round-to-nearest-even) and widening.
+    if (from == .float and to == .float) return op.FConvert;
     if (from == .float and to != .float) return if (to.int.signedness == .signed) op.ConvertFToS else op.ConvertFToU;
     if (from != .float and to == .float) return if (from.int.signedness == .signed) op.ConvertSToF else op.ConvertUToF;
     return error.UnsupportedConstruct;
@@ -1266,6 +1296,115 @@ test "emits a scalar function and reads it back (round-trip through the frontend
         \\    ret v3
         \\}
     , "{f}", .{back});
+}
+
+test "an f16 function emits OpTypeFloat 16, the Float16 capability, f16 arithmetic, an f16 constant, and OpFConvert" {
+    const allocator = testing.allocator;
+
+    // fn f(x: f16, y: f16) -> f32 { let s = x + y; let sc = s * 1.0h; return f32(sc); }
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const f16t = try func.types.intern(.{ .float = .f16 });
+    const f32t = try func.types.intern(.{ .float = .f32 });
+    const b = try func.appendBlock();
+    const x = try func.appendBlockParam(b, f16t);
+    const y = try func.appendBlockParam(b, f16t);
+    const s = try func.appendInst(b, f16t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = y } });
+    const one = try func.appendInst(b, f16t, .{ .fconst = 1.0 });
+    const sc = try func.appendInst(b, f16t, .{ .arith = .{ .op = .mul, .lhs = s, .rhs = one } });
+    const widened = try func.appendInst(b, f32t, .{ .convert = .{ .value = sc } });
+    func.setTerminator(b, .{ .ret = widened });
+
+    const words = try emitModule(allocator, &func, "f");
+    defer allocator.free(words);
+    _ = try binary.Reader.init(words);
+
+    var reader = try binary.Reader.init(words);
+    var saw_f16_type = false;
+    var saw_f32_type = false;
+    var saw_float16_cap = false;
+    var saw_fadd = false;
+    var saw_fmul = false;
+    var saw_fconst_narrow = false; // the f16 OpConstant: one operand word, low 16 bits set
+    var saw_fconvert = false;
+    while (try reader.next()) |inst| {
+        switch (inst.opcode) {
+            op.Capability => if (inst.operands[0] == 9) {
+                saw_float16_cap = true;
+            },
+            op.TypeFloat => switch (inst.operands[1]) {
+                16 => saw_f16_type = true,
+                32 => saw_f32_type = true,
+                else => {},
+            },
+            op.FAdd => saw_fadd = true,
+            op.FMul => saw_fmul = true,
+            op.Constant => if (inst.operands.len == 3 and inst.operands[2] == 0x3c00) {
+                // 1.0 as f16 bits (sign 0, exp 01111, mantissa 0), upper 16 bits zero.
+                saw_fconst_narrow = true;
+            },
+            op.FConvert => saw_fconvert = true,
+            else => {},
+        }
+    }
+    try testing.expect(saw_f16_type);
+    try testing.expect(saw_f32_type);
+    try testing.expect(saw_float16_cap);
+    try testing.expect(saw_fadd);
+    try testing.expect(saw_fmul);
+    try testing.expect(saw_fconst_narrow);
+    try testing.expect(saw_fconvert);
+
+    // The frontend reads it back to an equivalent IR function: f16 types/ops survive the
+    // round trip (widened through fconst's f64 carrier, same as f32/f64 already are).
+    var back = try @import("lower.zig").lowerModule(allocator, words);
+    defer back.deinit();
+    try testing.expectFmt(
+        \\fn {
+        \\  block0(v0: f16, v1: f16):
+        \\    const v2: f16 = 1
+        \\    let v3 = v0 + v1
+        \\    let v4 = v3 * v2
+        \\    let v5 = convert f32, v4
+        \\    ret v5
+        \\}
+    , "{f}", .{back});
+}
+
+test "a non-f16 module does not emit the Float16 capability" {
+    const allocator = testing.allocator;
+    const i32k = ir.types.TypeKind{ .int = .{ .signedness = .signed, .bits = 32 } };
+
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(i32k);
+    const b = try func.appendBlock();
+    const x = try func.appendBlockParam(b, t);
+    const y = try func.appendBlockParam(b, t);
+    const r = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = y } });
+    func.setTerminator(b, .{ .ret = r });
+
+    const words = try emitModule(allocator, &func, "f");
+    defer allocator.free(words);
+
+    var reader = try binary.Reader.init(words);
+    while (try reader.next()) |inst| {
+        if (inst.opcode == op.Capability) try testing.expect(inst.operands[0] != 9);
+    }
+}
+
+test "composite (vector) f16 is rejected, only scalar f16 is supported" {
+    const allocator = testing.allocator;
+
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const f16t = try func.types.intern(.{ .float = .f16 });
+    const vec = try func.types.intern(.{ .vector = .{ .elem = f16t, .len = 4 } });
+    const b = try func.appendBlock();
+    const x = try func.appendBlockParam(b, vec);
+    func.setTerminator(b, .{ .ret = x });
+
+    try testing.expectError(error.UnsupportedConstruct, emitModule(allocator, &func, "f"));
 }
 
 test "emits a fragment shader entry point (in -> out)" {

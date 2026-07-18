@@ -189,8 +189,12 @@ fn mapOpcode(caller: *Function, callee: *const Function, vmap: std.AutoHashMapUn
         .load => |l| .{ .load = .{ .ptr = m(vmap, l.ptr) } },
         .alloca => |al| .{ .alloca = .{ .elem = try mapType(caller, callee, tmap, al.elem) } },
         .global_addr => |ga| .{ .global_addr = .{ .symbol = try caller.internSymbol(callee.symbolName(ga.symbol)) } },
+        // dot is pure, like arith: remap its 3 operands. (Its vector operand types
+        // fail the `scalar` gate today, so this is unreachable in practice, but the
+        // remap is here so a future vector-aware inline path needs no new wiring.)
+        .dot => |d| .{ .dot = .{ .acc = m(vmap, d.acc), .a = m(vmap, d.a), .b = m(vmap, d.b) } },
         // Excluded by `inlinable`: these never reach here.
-        .extract, .struct_new, .store, .call, .call_indirect, .@"if" => unreachable,
+        .extract, .struct_new, .store, .prefetch, .matmul, .call, .call_indirect, .@"if" => unreachable,
     };
 }
 
@@ -227,6 +231,17 @@ fn substituteValue(func: *Function, from: Value, to: Value) void {
             .store => |*st| {
                 st.value = r(from, to, st.value);
                 st.ptr = r(from, to, st.ptr);
+            },
+            .prefetch => |*pf| pf.ptr = r(from, to, pf.ptr),
+            .dot => |*d| {
+                d.acc = r(from, to, d.acc);
+                d.a = r(from, to, d.a);
+                d.b = r(from, to, d.b);
+            },
+            .matmul => |*mm| {
+                mm.a = r(from, to, mm.a);
+                mm.b = r(from, to, mm.b);
+                mm.c = r(from, to, mm.c);
             },
             .struct_new => |sn| for (func.valueListMut(sn.fields)) |*f| {
                 f.* = r(from, to, f.*);
@@ -270,6 +285,8 @@ fn inlinableMulti(callee: *const Function) bool {
             .struct_new, .extract => return false, // aggregate type remap is not handled
             .@"if" => {}, // control flow, cloned in a later pass
             .store => |st| _ = st, // yields no value, cloned in a later pass
+            .prefetch => |pf| _ = pf, // yields no value, cloned in a later pass
+            .matmul => |mm| _ = mm, // yields no value, cloned in a later pass
             .alloca => |al| if (!scalar(callee, al.elem)) return false,
             else => {
                 const r = callee.instResult(inst) orelse return false;
@@ -392,6 +409,46 @@ fn inlineCallMulti(allocator: std.mem.Allocator, caller: *Function, bi: u32, cal
         for (callee.blockInsts(@enumFromInt(cb))) |cinst| switch (callee.opcode(cinst)) {
             .@"if" => {},
             .store => |st| try caller.appendStore(nb, mapV(vmap, st.value), mapV(vmap, st.ptr)),
+            .prefetch => |pf| try caller.appendPrefetch(nb, mapV(vmap, pf.ptr)),
+            // A `per_column` scale's ScaleList handle (and a bias's BiasList handle) is relative to
+            // the CALLEE's pools, which is meaningless in the caller (a different function, different
+            // pools). Re-intern both through the spec builder so each handle is re-resolved via the
+            // CALLEE's scaleList/biasList and re-interned into the CALLER's pools; scalar/null quants
+            // carry no pool handle, so this still round-trips them unchanged.
+            .matmul => |mm| {
+                if (mm.quant) |q| {
+                    const spec: Function.MatMulQuantSpec = .{
+                        .scale_scalar = switch (q.scale) {
+                            .scalar => |sb| sb,
+                            .per_column => null,
+                        },
+                        .scale_per_column = switch (q.scale) {
+                            .scalar => null,
+                            .per_column => |h| callee.scaleList(h),
+                        },
+                        .bias = if (q.bias) |bh| callee.biasList(bh) else null,
+                        .zero_point = q.zero_point,
+                        .relu = q.relu,
+                        .out = q.out,
+                        .input_signs = mm.input_signs, // plain value, no pool handle, copies as-is
+                    };
+                    try caller.appendMatmulQuantSpec(nb, mapV(vmap, mm.a), mapV(vmap, mm.b), mapV(vmap, mm.c), mm.m, mm.n, mm.k, mm.dtype, mm.accumulate, spec);
+                } else if (mm.input_signs) |s|
+                    try caller.appendMatmulSigned(nb, mapV(vmap, mm.a), mapV(vmap, mm.b), mapV(vmap, mm.c), mm.m, mm.n, mm.k, mm.dtype, mm.accumulate, s)
+                else
+                    try caller.appendMatmul(nb, mapV(vmap, mm.a), mapV(vmap, mm.b), mapV(vmap, mm.c), mm.m, mm.n, mm.k, mm.dtype, mm.accumulate);
+                // The builders above default `embedded` to false; carry the callee op's flag onto the
+                // just-appended matmul (the last inst in nb) so a self-contained matmul stays
+                // self-contained after inlining into a caller that has live values around it.
+                if (mm.embedded) {
+                    const appended = caller.blockInsts(nb);
+                    const last = appended[appended.len - 1];
+                    // The matmul builders each append exactly one statement, so the last inst in nb is
+                    // that matmul; assert it rather than silently flag-flip an unrelated opcode.
+                    std.debug.assert(caller.opcode(last) == .matmul);
+                    caller.opcodeMut(last).matmul.embedded = true;
+                }
+            },
             else => |op| {
                 const cres = callee.instResult(cinst).?;
                 const rty = try mapType(caller, callee, &tmap, callee.valueType(cres));

@@ -14,8 +14,10 @@ pub const Int = struct {
     bits: u16,
 };
 
-/// The floating-point formats in the primitive core.
-pub const FloatKind = enum { f32, f64 };
+/// The floating-point formats in the primitive core. f16 is appended (not
+/// inserted) so f32/f64 keep their existing tag values; nothing may rely on
+/// f16's own tag value ordering relative to future additions.
+pub const FloatKind = enum { f32, f64, f16 };
 
 /// A fixed-length SIMD vector over a primitive scalar element.
 pub const Vector = struct {
@@ -167,15 +169,15 @@ pub const TypeTable = struct {
 pub const ParseError = error{InvalidType};
 
 fn isLetter(c: u8) bool {
-    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z');
+    return std.ascii.isAlphabetic(c);
 }
 
 fn isDigit(c: u8) bool {
-    return c >= '0' and c <= '9';
+    return std.ascii.isDigit(c);
 }
 
 fn isWordChar(c: u8) bool {
-    return isLetter(c) or isDigit(c);
+    return std.ascii.isAlphanumeric(c);
 }
 
 /// A cursor-based recursive-descent parser over a single type's text.
@@ -295,6 +297,7 @@ const TypeParser = struct {
         if (std.mem.eql(u8, word, "ptr")) return self.table.intern(.ptr);
         if (std.mem.eql(u8, word, "f32")) return self.table.intern(.{ .float = .f32 });
         if (std.mem.eql(u8, word, "f64")) return self.table.intern(.{ .float = .f64 });
+        if (std.mem.eql(u8, word, "f16")) return self.table.intern(.{ .float = .f16 });
         if (word.len >= 2 and (word[0] == 'i' or word[0] == 'u')) {
             const signedness: std.builtin.Signedness = if (word[0] == 'i') .signed else .unsigned;
             const bits = std.fmt.parseInt(u16, word[1..], 10) catch return error.InvalidType;
@@ -440,6 +443,29 @@ test "float and pointer primitives intern distinctly" {
     try std.testing.expectEqual(ptr_a, ptr_b);
     try std.testing.expect(f32_a != f64_t);
     try std.testing.expect(f32_a != ptr_a);
+}
+
+test "f16 parses, prints, and interns distinctly from f32/f64" {
+    var table = TypeTable.init(std.testing.allocator);
+    defer table.deinit();
+
+    const f16_t = try table.intern(.{ .float = .f16 });
+    const f32_t = try table.intern(.{ .float = .f32 });
+    const f64_t = try table.intern(.{ .float = .f64 });
+
+    // parseType interns the same handle a direct intern() call would.
+    try std.testing.expectEqual(f16_t, try table.parseType("f16"));
+
+    // The printer is free via @tagName, so it must round-trip the source text.
+    try std.testing.expectFmt("f16", "{f}", .{table.fmt(f16_t)});
+
+    // f16 is a distinct type from f32/f64, not an alias of either.
+    try std.testing.expect(f16_t != f32_t);
+    try std.testing.expect(f16_t != f64_t);
+
+    // Re-interning f16 dedups to the same handle (appending it kept f32/f64's
+    // own tag values stable, so this is not sensitive to enum ordering).
+    try std.testing.expectEqual(f16_t, try table.intern(.{ .float = .f16 }));
 }
 
 test "type_kind reads back the interned kind" {

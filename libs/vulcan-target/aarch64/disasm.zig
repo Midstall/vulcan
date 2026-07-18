@@ -134,7 +134,9 @@ fn formatElfImpl(allocator: std.mem.Allocator, code: []const u32, base: u64, sym
 /// when a context is present, else the self-contained `.±N` form.
 fn renderTarget(a: std.mem.Allocator, buf: *std.ArrayList(u8), ctx: ?Context, rel_bytes: i64) !void {
     if (ctx) |c| {
-        const abs: u64 = @intCast(@as(i64, @intCast(c.pc)) + rel_bytes);
+        // Wrapping add (like the adrp path): a disassembler must never panic on the
+        // bytes it is given, including a branch whose displacement runs below zero.
+        const abs: u64 = @bitCast(@as(i64, @bitCast(c.pc)) +% rel_bytes);
         try buf.print(a, "0x{x}", .{abs});
         try annotateSym(a, buf, c.syms, abs);
     } else {
@@ -734,13 +736,16 @@ fn memImm(a: std.mem.Allocator, buf: *std.ArrayList(u8), w: u32) !bool {
         .{ .match = 0xFD400000, .mnem = "ldr", .x64 = false, .scale = 3, .fp = true, .dbl = true },
         .{ .match = 0x3D800000, .mnem = "str", .x64 = false, .scale = 4, .fp = true, .dbl = false }, // Q
         .{ .match = 0x3DC00000, .mnem = "ldr", .x64 = false, .scale = 4, .fp = true, .dbl = false }, // Q
+        .{ .match = 0x7D000000, .mnem = "str", .x64 = false, .scale = 1, .fp = true, .dbl = false }, // H (f16)
+        .{ .match = 0x7D400000, .mnem = "ldr", .x64 = false, .scale = 1, .fp = true, .dbl = false }, // H (f16)
     };
     for (table) |m| {
         if (w & 0xFFC00000 != m.match) continue;
         const off: u32 = ((w >> 10) & 0xFFF) << m.scale;
         try buf.print(a, "{s} ", .{m.mnem});
         if (m.fp) {
-            const c: u8 = if (m.scale == 4) 'q' else if (m.dbl) 'd' else 's';
+            // The FP view: Q (128-bit), D (64-bit), H (16-bit, the f16 boundary form), else S.
+            const c: u8 = if (m.scale == 4) 'q' else if (m.dbl) 'd' else if (m.scale == 1) 'h' else 's';
             try buf.print(a, "{c}{d}", .{ c, rd(w) });
         } else {
             try gp(buf, a, m.x64, rd(w));
@@ -773,6 +778,21 @@ fn fpDecode(a: std.mem.Allocator, buf: *std.ArrayList(u8), w: u32) !bool {
     for (fp3) |e| {
         if (w & 0xFFA0FC00 == e.match) {
             try buf.print(a, "{s} {c}{d}, {c}{d}, {c}{d}", .{ e.mnem, fc, rd(w), fc, rn(w), fc, rm(w) });
+            return true;
+        }
+    }
+    // Floating-point data-processing (3-source): Rd = op(Rn*Rm, Ra). Mask excludes ftype
+    // (bit 22, read via `dbl` above) and the four 5-bit register fields.
+    const FP3A = struct { match: u32, mnem: []const u8 };
+    const fp3a = [_]FP3A{
+        .{ .match = 0x1F000000, .mnem = "fmadd" },
+        .{ .match = 0x1F008000, .mnem = "fmsub" },
+        .{ .match = 0x1F200000, .mnem = "fnmadd" },
+        .{ .match = 0x1F208000, .mnem = "fnmsub" },
+    };
+    for (fp3a) |e| {
+        if (w & 0xFF208000 == e.match) {
+            try buf.print(a, "{s} {c}{d}, {c}{d}, {c}{d}, {c}{d}", .{ e.mnem, fc, rd(w), fc, rn(w), fc, rm(w), fc, ra(w) });
             return true;
         }
     }
@@ -855,6 +875,18 @@ fn fpDecode(a: std.mem.Allocator, buf: *std.ArrayList(u8), w: u32) !bool {
         try buf.print(a, "fcvt s{d}, d{d}", .{ rd(w), rn(w) });
         return true;
     }
+    if (w & 0xFFFFFC00 == 0x1EE24000) { // fcvt s, h (h->s, f16 widen)
+        try buf.print(a, "fcvt s{d}, h{d}", .{ rd(w), rn(w) });
+        return true;
+    }
+    if (w & 0xFFFFFC00 == 0x1E23C000) { // fcvt h, s (s->h, f16 narrow)
+        try buf.print(a, "fcvt h{d}, s{d}", .{ rd(w), rn(w) });
+        return true;
+    }
+    if (w & 0xFFFFFC00 == 0x1E63C000) { // fcvt h, d (d->h, f16 narrow, single round)
+        try buf.print(a, "fcvt h{d}, d{d}", .{ rd(w), rn(w) });
+        return true;
+    }
     return false;
 }
 
@@ -873,6 +905,8 @@ fn vecDecode(a: std.mem.Allocator, buf: *std.ArrayList(u8), w: u32) !bool {
         .{ .match = 0x6EA0E400, .mnem = "fcmgt", .b16 = false },
         .{ .match = 0x6E20E400, .mnem = "fcmge", .b16 = false },
         .{ .match = 0x6E601C00, .mnem = "bsl", .b16 = true },
+        .{ .match = 0x4E20CC00, .mnem = "fmla", .b16 = false },
+        .{ .match = 0x4EA0CC00, .mnem = "fmls", .b16 = false },
     };
     for (v3) |e| {
         if (w == e.match | (@as(u32, rm(w)) << 16) | (@as(u32, rn(w)) << 5) | rd(w)) {
@@ -1143,18 +1177,20 @@ test "decodes bitfield, movn, mulh, and SIMD unscaled loads (verified against ob
 }
 
 test "round-trips scalar and vector floating point" {
-    try expectOne(encode.fadd(.x0, .x1, .x2, false), "fadd s0, s1, s2");
-    try expectOne(encode.fdiv(.x0, .x1, .x2, true), "fdiv d0, d1, d2");
-    try expectOne(encode.fcmp(.x1, .x2, false), "fcmp s1, s2");
-    try expectOne(encode.fcsel(.x0, .x1, .x2, .mi, true), "fcsel d0, d1, d2, mi");
+    try expectOne(encode.fadd(.x0, .x1, .x2, .single), "fadd s0, s1, s2");
+    try expectOne(encode.fdiv(.x0, .x1, .x2, .double), "fdiv d0, d1, d2");
+    try expectOne(encode.fcmp(.x1, .x2, .single), "fcmp s1, s2");
+    try expectOne(encode.fcsel(.x0, .x1, .x2, .mi, .double), "fcsel d0, d1, d2, mi");
     try expectOne(encode.fsqrt(.x0, .x1, false), "fsqrt s0, s1");
     try expectOne(encode.fmovFromGpr(.x0, .x1, false), "fmov s0, w1");
     try expectOne(encode.fmovToGpr(.x0, .x1, true), "fmov x0, d1");
-    try expectOne(encode.cvtIntToFloat(.x0, .x1, false, true), "scvtf s0, w1");
-    try expectOne(encode.cvtFloatToInt(.x0, .x1, false, true), "fcvtzs w0, s1");
+    try expectOne(encode.cvtIntToFloat(.x0, .x1, .single, true), "scvtf s0, w1");
+    try expectOne(encode.cvtFloatToInt(.x0, .x1, .single, true), "fcvtzs w0, s1");
     try expectOne(encode.fcvt(.x0, .x1, true), "fcvt d0, s1");
     try expectOne(encode.faddVec(.x0, .x1, .x2), "fadd v0.4s, v1.4s, v2.4s");
     try expectOne(encode.fmulVec(.x0, .x1, .x2), "fmul v0.4s, v1.4s, v2.4s");
+    try expectOne(encode.fmlaVec(.x0, .x1, .x2), "fmla v0.4s, v1.4s, v2.4s");
+    try expectOne(encode.fmlsVec(.x0, .x1, .x2), "fmls v0.4s, v1.4s, v2.4s");
     try expectOne(encode.fnegVec(.x0, .x1), "fneg v0.4s, v1.4s");
     try expectOne(encode.mvnVec(.x0, .x1), "mvn v0.16b, v1.16b");
     try expectOne(encode.bslVec(.x0, .x1, .x2), "bsl v0.16b, v1.16b, v2.16b");
@@ -1162,4 +1198,8 @@ test "round-trips scalar and vector floating point" {
     try expectOne(encode.dupLane(.x0, .x1, 2), "dup s0, v1.s[2]");
     try expectOne(encode.insLane(.x0, 1, .x1), "ins v0.s[1], v1.s[0]");
     try expectOne(encode.movVec(.x0, .x1), "mov v0.16b, v1.16b");
+    try expectOne(encode.fmadd(.x0, .x1, .x2, .x3, false), "fmadd s0, s1, s2, s3");
+    try expectOne(encode.fmadd(.x0, .x1, .x2, .x3, true), "fmadd d0, d1, d2, d3");
+    try expectOne(encode.fmsub(.x0, .x1, .x2, .x3, false), "fmsub s0, s1, s2, s3");
+    try expectOne(encode.fnmsub(.x0, .x1, .x2, .x3, true), "fnmsub d0, d1, d2, d3");
 }

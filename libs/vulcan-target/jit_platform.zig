@@ -57,7 +57,11 @@ fn uefiProtect(_: ?*anyopaque, _: ExecMemory) bool {
 fn uefiFree(_: ?*anyopaque, mem: ExecMemory) void {
     const bs = uefi.system_table.boot_services orelse return;
     const page_ptr: [*]align(4096) uefi.Page = @ptrCast(@alignCast(mem.ptr));
-    bs.freePages(page_ptr[0 .. mem.len / 4096]) catch {};
+    // freeFn cannot propagate (its signature returns void) and a leaked page at
+    // JIT-buffer teardown is non-fatal, but the failure must be observable rather
+    // than silently swallowed.
+    bs.freePages(page_ptr[0 .. mem.len / 4096]) catch |err|
+        std.log.warn("uefiFree: freePages failed: {s}", .{@errorName(err)});
 }
 
 /// The provider for the current target: UEFI boot-services pages on UEFI, posix mmap otherwise.

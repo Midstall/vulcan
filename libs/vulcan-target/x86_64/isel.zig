@@ -64,6 +64,17 @@ fn isDouble(func: *const Function, v: Value) bool {
         else => false,
     };
 }
+/// Whether `v` is an f16 (half). f16 is emulated: it lives in an xmm register as its f32
+/// widening (so `isDouble(f16)` is false and every in-register op uses the scalar-single SSE
+/// form naturally), and the boundaries widen/narrow with the F16C conversions. `isHalf` marks
+/// the sites that must add that widening/narrowing: memory load/store, narrowing converts, the
+/// int->f16 and f32/f64->f16 converts, arithmetic results, and the f16 constant.
+fn isHalf(func: *const Function, v: Value) bool {
+    return switch (func.types.type_kind(func.valueType(v))) {
+        .float => |f| f == .f16,
+        else => false,
+    };
+}
 /// Whether `v` lives in an xmm register (a scalar float or a SIMD vector).
 fn isXmm(func: *const Function, v: Value) bool {
     return isFloat(func, v) or isVector(func, v);
@@ -211,6 +222,12 @@ pub fn selectFunction(allocator: std.mem.Allocator, func: *const Function) Error
 
 /// Compile `func` to machine code plus its call relocations. Caller owns it.
 pub fn compile(allocator: std.mem.Allocator, func: *const Function) Error!Compiled {
+    // f16 is now lowered here via F16C (held as its f32 widening in an xmm register, all
+    // arithmetic in scalar-single SSE, hardware vcvtph2ps/vcvtps2ph conversion at the
+    // boundaries). The other backends still reject f16 via `functionUsesF16`; x86_64 no longer
+    // does. Only SCALAR f16 is handled, so f16 nested in a vector/aggregate (which would fall
+    // through to the raw-vector path and miscompile the half lanes) is still rejected cleanly.
+    if (ir.function.functionUsesCompositeF16(func)) return error.Unsupported;
     const nblocks = func.blockCount();
     if (nblocks == 0) return error.Unsupported;
 
@@ -339,6 +356,18 @@ fn lineOf(func: *const Function, inst: ir.function.Inst) ?u32 {
     return null;
 }
 
+/// Round the f16 value held in the low f32 lane of `reg` to nearest-even half and re-widen it,
+/// in place. This is the per-op IEEE rounding of the f16 emulation: an f16 arithmetic result,
+/// an int/f32/f64 -> f16 convert, or an f16 constant is first computed in f32, then this
+/// narrows it to a half (vcvtps2ph, RNE) and widens it back (vcvtph2ps) so the register again
+/// holds an exact half value. Skipping it would keep f32 precision, which is WRONG for f16
+/// semantics (each op must round to nearest-even half). Both F16C ops are 128-bit and operate
+/// in place, so no scratch register is needed.
+fn roundToHalf(allocator: std.mem.Allocator, ctx: *Ctx, reg: Xmm) Error!void {
+    try ctx.put(allocator, encode.vcvtps2ph(reg, reg, 0)); // imm8 = 0 -> round-to-nearest-even
+    try ctx.put(allocator, encode.vcvtph2ps(reg, reg));
+}
+
 fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Error!void {
     const func = ctx.func;
     if (func.opcode(inst) == .store) {
@@ -347,13 +376,28 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
         const base = try ctx.use(allocator, st.ptr, scratch2);
         if (isXmm(func, st.value)) {
             const val = try ctx.useXmm(allocator, st.value, xmm_op0);
-            try ctx.put(allocator, if (isVector(func, st.value)) encode.movupsStoreMem(base, 0, val) else if (isDouble(func, st.value)) encode.movsdStoreMem(base, 0, val) else encode.movssStoreMem(base, 0, val));
+            if (isHalf(func, st.value)) {
+                // Store a 16-bit IEEE half: narrow the held f32 (lane 0) to a half with
+                // vcvtps2ph (RNE), move it to a gpr, and write exactly 2 bytes. The held value
+                // is already an exact half, so the narrow is lossless. Narrow into xmm_scratch
+                // so `val` (which useXmm never reloads into the scratch) is not clobbered.
+                try ctx.put(allocator, encode.vcvtps2ph(xmm_scratch, val, 0));
+                try ctx.put(allocator, encode.movdFromXmm(scratch1, xmm_scratch));
+                try ctx.put(allocator, encode.movToMem16(base, 0, scratch1));
+            } else {
+                try ctx.put(allocator, if (isVector(func, st.value)) encode.movupsStoreMem(base, 0, val) else if (isDouble(func, st.value)) encode.movsdStoreMem(base, 0, val) else encode.movssStoreMem(base, 0, val));
+            }
         } else {
             const val = try ctx.use(allocator, st.value, scratch1);
             // Store the value's own width: a 32-bit int writes 4 bytes, not 8 (an 8-byte store
             // would clobber the next element of a tightly-packed i32 array).
             try ctx.put(allocator, if (intBits(func, st.value) <= 32) encode.movToMem32(base, 0, val) else encode.movToMem(base, 0, val));
         }
+        return;
+    }
+    if (func.opcode(inst) == .prefetch) {
+        // A software prefetch hint: no result, and x86-64 codegen here has no need for
+        // one, so it is simply dropped (a valid no-op lowering of a hint).
         return;
     }
     if (func.opcode(inst) == .call_indirect) {
@@ -455,7 +499,10 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
                 try ctx.put(allocator, encode.movImm64(scratch1, @bitCast(val)));
                 try ctx.put(allocator, encode.movqToXmm(rd, scratch1));
             } else {
-                const bits: u32 = @bitCast(@as(f32, @floatCast(val)));
+                // An f16 constant is materialized as its f32 widening (the value rounded to
+                // half first, `@as(f32, @as(f16, val))`), keeping the invariant that an f16 in
+                // a register is its exact-half f32 form. f32 keeps its full value.
+                const bits: u32 = @bitCast(if (isHalf(func, result)) @as(f32, @as(f16, @floatCast(val))) else @as(f32, @floatCast(val)));
                 try ctx.put(allocator, encode.movImm(scratch1, @bitCast(bits)));
                 try ctx.put(allocator, encode.movdToXmm(rd, scratch1));
             }
@@ -509,6 +556,10 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
                     try ctx.put(allocator, encode.movupsRR(work, rl));
                     try ctx.put(allocator, try op(a.op, vec, dbl, work, rr));
                 }
+                // An f16 op is done in the scalar-single (f32) form, then its result is rounded
+                // to nearest-even half so the register again holds an exact half value (correct
+                // per-op IEEE f16 semantics; the operands were already exact halves).
+                if (isHalf(func, result)) try roundToHalf(allocator, ctx, work);
                 try ctx.storeXmm(allocator, result, work);
                 return;
             }
@@ -678,22 +729,38 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
             if (!src_float and dst_float) {
                 const src = try ctx.use(allocator, cv.value, scratch1); // i32 in a gpr
                 const rd = try ctx.dstXmm(result, xmm_scratch);
+                // int -> float: cvtsi2ss/cvtsi2sd. isDouble(f16) is false, so an int->f16 lands
+                // in the scalar-single form first, then rounds to nearest-even half.
                 try ctx.put(allocator, if (isDouble(func, result)) encode.cvtsi2sd(rd, src) else encode.cvtsi2ss(rd, src));
+                if (isHalf(func, result)) try roundToHalf(allocator, ctx, rd);
                 try ctx.storeXmm(allocator, result, rd);
             } else if (src_float and !dst_float) {
+                // float -> int (truncate toward zero). An f16 source is held as its f32
+                // widening, and isDouble(f16) is false, so cvttss2si reads the right value.
                 const src = try ctx.useXmm(allocator, cv.value, xmm_op0);
                 const rd = ctx.dst(result, scratch1); // i32 result in a gpr
                 try ctx.put(allocator, if (isDouble(func, cv.value)) encode.cvttsd2si(rd, src) else encode.cvttss2si(rd, src));
                 try ctx.store(allocator, result, rd);
             } else if (src_float and dst_float) {
-                // f32 <-> f64: widen or narrow (a same-width float convert is just a copy).
+                // float -> float. An f16 is always held as its f32 widening (isDouble(f16) is
+                // false), so f16->f32 falls out as a same-width copy and f16->f64 as the plain
+                // cvtss2sd widen. Only a narrowing TO f16 needs special handling: it must round
+                // to nearest-even half rather than leave f32 precision in place.
                 const src = try ctx.useXmm(allocator, cv.value, xmm_op0);
                 const rd = try ctx.dstXmm(result, xmm_scratch);
                 const sd = isDouble(func, cv.value);
                 const dd = isDouble(func, result);
-                if (sd == dd) {
+                if (isHalf(func, result)) {
+                    // -> f16: bring the source to f32 (an f64 source narrows with cvtsd2ss),
+                    // then round to nearest-even half and widen back to the held f32 form.
+                    if (sd) try ctx.put(allocator, encode.cvtsd2ss(rd, src)) else if (rd != src) try ctx.put(allocator, encode.movupsRR(rd, src));
+                    try roundToHalf(allocator, ctx, rd);
+                } else if (sd == dd) {
+                    // Same width, dest not half: a plain copy (f32->f32, f64->f64, f16->f32).
                     if (rd != src) try ctx.put(allocator, encode.movupsRR(rd, src));
                 } else {
+                    // Different widths, dest not half: the base single<->double convert,
+                    // byte-identical to the pre-f16 behavior, and also the exact f16->f64 widen.
                     try ctx.put(allocator, if (dd) encode.cvtss2sd(rd, src) else encode.cvtsd2ss(rd, src));
                 }
                 try ctx.storeXmm(allocator, result, rd);
@@ -747,6 +814,10 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
                 return;
             }
             // Float math unary ops: sqrt, ceil, floor, trunc, nearest. All live in xmm.
+            // f16 is held as its f32 widening; a sqrtss/roundss would leave an un-narrowed f32 (no
+            // round-to-half), so an f16 unary math op is not lowered - reject cleanly rather than
+            // silently produce a value that is not a valid half (mirrors the wasm/aarch64 backends).
+            if (isHalf(func, result_val.?)) return error.Unsupported;
             const src = try ctx.useXmm(allocator, u.value, xmm_op0);
             const rd = try ctx.dstXmm(result_val.?, xmm_scratch);
             const dbl = isDouble(func, u.value);
@@ -886,7 +957,16 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
             const base = try ctx.use(allocator, l.ptr, scratch2);
             if (isXmm(func, result)) {
                 const rd = try ctx.dstXmm(result, xmm_scratch);
-                try ctx.put(allocator, if (isVector(func, result)) encode.movupsLoadMem(rd, base, 0) else if (isDouble(func, result)) encode.movsdLoadMem(rd, base, 0) else encode.movssLoadMem(rd, base, 0));
+                if (isHalf(func, result)) {
+                    // Load a 16-bit IEEE half and widen to the held f32 form: movzx word into a
+                    // gpr, movd into the xmm low lane, vcvtph2ps. NOT movss, which would read 4
+                    // bytes from a 2-byte object (pulling in the next element).
+                    try ctx.put(allocator, encode.movzxWordFromMem(scratch1, base, 0));
+                    try ctx.put(allocator, encode.movdToXmm(rd, scratch1));
+                    try ctx.put(allocator, encode.vcvtph2ps(rd, rd));
+                } else {
+                    try ctx.put(allocator, if (isVector(func, result)) encode.movupsLoadMem(rd, base, 0) else if (isDouble(func, result)) encode.movsdLoadMem(rd, base, 0) else encode.movssLoadMem(rd, base, 0));
+                }
                 try ctx.storeXmm(allocator, result, rd);
             } else {
                 const rd = ctx.dst(result, scratch1);
@@ -1312,7 +1392,11 @@ fn typeSize(func: *const Function, ty: ir.types.Type) u32 {
         .bool => 1,
         .int => |i| (@as(u32, i.bits) + 7) / 8,
         .ptr => 8,
-        .float => |f| if (f == .f32) 4 else 8,
+        .float => |f| switch (f) {
+            .f16 => 2, // a 2-byte IEEE half in memory (its in-register form is the f32 widening)
+            .f32 => 4,
+            .f64 => 8,
+        },
         .array => |a| @as(u32, @intCast(a.len)) * typeSize(func, a.elem),
         .vector => |v| @as(u32, v.len) * typeSize(func, v.elem),
         else => 8,
@@ -1349,6 +1433,34 @@ test "selects a scalar float function (SSE, xmm allocation)" {
         if (code[i] == 0x0F and code[i + 1] == 0x59) mulss = true; // mulss opcode
     }
     try std.testing.expect(addss and mulss); // the float add/mul lowered to SSE
+}
+
+test "an f16 function now compiles on x86_64 (F16C, no reject gate)" {
+    // The f16 rejection gate was replaced with real F16C lowering. A function that adds two f16
+    // values must now compile: it emits the scalar-single addss followed by the round-to-half
+    // pair (vcvtps2ph then vcvtph2ps). Byte-scan the code for both F16C opcode maps.
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .float = .f16 });
+    const b = try func.appendBlock();
+    const x = try func.appendBlockParam(b, t);
+    const y = try func.appendBlockParam(b, t);
+    const s = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = y } });
+    func.setTerminator(b, .{ .ret = s });
+
+    const code = try selectFunction(allocator, &func);
+    defer allocator.free(code);
+    var saw_narrow = false; // vcvtps2ph: VEX C4, ..., 0F3A map, opcode 1D
+    var saw_widen = false; // vcvtph2ps: VEX C4, ..., 0F38 map, opcode 13
+    for (0..code.len) |i| {
+        if (code[i] != 0xC4 or i + 4 >= code.len) continue;
+        const map = code[i + 1] & 0x1F; // low 5 bits of VEX byte2 are mmmmm
+        const op = code[i + 3];
+        if (map == 0x03 and op == 0x1D) saw_narrow = true;
+        if (map == 0x02 and op == 0x13) saw_widen = true;
+    }
+    try std.testing.expect(saw_narrow and saw_widen);
 }
 
 test "selects a straight-line arithmetic function" {

@@ -6,6 +6,7 @@
   zig,
   lld,
   binutils,
+  etsoc-sysemu,
 }:
 stdenv.mkDerivation (finalAttrs: {
   pname = "vulcan";
@@ -23,6 +24,9 @@ stdenv.mkDerivation (finalAttrs: {
   postConfigure = ''
     ln -s $deps $ZIG_GLOBAL_CACHE_DIR/p
   '';
+
+  doCheck = true;
+  nativeCheckInputs = lib.optional etsoc-sysemu.meta.available etsoc-sysemu;
 
   passthru.shell = mkShell {
     name = "vulcan-dev-shell";

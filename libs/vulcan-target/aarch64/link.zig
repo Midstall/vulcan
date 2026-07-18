@@ -63,7 +63,7 @@ pub fn compileModule(allocator: std.mem.Allocator, module: *const Module) Error!
     defer allocator.free(word_off);
     var total: usize = 0;
     for (funcs, 0..) |e, i| {
-        compiled[i] = try isel.compileFunction(allocator, e.func);
+        compiled[i] = try isel.compileFunction(allocator, e.func, .{});
         n = i + 1;
         word_off[i] = total;
         total += compiled[i].code.len;

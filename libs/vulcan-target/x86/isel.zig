@@ -94,6 +94,10 @@ pub fn selectFunction(allocator: std.mem.Allocator, func: *const Function) Error
 
 /// Compile `func` to machine code plus its call relocations. The caller owns it.
 pub fn compile(allocator: std.mem.Allocator, func: *const Function) Error!Compiled {
+    // f16 not yet lowered on this backend (f16 roadmap Pn); reject cleanly rather than
+    // silently treat as f64.
+    if (ir.function.functionUsesF16(func)) return error.Unsupported;
+
     const nblocks = func.blockCount();
     if (nblocks == 0) return error.Unsupported;
 
@@ -519,4 +523,18 @@ test "selects a straight-line arithmetic function" {
     const code = try selectFunction(allocator, &func);
     defer allocator.free(code);
     try std.testing.expectEqual(@as(u8, 0xC3), code[code.len - 1]); // ret
+}
+
+test "an f16 function is rejected cleanly, not miscompiled as f64" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .float = .f16 });
+    const b = try func.appendBlock();
+    const x = try func.appendBlockParam(b, t);
+    const y = try func.appendBlockParam(b, t);
+    const s = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = y } });
+    func.setTerminator(b, .{ .ret = s });
+
+    try std.testing.expectError(error.Unsupported, selectFunction(allocator, &func));
 }

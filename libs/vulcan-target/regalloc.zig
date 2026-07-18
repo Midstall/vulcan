@@ -93,6 +93,17 @@ fn forEachUse(func: *const Function, inst: ir.function.Inst, last_use: []u32, po
             markUse(last_use, st.value, pos);
             markUse(last_use, st.ptr, pos);
         },
+        .prefetch => |pf| markUse(last_use, pf.ptr, pos),
+        .dot => |d| {
+            markUse(last_use, d.acc, pos);
+            markUse(last_use, d.a, pos);
+            markUse(last_use, d.b, pos);
+        },
+        .matmul => |mmv| {
+            markUse(last_use, mmv.a, pos);
+            markUse(last_use, mmv.b, pos);
+            markUse(last_use, mmv.c, pos);
+        },
         .struct_new => |sn| for (func.valueList(sn.fields)) |f| markUse(last_use, f, pos),
         .call => |c| for (func.valueList(c.args)) |a| markUse(last_use, a, pos),
         .call_indirect => |c| {
@@ -142,6 +153,17 @@ fn markUsedBitset(func: *const Function, inst: ir.function.Inst, row: []bool) vo
         .store => |st| {
             setUsed(row, st.value);
             setUsed(row, st.ptr);
+        },
+        .prefetch => |pf| setUsed(row, pf.ptr),
+        .dot => |d| {
+            setUsed(row, d.acc);
+            setUsed(row, d.a);
+            setUsed(row, d.b);
+        },
+        .matmul => |mmv| {
+            setUsed(row, mmv.a);
+            setUsed(row, mmv.b);
+            setUsed(row, mmv.c);
         },
         .struct_new => |sn| for (func.valueList(sn.fields)) |f| setUsed(row, f),
         .call => |c| for (func.valueList(c.args)) |a| setUsed(row, a),

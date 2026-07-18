@@ -252,6 +252,40 @@ pub fn ucomiss(a: Xmm, b: Xmm) Inst {
     return ssePacked(0x2E, a, b);
 }
 
+// F16C (half<->single conversion). Both ops are VEX-only (there is NO legacy SSE encoding)
+// and operate on 128-bit registers, so they need the 3-byte VEX with L=0 rather than the
+// L=1 form the AVX helpers above use. `vex128` is that L=0 variant of `vex3`.
+
+/// A 3-byte VEX (register-direct) at 128-bit width (VEX.L=0, VEX.W=0). Otherwise identical
+/// to `vex3`: ModRM.reg = `reg`, ModRM.rm = `rm`, VEX.vvvv = `vvvv` (0 means unused, encoded
+/// as 1111). `pp` selects the implied prefix (01 = 66), `mmmmm` the opcode map (00010 = 0F38,
+/// 00011 = 0F3A).
+fn vex128(reg: u8, rm: u8, vvvv: u8, opcode: u8, pp: u2, mmmmm: u5, imm: ?u8) Inst {
+    const not_r: u8 = (~(reg >> 3)) & 1;
+    const not_b: u8 = (~(rm >> 3)) & 1;
+    const byte2: u8 = (not_r << 7) | (1 << 6) | (not_b << 5) | mmmmm; // X unused (no index) -> 1
+    const not_vvvv: u8 = (~vvvv) & 0xF;
+    const byte3: u8 = (not_vvvv << 3) | pp; // W=0, L=0 (128-bit)
+    const mod: u8 = 0xC0 | ((reg & 7) << 3) | (rm & 7);
+    if (imm) |i| return Inst.of(&.{ 0xC4, byte2, byte3, opcode, mod, i });
+    return Inst.of(&.{ 0xC4, byte2, byte3, opcode, mod });
+}
+
+/// `vcvtph2ps dst, src` (VEX.128.66.0F38.W0 13 /r): widen the four packed IEEE halves in the
+/// low 64 bits of `src` to four packed f32 in `dst`. Lane 0 is the scalar half we hold; the
+/// other lanes widen harmlessly. Has no NDS operand, so vvvv is unused (1111).
+pub fn vcvtph2ps(dst: Xmm, src: Xmm) Inst {
+    return vex128(xn(dst), xn(src), 0, 0x13, 0b01, 0b00010, null);
+}
+
+/// `vcvtps2ph dst, src, imm8` (VEX.128.66.0F3A.W0 1D /r ib): narrow the four packed f32 in
+/// `src` to four packed IEEE halves in the low 64 bits of `dst` (zeroing dst[127:64]). This is
+/// a STORE-form op, so ModRM.reg is the SOURCE and ModRM.rm the DESTINATION. imm8 with bit2=0
+/// selects the rounding mode from bits1:0 (0 = round-to-nearest-even), NOT MXCSR.
+pub fn vcvtps2ph(dst: Xmm, src: Xmm, imm: u8) Inst {
+    return vex128(xn(src), xn(dst), 0, 0x1D, 0b01, 0b00011, imm);
+}
+
 // Double-precision (scalar f64) SSE2: the same encoders with an F2 prefix, plus the 64-bit
 // conversions, ucomisd (66 prefix), and the f32<->f64 conversions (xx 0F 5A).
 /// Scalar double-precision `addsd`/`subsd`/`mulsd`/`divsd dst, src` (F2 0F 58/5C/59/5E /r).
@@ -711,6 +745,72 @@ pub fn movsxdFromMem(dst: Reg, base: Reg, disp: i32) Inst {
     return movMem(0x63, dst, base, disp);
 }
 
+/// `movzx dst, word ptr [base+disp32]` (0F B7 /r): load 16 bits, zero-extended into the 32-bit
+/// (and thus the full 64-bit) register. Used to bring an IEEE half out of memory before it is
+/// widened to f32. A base of rsp/r12 (rm low bits = 100) needs the 0x24 SIB byte; r8..15 base
+/// or dst needs a REX bit.
+pub fn movzxWordFromMem(dst: Reg, base: Reg, disp: i32) Inst {
+    const u: u32 = @bitCast(disp);
+    const r = n(dst);
+    const b = n(base);
+    const modrm_byte: u8 = 0x80 | ((r & 7) << 3) | (b & 7); // mod=10 (disp32), reg=dst, rm=base
+    const ext = r >= 8 or b >= 8;
+    const rex: u8 = 0x40 | (@as(u8, @intFromBool(r >= 8)) << 2) | @intFromBool(b >= 8);
+    const sib = (b & 7) == 4;
+    var buf: [9]u8 = undefined;
+    var i: usize = 0;
+    if (ext) {
+        buf[i] = rex;
+        i += 1;
+    }
+    buf[i] = 0x0F;
+    buf[i + 1] = 0xB7;
+    buf[i + 2] = modrm_byte;
+    i += 3;
+    if (sib) {
+        buf[i] = 0x24;
+        i += 1;
+    }
+    buf[i] = @truncate(u);
+    buf[i + 1] = @truncate(u >> 8);
+    buf[i + 2] = @truncate(u >> 16);
+    buf[i + 3] = @truncate(u >> 24);
+    return Inst.of(buf[0 .. i + 4]);
+}
+
+/// `mov word ptr [base+disp32], src` (66 89 /r): store the low 16 bits of `src`. The 66
+/// operand-size prefix (before any REX) makes it a 16-bit store, so exactly 2 bytes are
+/// written (an IEEE half). A base of rsp/r12 needs the 0x24 SIB byte; r8..15 needs a REX bit.
+pub fn movToMem16(base: Reg, disp: i32, src: Reg) Inst {
+    const u: u32 = @bitCast(disp);
+    const r = n(src);
+    const b = n(base);
+    const modrm_byte: u8 = 0x80 | ((r & 7) << 3) | (b & 7); // mod=10 (disp32), reg=src, rm=base
+    const ext = r >= 8 or b >= 8;
+    const rex: u8 = 0x40 | (@as(u8, @intFromBool(r >= 8)) << 2) | @intFromBool(b >= 8);
+    const sib = (b & 7) == 4;
+    var buf: [10]u8 = undefined;
+    var i: usize = 0;
+    buf[i] = 0x66; // 16-bit operand size, must precede REX
+    i += 1;
+    if (ext) {
+        buf[i] = rex;
+        i += 1;
+    }
+    buf[i] = 0x89;
+    buf[i + 1] = modrm_byte;
+    i += 2;
+    if (sib) {
+        buf[i] = 0x24;
+        i += 1;
+    }
+    buf[i] = @truncate(u);
+    buf[i + 1] = @truncate(u >> 8);
+    buf[i + 2] = @truncate(u >> 16);
+    buf[i + 3] = @truncate(u >> 24);
+    return Inst.of(buf[0 .. i + 4]);
+}
+
 /// `lea dst, [rsp + disp32]` (REX.W 8D /r): materialize a stack address (e.g. an alloca slot).
 /// The rsp base needs the 0x24 SIB byte, mod=10 for the disp32 form.
 pub fn leaFromStack(dst: Reg, disp: i32) Inst {
@@ -848,6 +948,17 @@ test "known SSE encodings" {
     try std.testing.expectEqualSlices(u8, &.{ 0xF2, 0x0F, 0x3A, 0x11, 0xC1, 0x01 }, roundsd(.xmm0, .xmm1, 0x01).slice());
 }
 
+test "known F16C encodings" {
+    // vcvtph2ps xmm0, xmm1 -> VEX.128.66.0F38.W0 13 /r -> C4 E2 79 13 C1.
+    try std.testing.expectEqualSlices(u8, &.{ 0xC4, 0xE2, 0x79, 0x13, 0xC1 }, vcvtph2ps(.xmm0, .xmm1).slice());
+    // vcvtps2ph xmm0, xmm1, 0 -> VEX.128.66.0F3A.W0 1D /r ib (reg=src, rm=dst) -> C4 E3 79 1D C8 00.
+    try std.testing.expectEqualSlices(u8, &.{ 0xC4, 0xE3, 0x79, 0x1D, 0xC8, 0x00 }, vcvtps2ph(.xmm0, .xmm1, 0).slice());
+    // The reserved scratch registers actually used by isel: vcvtph2ps xmm13, xmm14 -> C4 42 79 13 EE.
+    try std.testing.expectEqualSlices(u8, &.{ 0xC4, 0x42, 0x79, 0x13, 0xEE }, vcvtph2ps(.xmm13, .xmm14).slice());
+    // vcvtps2ph xmm15, xmm13, 0 (store-form: reg=src=xmm13, rm=dst=xmm15) -> C4 43 79 1D EF 00.
+    try std.testing.expectEqualSlices(u8, &.{ 0xC4, 0x43, 0x79, 0x1D, 0xEF, 0x00 }, vcvtps2ph(.xmm15, .xmm13, 0).slice());
+}
+
 test "known AVX (VEX 256-bit) encodings" {
     try std.testing.expectEqualSlices(u8, &.{ 0xC4, 0xE1, 0x74, 0x58, 0xC2 }, vaddps(.xmm0, .xmm1, .xmm2).slice()); // vaddps ymm0, ymm1, ymm2
     try std.testing.expectEqualSlices(u8, &.{ 0xC4, 0xE1, 0x74, 0x59, 0xC2 }, vmulps(.xmm0, .xmm1, .xmm2).slice()); // vmulps ymm0, ymm1, ymm2
@@ -878,6 +989,14 @@ test "memory-operand encodings" {
     try std.testing.expectEqualSlices(u8, &.{ 0x0F, 0x11, 0x8A, 0x00, 0x00, 0x00, 0x00 }, movupsStoreMem(.rdx, 0, .xmm1).slice());
     // movss [rsp+8], xmm2 needs the SIB byte: F3 0F 11, reg=xmm2(2) rm=rsp(4).
     try std.testing.expectEqualSlices(u8, &.{ 0xF3, 0x0F, 0x11, 0x94, 0x24, 0x08, 0x00, 0x00, 0x00 }, movssStoreMem(.rsp, 8, .xmm2).slice());
+    // movzx eax, word ptr [rcx+16]: 0F B7, mod=10 reg=rax(0) rm=rcx(1) -> 0x81, disp32.
+    try std.testing.expectEqualSlices(u8, &.{ 0x0F, 0xB7, 0x81, 0x10, 0x00, 0x00, 0x00 }, movzxWordFromMem(.rax, .rcx, 16).slice());
+    // movzx r10d, word ptr [r11+0]: both extended -> REX.RB=0x45, SIB not needed (r11 low bits=3).
+    try std.testing.expectEqualSlices(u8, &.{ 0x45, 0x0F, 0xB7, 0x93, 0x00, 0x00, 0x00, 0x00 }, movzxWordFromMem(.r10, .r11, 0).slice());
+    // mov word ptr [rdx+0], ax: 66 89, mod=10 reg=rax(0) rm=rdx(2) -> 0x82, disp32.
+    try std.testing.expectEqualSlices(u8, &.{ 0x66, 0x89, 0x82, 0x00, 0x00, 0x00, 0x00 }, movToMem16(.rdx, 0, .rax).slice());
+    // mov word ptr [rsp+8], ax needs the SIB byte: 66 89, reg=rax(0) rm=rsp(4) -> 0x84.
+    try std.testing.expectEqualSlices(u8, &.{ 0x66, 0x89, 0x84, 0x24, 0x08, 0x00, 0x00, 0x00 }, movToMem16(.rsp, 8, .rax).slice());
 }
 
 test "control-flow encodings" {

@@ -469,10 +469,13 @@ const Eval = struct {
                 lhs *%= try self.parseUnary();
             } else if (self.matchOp("/")) {
                 const rhs = try self.parseUnary();
-                lhs = if (rhs == 0) 0 else @divTrunc(lhs, rhs);
+                // Guard the minInt/-1 overflow (illegal behavior) as well as div-by-zero;
+                // -1 divides to the wrapping negation, matching the wraparound used above.
+                lhs = if (rhs == 0) 0 else if (rhs == -1) 0 -% lhs else @divTrunc(lhs, rhs);
             } else if (self.matchOp("%")) {
                 const rhs = try self.parseUnary();
-                lhs = if (rhs == 0) 0 else @rem(lhs, rhs);
+                // x % -1 is 0; guarding it also avoids the minInt/-1 @rem overflow.
+                lhs = if (rhs == 0) 0 else if (rhs == -1) 0 else @rem(lhs, rhs);
             } else break;
         }
         return lhs;
