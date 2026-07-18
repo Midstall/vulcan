@@ -209,6 +209,7 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
                     try ctx.put(allocator, encode.imulImm(rd, try ctx.use(allocator, a.lhs, scratch1), imm));
                     try ctx.store(allocator, result, rd);
                 },
+                .mulh => return error.Unsupported, // no immediate form; expanded before isel
                 .add, .sub, .bit_and, .bit_or, .bit_xor => {
                     const rl = try ctx.use(allocator, a.lhs, scratch1);
                     const rd = ctx.dst(result, scratch1);
@@ -366,7 +367,7 @@ fn binary(op: ir.function.BinOp, dst: Reg, src: Reg) Error!encode.Inst {
         .bit_and => encode.andr(dst, src),
         .bit_or => encode.orr(dst, src),
         .bit_xor => encode.xorr(dst, src),
-        .div, .rem, .shl, .shr => error.Unsupported,
+        .div, .rem, .shl, .shr, .mulh => error.Unsupported,
     };
 }
 

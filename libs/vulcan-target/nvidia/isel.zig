@@ -2127,8 +2127,9 @@ fn arith(func: *const Function, op: ir.function.BinOp, rd: u8, ra: u8, rb: u8, l
         .bit_xor => encode.lop3(rd, ra, rb, encode.LUT_XOR, .{}),
         .shl => encode.shf(rd, ra, rb, false, false, .{}),
         .shr => encode.shf(rd, ra, rb, true, isSignedRaw(func, lhs), .{}),
-        // Integer divide is a multi-instruction reciprocal sequence, deferred.
-        .div, .rem => error.Unsupported,
+        // Integer divide is a multi-instruction reciprocal sequence, deferred. `mulh` is expanded
+        // to plain multiplies/shifts (`expandMulh`) before this backend's isel.
+        .div, .rem, .mulh => error.Unsupported,
     };
 }
 

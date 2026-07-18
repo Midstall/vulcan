@@ -1135,6 +1135,7 @@ fn arithWord(op: BinOp, rd: Reg, rs1: Reg, rs2: Reg) u32 {
         .add => encode.add(rd, rs1, rs2),
         .sub => encode.sub(rd, rs1, rs2),
         .mul => encode.mul(rd, rs1, rs2),
+        .mulh => encode.mulh(rd, rs1, rs2), // signed high multiply; unsigned takes mulhu in the caller
         .div => encode.div(rd, rs1, rs2),
         .rem => encode.rem(rd, rs1, rs2),
         .bit_and => encode.and_(rd, rs1, rs2),
@@ -2512,7 +2513,7 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                                     .bit_xor => encode.fxor_pi(rd, lhs, rhs),
                                     .shl => encode.fsll_pi(rd, lhs, rhs),
                                     .shr => if (unsigned) encode.fsrl_pi(rd, lhs, rhs) else encode.fsra_pi(rd, lhs, rhs),
-                                    .div, .rem => return error.Unsupported, // no packed-integer divide/remainder op
+                                    .div, .rem, .mulh => return error.Unsupported, // no packed-integer divide/remainder/high-multiply op
                                 };
                             } else switch (a.op) {
                                 .add => encode.fadd_ps(rd, lhs, rhs),
@@ -2658,6 +2659,8 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                             encode.remu(rd, rs1, rs2)
                         else if (unsigned and a.op == .shr)
                             encode.srl(rd, rs1, rs2) // logical right shift
+                        else if (unsigned and a.op == .mulh)
+                            encode.mulhu(rd, rs1, rs2) // unsigned high multiply
                         else
                             arithWord(a.op, rd, rs1, rs2);
                         try code.append(allocator, word);
@@ -2683,7 +2686,7 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                             (if (unsigned) encode.srli(rd, rs1, @intCast(a.imm)) else encode.srai(rd, rs1, @intCast(a.imm)))
                         else
                             return error.Unsupported,
-                        .mul, .div, .rem => return error.Unsupported, // no immediate form
+                        .mul, .mulh, .div, .rem => return error.Unsupported, // no immediate form
                     };
                     try code.append(allocator, word);
                     if (ai_spill) |idx| try code.append(allocator, encode.sd(rd, .x2, @intCast(spill_base + idx * 8)));
@@ -2731,7 +2734,8 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                         try code.append(allocator, encode.lui(rd, hi));
                         try code.append(allocator, encode.addi(rd, rd, lo));
                     } else {
-                        return error.Unsupported; // 64-bit constant: needs a longer sequence
+                        // Full 64-bit constant (e.g. a division magic number): built MSB-first.
+                        try loadImm64(allocator, &code, rd, @bitCast(c));
                     }
                     if (ic_spill) |idx| try code.append(allocator, encode.sd(rd, .x2, @intCast(spill_base + idx * 8)));
                 },

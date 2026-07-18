@@ -319,6 +319,54 @@ fn optimized(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void
         try std.testing.expect(try opt.optimize(allocator, &f));
         try h.expectRun(io, allocator, &f, &.{ 2, 3, 4 }, 24, backend);
     }
+    { // magic-number lowering of unsigned 64-bit division by a constant (x / 10), executed
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 64 } });
+        const b = try f.appendBlock();
+        const x = try f.appendBlockParam(b, t);
+        const ten = try f.appendInst(b, t, .{ .iconst = 10 });
+        const q = try f.appendInst(b, t, .{ .arith = .{ .op = .div, .lhs = x, .rhs = ten } });
+        f.setTerminator(b, .{ .ret = q });
+        try std.testing.expect(try opt.optimize(allocator, &f));
+        try h.expectRun(io, allocator, &f, &.{1234567}, 123456, backend);
+    }
+    { // magic-number lowering of unsigned 64-bit remainder by a constant (x % 10), executed
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 64 } });
+        const b = try f.appendBlock();
+        const x = try f.appendBlockParam(b, t);
+        const ten = try f.appendInst(b, t, .{ .iconst = 10 });
+        const r = try f.appendInst(b, t, .{ .arith = .{ .op = .rem, .lhs = x, .rhs = ten } });
+        f.setTerminator(b, .{ .ret = r });
+        try std.testing.expect(try opt.optimize(allocator, &f));
+        try h.expectRun(io, allocator, &f, &.{1234567}, 7, backend);
+    }
+    { // magic-number lowering of signed 64-bit division by a constant (x / 7), negative dividend
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
+        const b = try f.appendBlock();
+        const x = try f.appendBlockParam(b, t);
+        const seven = try f.appendInst(b, t, .{ .iconst = 7 });
+        const q = try f.appendInst(b, t, .{ .arith = .{ .op = .div, .lhs = x, .rhs = seven } });
+        f.setTerminator(b, .{ .ret = q });
+        try std.testing.expect(try opt.optimize(allocator, &f));
+        try h.expectRun(io, allocator, &f, &.{-100}, -14, backend); // trunc toward zero
+    }
+    { // magic-number lowering of signed 64-bit remainder by a constant (x % 7), negative dividend
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
+        const b = try f.appendBlock();
+        const x = try f.appendBlockParam(b, t);
+        const seven = try f.appendInst(b, t, .{ .iconst = 7 });
+        const r = try f.appendInst(b, t, .{ .arith = .{ .op = .rem, .lhs = x, .rhs = seven } });
+        f.setTerminator(b, .{ .ret = r });
+        try std.testing.expect(try opt.optimize(allocator, &f));
+        try h.expectRun(io, allocator, &f, &.{-100}, -2, backend); // -100 = -14*7 - 2
+    }
 }
 
 fn bitcodeAndLto(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {

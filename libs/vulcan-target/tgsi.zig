@@ -137,6 +137,7 @@ fn binOpMnemonic(op: ir.function.BinOp, is_int: bool, signed: bool) Error![]cons
         .shl => "SHL",
         .shr => if (signed) "ISHR" else "USHR",
         .rem => error.Unsupported, // handled separately (float sequence / MOD / UMOD)
+        .mulh => error.Unsupported, // expanded to multiplies/shifts before isel (`expandMulh`)
     };
 }
 

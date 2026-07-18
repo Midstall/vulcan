@@ -20,7 +20,7 @@ const UnitClass = model.UnitClass;
 
 fn altraArith(op: ir.function.BinOp) u32 {
     return switch (op) {
-        .mul => 4,
+        .mul, .mulh => 4,
         .div, .rem => 18,
         .add, .sub, .bit_and, .bit_or, .bit_xor, .shl, .shr => 1,
     };
@@ -59,7 +59,7 @@ fn altraArithThroughput(op: ir.function.BinOp, elem_float: bool) u32 {
     return switch (op) {
         // Pipelined FP multiplier (1, measured ~0.5-0.9) vs partially-pipelined integer multiplier
         // (3, measured), see the on-host probes in altra_measure_test.zig.
-        .mul => if (elem_float) 1 else 3,
+        .mul, .mulh => if (elem_float) 1 else 3,
         .div, .rem => 18, // non-pipelined iterative divider: throughput == latency for both types
         .add, .sub, .bit_and, .bit_or, .bit_xor, .shl, .shr => 1,
     };
@@ -83,7 +83,7 @@ fn altraThroughput(op: ir.function.Opcode, elem_float: bool) u32 {
 
 fn etsocArith(op: ir.function.BinOp) u32 {
     return switch (op) {
-        .mul => 8,
+        .mul, .mulh => 8,
         .div, .rem => 65,
         .add, .sub, .bit_and, .bit_or, .bit_xor, .shl, .shr => 1,
     };
@@ -120,7 +120,7 @@ fn etsocArithThroughput(op: ir.function.BinOp, elem_float: bool) u32 {
     return switch (op) {
         // Async multicycle MulDiv for integers (8 = latency, non-pipelined, FE-Intpipe 3.4.2) vs the
         // pipelined VPU TXFMA for FP (1, Minion VPU Spec 2.1).
-        .mul => if (elem_float) 1 else 8,
+        .mul, .mulh => if (elem_float) 1 else 8,
         .div, .rem => 65, // same async MulDiv block, iterative non-restoring divide (33/65 cyc): both types
         .add, .sub, .bit_and, .bit_or, .bit_xor, .shl, .shr => 1,
     };
@@ -146,7 +146,7 @@ fn etsocThroughput(op: ir.function.Opcode, elem_float: bool) u32 {
 // riscv64/schedule.zig riverLatency, refine against river_hdl later.
 fn riverInorderArith(op: ir.function.BinOp) u32 {
     return switch (op) {
-        .mul => 3,
+        .mul, .mulh => 3,
         .div, .rem => 6,
         .add, .sub, .bit_and, .bit_or, .bit_xor, .shl, .shr => 1,
     };
@@ -173,7 +173,7 @@ fn riverInorderLatency(op: ir.function.Opcode) u32 {
 // against river_hdl later.
 fn riverMacroArith(op: ir.function.BinOp) u32 {
     return switch (op) {
-        .mul => 3,
+        .mul, .mulh => 3,
         .div, .rem => 6,
         .add, .sub, .bit_and, .bit_or, .bit_xor, .shl, .shr => 1,
     };
@@ -203,7 +203,7 @@ fn riverMacroLatency(op: ir.function.Opcode) u32 {
 fn riverInorderArithThroughput(op: ir.function.BinOp, elem_float: bool) u32 {
     _ = elem_float; // no FPU on these tiers: FP and integer mul are both the non-pipelined MulDiv
     return switch (op) {
-        .mul => 3, // non-pipelined multiplier: throughput == latency (no evidence of a pipelined FPU)
+        .mul, .mulh => 3, // non-pipelined multiplier: throughput == latency (no evidence of a pipelined FPU)
         .div, .rem => 6, // non-pipelined divide: throughput == latency
         .add, .sub, .bit_and, .bit_or, .bit_xor, .shl, .shr => 1,
     };
@@ -231,7 +231,7 @@ fn riverInorderThroughput(op: ir.function.Opcode, elem_float: bool) u32 {
 fn riverPipelinedArithThroughput(op: ir.function.BinOp, elem_float: bool) u32 {
     _ = elem_float; // pipelined for both the integer multiplier and the FPU on these tiers
     return switch (op) {
-        .mul => 1, // pipelined multiplier (int and FP): one independent mul per cycle
+        .mul, .mulh => 1, // pipelined multiplier (int and FP): one independent mul per cycle
         .div, .rem => 6, // non-pipelined divide: throughput == latency
         .add, .sub, .bit_and, .bit_or, .bit_xor, .shl, .shr => 1,
     };
@@ -251,7 +251,7 @@ fn riverPipelinedThroughput(op: ir.function.Opcode, elem_float: bool) u32 {
 
 fn sharedArithUnit(op: ir.function.BinOp) UnitClass {
     return switch (op) {
-        .mul, .div, .rem => .muldiv,
+        .mul, .mulh, .div, .rem => .muldiv,
         .add, .sub, .bit_and, .bit_or, .bit_xor, .shl, .shr => .alu,
     };
 }

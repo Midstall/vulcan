@@ -1920,6 +1920,9 @@ fn emitBinary(allocator: std.mem.Allocator, code: *std.ArrayList(u32), op: ir.fu
         .add => encode.add(rd, rn, rm),
         .sub => encode.sub(rd, rn, rm),
         .mul => encode.mul(rd, rn, rm),
+        // High half of a 64x64 product. Only the magic-number divide emits this, always on 64-bit
+        // operands, so the x-register smulh/umulh (which read the full 64 bits) is exactly right.
+        .mulh => if (signed) encode.smulh(rd, rn, rm) else encode.umulh(rd, rn, rm),
         .bit_and => encode.andr(rd, rn, rm),
         .bit_or => encode.orr(rd, rn, rm),
         .bit_xor => encode.eor(rd, rn, rm),

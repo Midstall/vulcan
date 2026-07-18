@@ -364,7 +364,7 @@ test "out-of-order keeps program order while in-order hoists the higher-latency 
 fn windowTestLatency(op: ir.function.Opcode) u32 {
     return switch (op) {
         .arith => |a| switch (a.op) {
-            .mul => 5,
+            .mul, .mulh => 5,
             .div, .rem, .add, .sub, .bit_and, .bit_or, .bit_xor, .shl, .shr => 1,
         },
         .arith_imm, .iconst, .fconst, .icmp, .select, .struct_new, .extract, .convert, .unary, .alloca, .global_addr, .load, .store, .prefetch, .dot, .matmul, .@"if", .call, .call_indirect => 1,

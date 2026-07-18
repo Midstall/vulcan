@@ -1204,6 +1204,9 @@ fn arithOpcode(kind: TypeKind, o: BinOp) Error!u16 {
         .bit_xor => op.BitwiseXor,
         .shl => op.ShiftLeftLogical,
         .shr => if (signed) op.ShiftRightArithmetic else op.ShiftRightLogical,
+        // The magic-number divide lowering that produces `mulh` is expanded to plain
+        // multiplies/shifts (`expandMulh`) before this backend's isel, so it never reaches here.
+        .mulh => return error.UnsupportedConstruct,
     };
 }
 

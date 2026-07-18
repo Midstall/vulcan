@@ -354,7 +354,7 @@ fn buildMemMulAdd(allocator: std.mem.Allocator) anyerror!Function {
 
 fn customArith(op: ir.function.BinOp) u32 {
     return switch (op) {
-        .mul => 3,
+        .mul, .mulh => 3,
         .div, .rem => 20,
         .add, .sub, .bit_and, .bit_or, .bit_xor, .shl, .shr => 1,
     };
@@ -381,7 +381,7 @@ fn customLatency(op: ir.function.Opcode) u32 {
 fn customArithThroughput(op: ir.function.BinOp, elem_float: bool) u32 {
     _ = elem_float; // unpipelined multiplier, no FPU: FP and integer mul share the non-pipelined price
     return switch (op) {
-        .mul => 3,
+        .mul, .mulh => 3,
         .div, .rem => 20,
         .add, .sub, .bit_and, .bit_or, .bit_xor, .shl, .shr => 1,
     };
@@ -422,7 +422,7 @@ fn customUnit(op: ir.function.Opcode) opt.microarch.UnitClass {
 
 fn customArithUnit(op: ir.function.BinOp) opt.microarch.UnitClass {
     return switch (op) {
-        .mul, .div, .rem => .muldiv,
+        .mul, .mulh, .div, .rem => .muldiv,
         .add, .sub, .bit_and, .bit_or, .bit_xor, .shl, .shr => .alu,
     };
 }

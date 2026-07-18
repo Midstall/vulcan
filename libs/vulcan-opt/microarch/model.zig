@@ -158,6 +158,7 @@ pub const Model = struct {
     /// Compile-time consistency check. Call from a `comptime` block on every model constant so a
     /// malformed model fails the build, not a device.
     pub fn validate(comptime m: Model) void {
+        @setEvalBranchQuota(4000); // the per-BinOp throughput<=latency sweep below grows with the enum
         if (m.exec == .in_order and m.rob_size != 0)
             @compileError("in-order model must have rob_size 0");
         if (m.units.fpsimd == 0 and m.vector_bits != 0)
