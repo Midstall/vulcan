@@ -111,7 +111,7 @@ pub fn scalarCost(model: *const Model, op: BinOp, elem_is_float: bool, lanes: u8
 /// the pack overhead scales with both `lanes` and how many distinct operand vectors must be built.
 pub fn vectorCost(model: *const Model, op: BinOp, elem_is_float: bool, lanes: u8, distinct_operand_vectors: u8) f64 {
     // The plain (no-coalescing) form: every operand vector is packed, the result is unpacked.
-    return vectorCostMem(model, op, elem_is_float, lanes, distinct_operand_vectors, 0, 0, false, false);
+    return vectorCostMem(model, op, elem_is_float, lanes, distinct_operand_vectors, 0, 0, 0, false, false);
 }
 
 /// Throughput cost of the vectorized form WITH memory coalescing and chain reuse accounted for. Of
@@ -132,10 +132,11 @@ pub fn vectorCostMem(
     distinct_operand_vectors: u8,
     coalesced_operand_vectors: u8,
     chained_operand_vectors: u8,
+    splat_operand_vectors: u8,
     result_coalesced_store: bool,
     result_chained: bool,
 ) f64 {
-    std.debug.assert(coalesced_operand_vectors + chained_operand_vectors <= distinct_operand_vectors);
+    std.debug.assert(coalesced_operand_vectors + chained_operand_vectors + splat_operand_vectors <= distinct_operand_vectors);
     // A result cannot both stay in a register (chained into a consumer) and be written to memory (a
     // coalesced store); the vectorizer picks one, preferring the store when the result is stored.
     std.debug.assert(!(result_chained and result_coalesced_store));
@@ -144,10 +145,13 @@ pub fn vectorCostMem(
     // FP throughput, a <N x i32> mul by the integer throughput).
     const vec_op = opWeight(model, op, elem_is_float);
     // Operand vectors that must still be packed (lane-insert per lane), after subtracting those that
-    // coalesce to one wide load apiece and those reused for free from an earlier group.
-    const packed_vectors: f64 = @floatFromInt(distinct_operand_vectors - coalesced_operand_vectors - chained_operand_vectors);
+    // coalesce to one wide load, are reused for free from an earlier group, or are a splat.
+    const packed_vectors: f64 = @floatFromInt(distinct_operand_vectors - coalesced_operand_vectors - chained_operand_vectors - splat_operand_vectors);
     const pack = packed_vectors * lanes_f * PACK_COST_PER_LANE;
     const loads = @as(f64, @floatFromInt(coalesced_operand_vectors)) * VECTOR_MEM_COST;
+    // A splat operand (the same scalar in every lane, e.g. the SAXPY multiplier) is one broadcast
+    // instruction (`dup`), not a per-lane pack, so it is priced like a single wide op, not `lanes`.
+    const splats = @as(f64, @floatFromInt(splat_operand_vectors)) * VECTOR_MEM_COST;
     // Chained results cost nothing (no extract, no store, they ride a vector register into the next
     // group); a coalesced store is one wide store; otherwise `lanes` lane-extracts.
     const unpack = if (result_chained)
@@ -156,7 +160,7 @@ pub fn vectorCostMem(
         VECTOR_MEM_COST
     else
         lanes_f * UNPACK_COST_PER_LANE;
-    return vec_op + pack + loads + unpack;
+    return vec_op + pack + loads + splats + unpack;
 }
 
 /// The gate: is SLP-vectorizing this group profitable for `model`? True only when the vector form is
@@ -197,14 +201,15 @@ pub fn slpProfitableMem(
     distinct_operand_vectors: u8,
     coalesced_operand_vectors: u8,
     chained_operand_vectors: u8,
+    splat_operand_vectors: u8,
     result_coalesced_store: bool,
     result_chained: bool,
 ) bool {
     std.debug.assert(lanes >= 2);
     std.debug.assert(distinct_operand_vectors >= 1 and distinct_operand_vectors <= 2);
-    std.debug.assert(coalesced_operand_vectors + chained_operand_vectors <= distinct_operand_vectors);
+    std.debug.assert(coalesced_operand_vectors + chained_operand_vectors + splat_operand_vectors <= distinct_operand_vectors);
     const scalar = scalarCost(model, group_op, elem_is_float, lanes);
-    const vector = vectorCostMem(model, group_op, elem_is_float, lanes, distinct_operand_vectors, coalesced_operand_vectors, chained_operand_vectors, result_coalesced_store, result_chained);
+    const vector = vectorCostMem(model, group_op, elem_is_float, lanes, distinct_operand_vectors, coalesced_operand_vectors, chained_operand_vectors, splat_operand_vectors, result_coalesced_store, result_chained);
     return vector < scalar;
 }
 
@@ -311,14 +316,14 @@ test "memory coalescing flips a wide-core cheap-add group from declined to profi
     // operands are contiguous loads AND its results go to contiguous stores: the pack/unpack
     // overhead collapses to three cheap wide memory ops.
     const altra = registry.modelFor(.@"ampere-altra");
-    try std.testing.expect(!slpProfitableMem(altra, .add, true, 4, 2, 0, 0, false, false)); // register inputs: declined
-    try std.testing.expect(slpProfitableMem(altra, .add, true, 4, 2, 2, 0, true, false)); // both loads + store: profitable
+    try std.testing.expect(!slpProfitableMem(altra, .add, true, 4, 2, 0, 0, 0, false, false)); // register inputs: declined
+    try std.testing.expect(slpProfitableMem(altra, .add, true, 4, 2, 2, 0, 0, true, false)); // both loads + store: profitable
     // Load coalescing alone (result still unpacked) is NOT enough on this cheap-add shape; the win
     // needs the result store to coalesce too. This documents why the vectorizer prices both sides.
-    try std.testing.expect(!slpProfitableMem(altra, .add, true, 4, 2, 2, 0, false, false));
+    try std.testing.expect(!slpProfitableMem(altra, .add, true, 4, 2, 2, 0, 0, false, false));
     // A chained (already-live) operand plus one coalesced load plus a coalesced store is profitable:
     // this is the multiply-add shape's second group, where the mul result feeds the add for free.
-    try std.testing.expect(slpProfitableMem(altra, .add, true, 4, 2, 1, 1, true, false));
+    try std.testing.expect(slpProfitableMem(altra, .add, true, 4, 2, 1, 1, 0, true, false));
 }
 
 test "result-chaining credits the free unpack: the SAXPY mul group becomes profitable on ampere" {
@@ -330,39 +335,39 @@ test "result-chaining credits the free unpack: the SAXPY mul group becomes profi
     // profitable: scalar = (4/2 ports)*1 = 2.0, vector = 1(mul) + 0(pack, both operands coalesce) +
     // 2*0.2(loads) + 0(chained result) = 1.4 < 2.0.
     const altra = registry.modelFor(.@"ampere-altra");
-    try std.testing.expect(slpProfitableMem(altra, .mul, true, 4, 2, 2, 0, false, true)); // two loads + chained result
+    try std.testing.expect(slpProfitableMem(altra, .mul, true, 4, 2, 2, 0, 0, false, true)); // two loads + chained result
 
     // The throughput fix is preserved: the same register-input mul group (no coalesceable memory) whose
     // result feeds a STORE (result_coalesced_store) or a RETURN (neither store nor chain) stays
     // DECLINED. The credit only removes the unpack, never the packs, so a register mul whose two
     // operand vectors must be packed loses regardless of how its result leaves the group.
-    try std.testing.expect(!slpProfitableMem(altra, .mul, true, 4, 2, 0, 0, true, false)); // register mul -> coalesced store: declined
-    try std.testing.expect(!slpProfitableMem(altra, .mul, true, 4, 2, 0, 0, false, false)); // register mul -> return: declined
+    try std.testing.expect(!slpProfitableMem(altra, .mul, true, 4, 2, 0, 0, 0, true, false)); // register mul -> coalesced store: declined
+    try std.testing.expect(!slpProfitableMem(altra, .mul, true, 4, 2, 0, 0, 0, false, false)); // register mul -> return: declined
     // Even a register mul whose result CHAINS is still declined: the two packs (1.6) dominate. Only
     // when the operands ALSO ride memory (wide loads, 0.4) does the chained mul group win. This is why
     // the credit re-enables the memory SAXPY without ever rescuing a register-input mul SLP group.
-    try std.testing.expect(!slpProfitableMem(altra, .mul, true, 4, 2, 0, 0, false, true)); // register mul -> chained: still declined
+    try std.testing.expect(!slpProfitableMem(altra, .mul, true, 4, 2, 0, 0, 0, false, true)); // register mul -> chained: still declined
     // And the register cheap-add stays declined under every result disposition.
-    try std.testing.expect(!slpProfitableMem(altra, .add, true, 4, 2, 0, 0, false, true));
+    try std.testing.expect(!slpProfitableMem(altra, .add, true, 4, 2, 0, 0, 0, false, true));
 }
 
 test "memory coalescing never rescues a register-input group (no coalesceable memory)" {
     // With zero coalesced operands and no coalesced store, `slpProfitableMem` is identical to the
     // plain gate, so a register-input cheap add stays declined on the wide core at every width.
     const altra = registry.modelFor(.@"ampere-altra");
-    try std.testing.expectEqual(slpProfitable(altra, .add, true, 4, 2), slpProfitableMem(altra, .add, true, 4, 2, 0, 0, false, false));
-    try std.testing.expectEqual(slpProfitable(altra, .add, true, 8, 2), slpProfitableMem(altra, .add, true, 8, 2, 0, 0, false, false));
-    try std.testing.expect(!slpProfitableMem(altra, .add, true, 8, 2, 0, 0, false, false));
+    try std.testing.expectEqual(slpProfitable(altra, .add, true, 4, 2), slpProfitableMem(altra, .add, true, 4, 2, 0, 0, 0, false, false));
+    try std.testing.expectEqual(slpProfitable(altra, .add, true, 8, 2), slpProfitableMem(altra, .add, true, 8, 2, 0, 0, 0, false, false));
+    try std.testing.expect(!slpProfitableMem(altra, .add, true, 8, 2, 0, 0, 0, false, false));
 }
 
 test "coalesced vector cost is strictly below the packed cost for the same group" {
     // One wide load beats `lanes` lane-inserts; one wide store beats `lanes` lane-extracts.
     const etsoc = registry.modelFor(.@"et-soc");
-    try std.testing.expect(vectorCostMem(etsoc, .add, false, 8, 2, 2, 0, true, false) < vectorCostMem(etsoc, .add, false, 8, 2, 0, 0, false, false));
+    try std.testing.expect(vectorCostMem(etsoc, .add, false, 8, 2, 2, 0, 0, true, false) < vectorCostMem(etsoc, .add, false, 8, 2, 0, 0, 0, false, false));
     // A chained result (no unpack at all) is cheaper still than a coalesced store (one wide store).
-    try std.testing.expect(vectorCostMem(etsoc, .add, false, 8, 2, 2, 0, false, true) < vectorCostMem(etsoc, .add, false, 8, 2, 2, 0, true, false));
+    try std.testing.expect(vectorCostMem(etsoc, .add, false, 8, 2, 2, 0, 0, false, true) < vectorCostMem(etsoc, .add, false, 8, 2, 2, 0, 0, true, false));
     // And the zero-coalescing form matches the plain vectorCost exactly.
-    try std.testing.expectEqual(vectorCost(etsoc, .add, false, 8, 2), vectorCostMem(etsoc, .add, false, 8, 2, 0, 0, false, false));
+    try std.testing.expectEqual(vectorCost(etsoc, .add, false, 8, 2), vectorCostMem(etsoc, .add, false, 8, 2, 0, 0, 0, false, false));
 }
 
 test "cost ordering is sane: vector cost rises with distinct operand vectors and with lanes" {

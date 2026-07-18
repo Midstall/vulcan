@@ -253,6 +253,11 @@ fn vectorizeOne(
             // how many of those the loads coalesce (wide loads, not packs); `chained_ops` is how many
             // are reused for free from an earlier group (no pack, no load). `result_chained` credits
             // the producer side: the result rides a vector into a consumer group, so no unpack.
+            // A splat operand is the same scalar in every lane (e.g. the SAXPY invariant multiplier):
+            // built by one broadcast (`dup`), not a per-lane pack. Only when it is not already a chain
+            // reuse or a coalesced load run (those take priority in `buildOperand`).
+            const splat_a = !chain_a and run_a == null and allSame(ca[0..lanes]);
+            const splat_b = if (a_eq_b) splat_a else (!chain_b and run_b == null and allSame(cb[0..lanes]));
             if (model) |m| {
                 const distinct: u8 = if (a_eq_b) 1 else 2;
                 const coalesced_ops: u8 = if (a_eq_b)
@@ -263,7 +268,11 @@ fn vectorizeOne(
                     (if (chain_a) @as(u8, 1) else 0)
                 else
                     (if (chain_a) @as(u8, 1) else 0) + (if (chain_b) @as(u8, 1) else 0);
-                if (!cost.slpProfitableMem(m, head.arith.op, is_f32, lanes, distinct, coalesced_ops, chained_ops, result_store, result_chained)) continue :scan;
+                const splat_ops: u8 = if (a_eq_b)
+                    (if (splat_a) @as(u8, 1) else 0)
+                else
+                    (if (splat_a) @as(u8, 1) else 0) + (if (splat_b) @as(u8, 1) else 0);
+                if (!cost.slpProfitableMem(m, head.arith.op, is_f32, lanes, distinct, coalesced_ops, chained_ops, splat_ops, result_store, result_chained)) continue :scan;
             }
             pos = g;
             op = head.arith.op;
@@ -335,6 +344,12 @@ fn buildOperand(
         return v;
     }
     return pack(func, block, vt, scalars);
+}
+
+/// Whether every scalar in `scalars` is the same value (a splat: one broadcast, not a pack).
+fn allSame(scalars: []const Value) bool {
+    for (scalars[1..]) |s| if (s != scalars[0]) return false;
+    return true;
 }
 
 /// If `scalars` are exactly lanes 0..N-1 of one existing vector, return that vector (chain reuse).

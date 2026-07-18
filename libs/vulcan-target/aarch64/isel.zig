@@ -762,9 +762,20 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                     const fields = func.valueList(sn.fields);
                     if (fields.len != 4) return error.Unsupported; // <4 x f32> only for now
                     const rd = resultReg(&alloc, func, result);
-                    for ([_]u2{ 1, 2, 3, 0 }) |lane| {
-                        const fr = try ctx.loadOp(allocator, &code, fields[lane], fp_spill_op[0]);
-                        try code.append(allocator, encode.insLane(rd, lane, fr));
+                    // A splat (every lane the same scalar) is one `dup` from that scalar's lane 0,
+                    // not four inserts. This is what makes the vectorizer's invariant operand (e.g.
+                    // the SAXPY multiplier) cheap enough to fuse on a wide core.
+                    const splat = for (fields[1..]) |f| {
+                        if (f != fields[0]) break false;
+                    } else true;
+                    if (splat) {
+                        const fr = try ctx.loadOp(allocator, &code, fields[0], fp_spill_op[0]);
+                        try code.append(allocator, encode.dupVecLane(rd, fr, 0));
+                    } else {
+                        for ([_]u2{ 1, 2, 3, 0 }) |lane| {
+                            const fr = try ctx.loadOp(allocator, &code, fields[lane], fp_spill_op[0]);
+                            try code.append(allocator, encode.insLane(rd, lane, fr));
+                        }
                     }
                     try storeResult(allocator, &code, ctx, result, rd);
                 },
