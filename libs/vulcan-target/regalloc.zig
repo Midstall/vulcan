@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const ir = @import("vulcan-ir");
+const addrfold = @import("addrfold.zig");
 
 const Function = ir.function.Function;
 const Value = ir.function.Value;
@@ -25,7 +26,16 @@ pub fn lessByStart(_: void, a: Interval, b: Interval) bool {
 
 /// Compute one live interval per value, sorted by start position. Caller owns the
 /// returned slice.
-pub fn computeLiveIntervals(allocator: std.mem.Allocator, func: *const Function) Error![]Interval {
+///
+/// `fold` is an optional address-mode-fold analysis. When null (every legacy caller) the output
+/// is byte-identical to before folding existed: no use is rerouted and no value is excluded. When
+/// non-null, a folded load/store attributes its POINTER use to the fold base (so the base stays
+/// live to the mem op, even across a block), and the dead-add result values (their only uses folded
+/// away) are EXCLUDED from the returned intervals. A dead-add result would otherwise be an
+/// end-before-start interval (its uses rerouted off it), so dropping it is both correct and
+/// necessary. Both consumers iterate the returned array and map `interval.value -> reg`, so a
+/// shorter (filtered) array allocates the right registers and never resurrects a dead add.
+pub fn computeLiveIntervals(allocator: std.mem.Allocator, func: *const Function, fold: ?*const addrfold.Analysis) Error![]Interval {
     const nval = func.valueCount();
     const nblocks = func.blockCount();
 
@@ -47,7 +57,7 @@ pub fn computeLiveIntervals(allocator: std.mem.Allocator, func: *const Function)
         }
         pos += 1;
         for (func.blockInsts(block)) |inst| {
-            forEachUse(func, inst, last_use, pos);
+            forEachUse(func, inst, last_use, pos, fold);
             if (func.instResult(inst)) |r| def_pos[@intFromEnum(r)] = pos;
             pos += 1;
         }
@@ -55,20 +65,44 @@ pub fn computeLiveIntervals(allocator: std.mem.Allocator, func: *const Function)
         if (func.terminator(block)) |term| forEachTermUse(func, term, last_use, pos);
         pos += 1;
     }
-    try extendLiveRanges(allocator, func, last_use, block_end);
+    try extendLiveRanges(allocator, func, last_use, block_end, fold);
 
-    const ivals = try allocator.alloc(Interval, nval);
+    // Count the surviving values first so the returned slice is exactly its own length (the caller
+    // frees the returned slice, so it must not be a subslice of a larger allocation). With fold null
+    // every value survives, so `nlive == nval` and the fill below is byte-identical index order.
+    var nlive: usize = nval;
+    if (fold) |fa| {
+        nlive = 0;
+        for (0..nval) |i| {
+            if (isDeadAddResult(func, fa, @enumFromInt(i))) continue;
+            nlive += 1;
+        }
+    }
+    const ivals = try allocator.alloc(Interval, nlive);
     errdefer allocator.free(ivals);
-    for (0..nval) |i| ivals[i] = .{ .value = @enumFromInt(i), .start = def_pos[i], .end = last_use[i] };
+    var w: usize = 0;
+    for (0..nval) |i| {
+        if (fold) |fa| if (isDeadAddResult(func, fa, @enumFromInt(i))) continue;
+        ivals[w] = .{ .value = @enumFromInt(i), .start = def_pos[i], .end = last_use[i] };
+        w += 1;
+    }
+    std.debug.assert(w == nlive);
     std.mem.sort(Interval, ivals, {}, lessByStart);
     return ivals;
+}
+
+/// Whether `v` is the result of an `arith_imm.add` that the fold marked dead (its only uses folded
+/// away). A block param has no defining inst, so it never qualifies.
+fn isDeadAddResult(func: *const Function, fold: *const addrfold.Analysis, v: Value) bool {
+    const def = func.definingInst(v) orelse return false;
+    return fold.isDeadAdd(def);
 }
 
 fn markUse(last_use: []u32, v: Value, pos: u32) void {
     if (pos > last_use[@intFromEnum(v)]) last_use[@intFromEnum(v)] = pos;
 }
 
-fn forEachUse(func: *const Function, inst: ir.function.Inst, last_use: []u32, pos: u32) void {
+fn forEachUse(func: *const Function, inst: ir.function.Inst, last_use: []u32, pos: u32, fold: ?*const addrfold.Analysis) void {
     switch (func.opcode(inst)) {
         .iconst, .fconst, .alloca, .global_addr => {},
         .arith => |a| {
@@ -88,10 +122,13 @@ fn forEachUse(func: *const Function, inst: ir.function.Inst, last_use: []u32, po
         .extract => |e| markUse(last_use, e.aggregate, pos),
         .convert => |cv| markUse(last_use, cv.value, pos),
         .unary => |u| markUse(last_use, u.value, pos),
-        .load => |l| markUse(last_use, l.ptr, pos),
+        // A folded load/store attributes its pointer use to the fold base, so the base's live range
+        // reaches the mem op (even cross-block). `baseOf` returns the raw ptr when unfolded, so the
+        // fold-null path (no fold call at all) is byte-identical.
+        .load => |l| markUse(last_use, if (fold) |fa| fa.baseOf(func, inst) else l.ptr, pos),
         .store => |st| {
             markUse(last_use, st.value, pos);
-            markUse(last_use, st.ptr, pos);
+            markUse(last_use, if (fold) |fa| fa.baseOf(func, inst) else st.ptr, pos);
         },
         .prefetch => |pf| markUse(last_use, pf.ptr, pos),
         .dot => |d| {
@@ -129,7 +166,7 @@ fn setUsed(row: []bool, v: Value) void {
     row[@intFromEnum(v)] = true;
 }
 
-fn markUsedBitset(func: *const Function, inst: ir.function.Inst, row: []bool) void {
+fn markUsedBitset(func: *const Function, inst: ir.function.Inst, row: []bool, fold: ?*const addrfold.Analysis) void {
     switch (func.opcode(inst)) {
         .iconst, .fconst, .alloca, .global_addr => {},
         .arith => |a| {
@@ -149,10 +186,13 @@ fn markUsedBitset(func: *const Function, inst: ir.function.Inst, row: []bool) vo
         .extract => |e| setUsed(row, e.aggregate),
         .convert => |cv| setUsed(row, cv.value),
         .unary => |u| setUsed(row, u.value),
-        .load => |l| setUsed(row, l.ptr),
+        // Same fold reroute as `forEachUse`, in the backward liveness fixpoint (`extendLiveRanges`):
+        // a folded mem op's pointer use is the fold base, so the base's cross-block liveness reaches
+        // the mem op. `baseOf` is the raw ptr when unfolded, so the fold-null path is byte-identical.
+        .load => |l| setUsed(row, if (fold) |fa| fa.baseOf(func, inst) else l.ptr),
         .store => |st| {
             setUsed(row, st.value);
-            setUsed(row, st.ptr);
+            setUsed(row, if (fold) |fa| fa.baseOf(func, inst) else st.ptr);
         },
         .prefetch => |pf| setUsed(row, pf.ptr),
         .dot => |d| {
@@ -188,7 +228,7 @@ fn markUsedTermBitset(func: *const Function, term: ir.function.Terminator, row: 
 
 /// Backward liveness dataflow. Extends `last_use[v]` to the end of every block
 /// where `v` is live-out, so a value live across a loop keeps its register.
-fn extendLiveRanges(allocator: std.mem.Allocator, func: *const Function, last_use: []u32, block_end: []const u32) Error!void {
+fn extendLiveRanges(allocator: std.mem.Allocator, func: *const Function, last_use: []u32, block_end: []const u32, fold: ?*const addrfold.Analysis) Error!void {
     const nblocks = func.blockCount();
     const nval = func.valueCount();
     if (nblocks == 0 or nval == 0) return;
@@ -211,7 +251,7 @@ fn extendLiveRanges(allocator: std.mem.Allocator, func: *const Function, last_us
         const row = used[bi * nval ..][0..nval];
         for (func.blockParams(block)) |p| defined[bi * nval + @intFromEnum(p)] = true;
         for (func.blockInsts(block)) |inst| {
-            markUsedBitset(func, inst, row);
+            markUsedBitset(func, inst, row, fold);
             if (func.instResult(inst)) |r| defined[bi * nval + @intFromEnum(r)] = true;
             if (func.opcode(inst) == .@"if") {
                 const cf = func.opcode(inst).@"if";

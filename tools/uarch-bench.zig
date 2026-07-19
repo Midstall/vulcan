@@ -458,6 +458,43 @@ fn buildMemMulAdd(allocator: std.mem.Allocator) anyerror!Function {
     return func;
 }
 
+/// A straight-line consecutive-word memory copy: load `words` contiguous i64 from `in`, then store
+/// them to `out`, then read `out[0]` and `out[words - 1]` back and return their sum so the check in
+/// `benchGeneric` actually exercises the store half of the copy (a return value built only from the
+/// loaded values, as before, would pass its baseline/tuned equivalence check even if the stores were
+/// wrong). This is the ldp/stp peephole's shape: adjacent same-base loads and adjacent same-base
+/// stores. The always-on `pairMemory` pass runs inside compileFunction for BOTH the baseline and
+/// tuned builds, so the bench reports this memory-heavy kernel's cycles either way and confirms it
+/// runs. With address folding (Task 3) the constant-index loads/stores now fold to `[base, #off]`,
+/// their address-adds die, and the resulting adjacent same-base runs fuse into ldp/stp, so the copy
+/// body itself is paired here (in both builds equally, so the tuned/baseline ratio stays near 1.0
+/// while the absolute cycles drop versus the pre-fold, one-add-per-access shape).
+fn buildMemPair(allocator: std.mem.Allocator) anyerror!Function {
+    var func = Function.init(allocator);
+    errdefer func.deinit();
+    const i64_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
+    const ptr_t = try func.types.intern(.ptr);
+    const words = 16;
+    const entry = try func.appendBlock();
+    const in = try func.appendBlockParam(entry, ptr_t);
+    const out = try func.appendBlockParam(entry, ptr_t);
+    var loaded: [words]Value = undefined;
+    for (0..words) |i| {
+        const addr = if (i == 0) in else try func.appendArithImm(entry, ptr_t, .add, in, @intCast(i * 8));
+        loaded[i] = try func.appendInst(entry, i64_t, .{ .load = .{ .ptr = addr } });
+    }
+    var out_addrs: [words]Value = undefined;
+    for (0..words) |i| {
+        out_addrs[i] = if (i == 0) out else try func.appendArithImm(entry, ptr_t, .add, out, @intCast(i * 8));
+        try func.appendStore(entry, loaded[i], out_addrs[i]);
+    }
+    const back0 = try func.appendInst(entry, i64_t, .{ .load = .{ .ptr = out_addrs[0] } });
+    const backN = try func.appendInst(entry, i64_t, .{ .load = .{ .ptr = out_addrs[words - 1] } });
+    const sum = try func.appendInst(entry, i64_t, .{ .arith = .{ .op = .add, .lhs = back0, .rhs = backN } });
+    func.setTerminator(entry, .{ .ret = sum });
+    return func;
+}
+
 fn customArith(op: ir.function.BinOp) u32 {
     return switch (op) {
         .mul, .mulh => 3,
@@ -899,6 +936,24 @@ pub fn benchModel(allocator: std.mem.Allocator, io: std.Io, model: *const Model,
         buildMemMulAdd,
         &.{.{ &mma_a, &mma_b, &mma_out }},
         .{ &mma_a, &mma_b, &mma_out },
+    );
+
+    // The consecutive-word memory copy: the ldp/stp peephole's adjacent-load/adjacent-store shape.
+    // Both baseline and tuned go through the always-on pairMemory pass, so this reports the copy
+    // kernel's cycles and confirms it runs correctly (baseline == tuned) under fusion.
+    var pair_in: [16]i64 = undefined;
+    for (&pair_in, 0..) |*v, idx| v.* = @as(i64, @intCast(idx)) * 7 - 3;
+    var pair_out = [_]i64{0} ** 16;
+    try benchGeneric(
+        *const fn ([*]i64, [*]i64) callconv(.c) i64,
+        allocator,
+        io,
+        model,
+        w,
+        "mem-pair",
+        buildMemPair,
+        &.{.{ &pair_in, &pair_out }},
+        .{ &pair_in, &pair_out },
     );
 
     // The SAXPY map LOOP over real f32 arrays: exercises the loop vectorizer (main body unrolled by the

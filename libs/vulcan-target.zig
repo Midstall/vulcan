@@ -39,6 +39,9 @@ pub const regalloc = @import("vulcan-target/regalloc.zig");
 /// Shared, target-independent Wimmer-Franz register allocator (target abstraction + algorithm).
 pub const wimmer = @import("vulcan-target/wimmer.zig");
 
+/// Shared, target-independent address-mode-folding analysis (recognizer + dead-add analysis).
+pub const addrfold = @import("vulcan-target/addrfold.zig");
+
 /// Native target: the backend matching the host CPU, for in-process JIT.
 pub const native = @import("vulcan-target/native.zig");
 

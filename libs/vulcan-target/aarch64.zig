@@ -6,6 +6,7 @@ const std = @import("std");
 pub const encode = @import("aarch64/encode.zig");
 pub const disasm = @import("aarch64/disasm.zig");
 pub const isel = @import("aarch64/isel.zig");
+pub const peephole = @import("aarch64/peephole.zig");
 pub const link = @import("aarch64/link.zig");
 pub const object = @import("aarch64/object.zig");
 pub const ld = @import("aarch64/ld.zig");

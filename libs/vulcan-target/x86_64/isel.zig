@@ -15,11 +15,41 @@ const ir = @import("vulcan-ir");
 const encode = @import("encode.zig");
 const regalloc = @import("../regalloc.zig");
 const wimmer = @import("../wimmer.zig");
+const addrfold = @import("../addrfold.zig");
 
 const Function = ir.function.Function;
 const Value = ir.function.Value;
 const Block = ir.function.Block;
 const Reg = encode.Reg;
+
+/// A shared no-fold analysis for the paths that must stay fold-agnostic (the Wimmer differential
+/// compile, the allocator test hooks): its `baseOf`/`offOf`/`isDeadAdd` behave as if nothing folded,
+/// so those paths emit byte-identical code to before address folding existed. `Ctx.fold` defaults to
+/// it, so only `compile` (which builds a real analysis) ever overrides it.
+const empty_fold: addrfold.Analysis = addrfold.Analysis.empty;
+
+/// The x86-64 fold predicate for `addrfold.analyze`: fold a load/store whose pointer is an
+/// `arith_imm.add(base, imm)` into a `[base + disp32]` addressing mode, for ANY access size (x86
+/// mem operands carry a 32-bit signed displacement regardless of width). Foldable exactly when the
+/// add's imm fits a signed 32-bit displacement. The isel already assumes an `arith_imm` imm fits
+/// i32 (`@intCast(a.imm)` when it emits the add), so this matches an existing invariant. Returns the
+/// byte offset (equal to the add's imm) when in range, else null. `analyze` calls this only after
+/// confirming the pointer is an `arith_imm.add`, so the unwraps below are guaranteed, still asserted.
+fn x86_64FoldOffset(_: void, func: *const Function, mem_inst: ir.function.Inst) ?i64 {
+    const ptr = switch (func.opcode(mem_inst)) {
+        .load => |l| l.ptr,
+        .store => |st| st.ptr,
+        else => unreachable, // analyze only hands foldOffset a load or store
+    };
+    const def = func.definingInst(ptr).?; // analyze confirmed ptr is defined by an arith_imm.add
+    const add = switch (func.opcode(def)) {
+        .arith_imm => |a| a,
+        else => unreachable,
+    };
+    std.debug.assert(add.op == .add);
+    if (std.math.cast(i32, add.imm) == null) return null;
+    return add.imm;
+}
 
 pub const Error = std.mem.Allocator.Error || error{Unsupported};
 
@@ -184,6 +214,10 @@ const Ctx = struct {
     // block-parameter moves; both stay empty/false for the default path, so emission is byte-identical.
     edge_moves: []EdgeMoveSet = &.{},
     edge_move_driven: bool = false,
+    // Address-mode-fold analysis, consulted by the load/store emit arms and the dead-add skip. Defaults
+    // to the empty analysis (nothing folds), so the Wimmer path and the allocator test hooks stay
+    // byte-identical. `compile` overrides it with a real analysis of `func`.
+    fold: *const addrfold.Analysis = &empty_fold,
 
     fn loc(self: *const Ctx, v: Value) Loc {
         if (self.segments.get(v)) |segs| {
@@ -298,7 +332,7 @@ pub fn splitCountForTest(allocator: std.mem.Allocator, func: *const Function) Er
     var num_slots: u32 = 0;
     var def_pos: []u32 = &.{};
     defer allocator.free(def_pos);
-    try assignRegs(allocator, func, &loc_of, &num_slots, &def_pos, &segments, &actions);
+    try assignRegs(allocator, func, &loc_of, &num_slots, &def_pos, &segments, &actions, &empty_fold);
     return segments.count();
 }
 
@@ -321,7 +355,7 @@ pub fn reHomeCountForTest(allocator: std.mem.Allocator, func: *const Function) E
     var num_slots: u32 = 0;
     var def_pos: []u32 = &.{};
     defer allocator.free(def_pos);
-    try assignRegs(allocator, func, &loc_of, &num_slots, &def_pos, &segments, &actions);
+    try assignRegs(allocator, func, &loc_of, &num_slots, &def_pos, &segments, &actions, &empty_fold);
     var count: usize = 0;
     var it = segments.valueIterator();
     while (it.next()) |segs| {
@@ -348,7 +382,13 @@ pub fn compile(allocator: std.mem.Allocator, func: *const Function) Error!Compil
     const nblocks = func.blockCount();
     if (nblocks == 0) return error.Unsupported;
 
-    var ctx = Ctx{ .func = func };
+    // Address-mode fold analysis: a load/store whose pointer is a foldable `arith_imm.add(base, imm)`
+    // addresses `[base + disp32]` directly and the dead add is skipped. A function with nothing
+    // foldable yields an empty analysis, keeping its output byte-identical.
+    var fold = try addrfold.analyze(allocator, func, {}, x86_64FoldOffset);
+    defer fold.deinit(allocator);
+
+    var ctx = Ctx{ .func = func, .fold = &fold };
     defer ctx.loc_of.deinit(allocator);
     defer ctx.code.deinit(allocator);
     defer ctx.fixups.deinit(allocator);
@@ -365,9 +405,9 @@ pub fn compile(allocator: std.mem.Allocator, func: *const Function) Error!Compil
     // backing allocation, so freeing it is a no-op), so an unconditional free is safe.
     defer allocator.free(ctx.def_pos);
     var num_slots: u32 = 0;
-    try assignRegs(allocator, func, &ctx.loc_of, &num_slots, &ctx.def_pos, &ctx.segments, &ctx.actions);
+    try assignRegs(allocator, func, &ctx.loc_of, &num_slots, &ctx.def_pos, &ctx.segments, &ctx.actions, &fold);
     var xmm_slots: u32 = 0;
-    try assignXmm(allocator, func, &ctx.loc_of, &xmm_slots);
+    try assignXmm(allocator, func, &ctx.loc_of, &xmm_slots, &fold);
     sortSplitActions(ctx.actions.items);
     // The default path saves no callee-saved register, so the frame is computed with a zero push
     // count (byte-identical to before this extraction) and `emitFromAllocation` pushes nothing.
@@ -643,10 +683,19 @@ fn roundToHalf(allocator: std.mem.Allocator, ctx: *Ctx, reg: Xmm) Error!void {
 
 fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Error!void {
     const func = ctx.func;
+    // A folded address-add is dead: every use of its result was rerouted to the base by the fold, so
+    // it claims no register (excluded from the intervals) and emits nothing. Skip before the result
+    // unwrap below (an arith_imm has a result), mirroring the `.prefetch` no-op drop. With the empty
+    // analysis (Wimmer path, test hooks) `isDeadAdd` is always false, so this is byte-identical.
+    if (ctx.fold.isDeadAdd(inst)) return;
     if (func.opcode(inst) == .store) {
         // `store` produces no result, so handle it before the result unwrap below.
         const st = func.opcode(inst).store;
-        const base = try ctx.use(allocator, st.ptr, scratch2);
+        // A folded store addresses `[base + disp32]`: `baseOf` yields the fold base (the add's lhs)
+        // and `offOf` the displacement. Both are the raw ptr and 0 when unfolded, so the non-folding
+        // case is byte-identical.
+        const base = try ctx.use(allocator, ctx.fold.baseOf(func, inst), scratch2);
+        const disp: i32 = @intCast(ctx.fold.offOf(inst));
         if (isXmm(func, st.value)) {
             const val = try ctx.useXmm(allocator, st.value, xmm_op0);
             if (isHalf(func, st.value)) {
@@ -656,9 +705,9 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
                 // so `val` (which useXmm never reloads into the scratch) is not clobbered.
                 try ctx.put(allocator, encode.vcvtps2ph(xmm_scratch, val, 0));
                 try ctx.put(allocator, encode.movdFromXmm(scratch1, xmm_scratch));
-                try ctx.put(allocator, encode.movToMem16(base, 0, scratch1));
+                try ctx.put(allocator, encode.movToMem16(base, disp, scratch1));
             } else {
-                try ctx.put(allocator, if (isVector(func, st.value)) encode.movupsStoreMem(base, 0, val) else if (isDouble(func, st.value)) encode.movsdStoreMem(base, 0, val) else encode.movssStoreMem(base, 0, val));
+                try ctx.put(allocator, if (isVector(func, st.value)) encode.movupsStoreMem(base, disp, val) else if (isDouble(func, st.value)) encode.movsdStoreMem(base, disp, val) else encode.movssStoreMem(base, disp, val));
             }
         } else {
             const val = try ctx.use(allocator, st.value, scratch1);
@@ -666,10 +715,10 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
             // an 8-bit store writes 1 byte, a 16-bit 2, a 32-bit 4, a 64-bit/pointer 8. A wider
             // store would clobber the next element of a tightly-packed array (e.g. an i8 store8).
             try ctx.put(allocator, switch (intBits(func, st.value)) {
-                0...8 => encode.movToMem8(base, 0, val),
-                9...16 => encode.movToMem16(base, 0, val),
-                17...32 => encode.movToMem32(base, 0, val),
-                else => encode.movToMem(base, 0, val),
+                0...8 => encode.movToMem8(base, disp, val),
+                9...16 => encode.movToMem16(base, disp, val),
+                17...32 => encode.movToMem32(base, disp, val),
+                else => encode.movToMem(base, disp, val),
             });
         }
         return;
@@ -1293,21 +1342,24 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
             try ctx.put(allocator, encode.leaFromStack(rd, off));
             try ctx.store(allocator, result, rd);
         },
-        .load => |l| {
-            // The pointer operand is a general-register value, load through `[base + 0]`. An
-            // xmm result uses movups (vector) / movsd (f64) / movss (f32), else a general mov.
-            const base = try ctx.use(allocator, l.ptr, scratch2);
+        .load => {
+            // A folded load addresses `[base + disp32]`: `baseOf` yields the fold base (the add's
+            // lhs) and `offOf` the displacement. Both are the raw ptr and 0 when unfolded, so the
+            // non-folding case is byte-identical. An xmm result uses movups (vector) / movsd (f64) /
+            // movss (f32), else a general mov.
+            const base = try ctx.use(allocator, ctx.fold.baseOf(func, inst), scratch2);
+            const disp: i32 = @intCast(ctx.fold.offOf(inst));
             if (isXmm(func, result)) {
                 const rd = try ctx.dstXmm(result, xmm_scratch);
                 if (isHalf(func, result)) {
                     // Load a 16-bit IEEE half and widen to the held f32 form: movzx word into a
                     // gpr, movd into the xmm low lane, vcvtph2ps. NOT movss, which would read 4
                     // bytes from a 2-byte object (pulling in the next element).
-                    try ctx.put(allocator, encode.movzxWordFromMem(scratch1, base, 0));
+                    try ctx.put(allocator, encode.movzxWordFromMem(scratch1, base, disp));
                     try ctx.put(allocator, encode.movdToXmm(rd, scratch1));
                     try ctx.put(allocator, encode.vcvtph2ps(rd, rd));
                 } else {
-                    try ctx.put(allocator, if (isVector(func, result)) encode.movupsLoadMem(rd, base, 0) else if (isDouble(func, result)) encode.movsdLoadMem(rd, base, 0) else encode.movssLoadMem(rd, base, 0));
+                    try ctx.put(allocator, if (isVector(func, result)) encode.movupsLoadMem(rd, base, disp) else if (isDouble(func, result)) encode.movsdLoadMem(rd, base, disp) else encode.movssLoadMem(rd, base, disp));
                 }
                 try ctx.storeXmm(allocator, result, rd);
             } else {
@@ -1318,10 +1370,10 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
                 // the extend targets a 32-bit register so the upper 32 bits end up clean.
                 const signed = isSigned(func, result);
                 try ctx.put(allocator, switch (intBits(func, result)) {
-                    0...8 => if (signed) encode.movsxByteFromMem(rd, base, 0) else encode.movzxByteFromMem(rd, base, 0),
-                    9...16 => if (signed) encode.movsxWordFromMem(rd, base, 0) else encode.movzxWordFromMem(rd, base, 0),
-                    17...32 => if (signed) encode.movsxdFromMem(rd, base, 0) else encode.movFromMem32(rd, base, 0),
-                    else => encode.movFromMem(rd, base, 0),
+                    0...8 => if (signed) encode.movsxByteFromMem(rd, base, disp) else encode.movzxByteFromMem(rd, base, disp),
+                    9...16 => if (signed) encode.movsxWordFromMem(rd, base, disp) else encode.movzxWordFromMem(rd, base, disp),
+                    17...32 => if (signed) encode.movsxdFromMem(rd, base, disp) else encode.movFromMem32(rd, base, disp),
+                    else => encode.movFromMem(rd, base, disp),
                 });
                 try ctx.store(allocator, result, rd);
             }
@@ -2178,7 +2230,7 @@ pub fn compileFunctionWimmerX86(allocator: std.mem.Allocator, func: *Function) E
 /// arguments of an `if` are edge args (they move along a control edge), every other operand is an
 /// ordinary use. Mirrors the shared `regalloc.forEachUse` operand set, adding the edge-arg flag the
 /// split-liveness `is_intra` predicate needs. Kept local so `regalloc.zig` stays untouched.
-fn forEachOperand(func: *const Function, inst: ir.function.Inst, ctx: anytype, comptime f: fn (@TypeOf(ctx), Value, bool) void) void {
+fn forEachOperand(func: *const Function, inst: ir.function.Inst, fold: *const addrfold.Analysis, ctx: anytype, comptime f: fn (@TypeOf(ctx), Value, bool) void) void {
     switch (func.opcode(inst)) {
         .iconst, .fconst, .alloca, .global_addr => {},
         .arith => |a| {
@@ -2198,10 +2250,15 @@ fn forEachOperand(func: *const Function, inst: ir.function.Inst, ctx: anytype, c
         .extract => |e| f(ctx, e.aggregate, false),
         .convert => |cv| f(ctx, cv.value, false),
         .unary => |u| f(ctx, u.value, false),
-        .load => |l| f(ctx, l.ptr, false),
+        // A folded load/store attributes its POINTER use to the fold base (the add's lhs), not the
+        // add's own result, so the base stays live to the mem op and the dead add's result gets no
+        // use. `baseOf` returns the raw ptr when unfolded (the empty analysis), so the non-folding
+        // case is byte-identical. This mirrors `regalloc.forEachUse` exactly, keeping this local
+        // liveness in position/value parity with the shared interval computation.
+        .load => f(ctx, fold.baseOf(func, inst), false),
         .store => |st| {
             f(ctx, st.value, false);
-            f(ctx, st.ptr, false);
+            f(ctx, fold.baseOf(func, inst), false);
         },
         .prefetch => |pf| f(ctx, pf.ptr, false),
         .dot => |d| {
@@ -2259,7 +2316,7 @@ const LocalLiveness = struct {
 
 /// Build the local split-liveness data over `func`, mirroring `regalloc.computeLiveIntervals`'s
 /// position numbering. Caller owns the returned `LocalLiveness`.
-fn computeLocalLiveness(allocator: std.mem.Allocator, func: *const Function) Error!LocalLiveness {
+fn computeLocalLiveness(allocator: std.mem.Allocator, func: *const Function, fold: *const addrfold.Analysis) Error!LocalLiveness {
     const nval = func.valueCount();
 
     const def_pos = try allocator.alloc(u32, nval);
@@ -2324,7 +2381,7 @@ fn computeLocalLiveness(allocator: std.mem.Allocator, func: *const Function) Err
                 .pos = pos,
                 .bi = @intCast(bi),
             };
-            forEachOperand(func, inst, &col, Collector.visit);
+            forEachOperand(func, inst, fold, &col, Collector.visit);
             if (col.err) |e| return e;
             if (func.instResult(inst)) |r| {
                 def_pos[@intFromEnum(r)] = pos;
@@ -2498,7 +2555,7 @@ fn secondChance(
 /// Linear-scan register allocation with reuse and spilling. Entry parameters are not pinned,
 /// the prologue moves arguments into their assigned locations. R10/R11 are reserved as
 /// spill/move scratch. RAX/RDX/RCX are reserved for division/shifts.
-fn assignRegs(allocator: std.mem.Allocator, func: *const Function, loc_of: *std.AutoHashMapUnmanaged(Value, Loc), num_slots: *u32, def_pos_out: *[]u32, segments: *std.AutoHashMapUnmanaged(Value, []Segment), actions: *std.ArrayList(SplitAction)) Error!void {
+fn assignRegs(allocator: std.mem.Allocator, func: *const Function, loc_of: *std.AutoHashMapUnmanaged(Value, Loc), num_slots: *u32, def_pos_out: *[]u32, segments: *std.AutoHashMapUnmanaged(Value, []Segment), actions: *std.ArrayList(SplitAction), fold: *const addrfold.Analysis) Error!void {
     { // general args must fit the gpr ABI registers; fp args beyond xmm0..7 are loaded from the stack
         // by the prologue (System V callee-side stack args). Gpr stack args are not handled yet.
         var gpr_params: usize = 0;
@@ -2518,13 +2575,15 @@ fn assignRegs(allocator: std.mem.Allocator, func: *const Function, loc_of: *std.
         try pool.append(allocator, r);
     }
 
-    const ivals = try regalloc.computeLiveIntervals(allocator, func);
+    const ivals = try regalloc.computeLiveIntervals(allocator, func, fold);
     defer allocator.free(ivals);
 
     // Local split-liveness (use positions, is_intra, def positions) over the same position timeline
     // as the intervals. The victim heuristic below reads `use_positions` for the Belady/MIN key; the
-    // rest is kept for the later live-range-splitting tasks.
-    var lin = try computeLocalLiveness(allocator, func);
+    // rest is kept for the later live-range-splitting tasks. It must reroute a folded mem op's pointer
+    // use to the fold base exactly as `computeLiveIntervals` does, or the two disagree on the base's
+    // liveness and the heuristic sees the wrong next-use.
+    var lin = try computeLocalLiveness(allocator, func, fold);
     defer lin.deinit(allocator);
     // Surface the per-value def positions to the caller (compile stores them on Ctx for the
     // pos-coupling assert). Dupe because `lin` is freed when assignRegs returns. Ownership passes to
@@ -2655,8 +2714,8 @@ fn assignRegs(allocator: std.mem.Allocator, func: *const Function, loc_of: *std.
 /// are allocatable (xmm13/14/15 are reserved scratch). A value that does not fit a register
 /// (pressure, or live across a caller-clobbering call) spills to a 16-byte slot (movss for a
 /// scalar, movups for a whole vector). `xmm_slots` receives the slots used.
-fn assignXmm(allocator: std.mem.Allocator, func: *const Function, loc_of: *std.AutoHashMapUnmanaged(Value, Loc), xmm_slots: *u32) Error!void {
-    const ivals = try regalloc.computeLiveIntervals(allocator, func);
+fn assignXmm(allocator: std.mem.Allocator, func: *const Function, loc_of: *std.AutoHashMapUnmanaged(Value, Loc), xmm_slots: *u32, fold: *const addrfold.Analysis) Error!void {
+    const ivals = try regalloc.computeLiveIntervals(allocator, func, fold);
     defer allocator.free(ivals);
     const calls = try callPositions(allocator, func);
     defer allocator.free(calls);
@@ -2866,7 +2925,7 @@ test "x86-64 eviction spills the furthest-next-use value, not the furthest-end o
     }
     var actions: std.ArrayList(SplitAction) = .empty;
     defer actions.deinit(allocator);
-    try assignRegs(allocator, &func, &loc_of, &num_slots, &def_pos, &segments, &actions);
+    try assignRegs(allocator, &func, &loc_of, &num_slots, &def_pos, &segments, &actions, &empty_fold);
 
     // Exactly the next-use victim is evicted: far_use (furthest next use), not far_end (furthest
     // end). far_use is intra with a register prefix, so eviction TAIL-SPLITS it (register prefix,
@@ -2912,7 +2971,7 @@ test "x86-64 loc returns the whole-life location for an unsplit value" {
     defer allocator.free(ctx.def_pos);
     defer ctx.actions.deinit(allocator);
     var num_slots: u32 = 0;
-    try assignRegs(allocator, &func, &ctx.loc_of, &num_slots, &ctx.def_pos, &ctx.segments, &ctx.actions);
+    try assignRegs(allocator, &func, &ctx.loc_of, &num_slots, &ctx.def_pos, &ctx.segments, &ctx.actions, &empty_fold);
 
     // Nothing was split.
     try std.testing.expectEqual(@as(usize, 0), ctx.segments.count());
@@ -2964,7 +3023,7 @@ test "x86-64 local liveness records intra predicate and ascending use positions"
     const xuse = try func.appendInst(b1, t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = pparam } }); // X used in b1, a different block
     func.setTerminator(b1, .{ .ret = xuse });
 
-    var lin = try computeLocalLiveness(allocator, &func);
+    var lin = try computeLocalLiveness(allocator, &func, &empty_fold);
     defer lin.deinit(allocator);
 
     try std.testing.expect(lin.is_intra[@intFromEnum(v)]);
