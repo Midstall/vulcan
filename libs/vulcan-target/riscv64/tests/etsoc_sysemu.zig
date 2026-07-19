@@ -3372,3 +3372,278 @@ test "matmul_recog non-vacuity: a rejected nest is left as loops, unmutated and 
     defer diags.deinit();
     try std.testing.expect(diags.ok());
 }
+
+// ===========================================================================
+// riscv64 adoption RV-T4: the et-soc VPU vector class (class 3) through the SHARED Wimmer-Franz
+// allocator (`isel.compileFunctionWimmerRiscv(func, vpu = true)`) instead of the backend's own
+// `allocateRegisters`, driving the SAME battle-tested VPU emission. The sw-sysemu oracle above is the
+// execution check: each kernel is a 3-pointer 8-lane VPU function (a0=&in_a, a1=&in_b, a2=&out) that
+// `runVpuKernel` already knows how to run, so the shared-allocator output is executed and compared to
+// the mathematically-correct reference lane for lane, exactly like the native VPU tests above.
+//
+// The compile step runs UNCONDITIONALLY, before the sys_emu availability check, so a broken class-3
+// translation / spill / edge-move path fails these tests even where sw-sysemu is not on PATH (the
+// shared allocator additionally self-checks its result with `wimmer.verifyIntervals`). The structural
+// assertions (the VPU mask preamble is emitted, a spill emits `fsw.ps`) prove the VPU allocation
+// engaged without depending on the emulator. Where sw-sysemu IS present the lanes are executed too.
+// ===========================================================================
+
+/// The one-time VPU mask preamble word (`mov.m.x m0, x0, 0xFF`) the emission fires for any function
+/// that touches a VPU vector register or slot. Its presence proves the shared Wimmer path built a
+/// vpu-mode `RegDescription` and emitted the vpu preamble (RV-T4 change 4).
+const vpu_mask_preamble: u32 = encode.mov_m_x(0, .x0, 0xFF);
+
+/// Count `fsw.ps` words (8-lane VPU store): opcode 0x0B (0b0001011), funct3 = 0b110. A VPU vector
+/// spilled to a 32-byte stack slot stores through exactly this op (see isel `storeVpuVector` /
+/// the class-3 `emitSplitAction`), so a nonzero count is proof a vpu vector spilled.
+fn countFswPs(code: []const u32) usize {
+    var n: usize = 0;
+    for (code) |w| {
+        if ((w & 0x7F) == 0b0001011 and ((w >> 12) & 0x7) == 0b110) n += 1;
+    }
+    return n;
+}
+
+/// True if `code` contains the VPU mask preamble word.
+fn hasVpuMaskPreamble(code: []const u32) bool {
+    for (code) |w| {
+        if (w == vpu_mask_preamble) return true;
+    }
+    return false;
+}
+
+/// Compile `func` through the SHARED Wimmer-Franz allocator in VPU mode (`vpu = true`), the RV-T4
+/// path. Mutates `func` (splits critical edges). Caller owns the returned `Compiled`. NOT legalized,
+/// so the IR stays byte-identical to what the native `selectFunctionForModel` reference compiles.
+fn compileVpuWimmer(allocator: std.mem.Allocator, func: *Function) !isel.Compiled {
+    return isel.compileFunctionWimmerRiscv(allocator, func, true);
+}
+
+test "wimmer-vpu: an 8-lane f32 add compiles through the shared allocator and executes" {
+    const allocator = std.testing.allocator;
+    const model = mm.modelFor(.@"et-soc");
+    try std.testing.expect(model.vpu());
+
+    // Native reference kernel (the existing VPU codegen path), compiled directly.
+    var ref_func = Function.init(allocator);
+    defer ref_func.deinit();
+    try buildAddKernel(&ref_func);
+    const ref_code = try isel.selectFunctionForModel(allocator, &ref_func, model);
+    defer allocator.free(ref_code);
+
+    // Wimmer kernel: same IR, compiled through the SHARED allocator in vpu mode. This MUST succeed
+    // (a class-3 bail would be `error.Unsupported`) and runs unconditionally, so it fails everywhere
+    // if the RV-T4 translation regresses.
+    var wim_func = Function.init(allocator);
+    defer wim_func.deinit();
+    try buildAddKernel(&wim_func);
+    var wim = try compileVpuWimmer(allocator, &wim_func);
+    defer wim.deinit(allocator);
+
+    // Structural proof the vpu path engaged and did NOT spill (3 live vpu vectors < 12 registers).
+    try std.testing.expect(hasVpuMaskPreamble(wim.code));
+    try std.testing.expectEqual(@as(usize, 0), countFswPs(wim.code));
+
+    const in_a = [8]f32{ 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0 };
+    const in_b = [8]f32{ 10.5, 20.25, -3.5, 0.0, 100.0, -0.5, 42.0, 1000.0 };
+
+    const got = runVpuKernel(std.testing.io, allocator, wim.code, in_a, in_b) catch |e| switch (e) {
+        error.SkipZigTest => return error.SkipZigTest,
+        else => return e,
+    };
+    const ref = runVpuKernel(std.testing.io, allocator, ref_code, in_a, in_b) catch |e| switch (e) {
+        error.SkipZigTest => return error.SkipZigTest,
+        else => return e,
+    };
+    // Diff against the native reference AND the host f32 reference, lane for lane.
+    for (0..8) |i| {
+        try std.testing.expectEqual(@as(u32, @bitCast(ref[i])), @as(u32, @bitCast(got[i])));
+        try std.testing.expectEqual(@as(u32, @bitCast(in_a[i] + in_b[i])), @as(u32, @bitCast(got[i])));
+    }
+}
+
+/// How many splat-and-add vectors the pressure kernel builds. The vpu vector pool is f16..f27 (12
+/// registers), so 14 simultaneously-live `<8 x f32>` sums plus the live `va` exceed it and the shared
+/// allocator MUST spill a vpu vector to a 32-byte slot and reload it.
+const n_vpu_live = 14;
+
+/// Build the VPU register-pressure kernel `out[i] = sum_{j=0}^{13} (a[i] + j) = 14*a[i] + 91`: pack
+/// `va` from 8 scalar loads of `a`, then for each j build `sj = va + splat(j)` (a `<8 x f32>` whose
+/// every lane is the scalar constant `j`, packed from 8 copies of one `fconst` so only ONE scalar
+/// float is live per splat), keeping all 14 `sj` live at once, then reduce them. `va` stays live
+/// across every add. Peak live vpu vectors = va + 14 = 15 > 12, forcing a spill. Each `a[i] + j` is an
+/// exact small integer in f32, so the reduction is order-independent and bit-exact. `b` is unused.
+fn buildVpuPressureKernel(func: *Function) !void {
+    const V = ir.function.Value;
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const v8 = try func.types.intern(.{ .vector = .{ .len = 8, .elem = f32_t } });
+    const ptr_t = try func.types.intern(.ptr);
+    const b = try func.appendBlock();
+    const ptr_a = try func.appendBlockParam(b, ptr_t);
+    _ = try func.appendBlockParam(b, ptr_t); // ptr_b (unused, keeps the 3-pointer runVpuKernel shape)
+    const ptr_out = try func.appendBlockParam(b, ptr_t);
+
+    var av: [8]V = undefined;
+    for (0..8) |i| {
+        const addr_a = try func.appendArithImm(b, ptr_t, .add, ptr_a, @intCast(i * 4));
+        av[i] = try func.appendInst(b, f32_t, .{ .load = .{ .ptr = addr_a } });
+    }
+    const va = try func.appendInst(b, v8, .{ .struct_new = .{ .fields = try func.internValueList(&av) } });
+
+    var sums: [n_vpu_live]V = undefined;
+    for (0..n_vpu_live) |j| {
+        const cj = try func.appendInst(b, f32_t, .{ .fconst = @floatFromInt(j) });
+        var lanes = [_]V{ cj, cj, cj, cj, cj, cj, cj, cj };
+        const vj = try func.appendInst(b, v8, .{ .struct_new = .{ .fields = try func.internValueList(&lanes) } });
+        sums[j] = try func.appendInst(b, v8, .{ .arith = .{ .op = .add, .lhs = va, .rhs = vj } });
+    }
+    var acc = sums[0];
+    for (sums[1..]) |s| acc = try func.appendInst(b, v8, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = s } });
+    for (0..8) |i| {
+        const c = try func.appendInst(b, f32_t, .{ .extract = .{ .aggregate = acc, .index = @intCast(i) } });
+        const addr_out = try func.appendArithImm(b, ptr_t, .add, ptr_out, @intCast(i * 4));
+        try func.appendStore(b, c, addr_out);
+    }
+    func.setTerminator(b, .{ .ret = null });
+}
+
+test "wimmer-vpu: register pressure spills a vpu vector to a 32-byte slot and reloads it" {
+    const allocator = std.testing.allocator;
+    const model = mm.modelFor(.@"et-soc");
+    try std.testing.expect(model.vpu());
+
+    var wim_func = Function.init(allocator);
+    defer wim_func.deinit();
+    try buildVpuPressureKernel(&wim_func);
+    var wim = try compileVpuWimmer(allocator, &wim_func);
+    defer wim.deinit(allocator);
+
+    // The shared allocator ran out of the 12 vpu registers and spilled: proof is at least one
+    // `fsw.ps` store to a stack slot (the class-3 whole-value spill). This runs everywhere.
+    try std.testing.expect(hasVpuMaskPreamble(wim.code));
+    try std.testing.expect(countFswPs(wim.code) > 0);
+
+    const in_a = [8]f32{ 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0 };
+    const in_b = [8]f32{ 0, 0, 0, 0, 0, 0, 0, 0 };
+
+    const got = runVpuKernel(std.testing.io, allocator, wim.code, in_a, in_b) catch |e| switch (e) {
+        error.SkipZigTest => return error.SkipZigTest,
+        else => return e,
+    };
+    // out[i] = 14*a[i] + (0+1+...+13) = 14*a[i] + 91, exact for these small integer inputs.
+    for (0..8) |i| {
+        const expected: f32 = 14.0 * in_a[i] + 91.0;
+        try std.testing.expectEqual(@as(u32, @bitCast(expected)), @as(u32, @bitCast(got[i])));
+    }
+}
+
+/// The leaf callee `g(x) = x + 1` (scalar f32), its own function so the caller's `call` is a real
+/// inter-function call that clobbers every caller-saved register (all of f16..f27 among them).
+fn buildVpuScalarCallee(func: *Function) !void {
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const blk = try func.appendBlock();
+    const x = try func.appendBlockParam(blk, f32_t);
+    const one = try func.appendInst(blk, f32_t, .{ .fconst = 1.0 });
+    const r = try func.appendInst(blk, f32_t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = one } });
+    func.setTerminator(blk, .{ .ret = r });
+}
+
+/// Build the VPU across-call caller `f(a, b, out)`: pack `va` from 8 scalar loads of `a` BEFORE
+/// calling `g(1.0)`, then AFTER the call store `va`'s 8 lanes to `out`, so `out[i] = a[i]`. `va` (a
+/// `<8 x f32>`) is defined before the call and used after it, hence LIVE ACROSS the call. Every vpu
+/// vector register (f16..f27) is caller-saved, so the shared allocator cannot keep `va` in a register
+/// across the call: it must spill/split it to a 32-byte slot and reload it afterward. The NATIVE VPU
+/// allocator bails `error.Unsupported` on exactly this shape (a vector live across a call); the shared
+/// Wimmer path GENERALIZES that into a spill. `b` is unused.
+fn buildVpuAcrossCallCaller(func: *Function) !void {
+    const V = ir.function.Value;
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const v8 = try func.types.intern(.{ .vector = .{ .len = 8, .elem = f32_t } });
+    const ptr_t = try func.types.intern(.ptr);
+    const b = try func.appendBlock();
+    const ptr_a = try func.appendBlockParam(b, ptr_t);
+    _ = try func.appendBlockParam(b, ptr_t); // ptr_b (unused)
+    const ptr_out = try func.appendBlockParam(b, ptr_t);
+
+    var av: [8]V = undefined;
+    for (0..8) |i| {
+        const addr_a = try func.appendArithImm(b, ptr_t, .add, ptr_a, @intCast(i * 4));
+        av[i] = try func.appendInst(b, f32_t, .{ .load = .{ .ptr = addr_a } });
+    }
+    const va = try func.appendInst(b, v8, .{ .struct_new = .{ .fields = try func.internValueList(&av) } });
+
+    const one = try func.appendInst(b, f32_t, .{ .fconst = 1.0 });
+    _ = try func.appendCall(b, f32_t, "callee", &.{one});
+
+    for (0..8) |i| {
+        const c = try func.appendInst(b, f32_t, .{ .extract = .{ .aggregate = va, .index = @intCast(i) } });
+        const addr_out = try func.appendArithImm(b, ptr_t, .add, ptr_out, @intCast(i * 4));
+        try func.appendStore(b, c, addr_out);
+    }
+    func.setTerminator(b, .{ .ret = null });
+}
+
+/// Concatenate `caller` and `callee` code, resolve every `call` reloc in the caller (all target
+/// "callee") to an intra-image `jal`, and run the combined image (caller entry at word 0) under
+/// sw-sysemu as an 8-lane VPU kernel, returning the 8 f32 output lanes. Mirrors `wimmer_diff`'s
+/// `linkRunFloat`, but drives the sw-sysemu VPU image instead of qemu.
+fn linkRunVpu(io: std.Io, allocator: std.mem.Allocator, caller: *const isel.Compiled, callee: *const isel.Compiled, in_a: [8]f32, in_b: [8]f32) ![8]f32 {
+    const code = try allocator.alloc(u32, caller.code.len + callee.code.len);
+    defer allocator.free(code);
+    @memcpy(code[0..caller.code.len], caller.code);
+    @memcpy(code[caller.code.len..], callee.code);
+    const callee_start = caller.code.len;
+    for (caller.relocs) |reloc| {
+        std.debug.assert(reloc.kind == .call);
+        std.debug.assert(std.mem.eql(u8, reloc.symbol, "callee"));
+        const delta = (@as(i64, @intCast(callee_start)) - @as(i64, @intCast(reloc.offset))) * 4;
+        code[reloc.offset] = encode.jal(.x1, @intCast(delta));
+    }
+    return runVpuKernel(io, allocator, code, in_a, in_b);
+}
+
+test "wimmer-vpu: a vpu vector live across a call spills across the call (not an error)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    // The NATIVE allocator STILL bails `error.Unsupported` on a vpu vector live across a call (every
+    // f16..f27 is caller-saved and it has no vpu vector split), so there is no native reference to
+    // diff against: that limitation is exactly what the shared Wimmer path removes here. Confirm the
+    // native path really cannot compile this shape (documents why the oracle is the host reference).
+    var native_probe = Function.init(allocator);
+    defer native_probe.deinit();
+    try buildVpuAcrossCallCaller(&native_probe);
+    const model = mm.modelFor(.@"et-soc");
+    try std.testing.expectError(error.Unsupported, isel.selectFunctionForModel(allocator, &native_probe, model));
+
+    // Wimmer: caller through the SHARED allocator (this MUST succeed), callee through the native
+    // path, linked and run. `va` spills across the call and reloads afterward.
+    var wim_caller = Function.init(allocator);
+    defer wim_caller.deinit();
+    try buildVpuAcrossCallCaller(&wim_caller);
+    var caller_c = try compileVpuWimmer(allocator, &wim_caller);
+    defer caller_c.deinit(allocator);
+
+    // The spill store must be present: `va` was written to a 32-byte slot across the call.
+    try std.testing.expect(hasVpuMaskPreamble(caller_c.code));
+    try std.testing.expect(countFswPs(caller_c.code) > 0);
+
+    var callee_f = Function.init(allocator);
+    defer callee_f.deinit();
+    try buildVpuScalarCallee(&callee_f);
+    const callee_c = try isel.selectFunctionForModel(allocator, &callee_f, model);
+    // selectFunctionForModel returns just code; wrap it as a Compiled with no relocs for linkRunVpu.
+    const callee_wrapped: isel.Compiled = .{ .code = callee_c, .relocs = &.{} };
+    defer allocator.free(callee_c);
+
+    const in_a = [8]f32{ 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0 };
+    const in_b = [8]f32{ 0, 0, 0, 0, 0, 0, 0, 0 };
+    const got = linkRunVpu(io, allocator, &caller_c, &callee_wrapped, in_a, in_b) catch |e| switch (e) {
+        error.SkipZigTest => return error.SkipZigTest,
+        else => return e,
+    };
+    // `va` survived the call: out[i] = a[i], lane for lane.
+    for (0..8) |i| {
+        try std.testing.expectEqual(@as(u32, @bitCast(in_a[i])), @as(u32, @bitCast(got[i])));
+    }
+}

@@ -11,6 +11,7 @@ const schedule = @import("schedule.zig");
 const loops = @import("vulcan-opt").loops;
 const dominators = @import("vulcan-opt").dominators;
 const mm = @import("vulcan-opt").microarch;
+const wimmer = @import("../wimmer.zig");
 
 const Function = ir.function.Function;
 const Value = ir.function.Value;
@@ -24,16 +25,95 @@ const FReg = encode.FReg;
 /// value has several, selected by position through `segments`.
 const IntLoc = union(enum) { reg: Reg, slot: u32 };
 
+/// Where a scalar-float value lives at a given program point: a float register or a stack spill slot.
+/// The analogue of `IntLoc` for the float class. The DEFAULT riscv64 allocator never splits a float
+/// (only int splitting exists), so `floatLocationAt` always falls back to `float`/`float_spill` and
+/// this is unused on the default path; the shared Wimmer translation is the only producer of a split
+/// float (a `float_segments` list).
+const FloatLoc = union(enum) { reg: FReg, slot: u32 };
+
+/// Where an RVV vector value lives at a given program point: a vector register or a 16-byte stack
+/// spill slot. The vector-class analogue of `IntLoc`/`FloatLoc`. The DEFAULT riscv64 allocator never
+/// splits a vector, so `vectorLocationAt` always falls back to `vector`/`vector_spill` and this is
+/// unused on the default path; the shared Wimmer translation is the only producer of a split vector
+/// (a `vector_segments` list), which is exactly how a vector live across a call is spilled/reloaded.
+const VectorLoc = union(enum) { reg: VReg, slot: u32 };
+
+/// Where an et-soc VPU vector value lives at a given program point: a VPU vector register (an FReg in
+/// the f16..f27 partition) or a 32-byte stack spill slot. The VPU-class analogue of `VectorLoc`. The
+/// DEFAULT riscv64 allocator never splits a VPU value, so `vpuLocationAt` always falls back to
+/// `vpu_vector`/`vpu_vector_spill` and this is unused on the default path; the shared Wimmer
+/// translation is the only producer of a split VPU value (a `vpu_segments` list), which is exactly how
+/// a VPU value live across a call is spilled/reloaded (every f16..f27 is caller-saved).
+const VpuLoc = union(enum) { reg: FReg, slot: u32 };
+
 /// One piece of a split integer value's life: the value lives in `loc` from position `from` until
 /// the next segment (or, for the last one, to the end of its range). `segments[0].from` is the
 /// value's def position, so a lookup at any position at or after the def resolves to some segment.
 const Segment = struct { from: usize, loc: IntLoc };
 
-/// A store or reload to emit at position `at`, produced when an integer value is live-range split.
-/// A `.store` writes `value`'s register `reg` to slot `slot` at the split boundary (the tail moves to
-/// the stack). `.reload` is the second-chance re-home (Task 6d), not produced yet. Drained in the
-/// emission loop in `at` order.
-const SplitAction = struct { at: usize, kind: enum { store, reload }, value: Value, reg: Reg, slot: u32 };
+/// One piece of a split scalar-float value's life. The float-class analogue of `Segment`, held in
+/// `float_segments` and resolved by `floatLocationAt`. Only the shared Wimmer translation produces
+/// these (the native allocator never splits a float).
+const FloatSegment = struct { from: usize, loc: FloatLoc };
+
+/// One piece of a split RVV vector value's life. The vector-class analogue of `Segment`, held in
+/// `vector_segments` and resolved by `vectorLocationAt`. Only the shared Wimmer translation produces
+/// these (the native allocator never splits a vector). A vector live across a call is expressed as a
+/// register segment, then a spill-slot segment over the call, then a register segment again.
+const VectorSegment = struct { from: usize, loc: VectorLoc };
+
+/// One piece of a split et-soc VPU vector value's life. The VPU-class analogue of `VectorSegment`,
+/// held in `vpu_segments` and resolved by `vpuLocationAt`. Only the shared Wimmer translation produces
+/// these (the native allocator never splits a VPU value). A VPU value live across a call is expressed
+/// as a register segment, then a spill-slot segment over the call, then a register segment again.
+const VpuSegment = struct { from: usize, loc: VpuLoc };
+
+/// A store, reload, or register move to emit at position `at`, produced when a value is live-range
+/// split. `class` selects the register file: 0 = integer (sd/ld/mv on `spill_base`), 1 = scalar
+/// float (fsd|fsw / fld|flw / fmv on `float_spill_base`), 2 = RVV vector (vse32/vle32/vmv.v.v on
+/// `vspill_base`, the address computed into `spill_scratch1`), 3 = et-soc VPU vector (fsw.ps/flw.ps on
+/// `vpu_vspill_base`, a reg->reg move routed through the `vpu_pack_base` scratch since the VPU has no
+/// packed register move). A `.store` writes the value's register to
+/// its slot at a split boundary; a `.reload` brings the slot back into a register (the second-chance
+/// re-home, Task 6d); a `.move` copies one register into another (a register-to-register re-home,
+/// produced only by the shared Wimmer translation). The native `allocateRegisters` only ever
+/// produces class-0 `.store`/`.reload`, so it leaves every added field at its default and emission is
+/// byte-identical. Drained in the emission loop in `at` order (see `emitSplitAction`).
+const SplitAction = struct {
+    at: usize,
+    kind: enum { store, reload, move },
+    /// 0 = integer file (`reg`/`from_reg`), 1 = scalar-float file (`freg`/`from_freg`), 2 = RVV vector
+    /// (`vreg`/`from_vreg`), 3 = et-soc VPU vector (`freg`/`from_freg`, the FReg partition f16..f27).
+    class: u8 = 0,
+    value: Value,
+    /// Integer store source / reload or move destination (class 0).
+    reg: Reg = .x0,
+    /// Float store source / reload or move destination (class 1 scalar float, and class 3 VPU vector:
+    /// both ride the FReg file, disambiguated by `class`, never by index).
+    freg: FReg = .f0,
+    /// Vector store source / reload or move destination (class 2).
+    vreg: VReg = .v0,
+    /// Move source register; `reg`/`freg`/`vreg` is the destination. Class picks which is read.
+    from_reg: Reg = .x0,
+    from_freg: FReg = .f0,
+    from_vreg: VReg = .v0,
+    slot: u32 = 0,
+};
+
+/// One precomputed control-flow-edge move (the shared Wimmer path only), translated from a
+/// `wimmer.Move`: shuffle `src` into `dst` within `class` (0 int, 1 scalar float, 2 RVV vector, 3
+/// et-soc VPU vector). The register index is stored raw and decoded to a `Reg`/`FReg`/`VReg` per class
+/// at emission. The shared allocator already
+/// ORDERED these into a valid parallel-move sequence (every source read before it is overwritten,
+/// cycles broken and any slot<->slot shuffle routed through the class scratch), so the emitter
+/// replays them op-by-op with no reordering.
+const EdgeLoc = union(enum) { reg: u16, slot: u32 };
+const EdgeMove = struct { class: u8, src: EdgeLoc, dst: EdgeLoc };
+
+/// The ordered move list on one control-flow edge `pred -> succ` (translated from `wimmer.EdgeMoves`).
+/// Keyed by the block pair so the `.jump` emission can find the moves for the edge it lowers.
+const EdgeMoveSet = struct { pred: Block, succ: Block, moves: []EdgeMove };
 
 /// Register-file assignment. A value lives in an int, float, or vector register,
 /// or (when the file is exhausted) spills to a numbered stack slot.
@@ -69,6 +149,25 @@ const Allocation = struct {
     /// was split, so `intLocationAt` falls back to `int`/`int_spill` and emission is byte-identical
     /// to before splitting.
     segments: std.AutoHashMapUnmanaged(Value, []Segment) = .empty,
+    /// Split scalar-float values only (the shared Wimmer path): value -> ascending-by-`from` float
+    /// segment list. Empty on the default path (the native allocator never splits a float), so
+    /// `floatLocationAt` falls back to `float`/`float_spill` and emission is byte-identical.
+    float_segments: std.AutoHashMapUnmanaged(Value, []FloatSegment) = .empty,
+    /// Split RVV vector values only (the shared Wimmer path): value -> ascending-by-`from` vector
+    /// segment list. Empty on the default path (the native allocator never splits a vector), so
+    /// `vectorLocationAt` falls back to `vector`/`vector_spill` and emission is byte-identical. A
+    /// vector live across a call lands here (register, then slot over the call, then register).
+    vector_segments: std.AutoHashMapUnmanaged(Value, []VectorSegment) = .empty,
+    /// Split et-soc VPU vector values only (the shared Wimmer path): value -> ascending-by-`from` VPU
+    /// segment list. Empty on the default path (the native allocator never splits a VPU value), so
+    /// `vpuLocationAt` falls back to `vpu_vector`/`vpu_vector_spill` and emission is byte-identical. A
+    /// VPU value live across a call lands here (register, then 32-byte slot over the call, then register).
+    vpu_segments: std.AutoHashMapUnmanaged(Value, []VpuSegment) = .empty,
+    /// Precomputed, ordered control-flow-edge moves (the shared Wimmer path only). When
+    /// `edge_move_driven` is set the `.jump` emission replays these per edge and derives no block-param
+    /// moves itself. Empty + false is the DEFAULT path, whose edge lowering stays byte-identical.
+    edge_moves: []EdgeMoveSet = &.{},
+    edge_move_driven: bool = false,
     /// Per value: its definition position, in the same linear numbering as the liveness pass. The
     /// emission pos-coupling assert reads it. Always a heap-owned dupe (see `deinit`), so the `&.{}`
     /// sentinel is a zero-length slice with no backing allocation and freeing it is a no-op.
@@ -94,6 +193,17 @@ const Allocation = struct {
         var seg_it = self.segments.valueIterator();
         while (seg_it.next()) |segs| allocator.free(segs.*);
         self.segments.deinit(allocator);
+        var fseg_it = self.float_segments.valueIterator();
+        while (fseg_it.next()) |segs| allocator.free(segs.*);
+        self.float_segments.deinit(allocator);
+        var vseg_it = self.vector_segments.valueIterator();
+        while (vseg_it.next()) |segs| allocator.free(segs.*);
+        self.vector_segments.deinit(allocator);
+        var pseg_it = self.vpu_segments.valueIterator();
+        while (pseg_it.next()) |segs| allocator.free(segs.*);
+        self.vpu_segments.deinit(allocator);
+        for (self.edge_moves) |em| allocator.free(em.moves);
+        allocator.free(self.edge_moves);
         allocator.free(self.def_pos);
         self.actions.deinit(allocator);
     }
@@ -433,68 +543,223 @@ fn reloadInt(allocator: std.mem.Allocator, code: *std.ArrayList(u32), alloc: *co
     }
 }
 
-/// Reload a vector `v` into `scratch` if it was spilled (vle32 from its 16-byte slot, whose
-/// address is computed into `addr`), else return its assigned vector register.
-fn reloadVector(allocator: std.mem.Allocator, code: *std.ArrayList(u32), alloc: *const Allocation, vspill_base: u32, v: Value, scratch: VReg, addr: Reg) std.mem.Allocator.Error!VReg {
-    if (alloc.vector.get(v)) |vr| return vr;
-    const off: i12 = @intCast(vspill_base + alloc.vector_spill.get(v).? * 16);
-    try code.append(allocator, encode.addi(addr, .x2, off));
-    try code.append(allocator, encode.vle32(scratch, addr));
-    return scratch;
-}
-/// The vector register to compute `v` into: its assigned register, or `scratch` if spilled.
-fn dstVector(alloc: *const Allocation, v: Value, scratch: VReg) VReg {
-    return alloc.vector.get(v) orelse scratch;
-}
-/// Store a freshly-computed vector `v` (in `vr`) back to its spill slot, if it was spilled.
-fn storeVector(allocator: std.mem.Allocator, code: *std.ArrayList(u32), alloc: *const Allocation, vspill_base: u32, v: Value, vr: VReg, addr: Reg) std.mem.Allocator.Error!void {
-    if (alloc.vector.get(v) != null) return;
-    const off: i12 = @intCast(vspill_base + alloc.vector_spill.get(v).? * 16);
-    try code.append(allocator, encode.addi(addr, .x2, off));
-    try code.append(allocator, encode.vse32(vr, addr));
+/// The location of RVV vector value `v` at position `pos`: its active segment if `v` was split,
+/// otherwise its whole-life register or spill slot. The vector-class analogue of `intLocationAt`/
+/// `floatLocationAt`. With no splits (`vector_segments` empty, every default-path function) this is
+/// exactly the old `vector`/`vector_spill` lookup, so callers threaded through it stay byte-identical.
+fn vectorLocationAt(alloc: *const Allocation, v: Value, pos: usize) VectorLoc {
+    if (alloc.vector_segments.get(v)) |segs| {
+        var chosen = segs[0]; // non-empty, ascending by `from`
+        for (segs) |s| {
+            if (s.from <= pos) chosen = s else break;
+        }
+        return chosen.loc;
+    }
+    if (alloc.vector.get(v)) |r| return .{ .reg = r };
+    return .{ .slot = alloc.vector_spill.get(v).? };
 }
 
-/// Reload a vpu-mode vector `v` into `scratch` if it was spilled (`flw.ps` from its 32-byte slot
-/// on `sp`), else return its assigned FReg. Unlike `reloadVector`, no address register is needed:
-/// `flw.ps` (like scalar `flw`) carries its own 12-bit displacement.
-fn reloadVpuVector(allocator: std.mem.Allocator, code: *std.ArrayList(u32), alloc: *const Allocation, vpu_vspill_base: u32, v: Value, scratch: FReg) std.mem.Allocator.Error!FReg {
-    if (alloc.vpu_vector.get(v)) |fr| return fr;
-    const off: i12 = @intCast(vpu_vspill_base + alloc.vpu_vector_spill.get(v).? * 32);
-    try code.append(allocator, encode.flw_ps(scratch, .x2, off));
-    return scratch;
+/// Reload a vector `v` into `scratch` if it lives in a slot at `pos` (vle32 from its 16-byte slot,
+/// whose address is computed into `addr`), else return the vector register it lives in there. `pos`
+/// selects a split value's active segment; with no splits it is unobservable (whole-life fallback),
+/// so the default path is byte-identical.
+fn reloadVector(allocator: std.mem.Allocator, code: *std.ArrayList(u32), alloc: *const Allocation, vspill_base: u32, v: Value, pos: usize, scratch: VReg, addr: Reg) std.mem.Allocator.Error!VReg {
+    switch (vectorLocationAt(alloc, v, pos)) {
+        .reg => |vr| return vr,
+        .slot => |slot| {
+            const off: i12 = @intCast(vspill_base + slot * 16);
+            try code.append(allocator, encode.addi(addr, .x2, off));
+            try code.append(allocator, encode.vle32(scratch, addr));
+            return scratch;
+        },
+    }
 }
-/// The FReg to compute vpu-mode vector `v` into: its assigned register, or `scratch` if spilled.
-fn dstVpuVector(alloc: *const Allocation, v: Value, scratch: FReg) FReg {
-    return alloc.vpu_vector.get(v) orelse scratch;
+/// The vector register to compute `v` into at `pos`: its assigned register, or `scratch` if it lives
+/// in a slot there. At a def position a split value's first segment is `.reg`, so `.slot` means a
+/// wholly-spilled value, identical to the old `vector.get orelse scratch`.
+fn dstVector(alloc: *const Allocation, v: Value, pos: usize, scratch: VReg) VReg {
+    return switch (vectorLocationAt(alloc, v, pos)) {
+        .reg => |r| r,
+        .slot => scratch,
+    };
 }
-/// Store a freshly-computed vpu-mode vector `v` (in `fr`) back to its spill slot, if it was
-/// spilled.
-fn storeVpuVector(allocator: std.mem.Allocator, code: *std.ArrayList(u32), alloc: *const Allocation, vpu_vspill_base: u32, v: Value, fr: FReg) std.mem.Allocator.Error!void {
-    if (alloc.vpu_vector.get(v) != null) return;
-    const off: i12 = @intCast(vpu_vspill_base + alloc.vpu_vector_spill.get(v).? * 32);
-    try code.append(allocator, encode.fsw_ps(fr, .x2, off));
+/// Store a freshly-computed vector `v` (in `vr`) back to its spill slot, if it lives in a slot at
+/// `pos` (vse32 to its 16-byte slot, whose address is computed into `addr`).
+fn storeVector(allocator: std.mem.Allocator, code: *std.ArrayList(u32), alloc: *const Allocation, vspill_base: u32, v: Value, pos: usize, vr: VReg, addr: Reg) std.mem.Allocator.Error!void {
+    switch (vectorLocationAt(alloc, v, pos)) {
+        .reg => {},
+        .slot => |slot| {
+            const off: i12 = @intCast(vspill_base + slot * 16);
+            try code.append(allocator, encode.addi(addr, .x2, off));
+            try code.append(allocator, encode.vse32(vr, addr));
+        },
+    }
 }
 
-/// Resolve a scalar-float operand to a register: if `v` lives in a float register, return it. If it
-/// was spilled, reload it from its stack slot into `scratch` and return `scratch`. `d64` picks the
-/// load width (fld for f64, flw for f32); spilled values occupy a full 8-byte slot regardless (an
-/// f32 uses the low 4 bytes), mirroring `reloadInt`.
-fn reloadFloat(allocator: std.mem.Allocator, code: *std.ArrayList(u32), alloc: *const Allocation, float_spill_base: u32, v: Value, d64: bool, scratch: FReg) std.mem.Allocator.Error!FReg {
-    if (alloc.float.get(v)) |r| return r;
-    const off: i12 = @intCast(float_spill_base + alloc.float_spill.get(v).? * 8);
-    try code.append(allocator, if (d64) encode.fld(scratch, .x2, off) else encode.flw(scratch, .x2, off));
-    return scratch;
+/// The location of et-soc VPU vector value `v` at position `pos`: its active segment if `v` was
+/// split, otherwise its whole-life FReg or spill slot. The VPU-class analogue of `vectorLocationAt`.
+/// With no splits (`vpu_segments` empty, every default-path vpu function) this is exactly the old
+/// `vpu_vector`/`vpu_vector_spill` lookup, so callers threaded through it stay byte-identical.
+fn vpuLocationAt(alloc: *const Allocation, v: Value, pos: usize) VpuLoc {
+    if (alloc.vpu_segments.get(v)) |segs| {
+        var chosen = segs[0]; // non-empty, ascending by `from`
+        for (segs) |s| {
+            if (s.from <= pos) chosen = s else break;
+        }
+        return chosen.loc;
+    }
+    if (alloc.vpu_vector.get(v)) |fr| return .{ .reg = fr };
+    return .{ .slot = alloc.vpu_vector_spill.get(v).? };
 }
-/// The float register to compute `v` into: its assigned register, or `scratch` if spilled.
-fn dstFloat(alloc: *const Allocation, v: Value, scratch: FReg) FReg {
-    return alloc.float.get(v) orelse scratch;
+
+/// Reload a vpu-mode vector `v` into `scratch` if it lives in a slot at `pos` (`flw.ps` from its
+/// 32-byte slot on `sp`), else return the FReg it lives in there. Unlike `reloadVector`, no address
+/// register is needed: `flw.ps` (like scalar `flw`) carries its own 12-bit displacement. `pos` selects
+/// a split value's active segment; with no splits it is unobservable (whole-life fallback), so the
+/// default path is byte-identical.
+fn reloadVpuVector(allocator: std.mem.Allocator, code: *std.ArrayList(u32), alloc: *const Allocation, vpu_vspill_base: u32, v: Value, pos: usize, scratch: FReg) std.mem.Allocator.Error!FReg {
+    switch (vpuLocationAt(alloc, v, pos)) {
+        .reg => |fr| return fr,
+        .slot => |slot| {
+            const off: i12 = @intCast(vpu_vspill_base + slot * 32);
+            try code.append(allocator, encode.flw_ps(scratch, .x2, off));
+            return scratch;
+        },
+    }
 }
-/// Store a freshly-computed scalar-float `v` (in `fr`) back to its spill slot, if it was spilled.
-/// `d64` picks the store width (fsd for f64, fsw for f32).
-fn storeFloat(allocator: std.mem.Allocator, code: *std.ArrayList(u32), alloc: *const Allocation, float_spill_base: u32, v: Value, d64: bool, fr: FReg) std.mem.Allocator.Error!void {
-    if (alloc.float.get(v) != null) return;
-    const off: i12 = @intCast(float_spill_base + alloc.float_spill.get(v).? * 8);
-    try code.append(allocator, if (d64) encode.fsd(fr, .x2, off) else encode.fsw(fr, .x2, off));
+/// The FReg to compute vpu-mode vector `v` into at `pos`: its assigned register, or `scratch` if it
+/// lives in a slot there. At a def position a split value's first segment is `.reg`, so `.slot` means a
+/// wholly-spilled value, identical to the old `vpu_vector.get orelse scratch`.
+fn dstVpuVector(alloc: *const Allocation, v: Value, pos: usize, scratch: FReg) FReg {
+    return switch (vpuLocationAt(alloc, v, pos)) {
+        .reg => |fr| fr,
+        .slot => scratch,
+    };
+}
+/// Store a freshly-computed vpu-mode vector `v` (in `fr`) back to its spill slot, if it lives in a
+/// slot at `pos` (`fsw.ps` to its 32-byte slot on `sp`).
+fn storeVpuVector(allocator: std.mem.Allocator, code: *std.ArrayList(u32), alloc: *const Allocation, vpu_vspill_base: u32, v: Value, pos: usize, fr: FReg) std.mem.Allocator.Error!void {
+    switch (vpuLocationAt(alloc, v, pos)) {
+        .reg => {},
+        .slot => |slot| {
+            const off: i12 = @intCast(vpu_vspill_base + slot * 32);
+            try code.append(allocator, encode.fsw_ps(fr, .x2, off));
+        },
+    }
+}
+
+/// The location of scalar-float value `v` at position `pos`: its active segment if `v` was split,
+/// otherwise its whole-life register or spill slot. The float-class analogue of `intLocationAt`. With
+/// no splits (`float_segments` empty, every default-path function) this is exactly the old
+/// `float`/`float_spill` lookup, so callers threaded through it stay byte-identical.
+fn floatLocationAt(alloc: *const Allocation, v: Value, pos: usize) FloatLoc {
+    if (alloc.float_segments.get(v)) |segs| {
+        var chosen = segs[0]; // non-empty, ascending by `from`
+        for (segs) |s| {
+            if (s.from <= pos) chosen = s else break;
+        }
+        return chosen.loc;
+    }
+    if (alloc.float.get(v)) |r| return .{ .reg = r };
+    return .{ .slot = alloc.float_spill.get(v).? };
+}
+
+/// Resolve a scalar-float operand to a register: if `v` lives in a float register at `pos`, return
+/// it. If it lives in a slot, reload it from there into `scratch` and return `scratch`. `d64` picks
+/// the load width (fld for f64, flw for f32); spilled values occupy a full 8-byte slot regardless (an
+/// f32 uses the low 4 bytes), mirroring `reloadInt`. `pos` selects a split value's active segment;
+/// with no splits it is unobservable (whole-life fallback), so the default path is byte-identical.
+fn reloadFloat(allocator: std.mem.Allocator, code: *std.ArrayList(u32), alloc: *const Allocation, float_spill_base: u32, v: Value, pos: usize, d64: bool, scratch: FReg) std.mem.Allocator.Error!FReg {
+    switch (floatLocationAt(alloc, v, pos)) {
+        .reg => |r| return r,
+        .slot => |slot| {
+            const off: i12 = @intCast(float_spill_base + slot * 8);
+            try code.append(allocator, if (d64) encode.fld(scratch, .x2, off) else encode.flw(scratch, .x2, off));
+            return scratch;
+        },
+    }
+}
+/// The float register to compute `v` into at `pos`: its assigned register, or `scratch` if it lives
+/// in a slot there. At a def position a split value's first segment is `.reg`, so `.slot` means a
+/// wholly-spilled value, identical to the old `float.get orelse scratch`.
+fn dstFloat(alloc: *const Allocation, v: Value, pos: usize, scratch: FReg) FReg {
+    return switch (floatLocationAt(alloc, v, pos)) {
+        .reg => |r| r,
+        .slot => scratch,
+    };
+}
+/// Store a freshly-computed scalar-float `v` (in `fr`) back to its spill slot, if it lives in a slot
+/// at `pos`. `d64` picks the store width (fsd for f64, fsw for f32).
+fn storeFloat(allocator: std.mem.Allocator, code: *std.ArrayList(u32), alloc: *const Allocation, float_spill_base: u32, v: Value, pos: usize, d64: bool, fr: FReg) std.mem.Allocator.Error!void {
+    switch (floatLocationAt(alloc, v, pos)) {
+        .reg => {},
+        .slot => |slot| {
+            const off: i12 = @intCast(float_spill_base + slot * 8);
+            try code.append(allocator, if (d64) encode.fsd(fr, .x2, off) else encode.fsw(fr, .x2, off));
+        },
+    }
+}
+
+/// Emit one split-boundary action (see `SplitAction`). Class 0 is the integer file (sd/ld to
+/// `spill_base`, `mv` for a re-home), class 1 the scalar-float file (fsd|fsw / fld|flw to
+/// `float_spill_base`, `fmv` for a re-home, the width taken from the value's type). The native
+/// `allocateRegisters` only ever produces class-0 `.store`/`.reload`, so those arms are byte-identical
+/// to the inline drain they replace; `.move`, class 1, class 2 and class 3 are reachable only through
+/// the Wimmer path. Class 3 (et-soc VPU) stores/reloads a 32-byte packed slot with `fsw.ps`/`flw.ps`
+/// on `vpu_vspill_base`; its reg->reg re-home has no packed move instruction, so it round-trips
+/// through the reserved 32-byte `vpu_pack_base` scratch slot (`fsw.ps` then `flw.ps`).
+fn emitSplitAction(allocator: std.mem.Allocator, code: *std.ArrayList(u32), func: *const Function, spill_base: u32, float_spill_base: u32, vspill_base: u32, vpu_vspill_base: u32, vpu_pack_base: u32, act: SplitAction) std.mem.Allocator.Error!void {
+    switch (act.class) {
+        0 => switch (act.kind) {
+            .store => try code.append(allocator, encode.sd(act.reg, .x2, @intCast(spill_base + act.slot * 8))),
+            .reload => try code.append(allocator, encode.ld(act.reg, .x2, @intCast(spill_base + act.slot * 8))),
+            .move => if (act.reg != act.from_reg) try code.append(allocator, encode.addi(act.reg, act.from_reg, 0)),
+        },
+        1 => {
+            const off: i12 = @intCast(float_spill_base + act.slot * 8);
+            const d64 = is64Float(func, func.valueType(act.value));
+            switch (act.kind) {
+                .store => try code.append(allocator, if (d64) encode.fsd(act.freg, .x2, off) else encode.fsw(act.freg, .x2, off)),
+                .reload => try code.append(allocator, if (d64) encode.fld(act.freg, .x2, off) else encode.flw(act.freg, .x2, off)),
+                .move => if (act.freg != act.from_freg) try code.append(allocator, if (d64) encode.fmv_d(act.freg, act.from_freg) else encode.fmv_s(act.freg, act.from_freg)),
+            }
+        },
+        2 => {
+            // RVV vector: a 16-byte <4 x f32> slot. vse32/vle32 need the slot address in a GPR, so
+            // compute it into `spill_scratch1` (x8, reserved out of every pool). A reg->reg re-home is
+            // a whole-register `vmv.v.v`. This is the class a vector live across a call spills through.
+            const off: i12 = @intCast(vspill_base + act.slot * 16);
+            switch (act.kind) {
+                .store => {
+                    try code.append(allocator, encode.addi(spill_scratch1, .x2, off));
+                    try code.append(allocator, encode.vse32(act.vreg, spill_scratch1));
+                },
+                .reload => {
+                    try code.append(allocator, encode.addi(spill_scratch1, .x2, off));
+                    try code.append(allocator, encode.vle32(act.vreg, spill_scratch1));
+                },
+                .move => if (act.vreg != act.from_vreg) try code.append(allocator, encode.vmv_v_v(act.vreg, act.from_vreg)),
+            }
+        },
+        3 => {
+            // et-soc VPU vector: a 32-byte (8 x f32) slot addressed by `fsw.ps`/`flw.ps`'s own 12-bit
+            // displacement off `sp` (no address register needed). A reg->reg re-home has no packed VPU
+            // move instruction, so it round-trips through the reserved 32-byte `vpu_pack_base` scratch
+            // slot: `fsw.ps` the source, then `flw.ps` into the destination (each move is atomic, so a
+            // shared scratch slot is safe even inside a parallel-move cycle). This is the class a VPU
+            // value live across a call spills through (every f16..f27 is caller-saved).
+            const off: i12 = @intCast(vpu_vspill_base + act.slot * 32);
+            switch (act.kind) {
+                .store => try code.append(allocator, encode.fsw_ps(act.freg, .x2, off)),
+                .reload => try code.append(allocator, encode.flw_ps(act.freg, .x2, off)),
+                .move => if (act.freg != act.from_freg) {
+                    try code.append(allocator, encode.fsw_ps(act.from_freg, .x2, @intCast(vpu_pack_base)));
+                    try code.append(allocator, encode.flw_ps(act.freg, .x2, @intCast(vpu_pack_base)));
+                },
+            }
+        },
+        else => unreachable,
+    }
 }
 
 /// Materialize a 32-bit value into integer register `rd`.
@@ -2096,6 +2361,843 @@ fn popFloatSavedVpu(free: *std.ArrayList(FReg)) ?FReg {
     return null;
 }
 
+// ===========================================================================
+// riscv64 RegDescription for the shared Wimmer-Franz allocator (wimmer.zig).
+//
+// riscv64 has FOUR register classes, versus aarch64's two:
+//   class 0 "int"        (Reg,  8-byte slot)  index = @intFromEnum(Reg)  x0..x31
+//   class 1 "float"      (FReg, 8-byte slot)  index = @intFromEnum(FReg) f0..f31
+//   class 2 "vector"     (VReg, 16-byte slot) index = @intFromEnum(VReg) v0..v31  (RVV)
+//   class 3 "vpu_vector" (FReg, 32-byte slot) index = @intFromEnum(FReg) f0..f31  (et-soc VPU)
+//
+// A per-function `vpu` bool (from caps.vpu) picks ONE of the two vector classes: RVV (class 2) when
+// false, et-soc VPU (class 3) when true, so exactly one of class 2 / class 3 has a non-empty pool.
+// vpu mode also NARROWS the scalar-float pool (class 1) to f0..f7, because the VPU has no separate
+// vector file and instead partitions the shared FReg file (see the vpu note above `vpu_vector_regs`).
+//
+// INDEX-SPACE OVERLAP: class 1 and class 3 BOTH index the FReg enum, so their register indices
+// collide numerically (e.g. index 16 is f16 for either). They stay disjoint by POOL, never by index:
+// class 1 draws from f0..f7 (vpu) or f0..f9/f18..f29 (non-vpu), class 3 draws from f16..f27, and the
+// two are never both active in one function. The (class, index) pair is what disambiguates them, and
+// the eventual translation (Task 3) maps a (class, index) back to the right FReg/VReg. This is only
+// the DESCRIPTION; no allocation runs here.
+//
+// This mirrors `aarch64RegDescription`'s shape and builds its content from the pools/ABI/call logic
+// in `allocateRegisters` above.
+
+/// Backend context threaded through `classOf`/`useKind`. Unlike aarch64 (whose class decision needs
+/// no state), riscv64's class for a VECTOR value depends on the per-function `vpu` mode, so the ctx
+/// carries it. Two file-scope singletons give a stable, non-owned `ctx` pointer per mode with no
+/// per-call allocation (the shared `RegDescription.deinit` does not free `ctx`).
+const Riscv64RegCtx = struct { vpu: bool };
+const riscv64_reg_ctx_scalar: Riscv64RegCtx = .{ .vpu = false };
+const riscv64_reg_ctx_vpu: Riscv64RegCtx = .{ .vpu = true };
+
+/// `RegDescription.classOf` for riscv64: an integer value is class 0, a scalar float is class 1, and
+/// a vector is class 2 (RVV) or class 3 (VPU) depending on the ctx's `vpu` mode.
+fn riscv64ClassOf(ctx: *const anyopaque, func: *const Function, v: Value) u16 {
+    const rc: *const Riscv64RegCtx = @ptrCast(@alignCast(ctx));
+    const ty = func.valueType(v);
+    if (isVector(func, ty)) return if (rc.vpu) 3 else 2;
+    if (isFloat(func, ty)) return 1;
+    return 0;
+}
+
+/// `RegDescription.useKind` for riscv64: every operand needs a register. riscv64 has no memory
+/// operands, and some sites (e.g. the fused compare-and-branch) cannot reload a spilled operand, so
+/// `must_have_register` is both conservative and correct. Unused params are the generic hook shape.
+fn riscv64UseKind(ctx: *const anyopaque, func: *const Function, inst: ir.function.Inst, operand: Value) wimmer.UseKind {
+    _ = ctx;
+    _ = func;
+    _ = inst;
+    _ = operand;
+    return .must_have_register;
+}
+
+/// Allocate a `[]u16` of the class-relative indices (`@intFromEnum`) of `regs`. The caller owns it.
+fn regIndexSlice(allocator: std.mem.Allocator, comptime RegT: type, regs: []const RegT) std.mem.Allocator.Error![]u16 {
+    const out = try allocator.alloc(u16, regs.len);
+    for (regs, 0..) |r, i| out[i] = @intFromEnum(r);
+    return out;
+}
+
+/// Build the per-function riscv64 `RegDescription` the shared Wimmer-Franz allocator consumes,
+/// mirroring `aarch64RegDescription`. The four classes, entry-param pinning, per-call clobbers, and
+/// scratch registers come from `allocateRegisters`'s pools/ABI/call logic. `vpu` selects the et-soc
+/// VPU register model (class 3 active, narrowed float pool) over the RVV one (class 2 active). Task 1
+/// builds only the description (no allocation runs). The caller owns the result and must `deinit` it.
+///
+/// Call-clobber mechanism: every call site clobbers, per class, that class's CALLER-SAVED registers,
+/// AND ALL of the active vector class's registers (v1..v27 for RVV, f16..f27 for VPU), since every
+/// vector register is caller-saved. A vector value therefore cannot survive a call in a register, so
+/// the shared allocator SPILLS/splits it across the call. This GENERALIZES the old riscv64 path,
+/// which bailed `error.Unsupported` on a vector live across a call.
+///
+/// Scope note: the f16-scratch shrink (`temp_regs_f16`, when the function uses f16 without Zfh) is
+/// NOT modeled here. This signature has no capability input, and it is the byte-identical common
+/// case that class 0 uses the full `temp_regs`. A later task that wires the shared allocator into the
+/// riscv64 emission path can thread the f16 shrink through when needed.
+pub fn riscv64RegDescription(allocator: std.mem.Allocator, func: *const Function, vpu: bool) std.mem.Allocator.Error!wimmer.RegDescription {
+    // --- Class 0 (int): caller-saved temps x5/x7/x28..x31 + callee-saved x9/x18..x27. ---
+    const int_alloc = try allocator.alloc(u16, temp_regs.len + saved_regs.len);
+    errdefer allocator.free(int_alloc);
+    for (temp_regs, 0..) |r, i| int_alloc[i] = @intFromEnum(r);
+    for (saved_regs, 0..) |r, i| int_alloc[temp_regs.len + i] = @intFromEnum(r);
+    const int_cs = try regIndexSlice(allocator, Reg, &saved_regs);
+    errdefer allocator.free(int_cs);
+
+    // --- Class 1 (float): vpu narrows to f0..f7 (no callee-saved); non-vpu is the full temp +
+    // callee-saved float pool. ---
+    const float_alloc = if (vpu)
+        try regIndexSlice(allocator, FReg, &float_temp_regs_vpu)
+    else blk: {
+        const out = try allocator.alloc(u16, float_temp_regs.len + float_saved_regs.len);
+        for (float_temp_regs, 0..) |r, i| out[i] = @intFromEnum(r);
+        for (float_saved_regs, 0..) |r, i| out[float_temp_regs.len + i] = @intFromEnum(r);
+        break :blk out;
+    };
+    errdefer allocator.free(float_alloc);
+    const float_cs = if (vpu)
+        try allocator.alloc(u16, 0)
+    else
+        try regIndexSlice(allocator, FReg, &float_saved_regs);
+    errdefer allocator.free(float_cs);
+
+    // --- Class 2 (RVV vector): v1..v27, all caller-saved. Empty under vpu (no RVV). ---
+    const vec_alloc = if (vpu)
+        try allocator.alloc(u16, 0)
+    else
+        try regIndexSlice(allocator, VReg, &vector_regs);
+    errdefer allocator.free(vec_alloc);
+    const vec_cs = try allocator.alloc(u16, 0);
+    errdefer allocator.free(vec_cs);
+
+    // --- Class 3 (VPU vector): f16..f27, all caller-saved. Empty in non-vpu. ---
+    const vpu_alloc = if (vpu)
+        try regIndexSlice(allocator, FReg, &vpu_vector_regs)
+    else
+        try allocator.alloc(u16, 0);
+    errdefer allocator.free(vpu_alloc);
+    const vpu_cs = try allocator.alloc(u16, 0);
+    errdefer allocator.free(vpu_cs);
+
+    const classes = try allocator.alloc(wimmer.RegClass, 4);
+    errdefer allocator.free(classes);
+    classes[0] = .{ .name = "int", .allocatable = int_alloc, .callee_saved = int_cs, .slot_bytes = 8 };
+    classes[1] = .{ .name = "float", .allocatable = float_alloc, .callee_saved = float_cs, .slot_bytes = 8 };
+    classes[2] = .{ .name = "vector", .allocatable = vec_alloc, .callee_saved = vec_cs, .slot_bytes = 16 };
+    classes[3] = .{ .name = "vpu_vector", .allocatable = vpu_alloc, .callee_saved = vpu_cs, .slot_bytes = 32 };
+
+    // --- Entry params: the first 8 int params pin a0..a7 (x10..x17), the first 8 float params pin
+    // fa0..fa7 (f10..f17). A vector entry param has no ABI register (riscv64 rejects it downstream),
+    // so it is NOT pre-colored. Params past the first 8 of a class arrive on the stack and are left
+    // to the translation. int/float use SEPARATE ABI counters, matching `allocateRegisters`. ---
+    var ef: std.ArrayList(wimmer.FixedAssign) = .empty;
+    errdefer ef.deinit(allocator);
+    if (func.blockCount() != 0) {
+        var int_idx: usize = 0;
+        var float_idx: usize = 0;
+        for (func.blockParams(@enumFromInt(0))) |p| {
+            const ty = func.valueType(p);
+            if (isVector(func, ty)) continue; // no ABI vector register; not pre-colored
+            if (isFloat(func, ty)) {
+                if (float_idx < 8) try ef.append(allocator, .{ .value = p, .class = 1, .reg = @intFromEnum(fargReg(float_idx)) });
+                float_idx += 1;
+            } else {
+                if (int_idx < 8) try ef.append(allocator, .{ .value = p, .class = 0, .reg = @intFromEnum(argReg(int_idx)) });
+                int_idx += 1;
+            }
+        }
+    }
+    const entry_fixed = try ef.toOwnedSlice(allocator);
+    errdefer allocator.free(entry_fixed);
+
+    // --- Call sites: one per `.call` position, in the SAME single-step numbering `buildIntervals`
+    // uses (block-param row, one position per instruction, one terminator slot, over every block), so
+    // the positions line up with the intervals. ---
+    var call_positions: std.ArrayList(u32) = .empty;
+    defer call_positions.deinit(allocator);
+    {
+        var p: u32 = 0;
+        for (0..func.blockCount()) |bi| {
+            const block: Block = @enumFromInt(bi);
+            p += 1; // block-parameter row
+            for (func.blockInsts(block)) |inst| {
+                switch (func.opcode(inst)) {
+                    .call, .call_indirect => try call_positions.append(allocator, p),
+                    else => {},
+                }
+                p += 1;
+            }
+            p += 1; // terminator slot
+        }
+    }
+
+    const call_sites = try allocator.alloc(wimmer.CallSite, call_positions.items.len);
+    var built: usize = 0;
+    errdefer {
+        for (call_sites[0..built]) |cs| {
+            for (cs.clobbered) |cr| allocator.free(cr.regs);
+            allocator.free(cs.clobbered);
+        }
+        allocator.free(call_sites);
+    }
+    for (call_positions.items, 0..) |cpos, i| {
+        // Class 0: the caller-saved int temps (callee-saved x9/x18..x27 survive a call).
+        const int_clob = try regIndexSlice(allocator, Reg, &temp_regs);
+        errdefer allocator.free(int_clob);
+        // Class 1: the caller-saved float temps (vpu: f0..f7; non-vpu: f0..f7/f28/f29).
+        const float_clob = if (vpu)
+            try regIndexSlice(allocator, FReg, &float_temp_regs_vpu)
+        else
+            try regIndexSlice(allocator, FReg, &float_temp_regs);
+        errdefer allocator.free(float_clob);
+        // Class 2: ALL of v1..v27 (every RVV register is caller-saved). Empty under vpu.
+        const vec_clob = if (vpu)
+            try allocator.alloc(u16, 0)
+        else
+            try regIndexSlice(allocator, VReg, &vector_regs);
+        errdefer allocator.free(vec_clob);
+        // Class 3: ALL of f16..f27 (every VPU vector register is caller-saved). Empty in non-vpu.
+        const vpu_clob = if (vpu)
+            try regIndexSlice(allocator, FReg, &vpu_vector_regs)
+        else
+            try allocator.alloc(u16, 0);
+        errdefer allocator.free(vpu_clob);
+        const clob = try allocator.alloc(wimmer.ClassRegs, 4);
+        clob[0] = .{ .class = 0, .regs = int_clob };
+        clob[1] = .{ .class = 1, .regs = float_clob };
+        clob[2] = .{ .class = 2, .regs = vec_clob };
+        clob[3] = .{ .class = 3, .regs = vpu_clob };
+        call_sites[i] = .{ .pos = cpos, .clobbered = clob };
+        built = i + 1;
+    }
+
+    // --- Scratch, indexed by class: the reserved registers the backend already keeps out of every
+    // pool for parallel-move cycle breaking / spill reload. Int x6, float f31 (f8 in vpu, where f31
+    // sits inside the VPU partition), RVV v31, VPU f31 (reserved partition headroom). ---
+    const scratch = try allocator.alloc(u16, 4);
+    errdefer allocator.free(scratch);
+    scratch[0] = @intFromEnum(spill_scratch0);
+    scratch[1] = if (vpu) @intFromEnum(float_spill_scratch0_vpu) else @intFromEnum(float_scratch);
+    scratch[2] = @intFromEnum(vector_scratch);
+    scratch[3] = @intFromEnum(float_scratch);
+
+    return .{
+        .classes = classes,
+        .classOf = riscv64ClassOf,
+        .useKind = riscv64UseKind,
+        .entry_fixed = entry_fixed,
+        .call_sites = call_sites,
+        .scratch = scratch,
+        .ctx = if (vpu) &riscv64_reg_ctx_vpu else &riscv64_reg_ctx_scalar,
+    };
+}
+
+// ===========================================================================
+// Shared Wimmer-Franz integration (riscv64 adoption Tasks 2/3/4): translate a finished
+// `wimmer.Allocation` into this backend's own `Allocation` and drive the existing
+// `emitFromAllocation`. Covers ALL FOUR classes: INT, scalar-FLOAT, RVV VECTOR (0/1/2) and the et-soc
+// VPU VECTOR class (3, RV-T4); anything not faithfully translatable (an f16 function, a wrong-width
+// vector, a split/spilled entry param, a same-position action hazard, an if-edge move) bails
+// `error.Unsupported`, never a silent miscompile. The default `compileFunction` path is untouched.
+// ===========================================================================
+
+/// The register class of `v` for the shared allocator: 0 int, 1 scalar float, 2 RVV vector, 3 VPU
+/// vector (the last two selected by `vpu`). Mirrors `riscv64ClassOf` without the type-erased ctx.
+fn wimmerClassOf(func: *const Function, v: Value, vpu: bool) u16 {
+    const ty = func.valueType(v);
+    if (isVector(func, ty)) return if (vpu) 3 else 2;
+    if (isFloat(func, ty)) return 1;
+    return 0;
+}
+
+fn intLocFromWimmer(loc: wimmer.Location) IntLoc {
+    return switch (loc) {
+        .reg => |ri| .{ .reg = @enumFromInt(@as(u5, @intCast(ri))) },
+        .slot => |s| .{ .slot = s },
+    };
+}
+
+fn floatLocFromWimmer(loc: wimmer.Location) FloatLoc {
+    return switch (loc) {
+        .reg => |ri| .{ .reg = @enumFromInt(@as(u5, @intCast(ri))) },
+        .slot => |s| .{ .slot = s },
+    };
+}
+
+fn vectorLocFromWimmer(loc: wimmer.Location) VectorLoc {
+    return switch (loc) {
+        .reg => |ri| .{ .reg = @enumFromInt(@as(u5, @intCast(ri))) },
+        .slot => |s| .{ .slot = s },
+    };
+}
+
+fn vpuLocFromWimmer(loc: wimmer.Location) VpuLoc {
+    return switch (loc) {
+        .reg => |ri| .{ .reg = @enumFromInt(@as(u5, @intCast(ri))) },
+        .slot => |s| .{ .slot = s },
+    };
+}
+
+fn edgeLocFromWimmer(loc: wimmer.Location) EdgeLoc {
+    return switch (loc) {
+        .reg => |ri| .{ .reg = ri },
+        .slot => |s| .{ .slot = s },
+    };
+}
+
+/// Build the drain action realizing `src -> dst` for an INT `value` at `at`: register->slot a
+/// `.store`, slot->register a `.reload`, register->register a `.move`. A slot->slot transition needs
+/// a scratch this translation does not model, so it bails (never a silent miscompile).
+fn transitionIntAction(value: Value, src: IntLoc, dst: IntLoc, at: usize) Error!SplitAction {
+    return switch (src) {
+        .reg => |sr| switch (dst) {
+            .reg => |dr| .{ .at = at, .kind = .move, .class = 0, .value = value, .reg = dr, .from_reg = sr },
+            .slot => |ds| .{ .at = at, .kind = .store, .class = 0, .value = value, .reg = sr, .slot = ds },
+        },
+        .slot => |ss| switch (dst) {
+            .reg => |dr| .{ .at = at, .kind = .reload, .class = 0, .value = value, .reg = dr, .slot = ss },
+            .slot => error.Unsupported,
+        },
+    };
+}
+
+/// The scalar-float analogue of `transitionIntAction` (class 1, `freg`/`from_freg`).
+fn transitionFloatAction(value: Value, src: FloatLoc, dst: FloatLoc, at: usize) Error!SplitAction {
+    return switch (src) {
+        .reg => |sr| switch (dst) {
+            .reg => |dr| .{ .at = at, .kind = .move, .class = 1, .value = value, .freg = dr, .from_freg = sr },
+            .slot => |ds| .{ .at = at, .kind = .store, .class = 1, .value = value, .freg = sr, .slot = ds },
+        },
+        .slot => |ss| switch (dst) {
+            .reg => |dr| .{ .at = at, .kind = .reload, .class = 1, .value = value, .freg = dr, .slot = ss },
+            .slot => error.Unsupported,
+        },
+    };
+}
+
+/// The RVV vector analogue of `transitionIntAction`/`transitionFloatAction` (class 2, `vreg`/
+/// `from_vreg`): register->slot a `.store` (vse32), slot->register a `.reload` (vle32), register->
+/// register a `.move` (vmv.v.v). A slot->slot transition needs a scratch this translation does not
+/// model, so it bails (never a silent miscompile) - the shared resolver never emits one anyway.
+fn transitionVectorAction(value: Value, src: VectorLoc, dst: VectorLoc, at: usize) Error!SplitAction {
+    return switch (src) {
+        .reg => |sr| switch (dst) {
+            .reg => |dr| .{ .at = at, .kind = .move, .class = 2, .value = value, .vreg = dr, .from_vreg = sr },
+            .slot => |ds| .{ .at = at, .kind = .store, .class = 2, .value = value, .vreg = sr, .slot = ds },
+        },
+        .slot => |ss| switch (dst) {
+            .reg => |dr| .{ .at = at, .kind = .reload, .class = 2, .value = value, .vreg = dr, .slot = ss },
+            .slot => error.Unsupported,
+        },
+    };
+}
+
+/// The et-soc VPU vector analogue of `transitionVectorAction` (class 3, `freg`/`from_freg` on the
+/// f16..f27 partition): register->slot a `.store` (fsw.ps), slot->register a `.reload` (flw.ps),
+/// register->register a `.move` (a `vpu_pack_base` round trip, see the class-3 `emitSplitAction`). A
+/// slot->slot transition needs a scratch this translation does not model, so it bails (never a silent
+/// miscompile) - the shared resolver never emits one anyway.
+fn transitionVpuAction(value: Value, src: VpuLoc, dst: VpuLoc, at: usize) Error!SplitAction {
+    return switch (src) {
+        .reg => |sr| switch (dst) {
+            .reg => |dr| .{ .at = at, .kind = .move, .class = 3, .value = value, .freg = dr, .from_freg = sr },
+            .slot => |ds| .{ .at = at, .kind = .store, .class = 3, .value = value, .freg = sr, .slot = ds },
+        },
+        .slot => |ss| switch (dst) {
+            .reg => |dr| .{ .at = at, .kind = .reload, .class = 3, .value = value, .freg = dr, .slot = ss },
+            .slot => error.Unsupported,
+        },
+    };
+}
+
+/// A class-tagged register key: the int file is 0x000+, the scalar-float file 0x100+, the RVV vector
+/// file 0x200+, the VPU vector file 0x300+, so no two classes ever collide numerically (class 1 and
+/// class 3 both ride the FReg file but never coexist in one function; the tag keeps them apart anyway).
+fn actionDstKey(a: SplitAction) u32 {
+    return switch (a.class) {
+        0 => @intFromEnum(a.reg),
+        1 => 0x100 | @as(u32, @intFromEnum(a.freg)),
+        2 => 0x200 | @as(u32, @intFromEnum(a.vreg)),
+        3 => 0x300 | @as(u32, @intFromEnum(a.freg)),
+        else => unreachable,
+    };
+}
+fn actionSrcKey(a: SplitAction) u32 {
+    return switch (a.class) {
+        0 => @intFromEnum(a.reg),
+        1 => 0x100 | @as(u32, @intFromEnum(a.freg)),
+        2 => 0x200 | @as(u32, @intFromEnum(a.vreg)),
+        3 => 0x300 | @as(u32, @intFromEnum(a.freg)),
+        else => unreachable,
+    };
+}
+fn actionFromKey(a: SplitAction) u32 {
+    return switch (a.class) {
+        0 => @intFromEnum(a.from_reg),
+        1 => 0x100 | @as(u32, @intFromEnum(a.from_freg)),
+        2 => 0x200 | @as(u32, @intFromEnum(a.from_vreg)),
+        3 => 0x300 | @as(u32, @intFromEnum(a.from_freg)),
+        else => unreachable,
+    };
+}
+/// The register an action writes (reload/move destination), or null if it writes only memory.
+fn actionWrites(a: SplitAction) ?u32 {
+    return switch (a.kind) {
+        .store => null,
+        .reload, .move => actionDstKey(a),
+    };
+}
+/// The register an action reads (store source / move source), or null if it reads only memory.
+fn actionReads(a: SplitAction) ?u32 {
+    return switch (a.kind) {
+        .store => actionSrcKey(a),
+        .move => actionFromKey(a),
+        .reload => null,
+    };
+}
+/// Whether any two actions at the SAME position conflict on a register: one writes a register the
+/// other reads or writes. The emission drains a position's actions in a fixed order with no parallel-
+/// move resolution, so such a set could clobber a live value. This task does not model that, so the
+/// translation bails rather than risk a miscompile. O(n^2) over a short list.
+fn hasSamePosRegHazard(actions: []const SplitAction) bool {
+    for (actions, 0..) |a, i| {
+        for (actions[i + 1 ..]) |b| {
+            if (a.at != b.at) continue;
+            if (actionWrites(a)) |w| {
+                if (actionWrites(b)) |wb| {
+                    if (wb == w) return true;
+                }
+                if (actionReads(b)) |r| {
+                    if (r == w) return true;
+                }
+            }
+            if (actionWrites(b)) |w| {
+                if (actionReads(a)) |r| {
+                    if (r == w) return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+/// Whether block `block` ends in an `if` (a multi-successor terminator the riscv64 emission lowers as
+/// a bare branch, with no place to realize an edge move). Used to reject an edge move on an if-edge.
+fn blockHasIf(func: *const Function, block: Block) bool {
+    for (func.blockInsts(block)) |inst| {
+        if (func.opcode(inst) == .@"if") return true;
+    }
+    return false;
+}
+
+/// Whether any translated edge move sits on an edge whose predecessor ends in an `if`. The riscv64
+/// `.@"if"` emission only branches (it never realizes a move), and `splitCriticalEdges` splits only
+/// CRITICAL edges, so a surviving non-critical if-edge move would be silently dropped. Bail on it.
+fn edgeMoveOnIfEdge(func: *const Function, alloc: *const Allocation) bool {
+    for (alloc.edge_moves) |set| {
+        if (set.moves.len != 0 and blockHasIf(func, set.pred)) return true;
+    }
+    return false;
+}
+
+/// Translate a finished shared `wimmer.Allocation` into this backend's `Allocation` so the existing
+/// `emitFromAllocation` can consume it. A whole-life value (one segment) lands in the class `int`/
+/// `float` (register) or `int_spill`/`float_spill` (slot) maps exactly as the native allocator would
+/// leave it; a genuinely split value lands in `segments`/`float_segments` plus per-transition drain
+/// actions. Entry params are required whole-life in their ABI register (the shared hint), so the
+/// prologue's move is a no-op; anything else bails. An RVV vector (class 2) lands in `vector`/
+/// `vector_spill`/`vector_segments`; an et-soc VPU value (class 3) lands in `vpu_vector`/
+/// `vpu_vector_spill`/`vpu_segments`, a VPU value live across a call spilling to a 32-byte slot.
+fn translateAllocation(allocator: std.mem.Allocator, func: *const Function, vpu: bool, walloc: *const wimmer.Allocation) Error!Allocation {
+    var alloc: Allocation = .{
+        .int = .empty,
+        .float = .empty,
+        .vector = .empty,
+        .vector_spill = .empty,
+        .vector_spill_count = 0,
+        .vpu_vector = .empty,
+        .vpu_vector_spill = .empty,
+        .vpu_vector_spill_count = 0,
+        .int_spill = .empty,
+        .spill_count = 0,
+        .float_spill = .empty,
+        .float_spill_count = 0,
+        .incoming_stack = .empty,
+    };
+    errdefer alloc.deinit(allocator);
+
+    std.debug.assert(walloc.slot_count_per_class.len == 4);
+    alloc.spill_count = walloc.slot_count_per_class[0];
+    alloc.float_spill_count = walloc.slot_count_per_class[1];
+    // Class 2 (RVV vector) 16-byte slots and class 3 (et-soc VPU vector) 32-byte slots. Exactly one of
+    // the two is ever non-zero (RVV xor VPU, per the per-function `vpu` mode).
+    alloc.vector_spill_count = walloc.slot_count_per_class[2];
+    alloc.vpu_vector_spill_count = walloc.slot_count_per_class[3];
+
+    // def_pos in the SAME single-step numbering the shared allocator and `emitFromAllocation` use
+    // (block-param row, one position per instruction, one terminator slot, over every block). The
+    // caller guarantees every block is reachable, so this all-block walk matches the emission exactly.
+    const nval = func.valueCount();
+    const def_pos = try allocator.alloc(usize, nval);
+    errdefer allocator.free(def_pos);
+    @memset(def_pos, 0);
+    {
+        var pos: usize = 0;
+        for (0..func.blockCount()) |bi| {
+            const block: Block = @enumFromInt(bi);
+            for (func.blockParams(block)) |p| def_pos[@intFromEnum(p)] = pos;
+            pos += 1;
+            for (func.blockInsts(block)) |inst| {
+                if (func.instResult(inst)) |r| def_pos[@intFromEnum(r)] = pos;
+                pos += 1;
+            }
+            pos += 1; // terminator slot
+        }
+    }
+
+    // Entry-param ABI registers (a0..a7 int, fa0..fa7 float), used to require each param whole-life in
+    // its ABI register below. Separate int/float counters, matching `riscv64RegDescription`.
+    var eparam_class: std.AutoHashMapUnmanaged(Value, u8) = .empty; // 0 int, 1 float
+    defer eparam_class.deinit(allocator);
+    var eparam_reg: std.AutoHashMapUnmanaged(Value, u16) = .empty; // ABI register index
+    defer eparam_reg.deinit(allocator);
+    if (func.blockCount() != 0) {
+        var int_idx: usize = 0;
+        var float_idx: usize = 0;
+        for (func.blockParams(@enumFromInt(0))) |p| {
+            const ty = func.valueType(p);
+            if (isVector(func, ty)) return error.Unsupported; // no ABI vector register (riscv64 rejects it too)
+            if (isFloat(func, ty)) {
+                if (float_idx >= 8) return error.Unsupported; // fp stack params not modeled here
+                try eparam_class.put(allocator, p, 1);
+                try eparam_reg.put(allocator, p, @intFromEnum(fargReg(float_idx)));
+                float_idx += 1;
+            } else {
+                if (int_idx >= 8) return error.Unsupported; // int stack params not modeled here
+                try eparam_class.put(allocator, p, 0);
+                try eparam_reg.put(allocator, p, @intFromEnum(argReg(int_idx)));
+                int_idx += 1;
+            }
+        }
+    }
+
+    var it = walloc.segments.iterator();
+    while (it.next()) |e| {
+        const value = e.key_ptr.*;
+        const wsegs = e.value_ptr.*;
+        std.debug.assert(wsegs.len > 0);
+        const class = wimmerClassOf(func, value, vpu);
+        // The RVV lowering hardcodes VL=4 in its `vsetivli` preamble, so a vector of any other width
+        // would be miscompiled. Reject it (mirrors the native path's `isRvvWidth` gate).
+        if (class == 2 and !isRvvWidth(func, func.valueType(value))) return error.Unsupported;
+        // The et-soc VPU is a fixed 8-lane machine; any other width would be miscompiled. Reject it
+        // (mirrors the native path's `isVpuWidth` gate).
+        if (class == 3 and !isVpuWidth(func, func.valueType(value))) return error.Unsupported;
+
+        const is_eparam = eparam_class.get(value) != null;
+        // A split or slot-resident entry param would need prologue handling this task does not model.
+        if (is_eparam and (wsegs.len != 1 or wsegs[0].loc != .reg)) return error.Unsupported;
+
+        if (class == 0) {
+            if (wsegs.len == 1) {
+                switch (wsegs[0].loc) {
+                    .reg => |ri| {
+                        const r: Reg = @enumFromInt(@as(u5, @intCast(ri)));
+                        // An entry param must sit in its ABI register (the hint is a preference); if the
+                        // allocator placed it elsewhere the prologue would leave the wrong value there.
+                        if (eparam_reg.get(value)) |ar| {
+                            if (@as(u16, @intFromEnum(r)) != ar) return error.Unsupported;
+                        }
+                        try alloc.int.put(allocator, value, r);
+                    },
+                    .slot => |s| try alloc.int_spill.put(allocator, value, s),
+                }
+            } else {
+                const segs = try allocator.alloc(Segment, wsegs.len);
+                for (wsegs, 0..) |ws, i| segs[i] = .{ .from = ws.from, .loc = intLocFromWimmer(ws.loc) };
+                alloc.segments.put(allocator, value, segs) catch |err| {
+                    allocator.free(segs);
+                    return err;
+                };
+                var i: usize = 0;
+                while (i + 1 < wsegs.len) : (i += 1) {
+                    try alloc.actions.append(allocator, try transitionIntAction(value, segs[i].loc, segs[i + 1].loc, segs[i + 1].from));
+                }
+            }
+        } else if (class == 1) {
+            // class 1: scalar float.
+            if (wsegs.len == 1) {
+                switch (wsegs[0].loc) {
+                    .reg => |ri| {
+                        const fr: FReg = @enumFromInt(@as(u5, @intCast(ri)));
+                        if (eparam_reg.get(value)) |ar| {
+                            if (@as(u16, @intFromEnum(fr)) != ar) return error.Unsupported;
+                        }
+                        try alloc.float.put(allocator, value, fr);
+                    },
+                    .slot => |s| try alloc.float_spill.put(allocator, value, s),
+                }
+            } else {
+                const segs = try allocator.alloc(FloatSegment, wsegs.len);
+                for (wsegs, 0..) |ws, i| segs[i] = .{ .from = ws.from, .loc = floatLocFromWimmer(ws.loc) };
+                alloc.float_segments.put(allocator, value, segs) catch |err| {
+                    allocator.free(segs);
+                    return err;
+                };
+                var i: usize = 0;
+                while (i + 1 < wsegs.len) : (i += 1) {
+                    try alloc.actions.append(allocator, try transitionFloatAction(value, segs[i].loc, segs[i + 1].loc, segs[i + 1].from));
+                }
+            }
+        } else if (class == 2) {
+            // class 2: RVV vector. A vector entry param is rejected above (no ABI vector register), so
+            // no ABI-register check is needed here. A whole-life vector lands in `vector` (register) or
+            // `vector_spill` (16-byte slot); a split vector - the shape a vector live across a call
+            // takes, since every vector register is caller-saved - lands in `vector_segments` plus one
+            // store/reload/move action per boundary, drained by the class-2 arm of `emitSplitAction`.
+            if (wsegs.len == 1) {
+                switch (wsegs[0].loc) {
+                    .reg => |ri| try alloc.vector.put(allocator, value, @enumFromInt(@as(u5, @intCast(ri)))),
+                    .slot => |s| try alloc.vector_spill.put(allocator, value, s),
+                }
+            } else {
+                const segs = try allocator.alloc(VectorSegment, wsegs.len);
+                for (wsegs, 0..) |ws, i| segs[i] = .{ .from = ws.from, .loc = vectorLocFromWimmer(ws.loc) };
+                alloc.vector_segments.put(allocator, value, segs) catch |err| {
+                    allocator.free(segs);
+                    return err;
+                };
+                var i: usize = 0;
+                while (i + 1 < wsegs.len) : (i += 1) {
+                    try alloc.actions.append(allocator, try transitionVectorAction(value, segs[i].loc, segs[i + 1].loc, segs[i + 1].from));
+                }
+            }
+        } else {
+            // class 3: et-soc VPU vector (FReg partition f16..f27, 32-byte slots). A VPU vector entry
+            // param is rejected above (a vector entry param has no ABI register), so no ABI check is
+            // needed. A whole-life value lands in `vpu_vector` (register) or `vpu_vector_spill` (32-byte
+            // slot); a split value - the shape a VPU value live across a call takes, since every f16..f27
+            // is caller-saved - lands in `vpu_segments` plus one store/reload/move action per boundary,
+            // drained by the class-3 arm of `emitSplitAction`. This UN-BAILS the old RV-T4 stub.
+            std.debug.assert(class == 3);
+            if (wsegs.len == 1) {
+                switch (wsegs[0].loc) {
+                    .reg => |ri| try alloc.vpu_vector.put(allocator, value, @enumFromInt(@as(u5, @intCast(ri)))),
+                    .slot => |s| try alloc.vpu_vector_spill.put(allocator, value, s),
+                }
+            } else {
+                const segs = try allocator.alloc(VpuSegment, wsegs.len);
+                for (wsegs, 0..) |ws, i| segs[i] = .{ .from = ws.from, .loc = vpuLocFromWimmer(ws.loc) };
+                alloc.vpu_segments.put(allocator, value, segs) catch |err| {
+                    allocator.free(segs);
+                    return err;
+                };
+                var i: usize = 0;
+                while (i + 1 < wsegs.len) : (i += 1) {
+                    try alloc.actions.append(allocator, try transitionVpuAction(value, segs[i].loc, segs[i + 1].loc, segs[i + 1].from));
+                }
+            }
+        }
+    }
+
+    // The emission drains a position's actions in a fixed order with no parallel-move resolution, so a
+    // same-position register hazard could clobber a live value. Reject rather than risk a miscompile.
+    if (hasSamePosRegHazard(alloc.actions.items)) return error.Unsupported;
+
+    // Control-flow-edge moves: translate each ordered `wimmer.Move` into this backend's `EdgeMove`,
+    // keyed by (pred, succ). A scalar-float edge move that touches a SLOT is rejected: the width the
+    // slot was written with is unknown here (the `Move` carries no value), so an 8-byte round trip
+    // could mismatch a 4-byte f32 store and read a non-NaN-boxed value. Register-to-register float
+    // moves are safe (fmv.d copies the whole 64-bit register). A class-2 (RVV vector) or class-3
+    // (et-soc VPU vector) edge move IS supported, slots included: every such vector this path allows is
+    // a fixed width (16-byte <4 x f32> gated by `isRvvWidth`, 32-byte <8 x f32> gated by `isVpuWidth`),
+    // so a load/store round trip through its slot always moves exactly the whole vector, no ambiguity.
+    var edge_sets: std.ArrayList(EdgeMoveSet) = .empty;
+    errdefer {
+        for (edge_sets.items) |es| allocator.free(es.moves);
+        edge_sets.deinit(allocator);
+    }
+    for (walloc.edge_moves) |wem| {
+        const moves = try allocator.alloc(EdgeMove, wem.moves.len);
+        errdefer allocator.free(moves);
+        for (wem.moves, 0..) |wm, i| {
+            if (wm.class == 1 and (wm.src == .slot or wm.dst == .slot)) return error.Unsupported;
+            moves[i] = .{ .class = @intCast(wm.class), .src = edgeLocFromWimmer(wm.src), .dst = edgeLocFromWimmer(wm.dst) };
+        }
+        try edge_sets.append(allocator, .{ .pred = wem.pred, .succ = wem.succ, .moves = moves });
+    }
+    alloc.edge_moves = try edge_sets.toOwnedSlice(allocator);
+    alloc.edge_move_driven = true;
+
+    alloc.def_pos = def_pos;
+    return alloc;
+}
+
+/// The precomputed edge-move set for `pred -> succ`, or null when the edge needs no shuffle.
+fn findEdgeMoves(alloc: *const Allocation, pred: Block, succ: Block) ?*const EdgeMoveSet {
+    for (alloc.edge_moves) |*set| {
+        if (set.pred == pred and set.succ == succ) return set;
+    }
+    return null;
+}
+
+/// Replay the precomputed, already-ordered edge moves for `pred -> succ` op-by-op (the Wimmer path).
+/// The shared allocator resolved the parallel move (sources read before overwrite, cycles broken and
+/// any slot<->slot shuffle routed through the class scratch), so each move is a primitive reg/slot op.
+fn emitEdgeMoves(allocator: std.mem.Allocator, code: *std.ArrayList(u32), alloc: *const Allocation, spill_base: u32, float_spill_base: u32, vspill_base: u32, vpu_vspill_base: u32, vpu_pack_base: u32, pred: Block, succ: Block) std.mem.Allocator.Error!void {
+    _ = float_spill_base; // float slot edge moves are rejected in translation, so only int slots exist
+    const set = findEdgeMoves(alloc, pred, succ) orelse return;
+    for (set.moves) |m| try emitOneEdgeMove(allocator, code, spill_base, vspill_base, vpu_vspill_base, vpu_pack_base, m);
+}
+
+/// Emit one ordered edge move. Class 0 (int): reg->reg `mv`, reg->slot `sd`, slot->reg `ld` (8-byte
+/// slots). Class 1 (float): reg->reg `fmv.d` (a whole 64-bit copy, correct for both f32 NaN-box and
+/// f64); a slot-resident float move never reaches here (the translation rejects it). Class 2 (RVV
+/// vector): reg->reg `vmv.v.v`, reg->slot `vse32`, slot->reg `vle32` (16-byte slots, the fixed
+/// <4 x f32> width), the slot address computed into `spill_scratch1`. Class 3 (et-soc VPU vector):
+/// reg->reg a `vpu_pack_base` round trip (no packed move op), reg->slot `fsw.ps`, slot->reg `flw.ps`
+/// (32-byte slots, the fixed <8 x f32> width, addressed by the op's own displacement off `sp`). A
+/// slot->slot op never appears (the shared ordering expanded it through the class scratch), so it is
+/// unreachable.
+fn emitOneEdgeMove(allocator: std.mem.Allocator, code: *std.ArrayList(u32), spill_base: u32, vspill_base: u32, vpu_vspill_base: u32, vpu_pack_base: u32, m: EdgeMove) std.mem.Allocator.Error!void {
+    switch (m.class) {
+        0 => switch (m.src) {
+            .reg => |si| {
+                const sr: Reg = @enumFromInt(@as(u5, @intCast(si)));
+                switch (m.dst) {
+                    .reg => |di| {
+                        const dr: Reg = @enumFromInt(@as(u5, @intCast(di)));
+                        if (sr != dr) try code.append(allocator, encode.addi(dr, sr, 0));
+                    },
+                    .slot => |ds| try code.append(allocator, encode.sd(sr, .x2, @intCast(spill_base + ds * 8))),
+                }
+            },
+            .slot => |ss| switch (m.dst) {
+                .reg => |di| {
+                    const dr: Reg = @enumFromInt(@as(u5, @intCast(di)));
+                    try code.append(allocator, encode.ld(dr, .x2, @intCast(spill_base + ss * 8)));
+                },
+                .slot => unreachable, // slot->slot was expanded through the class scratch
+            },
+        },
+        1 => switch (m.src) {
+            .reg => |si| {
+                const sr: FReg = @enumFromInt(@as(u5, @intCast(si)));
+                switch (m.dst) {
+                    .reg => |di| {
+                        const dr: FReg = @enumFromInt(@as(u5, @intCast(di)));
+                        if (sr != dr) try code.append(allocator, encode.fmv_d(dr, sr));
+                    },
+                    .slot => unreachable, // a slot-resident float edge move is rejected in translation
+                }
+            },
+            .slot => unreachable, // ditto
+        },
+        2 => switch (m.src) {
+            .reg => |si| {
+                const sr: VReg = @enumFromInt(@as(u5, @intCast(si)));
+                switch (m.dst) {
+                    .reg => |di| {
+                        const dr: VReg = @enumFromInt(@as(u5, @intCast(di)));
+                        if (sr != dr) try code.append(allocator, encode.vmv_v_v(dr, sr));
+                    },
+                    .slot => |ds| {
+                        try code.append(allocator, encode.addi(spill_scratch1, .x2, @intCast(vspill_base + ds * 16)));
+                        try code.append(allocator, encode.vse32(sr, spill_scratch1));
+                    },
+                }
+            },
+            .slot => |ss| switch (m.dst) {
+                .reg => |di| {
+                    const dr: VReg = @enumFromInt(@as(u5, @intCast(di)));
+                    try code.append(allocator, encode.addi(spill_scratch1, .x2, @intCast(vspill_base + ss * 16)));
+                    try code.append(allocator, encode.vle32(dr, spill_scratch1));
+                },
+                .slot => unreachable, // slot->slot was expanded through the class scratch
+            },
+        },
+        3 => switch (m.src) {
+            .reg => |si| {
+                const sr: FReg = @enumFromInt(@as(u5, @intCast(si)));
+                switch (m.dst) {
+                    .reg => |di| {
+                        const dr: FReg = @enumFromInt(@as(u5, @intCast(di)));
+                        // No packed VPU register move: round-trip through the reserved 32-byte pack slot.
+                        if (sr != dr) {
+                            try code.append(allocator, encode.fsw_ps(sr, .x2, @intCast(vpu_pack_base)));
+                            try code.append(allocator, encode.flw_ps(dr, .x2, @intCast(vpu_pack_base)));
+                        }
+                    },
+                    .slot => |ds| try code.append(allocator, encode.fsw_ps(sr, .x2, @intCast(vpu_vspill_base + ds * 32))),
+                }
+            },
+            .slot => |ss| switch (m.dst) {
+                .reg => |di| {
+                    const dr: FReg = @enumFromInt(@as(u5, @intCast(di)));
+                    try code.append(allocator, encode.flw_ps(dr, .x2, @intCast(vpu_vspill_base + ss * 32)));
+                },
+                .slot => unreachable, // slot->slot was expanded through the class scratch
+            },
+        },
+        else => unreachable,
+    }
+}
+
+/// TEST-ONLY: compile `func` through the SHARED Wimmer-Franz allocator instead of the backend's own
+/// `allocateRegisters`, then emit through the SAME battle-tested `emitFromAllocation`. Covers all four
+/// classes: INT, scalar-FLOAT, RVV VECTOR, and (when `vpu`) the et-soc VPU VECTOR class. A vector live
+/// across a call now spills/splits (every RVV register, and every f16..f27 VPU register, is
+/// caller-saved) instead of bailing. An f16 function, a vector of a width other than the fixed 4-lane
+/// RVV group or 8-lane VPU width, a (VPU or RVV) vector ENTRY param (no ABI vector register), a
+/// split/spilled entry param, a same-position action hazard, an unreachable block, or an if-edge move
+/// all bail `error.Unsupported` (never a silent miscompile). `vpu` selects the et-soc VPU register
+/// model (class 3, narrowed scalar-float pool) over the RVV one (class 2). Splits critical edges up
+/// front (mutating `func`, so a differential caller keeps a separate reference), then runs the shared
+/// scan and translates its target-independent `Allocation` into this backend's. The default
+/// `compileFunction` is untouched.
+pub fn compileFunctionWimmerRiscv(allocator: std.mem.Allocator, func: *Function, vpu: bool) Error!Compiled {
+    if (func.blockCount() == 0) return error.Unsupported;
+    if (ir.function.functionUsesCompositeF16(func)) return error.Unsupported;
+    // The software f16 convert path reserves integer scratch (x28..x31) the shared pools do not model
+    // (see `riscv64RegDescription`'s scope note), so bail rather than miscompile a half function.
+    if (ir.function.functionUsesF16(func)) return error.Unsupported;
+
+    // Split edges FIRST (mutating `func`), before any numbering is built, so the resolver's
+    // no-critical-edge precondition holds and the description/scan/emission all see one CFG. TWO
+    // passes: `ir.critical_edge` splits every genuinely critical edge (giving the resolver a block for
+    // its shuffle), then this backend's own `splitCriticalEdges` splits every remaining if-edge that
+    // still carries ARGS into a jump landing block. The riscv64 `.@"if"` emission only branches (it
+    // cannot host an edge move, unlike aarch64's `emitIf`), so every block-param move must land on a
+    // JUMP edge; the second pass guarantees that, exactly as the native riscv64 path already does.
+    try ir.critical_edge.splitCriticalEdges(allocator, func);
+    try splitCriticalEdges(allocator, func);
+
+    // The shared numbering covers EVERY block, but `emitFromAllocation` skips unreachable ones without
+    // advancing its position counter. To keep the two numberings in lockstep, require all-reachable.
+    var doms = try dominators.compute(allocator, func);
+    defer doms.deinit(allocator);
+    for (doms.reachable) |r| {
+        if (!r) return error.Unsupported;
+    }
+
+    var desc = try riscv64RegDescription(allocator, func, vpu);
+    defer desc.deinit(allocator);
+    var walloc = try wimmer.allocate(allocator, func, &desc);
+    defer walloc.deinit(allocator);
+
+    var alloc = try translateAllocation(allocator, func, vpu, &walloc);
+    defer alloc.deinit(allocator);
+
+    // An edge move on an if-edge cannot be realized by the `.@"if"` emission (it only branches), so
+    // reject rather than drop it. Register phis land on jump edges, which the `.jump` path replays.
+    if (edgeMoveOnIfEdge(func, &alloc)) return error.Unsupported;
+
+    const caps: ModelCaps = .{ .vpu = vpu };
+    return emitFromAllocation(allocator, func, caps, false, doms.reachable, &alloc);
+}
+
 /// Assign a register to every value via a liveness-based linear scan over the
 /// register files. Entry parameters are pre-colored to argument registers. Other
 /// values draw from a temporary free list, reusing a register once its value
@@ -2667,10 +3769,6 @@ fn alignPadWords(words: usize, fetch_align: u16) usize {
 /// ORI-shaped (see encode.zig), so unlike the VPU path this one IS execution-validated: it
 /// decodes as a harmless no-op on any qemu-riscv64 host, Zicbop or not.
 pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps: ModelCaps) Error!Compiled {
-    const fetch_align = caps.fetch_align;
-    const vpu = caps.vpu;
-    const zicbop = caps.zicbop;
-    const zfh = caps.zfh;
     // f16 lowering has two modes (see `ModelCaps.zfh`). SOFTWARE EMULATION (no Zfh, the default):
     // an f16 is held as its f32 widening in a float register and every boundary rounds via the
     // inline convert routines (`emitHalfToFloat`/`emitFloatToHalf`); those routines need dedicated
@@ -2681,7 +3779,7 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
     // so `reserve_f16_scratch` gates on `!zfh`. A non-f16 function (or a native one) keeps the full
     // integer pool, byte-identical to before f16 support.
     const uses_f16 = ir.function.functionUsesF16(func);
-    const reserve_f16_scratch = uses_f16 and !zfh;
+    const reserve_f16_scratch = uses_f16 and !caps.zfh;
     // Only SCALAR f16 is handled; f16 nested in a vector/aggregate would fall through to the
     // raw-vector path and miscompile the half lanes, so reject that composite case cleanly.
     if (ir.function.functionUsesCompositeF16(func)) return error.Unsupported;
@@ -2698,8 +3796,26 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
     defer doms.deinit(allocator);
     const reachable = doms.reachable;
 
-    var alloc = try allocateRegisters(allocator, func, vpu, reserve_f16_scratch, reachable);
+    var alloc = try allocateRegisters(allocator, func, caps.vpu, reserve_f16_scratch, reachable);
     defer alloc.deinit(allocator);
+
+    return emitFromAllocation(allocator, func, caps, uses_f16, reachable, &alloc);
+}
+
+/// Emit machine code from a finished `Allocation` (the second half of `compileFunction`, split out
+/// so the shared Wimmer allocator can drive the SAME battle-tested emission through
+/// `compileFunctionWimmerRiscv`). This is a PURE extraction of everything after `allocateRegisters`:
+/// the frame layout, prologue, the per-block/instruction loop reading each value's location through
+/// `intLocationAt`/`floatLocationAt`, the split-boundary action drain, block-edge moves, branch
+/// relaxation, and the epilogue. `caps` carries the model seams (`fetch_align`/`vpu`/`zicbop`/`zfh`);
+/// `uses_f16` and `reachable` are what `compileFunction` computed. `alloc` is consumed read-only
+/// except for the defensive sort of its action list. Byte-identical for every existing caller (the
+/// full riscv64 suite proves it).
+fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps: ModelCaps, uses_f16: bool, reachable: []const bool, alloc: *Allocation) Error!Compiled {
+    const fetch_align = caps.fetch_align;
+    const vpu = caps.vpu;
+    const zicbop = caps.zicbop;
+    const zfh = caps.zfh;
 
     // Split-boundary actions are appended in monotonic `at` order already; sort defensively so the
     // per-instruction drain below can advance a single cursor. At the SAME position a `.reload` must
@@ -2708,7 +3824,8 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
         fn order(k: @TypeOf(@as(SplitAction, undefined).kind)) u8 {
             return switch (k) {
                 .reload => 0,
-                .store => 1,
+                .move => 1,
+                .store => 2,
             };
         }
         fn f(_: void, a: SplitAction, b: SplitAction) bool {
@@ -2793,6 +3910,21 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
             used = true;
             break;
         };
+        // A split float value is not in `alloc.float`; a callee-saved float register held only by a
+        // split prefix segment must still be preserved, so scan `float_segments` too (empty on the
+        // default path, so this loop finds nothing and the frame is byte-identical there).
+        if (!used) {
+            var sit = alloc.float_segments.valueIterator();
+            outer: while (sit.next()) |segs| {
+                for (segs.*) |seg| switch (seg.loc) {
+                    .reg => |rr| if (rr == s) {
+                        used = true;
+                        break :outer;
+                    },
+                    .slot => {},
+                };
+            }
+        }
         if (used) {
             frame = alignUp(frame, 8);
             if (frame > 2047) return error.Unsupported;
@@ -2904,7 +4036,11 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
     if (frame_size != 0) try code.append(allocator, encode.addi(.x2, .x2, -frame_size));
     if (non_leaf) try code.append(allocator, encode.sd(.x1, .x2, ra_off)); // save ra
     for (used_saved.items) |sv| try code.append(allocator, encode.sd(sv.reg, .x2, sv.off));
-    for (used_float_saved.items) |sv| try code.append(allocator, encode.fsd(sv.reg, .x2, sv.off));
+    // In vpu (et-soc) mode every scalar float is fp32 and the sw-sysemu oracle implements only the
+    // 32-bit fsw/flw scalar forms (not the 64-bit fsd/fld doubleword forms, which trap as illegal),
+    // so save the callee-saved float pair (f8/f9, the vpu float spill scratch) with fsw. Outside vpu
+    // mode a callee-saved float may hold an f64, so the 64-bit fsd is required.
+    for (used_float_saved.items) |sv| try code.append(allocator, if (vpu) encode.fsw(sv.reg, .x2, sv.off) else encode.fsd(sv.reg, .x2, sv.off));
 
     // Move any entry parameter homed to a non-argument register (because it
     // outlives a call) out of its incoming argument register. Load stack
@@ -2920,7 +4056,7 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                 } else {
                     // Entry float param spilled (it outlives a call but no callee-saved float reg
                     // was free): store the incoming argument register into its stack slot.
-                    try storeFloat(allocator, &code, &alloc, float_spill_base, p, is64Float(func, func.valueType(p)), arg);
+                    try storeFloat(allocator, &code, alloc, float_spill_base, p, 0, is64Float(func, func.valueType(p)), arg);
                 }
                 fa += 1;
             } else {
@@ -2938,15 +4074,22 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
         }
     }
 
-    // Configure the RVV unit once for the fixed 4-lane f32 group. VL and SEW
-    // persist as CPU state and nothing in a vector function changes them (a value
-    // live across a call is rejected by the allocator), so one vsetivli suffices.
-    if (!vpu and alloc.vector.count() != 0) try code.append(allocator, encode.vsetivli(.x0, 4, 0xD0));
+    // Configure the RVV unit once for the fixed 4-lane f32 group. VL and SEW persist as CPU state and
+    // nothing in a vector function changes them, so one vsetivli suffices for every vle32/vse32/arith.
+    // The default path fires this exactly as before (`alloc.vector.count() != 0`, byte-identical). The
+    // shared Wimmer path additionally spills/splits vectors (a vector live across a call), so it can
+    // hold vectors only in slots or split segments with `vector.count()` zero, yet still emit vle32/
+    // vse32 that need VL set - so fire the preamble on those signals too, gated on `edge_move_driven`
+    // (the Wimmer-only flag, always false on the default path) to keep default emission byte-identical.
+    if (!vpu and (alloc.vector.count() != 0 or
+        (alloc.edge_move_driven and (alloc.vector_spill_count != 0 or alloc.vector_segments.count() != 0))))
+        try code.append(allocator, encode.vsetivli(.x0, 4, 0xD0));
     // et-soc VPU mask preamble: VPU arithmetic is predicated by an M0..M7 mask register bank
     // rather than a vector length (there is no vtype/VL to configure), so a full-width 8-lane
     // op needs every mask bit set. Write M0 = 0xFF once, up front, analogous to the RVV
     // vsetivli hint above (both persist as CPU/register state for the rest of the function).
-    if (vpu and (alloc.vpu_vector.count() != 0 or alloc.vpu_vector_spill_count != 0))
+    if (vpu and (alloc.vpu_vector.count() != 0 or alloc.vpu_vector_spill_count != 0 or
+        (alloc.edge_move_driven and alloc.vpu_segments.count() != 0)))
         try code.append(allocator, encode.mov_m_x(0, .x0, 0xFF));
 
     const block_start = try allocator.alloc(usize, func.blockCount());
@@ -3012,15 +4155,14 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
             while (action_cursor < alloc.actions.items.len and alloc.actions.items[action_cursor].at <= inst_pos) {
                 const act = alloc.actions.items[action_cursor];
                 std.debug.assert(act.at == inst_pos); // actions land on instruction positions only
-                switch (act.kind) {
-                    .store => try code.append(allocator, encode.sd(act.reg, .x2, @intCast(spill_base + act.slot * 8))),
-                    // Second-chance re-home (Task 6d): load the slot back into `act.reg` just before
-                    // its next use, mirroring `reloadInt`'s slot path. From here on the value's `.reg`
-                    // re-home segment makes `intLocationAt` read the register directly. A reload MUST
-                    // drain before a store at the same position (the sort tiebreak guarantees it), so a
-                    // reload-then-respill at one use loads the live bits before re-saving them.
-                    .reload => try code.append(allocator, encode.ld(act.reg, .x2, @intCast(spill_base + act.slot * 8))),
-                }
+                // A `.store` writes the victim's register to its slot; a `.reload` is the second-chance
+                // re-home (Task 6d) that loads the slot back into `act.reg` just before its next use,
+                // after which the value's `.reg` re-home segment makes `intLocationAt` read the register
+                // directly. A reload MUST drain before a store at the same position (the sort tiebreak
+                // guarantees it), so a reload-then-respill at one use loads live bits before re-saving.
+                // The Wimmer path also produces class-1 (float) and `.move` actions; `emitSplitAction`
+                // dispatches on class/kind and is byte-identical for the native class-0 store/reload.
+                try emitSplitAction(allocator, &code, func, spill_base, float_spill_base, vspill_base, vpu_vspill_base, vpu_pack_base, act);
                 action_cursor += 1;
             }
             switch (func.opcode(inst)) {
@@ -3037,7 +4179,7 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                         // registers, one more than the two float spill scratches): otherwise it
                         // falls through and materializes as a standalone mul, and the add/sub below
                         // gates on the SAME predicate so it likewise does not fuse.
-                        if (isVector(func, func.valueType(a.lhs)) or fusesScalarFloatArith(func, &alloc, block_insts, inst_idx, vpu)) continue;
+                        if (isVector(func, func.valueType(a.lhs)) or fusesScalarFloatArith(func, alloc, block_insts, inst_idx, vpu)) continue;
                     }
                     if (isVector(func, func.valueType(a.lhs))) {
                         const result = func.instResult(inst).?;
@@ -3062,12 +4204,12 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                             const mul = func.opcode(block_insts[inst_idx - 1]).arith;
                             const mul_result = func.instResult(block_insts[inst_idx - 1]).?;
                             const c_val = if (a.lhs == mul_result) a.rhs else a.lhs; // the accumulator addend, c
-                            const va = try reloadVpuVector(allocator, &code, &alloc, vpu_vspill_base, mul.lhs, vpu_vec_op0);
-                            const vb = try reloadVpuVector(allocator, &code, &alloc, vpu_vspill_base, mul.rhs, vpu_vec_op1);
-                            const vc = try reloadVpuVector(allocator, &code, &alloc, vpu_vspill_base, c_val, vpu_vec_work);
-                            const rd = dstVpuVector(&alloc, result, vpu_vec_work);
+                            const va = try reloadVpuVector(allocator, &code, alloc, vpu_vspill_base, mul.lhs, inst_pos, vpu_vec_op0);
+                            const vb = try reloadVpuVector(allocator, &code, alloc, vpu_vspill_base, mul.rhs, inst_pos, vpu_vec_op1);
+                            const vc = try reloadVpuVector(allocator, &code, alloc, vpu_vspill_base, c_val, inst_pos, vpu_vec_work);
+                            const rd = dstVpuVector(alloc, result, inst_pos, vpu_vec_work);
                             try code.append(allocator, encode.fmadd_ps(rd, va, vb, vc));
-                            try storeVpuVector(allocator, &code, &alloc, vpu_vspill_base, result, rd);
+                            try storeVpuVector(allocator, &code, alloc, vpu_vspill_base, result, inst_pos, rd);
                         } else if (vpu) {
                             // et-soc VPU packed-single arithmetic (8-lane f32, the disjoint
                             // f16..f31 partition). Spilled operands reload into
@@ -3079,9 +4221,9 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                             // scalar reference. That emulator is not present in CI, so those
                             // tests skip there rather than fail; they run wherever sw-sysemu is
                             // on PATH.
-                            const lhs = try reloadVpuVector(allocator, &code, &alloc, vpu_vspill_base, a.lhs, vpu_vec_op0);
-                            const rhs = try reloadVpuVector(allocator, &code, &alloc, vpu_vspill_base, a.rhs, vpu_vec_op1);
-                            const rd = dstVpuVector(&alloc, result, vpu_vec_work);
+                            const lhs = try reloadVpuVector(allocator, &code, alloc, vpu_vspill_base, a.lhs, inst_pos, vpu_vec_op0);
+                            const rhs = try reloadVpuVector(allocator, &code, alloc, vpu_vspill_base, a.rhs, inst_pos, vpu_vec_op1);
+                            const rd = dstVpuVector(alloc, result, inst_pos, vpu_vec_work);
                             // The vector partition holds both `<8 x f32>` and `<8 x i32>` (isVector
                             // routes either here). The element type selects the op family: an
                             // integer element lowers to the packed-integer `pi` ops (the sibling of
@@ -3112,7 +4254,7 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                                 else => return error.Unsupported, // bitwise/shift/rem on float vectors
                             };
                             try code.append(allocator, word);
-                            try storeVpuVector(allocator, &code, &alloc, vpu_vspill_base, result, rd);
+                            try storeVpuVector(allocator, &code, alloc, vpu_vspill_base, result, inst_pos, rd);
                         } else if ((a.op == .add or a.op == .sub) and inst_idx >= 1 and
                             fusesIntoNextArith(func, block_insts, inst_idx - 1, vpu))
                         {
@@ -3135,9 +4277,9 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                             const mul = func.opcode(block_insts[inst_idx - 1]).arith;
                             const mul_result = func.instResult(block_insts[inst_idx - 1]).?;
                             const ra_val = if (a.lhs == mul_result) a.rhs else a.lhs; // the accumulator, c
-                            const vm1 = try reloadVector(allocator, &code, &alloc, vspill_base, mul.lhs, vec_op0, spill_scratch1);
-                            const vm2 = try reloadVector(allocator, &code, &alloc, vspill_base, mul.rhs, vec_op1, spill_scratch1);
-                            const vc = try reloadVector(allocator, &code, &alloc, vspill_base, ra_val, vector_scratch, spill_scratch1);
+                            const vm1 = try reloadVector(allocator, &code, alloc, vspill_base, mul.lhs, inst_pos, vec_op0, spill_scratch1);
+                            const vm2 = try reloadVector(allocator, &code, alloc, vspill_base, mul.rhs, inst_pos, vec_op1, spill_scratch1);
+                            const vc = try reloadVector(allocator, &code, alloc, vspill_base, ra_val, inst_pos, vector_scratch, spill_scratch1);
                             if (vc != vector_scratch) try code.append(allocator, encode.vmv_v_v(vector_scratch, vc));
                             try code.append(allocator, switch (a.op) {
                                 .add => encode.vfmacc_vv(vector_scratch, vm1, vm2),
@@ -3147,16 +4289,16 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                                     encode.vfnmsac_vv(vector_scratch, vm1, vm2), // c - a*b
                                 else => unreachable, // fusesIntoNextArith only accepts .add/.sub
                             });
-                            const rd = dstVector(&alloc, result, vec_work);
+                            const rd = dstVector(alloc, result, inst_pos, vec_work);
                             if (rd != vector_scratch) try code.append(allocator, encode.vmv_v_v(rd, vector_scratch));
-                            try storeVector(allocator, &code, &alloc, vspill_base, result, rd, spill_scratch1);
+                            try storeVector(allocator, &code, alloc, vspill_base, result, inst_pos, rd, spill_scratch1);
                         } else {
                             // RVV vector arithmetic. Spilled operands reload into
                             // vec_op0/op1, a spilled result computes in vec_work.
                             // spill_scratch1 holds the slot address.
-                            const lhs = try reloadVector(allocator, &code, &alloc, vspill_base, a.lhs, vec_op0, spill_scratch1);
-                            const rhs = try reloadVector(allocator, &code, &alloc, vspill_base, a.rhs, vec_op1, spill_scratch1);
-                            const rd = dstVector(&alloc, result, vec_work);
+                            const lhs = try reloadVector(allocator, &code, alloc, vspill_base, a.lhs, inst_pos, vec_op0, spill_scratch1);
+                            const rhs = try reloadVector(allocator, &code, alloc, vspill_base, a.rhs, inst_pos, vec_op1, spill_scratch1);
+                            const rd = dstVector(alloc, result, inst_pos, vec_work);
                             try code.append(allocator, switch (a.op) {
                                 .add => encode.vfadd_vv(rd, lhs, rhs),
                                 .sub => encode.vfsub_vv(rd, lhs, rhs),
@@ -3164,7 +4306,7 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                                 .div => encode.vfdiv_vv(rd, lhs, rhs),
                                 else => return error.Unsupported,
                             });
-                            try storeVector(allocator, &code, &alloc, vspill_base, result, rd, spill_scratch1);
+                            try storeVector(allocator, &code, alloc, vspill_base, result, inst_pos, rd, spill_scratch1);
                         }
                     } else if (isFloat(func, func.valueType(a.lhs))) {
                         // Fused multiply-add/sub, the add/sub side: when the immediately-
@@ -3178,7 +4320,7 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                         //   add(mul(a,b), c) = a*b+c -> fmadd:  rd = rs1*rs2 + rs3
                         //   sub(mul(a,b), c) = a*b-c -> fmsub:  rd = rs1*rs2 - rs3
                         //   sub(c, mul(a,b)) = c-a*b -> fnmsub: rd = rs3 - rs1*rs2
-                        if ((a.op == .add or a.op == .sub) and inst_idx >= 1 and fusesScalarFloatArith(func, &alloc, block_insts, inst_idx - 1, vpu)) {
+                        if ((a.op == .add or a.op == .sub) and inst_idx >= 1 and fusesScalarFloatArith(func, alloc, block_insts, inst_idx - 1, vpu)) {
                             // fusesScalarFloatArith guarantees every operand and the result is
                             // register-resident here, so the R4-type fma reads/writes real registers
                             // with no reload or spill store (byte-identical to the pre-spill path).
@@ -3206,9 +4348,9 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                         // Reload spilled operands into the two float spill scratches (distinct, so a
                         // both-operands-spilled binary op keeps both live), compute into the result's
                         // register or `fspill0` if it too spilled, then store it back.
-                        const rs1 = try reloadFloat(allocator, &code, &alloc, float_spill_base, a.lhs, d, fspill0);
-                        const rs2 = try reloadFloat(allocator, &code, &alloc, float_spill_base, a.rhs, d, fspill1);
-                        const rd = dstFloat(&alloc, result, fspill0);
+                        const rs1 = try reloadFloat(allocator, &code, alloc, float_spill_base, a.lhs, inst_pos, d, fspill0);
+                        const rs2 = try reloadFloat(allocator, &code, alloc, float_spill_base, a.rhs, inst_pos, d, fspill1);
+                        const rd = dstFloat(alloc, result, inst_pos, fspill0);
                         // Native f16 (Zfh): the operands are held as native halves (`is64Float(f16)`
                         // is false, so `d` is false and the reload used `flw`, which preserves the
                         // 32-bit NaN-boxed half), so emit the half op directly. It rounds once to
@@ -3234,12 +4376,12 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                         // the value lives in x6, so both float spill scratches are free for the round
                         // routine. The native path already rounded in-instruction, so it skips this.
                         if (isHalf(func, func.valueType(result)) and !zfh) try emitRoundToHalf(allocator, &code, rd, fspill0, fspill1);
-                        try storeFloat(allocator, &code, &alloc, float_spill_base, result, d, rd);
+                        try storeFloat(allocator, &code, alloc, float_spill_base, result, inst_pos, d, rd);
                     } else {
                         const result = func.instResult(inst).?;
-                        const rs1 = try reloadInt(allocator, &code, &alloc, spill_base, a.lhs, inst_pos, spill_scratch0);
-                        const rs2 = try reloadInt(allocator, &code, &alloc, spill_base, a.rhs, inst_pos, spill_scratch1);
-                        const rd_loc = intLocationAt(&alloc, result, inst_pos);
+                        const rs1 = try reloadInt(allocator, &code, alloc, spill_base, a.lhs, inst_pos, spill_scratch0);
+                        const rs2 = try reloadInt(allocator, &code, alloc, spill_base, a.rhs, inst_pos, spill_scratch1);
+                        const rd_loc = intLocationAt(alloc, result, inst_pos);
                         const rd = switch (rd_loc) {
                             .reg => |r| r,
                             .slot => spill_scratch0,
@@ -3265,8 +4407,8 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                 .arith_imm => |a| {
                     if (isFloat(func, func.valueType(a.lhs))) return error.Unsupported;
                     const result = func.instResult(inst).?;
-                    const rs1 = try reloadInt(allocator, &code, &alloc, spill_base, a.lhs, inst_pos, spill_scratch1);
-                    const rd_loc = intLocationAt(&alloc, result, inst_pos);
+                    const rs1 = try reloadInt(allocator, &code, alloc, spill_base, a.lhs, inst_pos, spill_scratch1);
+                    const rd_loc = intLocationAt(alloc, result, inst_pos);
                     const rd = switch (rd_loc) {
                         .reg => |r| r,
                         .slot => spill_scratch0,
@@ -3299,7 +4441,7 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                         // bits and move them into the float register, never an integer
                         // register the value was never assigned.
                         if (is64Float(func, func.valueType(res))) return error.Unsupported;
-                        const fr = dstFloat(&alloc, res, fspill0);
+                        const fr = dstFloat(alloc, res, inst_pos, fspill0);
                         // Native f16 (Zfh): a float-typed integer constant is a zero-init, so move
                         // its low 16 bits into the float register NaN-boxed (`fmv.h.x`); moving the
                         // f32-widening bits with `fmv.w.x` would leave an invalid NaN-box that the
@@ -3314,13 +4456,13 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                             try loadImm32(allocator, &code, scratch_reg, bits);
                             try code.append(allocator, encode.fmv_w_x(fr, scratch_reg));
                         }
-                        try storeFloat(allocator, &code, &alloc, float_spill_base, res, false, fr);
+                        try storeFloat(allocator, &code, alloc, float_spill_base, res, inst_pos, false, fr);
                         continue;
                     }
                     // A spilled integer constant materializes into the scratch, then stores to its
                     // slot (mirrors the `arith`/`arith_imm` result-spill tail). Resident in every
                     // currently-compiling case, so this is byte-identical there.
-                    const rd_loc = intLocationAt(&alloc, res, inst_pos);
+                    const rd_loc = intLocationAt(alloc, res, inst_pos);
                     const rd = switch (rd_loc) {
                         .reg => |r| r,
                         .slot => spill_scratch0,
@@ -3349,14 +4491,14 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                 .fconst => |val| {
                     const result = func.instResult(inst).?;
                     if (is64Float(func, func.valueType(result))) return error.Unsupported; // f64 const: later
-                    const fr = dstFloat(&alloc, result, fspill0);
+                    const fr = dstFloat(alloc, result, inst_pos, fspill0);
                     // Native f16 (Zfh): materialize the 16-bit half pattern and move it into the
                     // float register NaN-boxed with `fmv.h.x`, giving a native half.
                     if (zfh and isHalf(func, func.valueType(result))) {
                         const half_bits: u32 = @as(u16, @bitCast(@as(f16, @floatCast(val))));
                         try loadImm32(allocator, &code, scratch_reg, half_bits);
                         try code.append(allocator, encode.fmv_h_x(fr, scratch_reg));
-                        try storeFloat(allocator, &code, &alloc, float_spill_base, result, false, fr);
+                        try storeFloat(allocator, &code, alloc, float_spill_base, result, inst_pos, false, fr);
                         continue;
                     }
                     // Software f16 / f32: load the 32-bit pattern, then move it into the float
@@ -3369,12 +4511,12 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                         @bitCast(@as(f32, @floatCast(val)));
                     try loadImm32(allocator, &code, scratch_reg, bits);
                     try code.append(allocator, encode.fmv_w_x(fr, scratch_reg));
-                    try storeFloat(allocator, &code, &alloc, float_spill_base, result, false, fr);
+                    try storeFloat(allocator, &code, alloc, float_spill_base, result, inst_pos, false, fr);
                 },
                 .alloca => {
                     // The slot address is `sp + offset` into the frame.
                     const result = func.instResult(inst).?;
-                    const rd = switch (intLocationAt(&alloc, result, inst_pos)) {
+                    const rd = switch (intLocationAt(alloc, result, inst_pos)) {
                         .reg => |r| r,
                         .slot => return error.Unsupported,
                     };
@@ -3384,7 +4526,7 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                 .global_addr => |ga| {
                     // PC-relative symbol address: `auipc rd, %pcrel_hi(sym)` then
                     // `addi rd, rd, %pcrel_lo(.Lhi)`. The two relocations resolve together.
-                    const rd = switch (intLocationAt(&alloc, func.instResult(inst).?, inst_pos)) {
+                    const rd = switch (intLocationAt(alloc, func.instResult(inst).?, inst_pos)) {
                         .reg => |r| r,
                         .slot => return error.Unsupported,
                     };
@@ -3400,7 +4542,7 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                     // result register is distinct from the operands (drawn while
                     // they are still live), so there is no aliasing hazard.
                     if (isFloat(func, func.valueType(sel.then))) return error.Unsupported; // float select: later
-                    const rd = switch (intLocationAt(&alloc, func.instResult(inst).?, inst_pos)) {
+                    const rd = switch (intLocationAt(alloc, func.instResult(inst).?, inst_pos)) {
                         .reg => |r| r,
                         .slot => return error.Unsupported,
                     };
@@ -3408,15 +4550,15 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                     // than the two int spill scratches can reload; a spilled operand (e.g. a spilled
                     // int block param) is rejected cleanly rather than panicking on the unwrap.
                     // Resident in every currently-compiling case (byte-identical there).
-                    const cond = switch (intLocationAt(&alloc, sel.cond, inst_pos)) {
+                    const cond = switch (intLocationAt(alloc, sel.cond, inst_pos)) {
                         .reg => |r| r,
                         .slot => return error.Unsupported,
                     };
-                    const then_r = switch (intLocationAt(&alloc, sel.then, inst_pos)) {
+                    const then_r = switch (intLocationAt(alloc, sel.then, inst_pos)) {
                         .reg => |r| r,
                         .slot => return error.Unsupported,
                     };
-                    const else_r = switch (intLocationAt(&alloc, sel.@"else", inst_pos)) {
+                    const else_r = switch (intLocationAt(alloc, sel.@"else", inst_pos)) {
                         .reg => |r| r,
                         .slot => return error.Unsupported,
                     };
@@ -3438,8 +4580,8 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                         // An f16 is held as its f32 widening, so the single-precision view is shared.
                         if (src_half and !dst_half) {
                             // f16 -> f32 / f16 -> f64.
-                            const rs = try reloadFloat(allocator, &code, &alloc, float_spill_base, cv.value, false, fspill0);
-                            const rd = dstFloat(&alloc, result, fspill1);
+                            const rs = try reloadFloat(allocator, &code, alloc, float_spill_base, cv.value, inst_pos, false, fspill0);
+                            const rd = dstFloat(alloc, result, inst_pos, fspill1);
                             if (zfh) {
                                 // The native path does one exact widen from the native half (`fcvt.s.h` / `fcvt.d.h`).
                                 try code.append(allocator, if (is64Float(func, dst_ty)) encode.fcvt_d_h(rd, rs) else encode.fcvt_s_h(rd, rs));
@@ -3449,11 +4591,11 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                             } else if (rd != rs) {
                                 try code.append(allocator, encode.fmv_s(rd, rs)); // identity move (f16 -> f32)
                             }
-                            try storeFloat(allocator, &code, &alloc, float_spill_base, result, is64Float(func, dst_ty), rd);
+                            try storeFloat(allocator, &code, alloc, float_spill_base, result, inst_pos, is64Float(func, dst_ty), rd);
                         } else if (dst_half and !src_half) {
                             // f32 -> f16 / f64 -> f16.
-                            const rs = try reloadFloat(allocator, &code, &alloc, float_spill_base, cv.value, is64Float(func, src_ty), fspill0);
-                            const rd = dstFloat(&alloc, result, fspill0);
+                            const rs = try reloadFloat(allocator, &code, alloc, float_spill_base, cv.value, inst_pos, is64Float(func, src_ty), fspill0);
+                            const rd = dstFloat(alloc, result, inst_pos, fspill0);
                             if (zfh) {
                                 // The native path does one single-rounded narrow to a native half (`fcvt.h.s` /
                                 // `fcvt.h.d`); the double-round through f32 is unnecessary.
@@ -3468,7 +4610,7 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                                 }
                                 try emitRoundToHalf(allocator, &code, rd, fspill0, fspill1);
                             }
-                            try storeFloat(allocator, &code, &alloc, float_spill_base, result, false, rd);
+                            try storeFloat(allocator, &code, alloc, float_spill_base, result, inst_pos, false, rd);
                         } else {
                             return error.Unsupported; // f32<->f64 (no f16) not yet lowered
                         }
@@ -3480,8 +4622,8 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                         // which also discards any dirty high bits above the source width.
                         const src_bits = intBits(func, src_ty);
                         const dst_bits = intBits(func, dst_ty);
-                        const rs = try reloadInt(allocator, &code, &alloc, spill_base, cv.value, inst_pos, spill_scratch1);
-                        const rd_loc = intLocationAt(&alloc, result, inst_pos);
+                        const rs = try reloadInt(allocator, &code, alloc, spill_base, cv.value, inst_pos, spill_scratch1);
+                        const rd_loc = intLocationAt(alloc, result, inst_pos);
                         const rd = switch (rd_loc) {
                             .reg => |r| r,
                             .slot => spill_scratch0,
@@ -3505,11 +4647,11 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                         if (!isWord(func, src_ty)) return error.Unsupported;
                         // A spilled integer source has no reload path here yet: reject cleanly rather
                         // than panic. Resident in every currently-compiling case (byte-identical).
-                        const rs = switch (intLocationAt(&alloc, cv.value, inst_pos)) {
+                        const rs = switch (intLocationAt(alloc, cv.value, inst_pos)) {
                             .reg => |r| r,
                             .slot => return error.Unsupported,
                         };
-                        const rd = dstFloat(&alloc, result, fspill0);
+                        const rd = dstFloat(alloc, result, inst_pos, fspill0);
                         if (zfh and dst_half) {
                             // Native int -> f16: one single-rounded convert straight to a native half
                             // (`fcvt.h.w`), no detour through f32 and no software re-round.
@@ -3521,12 +4663,12 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                             try code.append(allocator, if (is64Float(func, dst_ty)) encode.fcvt_d_w(rd, rs) else encode.fcvt_s_w(rd, rs));
                             if (dst_half) try emitRoundToHalf(allocator, &code, rd, fspill0, fspill1);
                         }
-                        try storeFloat(allocator, &code, &alloc, float_spill_base, result, is64Float(func, dst_ty), rd);
+                        try storeFloat(allocator, &code, alloc, float_spill_base, result, inst_pos, is64Float(func, dst_ty), rd);
                     } else {
                         // float -> integer, only a 32-bit signed destination for now.
                         if (!isWord(func, dst_ty)) return error.Unsupported;
-                        const rs = try reloadFloat(allocator, &code, &alloc, float_spill_base, cv.value, is64Float(func, src_ty), fspill0);
-                        const rd = switch (intLocationAt(&alloc, result, inst_pos)) {
+                        const rs = try reloadFloat(allocator, &code, alloc, float_spill_base, cv.value, inst_pos, is64Float(func, src_ty), fspill0);
+                        const rd = switch (intLocationAt(alloc, result, inst_pos)) {
                             .reg => |r| r,
                             .slot => return error.Unsupported,
                         };
@@ -3545,7 +4687,7 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                     // A spilled base (a spilled int block param used as a load address) has no reload
                     // path here yet, so reject cleanly rather than panic on the unwrap. Resident in
                     // every currently-compiling case, so this is byte-identical there.
-                    const base = switch (intLocationAt(&alloc, l.ptr, inst_pos)) {
+                    const base = switch (intLocationAt(alloc, l.ptr, inst_pos)) {
                         .reg => |r| r,
                         .slot => return error.Unsupported,
                     };
@@ -3553,16 +4695,16 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                         if (vpu) {
                             // `flw.ps`, like scalar `flw`, carries its own displacement, so
                             // (unlike RVV's vle32) no separate address register is needed.
-                            const rd = dstVpuVector(&alloc, result, vpu_vec_work);
+                            const rd = dstVpuVector(alloc, result, inst_pos, vpu_vec_work);
                             try code.append(allocator, encode.flw_ps(rd, base, 0));
-                            try storeVpuVector(allocator, &code, &alloc, vpu_vspill_base, result, rd);
+                            try storeVpuVector(allocator, &code, alloc, vpu_vspill_base, result, inst_pos, rd);
                         } else {
-                            const rd = dstVector(&alloc, result, vec_work);
+                            const rd = dstVector(alloc, result, inst_pos, vec_work);
                             try code.append(allocator, encode.vle32(rd, base));
-                            try storeVector(allocator, &code, &alloc, vspill_base, result, rd, spill_scratch1);
+                            try storeVector(allocator, &code, alloc, vspill_base, result, inst_pos, rd, spill_scratch1);
                         }
                     } else if (isHalf(func, func.valueType(result))) {
-                        const rd = dstFloat(&alloc, result, fspill0);
+                        const rd = dstFloat(alloc, result, inst_pos, fspill0);
                         if (zfh) {
                             // In the native path, load the 2-byte IEEE half straight into the float register
                             // (`flh`, NaN-boxed), no software widen.
@@ -3575,14 +4717,14 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                             try emitHalfToFloat(allocator, &code, spill_scratch1, scratch_reg, fspill0, fspill1);
                             try code.append(allocator, encode.fmv_w_x(rd, spill_scratch1));
                         }
-                        try storeFloat(allocator, &code, &alloc, float_spill_base, result, false, rd);
+                        try storeFloat(allocator, &code, alloc, float_spill_base, result, inst_pos, false, rd);
                     } else if (isFloat(func, func.valueType(result))) {
                         const d = is64Float(func, func.valueType(result));
-                        const rd = dstFloat(&alloc, result, fspill0);
+                        const rd = dstFloat(alloc, result, inst_pos, fspill0);
                         try code.append(allocator, if (d) encode.fld(rd, base, 0) else encode.flw(rd, base, 0));
-                        try storeFloat(allocator, &code, &alloc, float_spill_base, result, d, rd);
+                        try storeFloat(allocator, &code, alloc, float_spill_base, result, inst_pos, d, rd);
                     } else {
-                        const rd = switch (intLocationAt(&alloc, result, inst_pos)) {
+                        const rd = switch (intLocationAt(alloc, result, inst_pos)) {
                             .reg => |r| r,
                             .slot => return error.Unsupported,
                         };
@@ -3600,20 +4742,20 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                 .store => |st| {
                     // A spilled store address has no reload path here yet: reject cleanly rather
                     // than panic. Resident in every currently-compiling case (byte-identical there).
-                    const base = switch (intLocationAt(&alloc, st.ptr, inst_pos)) {
+                    const base = switch (intLocationAt(alloc, st.ptr, inst_pos)) {
                         .reg => |r| r,
                         .slot => return error.Unsupported,
                     };
                     if (isVector(func, func.valueType(st.value))) {
                         if (vpu) {
-                            const vr = try reloadVpuVector(allocator, &code, &alloc, vpu_vspill_base, st.value, vpu_vec_op0);
+                            const vr = try reloadVpuVector(allocator, &code, alloc, vpu_vspill_base, st.value, inst_pos, vpu_vec_op0);
                             try code.append(allocator, encode.fsw_ps(vr, base, 0));
                         } else {
-                            const vr = try reloadVector(allocator, &code, &alloc, vspill_base, st.value, vec_op0, spill_scratch1);
+                            const vr = try reloadVector(allocator, &code, alloc, vspill_base, st.value, inst_pos, vec_op0, spill_scratch1);
                             try code.append(allocator, encode.vse32(vr, base));
                         }
                     } else if (isHalf(func, func.valueType(st.value))) {
-                        const vr = try reloadFloat(allocator, &code, &alloc, float_spill_base, st.value, false, fspill0);
+                        const vr = try reloadFloat(allocator, &code, alloc, float_spill_base, st.value, inst_pos, false, fspill0);
                         if (zfh) {
                             // In the native path, store the native half's 2 bytes straight to memory (`fsh`).
                             try code.append(allocator, encode.fsh(vr, base, 0));
@@ -3628,12 +4770,12 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                         }
                     } else if (isFloat(func, func.valueType(st.value))) {
                         const d = is64Float(func, func.valueType(st.value));
-                        const vr = try reloadFloat(allocator, &code, &alloc, float_spill_base, st.value, d, fspill0);
+                        const vr = try reloadFloat(allocator, &code, alloc, float_spill_base, st.value, inst_pos, d, fspill0);
                         try code.append(allocator, if (d) encode.fsd(vr, base, 0) else encode.fsw(vr, base, 0));
                     } else {
                         // A spilled int store value has no reload path here yet: reject cleanly
                         // rather than panic. Resident in every currently-compiling case.
-                        const vr = switch (intLocationAt(&alloc, st.value, inst_pos)) {
+                        const vr = switch (intLocationAt(alloc, st.value, inst_pos)) {
                             .reg => |r| r,
                             .slot => return error.Unsupported,
                         };
@@ -3659,7 +4801,7 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                     // instruction already materialized it into an int register.
                     // A spilled prefetch address has no reload path here yet: reject cleanly rather
                     // than panic. Resident in every currently-compiling case (byte-identical).
-                    const base = switch (intLocationAt(&alloc, pf.ptr, inst_pos)) {
+                    const base = switch (intLocationAt(alloc, pf.ptr, inst_pos)) {
                         .reg => |r| r,
                         .slot => return error.Unsupported,
                     };
@@ -3675,13 +4817,13 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                     // so the comparison is emitted exactly once.
                 } else if (isFloat(func, func.valueType(cmp.lhs))) {
                     // Float comparison: float operands, integer (bool) result.
-                    const rd = switch (intLocationAt(&alloc, func.instResult(inst).?, inst_pos)) {
+                    const rd = switch (intLocationAt(alloc, func.instResult(inst).?, inst_pos)) {
                         .reg => |r| r,
                         .slot => return error.Unsupported,
                     };
                     const d = is64Float(func, func.valueType(cmp.lhs));
-                    const rs1 = try reloadFloat(allocator, &code, &alloc, float_spill_base, cmp.lhs, d, fspill0);
-                    const rs2 = try reloadFloat(allocator, &code, &alloc, float_spill_base, cmp.rhs, d, fspill1);
+                    const rs1 = try reloadFloat(allocator, &code, alloc, float_spill_base, cmp.lhs, inst_pos, d, fspill0);
+                    const rs2 = try reloadFloat(allocator, &code, alloc, float_spill_base, cmp.rhs, inst_pos, d, fspill1);
                     // Native f16 (Zfh): compare the native halves directly (`feq.h`/`flt.h`/`fle.h`);
                     // the s-form compare would misread the NaN-boxed half's upper bits. SOFTWARE f16
                     // compares its held-as-f32 widening with the s-form, which is exact.
@@ -3702,9 +4844,9 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                     }
                 } else {
                     const result = func.instResult(inst).?;
-                    const rs1 = try reloadInt(allocator, &code, &alloc, spill_base, cmp.lhs, inst_pos, spill_scratch0);
-                    const rs2 = try reloadInt(allocator, &code, &alloc, spill_base, cmp.rhs, inst_pos, spill_scratch1);
-                    const rd_loc = intLocationAt(&alloc, result, inst_pos);
+                    const rs1 = try reloadInt(allocator, &code, alloc, spill_base, cmp.lhs, inst_pos, spill_scratch0);
+                    const rs2 = try reloadInt(allocator, &code, alloc, spill_base, cmp.rhs, inst_pos, spill_scratch1);
+                    const rd_loc = intLocationAt(alloc, result, inst_pos);
                     const rd = switch (rd_loc) {
                         .reg => |r| r,
                         .slot => spill_scratch0,
@@ -3748,8 +4890,8 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                     // re-encodes the right instruction.
                     if (inst_idx >= 1 and fusesIntoNextIf(func, block_insts, inst_idx - 1)) {
                         const cmp = func.opcode(block_insts[inst_idx - 1]).icmp;
-                        const rl = try reloadInt(allocator, &code, &alloc, spill_base, cmp.lhs, inst_pos, spill_scratch0);
-                        const rr = try reloadInt(allocator, &code, &alloc, spill_base, cmp.rhs, inst_pos, spill_scratch1);
+                        const rl = try reloadInt(allocator, &code, alloc, spill_base, cmp.lhs, inst_pos, spill_scratch0);
+                        const rr = try reloadInt(allocator, &code, alloc, spill_base, cmp.rhs, inst_pos, spill_scratch1);
                         const sel = branchFor(cmp.op, isUnsignedInt(func, func.valueType(cmp.lhs)));
                         const rs1 = if (sel.swap) rr else rl;
                         const rs2 = if (sel.swap) rl else rr;
@@ -3763,7 +4905,7 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                     // A spilled condition (e.g. an i1 block param used directly as the branch test)
                     // has no reload path here yet: reject cleanly rather than panic. Resident in
                     // every currently-compiling case (byte-identical there).
-                    const cond_reg = switch (intLocationAt(&alloc, cf.cond, inst_pos)) {
+                    const cond_reg = switch (intLocationAt(alloc, cf.cond, inst_pos)) {
                         .reg => |r| r,
                         .slot => return error.Unsupported,
                     };
@@ -3798,19 +4940,19 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                             // A spilled float arg reloads into the scratch, then moves to the arg
                             // register (the scratch is never an arg register, so it cannot clobber a
                             // not-yet-placed arg).
-                            const src = try reloadFloat(allocator, &code, &alloc, float_spill_base, arg, d, fspill0);
+                            const src = try reloadFloat(allocator, &code, alloc, float_spill_base, arg, inst_pos, d, fspill0);
                             if (src != dst) try code.append(allocator, if (d) encode.fmv_d(dst, src) else encode.fmv_s(dst, src));
                             float_i += 1;
                         } else if (int_i < 8) {
                             const dst = argReg(int_i);
-                            switch (intLocationAt(&alloc, arg, inst_pos)) {
+                            switch (intLocationAt(alloc, arg, inst_pos)) {
                                 .reg => |src| try int_moves.append(allocator, .{ .src = src, .dst = dst }),
                                 .slot => |slot| try int_spilled.append(allocator, .{ .dst = dst, .off = @intCast(spill_base + slot * 8) }),
                             }
                             int_i += 1;
                         } else {
                             // Stack argument: must be register-resident for now.
-                            try int_stack.append(allocator, switch (intLocationAt(&alloc, arg, inst_pos)) {
+                            try int_stack.append(allocator, switch (intLocationAt(alloc, arg, inst_pos)) {
                                 .reg => |r| r,
                                 .slot => return error.Unsupported,
                             });
@@ -3842,9 +4984,9 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                                 if (rd != .f10) try code.append(allocator, if (d) encode.fmv_d(rd, .f10) else encode.fmv_s(rd, .f10));
                             } else {
                                 // Spilled float result: store the incoming fa0 directly to its slot.
-                                try storeFloat(allocator, &code, &alloc, float_spill_base, result, d, .f10);
+                                try storeFloat(allocator, &code, alloc, float_spill_base, result, inst_pos, d, .f10);
                             }
-                        } else switch (intLocationAt(&alloc, result, inst_pos)) {
+                        } else switch (intLocationAt(alloc, result, inst_pos)) {
                             .reg => |rd| if (rd != .x10) try code.append(allocator, encode.addi(rd, .x10, 0)),
                             .slot => |slot| try code.append(allocator, encode.sd(.x10, .x2, @intCast(spill_base + slot * 8))),
                         }
@@ -3870,7 +5012,7 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                             // (reused per field) suffices because each field is stored immediately
                             // after it is reloaded.
                             for (fields, 0..) |field, k| {
-                                const r = try reloadInt(allocator, &code, &alloc, spill_base, field, inst_pos, spill_scratch0);
+                                const r = try reloadInt(allocator, &code, alloc, spill_base, field, inst_pos, spill_scratch0);
                                 try code.append(allocator, encode.sw(r, .x2, @intCast(vpu_pack_base + k * 4)));
                             }
                         } else {
@@ -3878,44 +5020,44 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                                 // Each field is stored immediately after it is read, so a single float
                                 // spill scratch (reused per field) suffices even when several fields are
                                 // spilled at once - the exact case the et-soc VPU SLP path hits.
-                                const fr = try reloadFloat(allocator, &code, &alloc, float_spill_base, field, false, fspill0);
+                                const fr = try reloadFloat(allocator, &code, alloc, float_spill_base, field, inst_pos, false, fspill0);
                                 try code.append(allocator, encode.fsw(fr, .x2, @intCast(vpu_pack_base + k * 4)));
                             }
                         }
-                        const rd = dstVpuVector(&alloc, result, vpu_vec_work);
+                        const rd = dstVpuVector(alloc, result, inst_pos, vpu_vec_work);
                         try code.append(allocator, encode.flw_ps(rd, .x2, @intCast(vpu_pack_base)));
-                        try storeVpuVector(allocator, &code, &alloc, vpu_vspill_base, result, rd);
+                        try storeVpuVector(allocator, &code, alloc, vpu_vspill_base, result, inst_pos, rd);
                     } else {
                         // Pack four scalar floats into a <4 x f32>. Seed lane 0 with the
                         // last field, then slide up inserting the earlier ones. The
                         // slide's vd must not overlap vs2, so alternate result and scratch.
                         if (fields.len != 4) return error.Unsupported;
-                        const rd = dstVector(&alloc, result, vec_work); // vec_work if the result is spilled
+                        const rd = dstVector(alloc, result, inst_pos, vec_work); // vec_work if the result is spilled
                         // Each field feeds exactly one slide instruction and the four uses are
                         // sequential (never simultaneously live), so a spilled field reloads into a
                         // single float scratch right before its slide. Byte-identical with no spill.
-                        const f3 = try reloadFloat(allocator, &code, &alloc, float_spill_base, fields[3], false, fspill0);
+                        const f3 = try reloadFloat(allocator, &code, alloc, float_spill_base, fields[3], inst_pos, false, fspill0);
                         try code.append(allocator, encode.vfmv_s_f(vector_scratch, f3)); // [f3]
-                        const f2 = try reloadFloat(allocator, &code, &alloc, float_spill_base, fields[2], false, fspill0);
+                        const f2 = try reloadFloat(allocator, &code, alloc, float_spill_base, fields[2], inst_pos, false, fspill0);
                         try code.append(allocator, encode.vfslide1up_vf(rd, vector_scratch, f2)); // [f2,f3]
-                        const f1 = try reloadFloat(allocator, &code, &alloc, float_spill_base, fields[1], false, fspill0);
+                        const f1 = try reloadFloat(allocator, &code, alloc, float_spill_base, fields[1], inst_pos, false, fspill0);
                         try code.append(allocator, encode.vfslide1up_vf(vector_scratch, rd, f1)); // [f1,f2,f3]
-                        const f0 = try reloadFloat(allocator, &code, &alloc, float_spill_base, fields[0], false, fspill0);
+                        const f0 = try reloadFloat(allocator, &code, alloc, float_spill_base, fields[0], inst_pos, false, fspill0);
                         try code.append(allocator, encode.vfslide1up_vf(rd, vector_scratch, f0)); // [f0,f1,f2,f3]
-                        try storeVector(allocator, &code, &alloc, vspill_base, result, rd, spill_scratch1);
+                        try storeVector(allocator, &code, alloc, vspill_base, result, inst_pos, rd, spill_scratch1);
                     }
                 },
                 .extract => |ex| {
                     if (vpu) {
                         if (ex.index >= 8) return error.Unsupported; // fmvs.x.ps takes a u3 lane index
                         const result = func.instResult(inst).?;
-                        const vs = try reloadVpuVector(allocator, &code, &alloc, vpu_vspill_base, ex.aggregate, vpu_vec_op0);
+                        const vs = try reloadVpuVector(allocator, &code, alloc, vpu_vspill_base, ex.aggregate, inst_pos, vpu_vec_op0);
                         if (isIntVector(func, func.valueType(ex.aggregate))) {
                             // Packed-integer lane extract: `fmvs.x.ps` lands the i32 lane straight
                             // in a GPR, and for an integer vector that GPR IS the result - no
                             // `fmv.w.x` float move. A spilled result stores from the int scratch
                             // (mirrors the int-arith spill store).
-                            const rd_loc = intLocationAt(&alloc, result, inst_pos);
+                            const rd_loc = intLocationAt(alloc, result, inst_pos);
                             const rd = switch (rd_loc) {
                                 .reg => |r| r,
                                 .slot => spill_scratch0,
@@ -3933,25 +5075,25 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                             // (fmv.w.x only reads the low 32 bits, so fmvs.x.ps's sign-fill of
                             // the upper 32 is harmless).
                             const d = is64Float(func, func.valueType(result));
-                            const rd = dstFloat(&alloc, result, fspill0);
+                            const rd = dstFloat(alloc, result, inst_pos, fspill0);
                             try code.append(allocator, encode.fmvs_x_ps(spill_scratch0, vs, @intCast(ex.index)));
                             try code.append(allocator, encode.fmv_w_x(rd, spill_scratch0));
-                            try storeFloat(allocator, &code, &alloc, float_spill_base, result, d, rd);
+                            try storeFloat(allocator, &code, alloc, float_spill_base, result, inst_pos, d, rd);
                         }
                     } else {
                         // Extract a lane to a scalar float. Lane 0 is a direct vfmv.f.s.
                         // a higher lane slides down to lane 0 first.
                         const result = func.instResult(inst).?;
                         const d = is64Float(func, func.valueType(result));
-                        const rd = dstFloat(&alloc, result, fspill0);
-                        const vs = try reloadVector(allocator, &code, &alloc, vspill_base, ex.aggregate, vec_op0, spill_scratch1);
+                        const rd = dstFloat(alloc, result, inst_pos, fspill0);
+                        const vs = try reloadVector(allocator, &code, alloc, vspill_base, ex.aggregate, inst_pos, vec_op0, spill_scratch1);
                         if (ex.index == 0) {
                             try code.append(allocator, encode.vfmv_f_s(rd, vs));
                         } else {
                             try code.append(allocator, encode.vslidedown_vi(vector_scratch, vs, @intCast(ex.index)));
                             try code.append(allocator, encode.vfmv_f_s(rd, vector_scratch));
                         }
-                        try storeFloat(allocator, &code, &alloc, float_spill_base, result, d, rd);
+                        try storeFloat(allocator, &code, alloc, float_spill_base, result, inst_pos, d, rd);
                     }
                 },
                 .matmul => |mmv| {
@@ -4053,15 +5195,15 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                     // pointer), x7 (staging word copy), x28 (64-aligned staging base). The a/b/c
                     // pointers must be register-resident (the raw `alloc.int.get`); how they must
                     // relate to the scratch set differs by embedded-ness and is handled just below.
-                    const a_reg = switch (intLocationAt(&alloc, mmv.a, inst_pos)) {
+                    const a_reg = switch (intLocationAt(alloc, mmv.a, inst_pos)) {
                         .reg => |r| r,
                         .slot => return error.Unsupported,
                     };
-                    const b_reg = switch (intLocationAt(&alloc, mmv.b, inst_pos)) {
+                    const b_reg = switch (intLocationAt(alloc, mmv.b, inst_pos)) {
                         .reg => |r| r,
                         .slot => return error.Unsupported,
                     };
-                    const c_reg = switch (intLocationAt(&alloc, mmv.c, inst_pos)) {
+                    const c_reg = switch (intLocationAt(alloc, mmv.c, inst_pos)) {
                         .reg => |r| r,
                         .slot => return error.Unsupported,
                     };
@@ -4493,10 +5635,7 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
         while (action_cursor < alloc.actions.items.len and alloc.actions.items[action_cursor].at <= term_pos) {
             const act = alloc.actions.items[action_cursor];
             std.debug.assert(act.at == term_pos); // only terminator-position actions remain here
-            switch (act.kind) {
-                .store => try code.append(allocator, encode.sd(act.reg, .x2, @intCast(spill_base + act.slot * 8))),
-                .reload => try code.append(allocator, encode.ld(act.reg, .x2, @intCast(spill_base + act.slot * 8))),
-            }
+            try emitSplitAction(allocator, &code, func, spill_base, float_spill_base, vspill_base, vpu_vspill_base, vpu_pack_base, act);
             action_cursor += 1;
         }
         if (!exited) {
@@ -4507,22 +5646,34 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                             // fmv fa0, freg  (skipped when already in fa0). A spilled return value
                             // reloads from its slot into the scratch first.
                             const d = is64Float(func, func.valueType(v));
-                            const fr = try reloadFloat(allocator, &code, &alloc, float_spill_base, v, d, fspill0);
+                            const fr = try reloadFloat(allocator, &code, alloc, float_spill_base, v, term_pos, d, fspill0);
                             if (fr != .f10) try code.append(allocator, if (d) encode.fmv_d(.f10, fr) else encode.fmv_s(.f10, fr));
                         } else {
                             // mv a0, reg  (skipped when already in a0)
-                            const r = try reloadInt(allocator, &code, &alloc, spill_base, v, term_pos, spill_scratch0);
+                            const r = try reloadInt(allocator, &code, alloc, spill_base, v, term_pos, spill_scratch0);
                             if (r != .x10) try code.append(allocator, encode.addi(.x10, r, 0));
                         }
                     }
                     // Epilogue: restore ra and the callee-saved registers, close the frame.
                     if (non_leaf) try code.append(allocator, encode.ld(.x1, .x2, ra_off)); // restore ra
                     for (used_saved.items) |sv| try code.append(allocator, encode.ld(sv.reg, .x2, sv.off));
-                    for (used_float_saved.items) |sv| try code.append(allocator, encode.fld(sv.reg, .x2, sv.off));
+                    // Restore the callee-saved floats with the width they were saved with: flw in vpu
+                    // mode (fp32 only, sw-sysemu has no 64-bit fld), fld otherwise (an f64 may live there).
+                    for (used_float_saved.items) |sv| try code.append(allocator, if (vpu) encode.flw(sv.reg, .x2, sv.off) else encode.fld(sv.reg, .x2, sv.off));
                     if (frame_size != 0) try code.append(allocator, encode.addi(.x2, .x2, frame_size));
                     try code.append(allocator, encode.jalr(.x0, .x1, 0)); // ret
                 },
-                .jump => |j| {
+                .jump => |j| jump_blk: {
+                    // Shared Wimmer path: the allocator already RESOLVED this edge into an ordered
+                    // parallel-move sequence (params, live-through values, spills, and cycles), so
+                    // replay it op-by-op and derive nothing, then the jal. `edge_move_driven` is false
+                    // for every default caller, so the derivation below runs unchanged there.
+                    if (alloc.edge_move_driven) {
+                        try emitEdgeMoves(allocator, &code, alloc, spill_base, float_spill_base, vspill_base, vpu_vspill_base, vpu_pack_base, block, j.target);
+                        try fixups.append(allocator, .{ .index = code.items.len, .target = j.target, .kind = .jal });
+                        try code.append(allocator, encode.jal(.x0, 0));
+                        break :jump_blk;
+                    }
                     // Move each argument into its block parameter's register before the jump. The
                     // edge's (arg_reg -> param_reg) moves can form a permutation CYCLE (a loop
                     // header whose back-edge permutes its carried values - e.g. a swap x10<->x11 -
@@ -4610,7 +5761,7 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                             // The destination param reads stay direct (a param is never split). The
                             // ARG source is read through `intLocationAt` at the terminator position.
                             if (alloc.int.get(param)) |pr| {
-                                switch (intLocationAt(&alloc, arg, term_pos)) {
+                                switch (intLocationAt(alloc, arg, term_pos)) {
                                     .reg => |ar| try int_moves.append(allocator, .{ .src = ar, .dst = pr }),
                                     .slot => try int_reloads.append(allocator, .{ .arg = arg, .dst = pr }),
                                 }
@@ -4626,7 +5777,7 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                     // spilled arg reloads into `fspill0` (disjoint from `float_scratch`, the move's
                     // cycle-breaking scratch) before being stored.
                     for (float_stores.items) |s| {
-                        const ar = try reloadFloat(allocator, &code, &alloc, float_spill_base, s.arg, s.d64, fspill0);
+                        const ar = try reloadFloat(allocator, &code, alloc, float_spill_base, s.arg, term_pos, s.d64, fspill0);
                         try code.append(allocator, if (s.d64) encode.fsd(ar, .x2, s.off) else encode.fsw(ar, .x2, s.off));
                     }
 
@@ -4636,7 +5787,7 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                     // `spill_scratch0` (x6), the move's cycle-breaking scratch, which the parallel
                     // move that follows may clobber - before being stored into the param's slot.
                     for (int_stores.items) |s| {
-                        const ar = try reloadInt(allocator, &code, &alloc, spill_base, s.arg, term_pos, spill_scratch1);
+                        const ar = try reloadInt(allocator, &code, alloc, spill_base, s.arg, term_pos, spill_scratch1);
                         try code.append(allocator, encode.sd(ar, .x2, s.off));
                     }
 
@@ -4646,7 +5797,7 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                     // move (mirrors the float/vector reloads). The arg is spilled by construction
                     // (a register arg took the reg->reg path), so `reloadInt` loads it into `r.dst`.
                     for (int_reloads.items) |r| {
-                        _ = try reloadInt(allocator, &code, &alloc, spill_base, r.arg, term_pos, r.dst);
+                        _ = try reloadInt(allocator, &code, alloc, spill_base, r.arg, term_pos, r.dst);
                     }
 
                     try parallelMoveFloat(allocator, &code, float_moves.items, float_scratch);
@@ -4654,20 +5805,20 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
                     // Spilled-float reloads write the now-final param registers, after the reg->reg
                     // move (mirrors the vector reloads below).
                     for (float_reloads.items) |r| {
-                        _ = try reloadFloat(allocator, &code, &alloc, float_spill_base, r.arg, r.d64, r.dst);
+                        _ = try reloadFloat(allocator, &code, alloc, float_spill_base, r.arg, term_pos, r.d64, r.dst);
                     }
 
                     // Vector spill/reg handling (see the ordering note above). Stores read arg
                     // registers while they still hold their edge values, so they must precede the
                     // reg->reg moves.
                     for (vec_stores.items) |s| {
-                        const ar = try reloadVector(allocator, &code, &alloc, vspill_base, s.arg, vec_op0, spill_scratch1);
+                        const ar = try reloadVector(allocator, &code, alloc, vspill_base, s.arg, term_pos, vec_op0, spill_scratch1);
                         try code.append(allocator, encode.addi(spill_scratch1, .x2, s.off));
                         try code.append(allocator, encode.vse32(ar, spill_scratch1));
                     }
                     try parallelMoveVector(allocator, &code, vec_moves.items, vector_scratch);
                     for (vec_reloads.items) |r| {
-                        const ar = try reloadVector(allocator, &code, &alloc, vspill_base, r.arg, r.dst, spill_scratch1);
+                        const ar = try reloadVector(allocator, &code, alloc, vspill_base, r.arg, term_pos, r.dst, spill_scratch1);
                         if (ar != r.dst) try code.append(allocator, encode.vmv_v_v(r.dst, ar));
                     }
 

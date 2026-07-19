@@ -1023,6 +1023,23 @@ pub fn callReg(reg: Reg) Inst {
     return Inst.of(&.{ 0xFF, mrm });
 }
 
+/// `push r64` (0x50+rd): push a 64-bit register onto the stack (rsp -= 8). No REX.W (push
+/// defaults to 64-bit operand size in long mode); r8..r15 need the REX.B extension bit, so
+/// `push r12` is `0x41 0x54`.
+pub fn pushReg(r: Reg) Inst {
+    const rn = n(r);
+    if (rn >= 8) return Inst.of(&.{ 0x41, 0x50 | (rn & 7) });
+    return Inst.of(&.{0x50 | rn});
+}
+
+/// `pop r64` (0x58+rd): pop the top of stack into a 64-bit register (rsp += 8). No REX.W;
+/// r8..r15 need the REX.B extension bit, so `pop r12` is `0x41 0x5C`.
+pub fn popReg(r: Reg) Inst {
+    const rn = n(r);
+    if (rn >= 8) return Inst.of(&.{ 0x41, 0x58 | (rn & 7) });
+    return Inst.of(&.{0x58 | rn});
+}
+
 /// `ret` (near return).
 pub fn ret() Inst {
     return Inst.of(&.{0xC3});
@@ -1049,6 +1066,13 @@ test "known x86-64 encodings" {
     try std.testing.expectEqualSlices(u8, &.{ 0x41, 0xB8, 0x2A, 0x00, 0x00, 0x00 }, movImm(.r8, 42, false).slice()); // mov r8d, 42
     try std.testing.expectEqualSlices(u8, &.{ 0x44, 0x01, 0xC0 }, add(.rax, .r8, false).slice()); // add eax, r8d
     try std.testing.expectEqualSlices(u8, &.{0xC3}, ret().slice());
+    // push/pop r64: 0x50+rd / 0x58+rd, REX.B for r8..r15.
+    try std.testing.expectEqualSlices(u8, &.{0x53}, pushReg(.rbx).slice()); // push rbx
+    try std.testing.expectEqualSlices(u8, &.{ 0x41, 0x54 }, pushReg(.r12).slice()); // push r12
+    try std.testing.expectEqualSlices(u8, &.{0x5B}, popReg(.rbx).slice()); // pop rbx
+    try std.testing.expectEqualSlices(u8, &.{ 0x41, 0x5C }, popReg(.r12).slice()); // pop r12
+    try std.testing.expectEqualSlices(u8, &.{0x50}, pushReg(.rax).slice()); // push rax
+    try std.testing.expectEqualSlices(u8, &.{ 0x41, 0x5F }, popReg(.r15).slice()); // pop r15
     // r8 needs REX.B. mov r8, rax: REX.WB=0x49, 89 /r reg=rax(0) rm=r8(0) -> C0.
     try std.testing.expectEqualSlices(u8, &.{ 0x49, 0x89, 0xC0 }, movReg(.r8, .rax).slice());
 }

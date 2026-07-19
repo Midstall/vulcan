@@ -189,6 +189,19 @@ pub fn build(b: *std.Build) void {
     const target_tests = b.addTest(.{ .root_module = vulcan_target });
     test_step.dependOn(&b.addRunArtifact(target_tests).step);
 
+    // Wimmer-Franz allocator target-abstraction unit tests: assert the aarch64 RegDescription
+    // (pools, entry-param pinning, call clobbers, scratch) the shared allocator consumes.
+    const wimmer_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("libs/vulcan-target/wimmer_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "vulcan-ir", .module = vulcan_ir },
+            .{ .name = "vulcan-target", .module = vulcan_target },
+        },
+    }) });
+    test_step.dependOn(&b.addRunArtifact(wimmer_tests).step);
+
     // The Wasm frontend's tests: structural (parsing + lowering) plus the engine.
     const wasm_tests = b.addTest(.{ .root_module = vulcan_wasm });
     test_step.dependOn(&b.addRunArtifact(wasm_tests).step);

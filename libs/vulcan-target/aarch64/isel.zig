@@ -12,6 +12,7 @@
 const std = @import("std");
 const ir = @import("vulcan-ir");
 const encode = @import("encode.zig");
+const wimmer = @import("../wimmer.zig");
 const loops = @import("vulcan-opt").loops;
 const mm = @import("vulcan-opt").microarch;
 
@@ -156,6 +157,19 @@ const Location = union(enum) { reg: Reg, slot: u32 };
 /// position, so a lookup at any position at or after the def resolves to some segment.
 const Segment = struct { from: u32, loc: Location };
 
+/// One precomputed control-flow-edge move (Task 8), translated from a `wimmer.Move`: shuffle `src`
+/// into `dst`, where `class` (0 gpr, 1 fpr) selects the move/load/store width. The shared allocator
+/// already ORDERED these into a valid parallel-move sequence (every source read before it is
+/// overwritten, cycles broken and slot->slot shuffles routed through the class scratch), so the
+/// emitter replays them op-by-op with no reordering.
+const EdgeMove = struct { src: Location, dst: Location, class: u16 };
+
+/// The ordered move list on one control-flow edge `pred -> succ` (Task 7's `wimmer.EdgeMoves`,
+/// translated into this backend's `Location` space). Keyed by the block pair so emission can find
+/// the moves for the edge it is currently lowering (the block being emitted plus the jump target,
+/// including the forwarding blocks `splitCriticalEdges` inserted).
+const EdgeMoveSet = struct { pred: Block, succ: Block, moves: []EdgeMove };
+
 /// A store or reload the emitter must insert at a split boundary. `at` is the instruction position
 /// the action lands before (the position at which the pool was exhausted for a tail split). `store`
 /// writes the victim's register to its new slot before the taker overwrites the register at `at`.
@@ -163,10 +177,14 @@ const Segment = struct { from: u32, loc: Location };
 /// (vector vs fp vs gpr).
 const SplitAction = struct {
     at: u32,
-    kind: enum { store, reload },
+    kind: enum { store, reload, move },
     value: Value,
     reg: Reg,
-    slot: u32,
+    slot: u32 = 0,
+    /// The SOURCE register of a `.move` (a register-to-register re-home at a split point); `reg` is
+    /// the destination. Only the shared Wimmer translation produces `.move`; the native `allocate`
+    /// never does, so it leaves this at its default and the native drain never reads it.
+    move_from: Reg = .zr,
 };
 
 /// The result of register allocation.
@@ -179,6 +197,12 @@ const Allocation = struct {
     // Stores/reloads to emit at split boundaries, appended in monotonically-ascending `at` order.
     // Empty means no value was split, so emission is byte-identical to before splitting.
     actions: std.ArrayList(SplitAction) = .empty,
+    // Precomputed, ordered control-flow-edge moves (the shared Wimmer path only). `edge_move_driven`
+    // marks this as an edge-move-authoritative allocation: emission then replays these per edge and
+    // never derives block-param moves itself. Empty + false is the DEFAULT `compileFunction` path,
+    // whose edge lowering stays byte-identical (it keeps deriving block-param moves).
+    edge_moves: []EdgeMoveSet = &.{},
+    edge_move_driven: bool = false,
     def_pos: []u32 = &.{}, // per value: its definition position (copied from Liveness, and the emission assert reads it)
     saved_gpr: std.ArrayList(Reg) = .empty, // callee-saved x-registers used (non-leaf)
     saved_fpr: std.ArrayList(Reg) = .empty, // callee-saved v-registers used (non-leaf)
@@ -191,6 +215,8 @@ const Allocation = struct {
         while (seg_it.next()) |segs| allocator.free(segs.*);
         self.segments.deinit(allocator);
         self.actions.deinit(allocator);
+        for (self.edge_moves) |em| allocator.free(em.moves);
+        allocator.free(self.edge_moves);
         // `def_pos` is always a heap-owned dupe (the `&.{}` sentinel is a zero-length slice with no
         // backing allocation, and freeing that is a no-op), so an unconditional free is safe.
         allocator.free(self.def_pos);
@@ -324,11 +350,6 @@ fn alignPadWords(words: usize, fetch_align: u16) usize {
 /// padding falls straight through into the header and every branch fixup is patched from
 /// `block_start` (recorded after padding), so it can never change what the function computes.
 pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps: ModelCaps) Error!Compiled {
-    const fetch_align = caps.fetch_align;
-    // Native half arithmetic (FEAT_FP16) vs the base-ISA emulation, gated on the model feature.
-    // `fp16 == false` (every non-model caller) keeps the emulation, byte-identical to before this
-    // capability existed; only `selectFunctionForModel` under a FEAT_FP16 model sets it true.
-    const fp16 = caps.fp16;
     // aarch64 is the reference f16 backend (f16 roadmap Task 3). By default f16 is EMULATED: an
     // f16 value lives in an S register as its f32 WIDENING (a value exactly representable in
     // half). The boundaries do the rounding via base-ISA `fcvt` (no FEAT_FP16): a memory
@@ -340,12 +361,75 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
     // Only SCALAR f16 is handled; f16 nested in a vector/aggregate would fall through to the
     // raw-vector path and miscompile the half lanes, so reject that composite case cleanly.
     if (ir.function.functionUsesCompositeF16(func)) return error.Unsupported;
-    const nblocks = func.blockCount();
-    if (nblocks == 0) return error.Unsupported;
+    if (func.blockCount() == 0) return error.Unsupported;
     const leaf = isLeaf(func);
 
     var alloc = try allocate(allocator, func, leaf);
     defer alloc.deinit(allocator);
+
+    return emitFromAllocation(allocator, func, caps, &alloc);
+}
+
+/// Emit one split-boundary action's machine code: a `store` writes `reg` to its slot, a `reload`
+/// brings a slot back into `reg`, and a `move` copies `move_from` into `reg` (register re-home). The
+/// store/reload width follows the value type (a SIMD vector round-trips all 128 bits, a scalar FP the
+/// low 64, a GPR the low 64), exactly as `loadOp`/`storeResult` do, so a stored value always reloads
+/// whole. Shared by the per-instruction and terminator drains in `emitFromAllocation`. The native
+/// `allocate` only ever produces `store`/`reload`, so those two arms are byte-identical to before this
+/// extraction; `move` is reachable only through the shared Wimmer translation.
+fn emitSplitAction(allocator: std.mem.Allocator, code: *std.ArrayList(u32), func: *const Function, spill_base: usize, act: SplitAction) Error!void {
+    switch (act.kind) {
+        .store => {
+            const off: u15 = @intCast(spill_base + act.slot * 16);
+            if (isVector(func, act.value)) {
+                try code.append(allocator, encode.strQ(act.reg, sp, off));
+            } else if (regClass(func, act.value) == .fpr) {
+                try code.append(allocator, encode.strFp(act.reg, sp, off, true));
+            } else {
+                try code.append(allocator, encode.strOff(act.reg, sp, off));
+            }
+        },
+        .reload => {
+            const off: u15 = @intCast(spill_base + act.slot * 16);
+            if (isVector(func, act.value)) {
+                try code.append(allocator, encode.ldrQ(act.reg, sp, off));
+            } else if (regClass(func, act.value) == .fpr) {
+                try code.append(allocator, encode.ldrFp(act.reg, sp, off, true));
+            } else {
+                try code.append(allocator, encode.ldrOff(act.reg, sp, off));
+            }
+        },
+        .move => {
+            // A register-to-register re-home (Wimmer path only): copy `move_from` into `reg`. Same
+            // value, so the copy width follows the value type. An identity move emits nothing.
+            if (act.move_from == act.reg) return;
+            if (isVector(func, act.value)) {
+                try code.append(allocator, encode.movVec(act.reg, act.move_from));
+            } else if (regClass(func, act.value) == .fpr) {
+                try code.append(allocator, encode.fmovReg(act.reg, act.move_from));
+            } else {
+                try code.append(allocator, encode.mov(act.reg, act.move_from));
+            }
+        },
+    }
+}
+
+/// Emit A64 machine code from a finished `Allocation` (the second half of `compileFunction`, split
+/// out so the shared Wimmer allocator can drive the SAME battle-tested emission through
+/// `compileFunctionWimmer`). This is a PURE extraction of everything after `allocate`: prologue and
+/// frame, the per-block/instruction loop reading each value's location through `Ctx.locationAt`, the
+/// split-boundary action drain, block-edge moves, and the epilogue. `caps` carries the model seams
+/// (`fetch_align`, `fp16`); an inert `.{}` reproduces `selectFunction`'s output exactly. `nblocks`
+/// and `leaf` are recomputed from `func` (identical to the values `compileFunction` passed to
+/// `allocate`), so the extraction is byte-identical for every existing caller.
+fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps: ModelCaps, alloc: *Allocation) Error!Compiled {
+    const fetch_align = caps.fetch_align;
+    // Native half arithmetic (FEAT_FP16) vs the base-ISA emulation, gated on the model feature.
+    // `fp16 == false` (every non-model caller) keeps the emulation, byte-identical to before this
+    // capability existed; only `selectFunctionForModel` under a FEAT_FP16 model sets it true.
+    const fp16 = caps.fp16;
+    const nblocks = func.blockCount();
+    const leaf = isLeaf(func);
 
     // Split-boundary actions are appended in monotonic `at` order already; sort defensively so the
     // per-instruction drain below can advance a single cursor. At the SAME position a `.reload` must
@@ -356,7 +440,8 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
         fn order(k: @TypeOf(@as(SplitAction, undefined).kind)) u8 {
             return switch (k) {
                 .reload => 0,
-                .store => 1,
+                .move => 1,
+                .store => 2,
             };
         }
         fn f(_: void, a: SplitAction, b: SplitAction) bool {
@@ -470,7 +555,7 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
 
     var ctx = Ctx{
         .func = func,
-        .alloc = &alloc,
+        .alloc = alloc,
         .spill_base = spill_base,
         .alloca_base = alloca_base,
         .alloca_off = &alloca_off,
@@ -486,6 +571,7 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
     var action_cursor: usize = 0;
     for (0..nblocks) |bi| {
         const block: Block = @enumFromInt(bi);
+        ctx.block = block; // the predecessor for any edge this block terminates in (edge-move keying)
         if (fetch_align > 4 and is_loop_header[bi]) {
             var pad = alignPadWords(code.items.len, fetch_align);
             while (pad > 0) : (pad -= 1) try code.append(allocator, encode.nop());
@@ -519,31 +605,7 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
             while (action_cursor < alloc.actions.items.len and alloc.actions.items[action_cursor].at <= ctx.pos) {
                 const act = alloc.actions.items[action_cursor];
                 std.debug.assert(act.at == ctx.pos); // actions land on instruction positions only
-                switch (act.kind) {
-                    .store => {
-                        const off: u15 = @intCast(spill_base + act.slot * 16);
-                        if (isVector(func, act.value)) {
-                            try code.append(allocator, encode.strQ(act.reg, sp, off));
-                        } else if (regClass(func, act.value) == .fpr) {
-                            try code.append(allocator, encode.strFp(act.reg, sp, off, true));
-                        } else {
-                            try code.append(allocator, encode.strOff(act.reg, sp, off));
-                        }
-                    },
-                    .reload => {
-                        // Second-chance reload: bring `act.value` back from its slot into `act.reg`
-                        // just before its next use, mirroring `loadOp`'s slot path. From here on its
-                        // `.reg` re-home segment makes `locationAt` read the register directly.
-                        const off: u15 = @intCast(spill_base + act.slot * 16);
-                        if (isVector(func, act.value)) {
-                            try code.append(allocator, encode.ldrQ(act.reg, sp, off));
-                        } else if (regClass(func, act.value) == .fpr) {
-                            try code.append(allocator, encode.ldrFp(act.reg, sp, off, true));
-                        } else {
-                            try code.append(allocator, encode.ldrOff(act.reg, sp, off));
-                        }
-                    },
-                }
+                try emitSplitAction(allocator, &code, func, spill_base, act);
                 action_cursor += 1;
             }
             switch (func.opcode(inst)) {
@@ -990,28 +1052,7 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
         while (action_cursor < alloc.actions.items.len and alloc.actions.items[action_cursor].at <= ctx.pos) {
             const act = alloc.actions.items[action_cursor];
             std.debug.assert(act.at == ctx.pos); // only terminator-position actions remain here
-            switch (act.kind) {
-                .store => {
-                    const off: u15 = @intCast(spill_base + act.slot * 16);
-                    if (isVector(func, act.value)) {
-                        try code.append(allocator, encode.strQ(act.reg, sp, off));
-                    } else if (regClass(func, act.value) == .fpr) {
-                        try code.append(allocator, encode.strFp(act.reg, sp, off, true));
-                    } else {
-                        try code.append(allocator, encode.strOff(act.reg, sp, off));
-                    }
-                },
-                .reload => {
-                    const off: u15 = @intCast(spill_base + act.slot * 16);
-                    if (isVector(func, act.value)) {
-                        try code.append(allocator, encode.ldrQ(act.reg, sp, off));
-                    } else if (regClass(func, act.value) == .fpr) {
-                        try code.append(allocator, encode.ldrFp(act.reg, sp, off, true));
-                    } else {
-                        try code.append(allocator, encode.ldrOff(act.reg, sp, off));
-                    }
-                },
-            }
+            try emitSplitAction(allocator, &code, func, spill_base, act);
             action_cursor += 1;
         }
         if (!terminated) {
@@ -1082,6 +1123,10 @@ const Ctx = struct {
     /// The current instruction position, mirrored from the allocator's `linearize` numbering and
     /// advanced by the emission loop. `locationAt` reads it to pick a split value's active segment.
     pos: u32 = 0,
+    /// The block currently being emitted (the PREDECESSOR of any edge this block terminates in).
+    /// `emitMoves` reads it with the jump target to key into the precomputed `edge_moves`. Defaults
+    /// to the entry block; the emission loop sets it per block.
+    block: Block = @enumFromInt(0),
 
     /// The location of `v` at the current instruction position (`self.pos`): its active segment if
     /// `v` was split, otherwise its whole-life register or spill slot. With no splits (segments
@@ -1311,7 +1356,17 @@ const Ctx = struct {
     /// Edge moves into the target's parameters (which are always in registers).
     /// GPR and FP register-resident arguments go through separate parallel moves.
     /// spilled arguments are reloaded straight into their parameter register.
+    ///
+    /// Two paths: an edge-move-driven allocation (the shared Wimmer path) replays the precomputed,
+    /// already-ordered `edge_moves` for the current edge `self.block -> jump.target` op-by-op and
+    /// derives nothing (the shared allocator resolved parameters AND live-through values, spills, and
+    /// cycles). The DEFAULT path (`edge_move_driven == false`) keeps deriving block-parameter moves
+    /// exactly as before, so its output is byte-identical when no allocation sets `edge_moves`.
     fn emitMoves(self: Ctx, allocator: std.mem.Allocator, code: *std.ArrayList(u32), jump: ir.function.Jump) Error!void {
+        if (self.alloc.edge_move_driven) {
+            try self.emitEdgeMoves(allocator, code, self.block, jump.target);
+            return;
+        }
         const args = self.func.blockArgs(jump);
         const params = self.func.blockParams(jump.target);
         if (args.len != params.len) return error.Unsupported;
@@ -1352,6 +1407,54 @@ const Ctx = struct {
                 },
                 .reg => {}, // already handled by the parallel move above
             }
+        }
+    }
+
+    /// Replay the precomputed, already-ordered edge moves for `pred -> succ` op-by-op. The shared
+    /// allocator resolved the parallel move (sources read before overwrite, cycles broken and
+    /// slot->slot shuffles routed through the class scratch), so each op is a primitive reg->reg
+    /// (move), reg->slot (store), or slot->reg (load). An edge with no shuffle has no entry, so
+    /// nothing is emitted for it. No reordering here would break that resolution.
+    fn emitEdgeMoves(self: Ctx, allocator: std.mem.Allocator, code: *std.ArrayList(u32), pred: Block, succ: Block) Error!void {
+        const set = self.findEdgeMoves(pred, succ) orelse return;
+        for (set.moves) |m| try self.emitEdgeMove(allocator, code, m);
+    }
+
+    /// The precomputed move set for the edge `pred -> succ`, or null when the edge needs no shuffle.
+    fn findEdgeMoves(self: Ctx, pred: Block, succ: Block) ?*const EdgeMoveSet {
+        for (self.alloc.edge_moves) |*set| {
+            if (set.pred == pred and set.succ == succ) return set;
+        }
+        return null;
+    }
+
+    /// Emit one ordered edge move as A64. The move width follows its class: a gpr move is a 64-bit
+    /// `mov`/`ldr`/`str`, an fpr move copies the whole 128-bit register (`movVec`) and loads/stores
+    /// the whole 16-byte slot (`ldrQ`/`strQ`) so both scalar floats and lane vectors round-trip
+    /// intact. Slot offsets mirror the action/reload math (`spill_base + slot * 16`). A slot->slot op
+    /// never appears (the shared ordering already expanded it through the class scratch), so it is a
+    /// programmer error here.
+    fn emitEdgeMove(self: Ctx, allocator: std.mem.Allocator, code: *std.ArrayList(u32), m: EdgeMove) Error!void {
+        std.debug.assert(m.class == 0 or m.class == 1);
+        const fpr = m.class == 1;
+        switch (m.src) {
+            .reg => |sr| switch (m.dst) {
+                .reg => |dr| {
+                    if (@intFromEnum(sr) == @intFromEnum(dr)) return; // identity move
+                    try code.append(allocator, if (fpr) encode.movVec(dr, sr) else encode.mov(dr, sr));
+                },
+                .slot => |ds| {
+                    const off: u15 = @intCast(self.spill_base + ds * 16);
+                    try code.append(allocator, if (fpr) encode.strQ(sr, sp, off) else encode.strOff(sr, sp, off));
+                },
+            },
+            .slot => |ss| switch (m.dst) {
+                .reg => |dr| {
+                    const off: u15 = @intCast(self.spill_base + ss * 16);
+                    try code.append(allocator, if (fpr) encode.ldrQ(dr, sp, off) else encode.ldrOff(dr, sp, off));
+                },
+                .slot => unreachable, // the shared ordering expands slot->slot through the class scratch
+            },
         }
     }
 };
@@ -1601,6 +1704,405 @@ fn nextUseAfter(uses: []const u32, p: u32) ?u32 {
 
 /// Linear-scan register allocation with spilling. Block parameters are pinned to
 /// registers. Instruction results spill when the pool is exhausted.
+// The backend context the shared Wimmer-Franz allocator threads through `classOf`/`useKind`. aarch64
+// needs no extra state (its class/use decisions read only the function, passed separately), so this
+// is a zero-field singleton whose address is a stable, non-owned `ctx` pointer.
+const AArch64RegCtx = struct {};
+const aarch64_reg_ctx: AArch64RegCtx = .{};
+
+/// `RegDescription.classOf` for aarch64: a value lives in the gpr class (0) or the fpr class (1),
+/// exactly as `regClass` decides (float/vector -> fpr, everything else -> gpr).
+fn aarch64ClassOf(ctx: *const anyopaque, func: *const Function, v: Value) u16 {
+    _ = ctx;
+    return @intFromEnum(regClass(func, v));
+}
+
+/// `RegDescription.useKind` for aarch64: every operand needs a register (aarch64 cannot fold a spill
+/// slot into an arithmetic operand). This is the conservative default; a backend that can read memory
+/// operands relaxes specific opcodes. Unused parameters are the generic hook shape.
+fn aarch64UseKind(ctx: *const anyopaque, func: *const Function, inst: ir.function.Inst, operand: Value) wimmer.UseKind {
+    _ = ctx;
+    _ = func;
+    _ = inst;
+    _ = operand;
+    return .must_have_register;
+}
+
+/// Build the per-function aarch64 `RegDescription` the shared Wimmer-Franz allocator consumes. The
+/// physical-register INDEX numbering is the register's own enum integer value: gpr class index n
+/// names x_n (x0..x30), fpr class index n names v_n (v0..v31), the two classes disambiguating the
+/// shared 0..31 index space. This MIRRORS the existing `allocate`: the leaf/non-leaf pools match its
+/// pool-building loop, entry params pin the ABI arg registers via `computeArgLocs`, and call sites
+/// use `linearize`'s call positions so the numbering matches emission. Task 1 builds only the
+/// description (no allocation runs). The caller owns the result and must `deinit` it.
+///
+/// Call-clobber approximation: class 1's per-call clobber lists ALL fp registers v0..v31, i.e. the
+/// caller-saved fp regs PLUS the callee-saved v8..v15. The extra v8..v15 encodes the vector quirk
+/// (a 128-bit vector in a callee-saved fp reg loses its upper half across a call, since AAPCS only
+/// preserves the low 64 bits) without type info at description-build time. It over-clobbers scalar
+/// floats slightly (a scalar float is also forced out of v8..v15 across a call); Task 2's interval
+/// builder may refine it to vector-only. Entry stack params (arg index >= 8) are NOT pre-colored
+/// here (they arrive on the stack); the Task 2 interval builder handles them.
+pub fn aarch64RegDescription(allocator: std.mem.Allocator, func: *const Function) Error!wimmer.RegDescription {
+    const leaf = isLeaf(func);
+
+    const eparams = func.blockParams(@enumFromInt(0));
+    const plocs = try allocator.alloc(ArgLoc, eparams.len);
+    defer allocator.free(plocs);
+    computeArgLocs(func, eparams, plocs);
+    var n_gpr: usize = 0;
+    var n_fpr: usize = 0;
+    for (plocs) |l| {
+        if (l.class == .gpr) n_gpr += 1 else n_fpr += 1;
+    }
+
+    // Allocatable pools, mirroring `allocate`'s pool-building loop EXACTLY. GPR: caller-saved
+    // temporaries x9..x12 + unused integer arg registers (leaf) or callee-saved x19..x28 (non-leaf).
+    // FPR: caller-saved v16..v23 + unused FP arg registers (leaf) or callee-saved v8..v15 (non-leaf).
+    var gpr_alloc: std.ArrayList(u16) = .empty;
+    errdefer gpr_alloc.deinit(allocator);
+    var fpr_alloc: std.ArrayList(u16) = .empty;
+    errdefer fpr_alloc.deinit(allocator);
+    if (leaf) {
+        for (9..13) |r| try gpr_alloc.append(allocator, @intCast(r));
+        for (@min(n_gpr, 8)..8) |r| try gpr_alloc.append(allocator, @intCast(r));
+        for (16..24) |r| try fpr_alloc.append(allocator, @intCast(r));
+        for (@min(n_fpr, 8)..8) |r| try fpr_alloc.append(allocator, @intCast(r));
+    } else {
+        for (19..29) |r| try gpr_alloc.append(allocator, @intCast(r));
+        for (8..16) |r| try fpr_alloc.append(allocator, @intCast(r));
+    }
+
+    // Callee-saved sets: x19..x28 (gpr), v8..v15 (fpr).
+    const gpr_cs = try allocator.alloc(u16, 10);
+    errdefer allocator.free(gpr_cs);
+    for (0..10) |i| gpr_cs[i] = @intCast(19 + i);
+    const fpr_cs = try allocator.alloc(u16, 8);
+    errdefer allocator.free(fpr_cs);
+    for (0..8) |i| fpr_cs[i] = @intCast(8 + i);
+
+    const gpr_alloc_owned = try gpr_alloc.toOwnedSlice(allocator);
+    errdefer allocator.free(gpr_alloc_owned);
+    const fpr_alloc_owned = try fpr_alloc.toOwnedSlice(allocator);
+    errdefer allocator.free(fpr_alloc_owned);
+
+    const classes = try allocator.alloc(wimmer.RegClass, 2);
+    errdefer allocator.free(classes);
+    // aarch64 uses uniform 16-byte spill slots for both classes (see the existing spill/frame code).
+    classes[0] = .{ .name = "gpr", .allocatable = gpr_alloc_owned, .callee_saved = gpr_cs, .slot_bytes = 16 };
+    classes[1] = .{ .name = "fpr", .allocatable = fpr_alloc_owned, .callee_saved = fpr_cs, .slot_bytes = 16 };
+
+    // Entry params: the first 8 gpr params pin x0..x7, the first 8 fp params pin v0..v7. Params with
+    // arg index >= 8 arrive on the stack and are left for the Task 2 interval builder.
+    var ef: std.ArrayList(wimmer.FixedAssign) = .empty;
+    errdefer ef.deinit(allocator);
+    for (eparams, plocs) |p, l| {
+        if (l.idx < 8) {
+            const class: u16 = if (l.class == .fpr) 1 else 0;
+            try ef.append(allocator, .{ .value = p, .class = class, .reg = @intCast(l.idx) });
+        }
+    }
+    const entry_fixed = try ef.toOwnedSlice(allocator);
+    errdefer allocator.free(entry_fixed);
+
+    // Call sites: one per call position, using `linearize`'s numbering so it matches emission.
+    var lin = try linearize(allocator, func);
+    defer lin.deinit(allocator);
+    const call_sites = try allocator.alloc(wimmer.CallSite, lin.call_positions.items.len);
+    var built: usize = 0;
+    errdefer {
+        for (call_sites[0..built]) |cs| {
+            for (cs.clobbered) |cr| allocator.free(cr.regs);
+            allocator.free(cs.clobbered);
+        }
+        allocator.free(call_sites);
+    }
+    for (lin.call_positions.items, 0..) |cpos, i| {
+        // Class 0: the caller-saved gpr set x0..x17 (x18 is the reserved platform register, excluded).
+        const gpr_clob = try allocator.alloc(u16, 18);
+        errdefer allocator.free(gpr_clob);
+        for (0..18) |j| gpr_clob[j] = @intCast(j);
+        // Class 1: all fp registers v0..v31 (caller-saved fp regs plus the v8..v15 vector quirk).
+        const fpr_clob = try allocator.alloc(u16, 32);
+        errdefer allocator.free(fpr_clob);
+        for (0..32) |j| fpr_clob[j] = @intCast(j);
+        const clob = try allocator.alloc(wimmer.ClassRegs, 2);
+        clob[0] = .{ .class = 0, .regs = gpr_clob };
+        clob[1] = .{ .class = 1, .regs = fpr_clob };
+        call_sites[i] = .{ .pos = cpos, .clobbered = clob };
+        built = i + 1;
+    }
+
+    // Scratch registers reserved for parallel-move cycle breaking, indexed by class: gpr uses
+    // `scratch_move` (x17), fpr uses `fp_move` (v27). These are the same regs the backend already
+    // reserves for parallel moves, kept out of every pool.
+    const scratch = try allocator.alloc(u16, 2);
+    errdefer allocator.free(scratch);
+    scratch[0] = @intCast(@intFromEnum(scratch_move));
+    scratch[1] = @intCast(@intFromEnum(fp_move));
+
+    return .{
+        .classes = classes,
+        .classOf = aarch64ClassOf,
+        .useKind = aarch64UseKind,
+        .entry_fixed = entry_fixed,
+        .call_sites = call_sites,
+        .scratch = scratch,
+        .ctx = &aarch64_reg_ctx,
+    };
+}
+
+/// TEST-ONLY: compile `func` through the SHARED Wimmer-Franz allocator instead of the backend's own
+/// `allocate`, then emit through the SAME battle-tested emission (`emitFromAllocation`). This is the
+/// first path that turns the shared allocator's output into executable machine code. It runs the
+/// shared scan, TRANSLATES its target-independent `Allocation` into this backend's own
+/// representation, and reuses the existing emission verbatim. The default `compileFunction` is
+/// untouched.
+///
+/// Scope (Task 8): LEAF functions, now including CROSS-BLOCK ones (loops, diamonds, lifetime holes,
+/// critical edges). Critical edges are split up front so the shared allocator's edge-move resolution
+/// has a block to place its shuffle on, and the translated `edge_moves` drive emission. It still
+/// bails `error.Unsupported` on anything it cannot yet express FAITHFULLY (never a silent
+/// miscompile): non-leaf functions (the prologue's callee-saved param shuffle is not modeled here), a
+/// split or non-register entry parameter, and a same-position intra-block action register hazard.
+///
+/// Takes `func` by mutable pointer because `splitCriticalEdges` inserts forwarding blocks in place;
+/// all downstream numbering (the RegDescription, the scan, and emission) runs on the SPLIT CFG. A
+/// differential caller that must keep an unmutated reference builds two identical functions and
+/// compiles one each way (see the cross-block tests).
+pub fn compileFunctionWimmer(allocator: std.mem.Allocator, func: *Function) Error!Compiled {
+    if (ir.function.functionUsesCompositeF16(func)) return error.Unsupported;
+    if (func.blockCount() == 0) return error.Unsupported;
+    if (!isLeaf(func)) return error.Unsupported;
+
+    // Split critical edges FIRST (mutating `func`), before any numbering is built, so the resolver's
+    // no-critical-edge precondition holds and the RegDescription/scan/emission all see one CFG.
+    try ir.critical_edge.splitCriticalEdges(allocator, func);
+
+    var desc = try aarch64RegDescription(allocator, func);
+    defer desc.deinit(allocator);
+    var walloc = try wimmer.allocate(allocator, func, &desc);
+    defer walloc.deinit(allocator);
+
+    var alloc = try translateAllocation(allocator, func, &walloc);
+    defer alloc.deinit(allocator);
+    return emitFromAllocation(allocator, func, .{}, &alloc);
+}
+
+/// The aarch64 (uniform 16-byte) spill-slot index for a Wimmer per-class slot: GPR (class 0) slots
+/// take `[0, gpr_slots)`, FPR (class 1) slots take `[gpr_slots, gpr_slots + fpr_slots)`. This keeps
+/// every spilled value on a distinct slot, which is all the frame offset math needs.
+fn aarch64Slot(class: u16, wimmer_slot: u32, gpr_slots: u32) u32 {
+    return switch (class) {
+        0 => wimmer_slot,
+        1 => gpr_slots + wimmer_slot,
+        else => unreachable,
+    };
+}
+
+/// Translate a finished shared `wimmer.Allocation` into this backend's own `Allocation` so the
+/// existing emission can consume it. A whole-life value (one segment) lands in the `reg`/`spill`
+/// maps exactly as the native allocate would leave it (so the prologue's direct `reg` reads and
+/// `collectSaved` behave identically); a genuinely split value lands in `segments`, which
+/// `locationAt` resolves per position. Each intra-block segment transition becomes a drain action
+/// (store / reload / register move). Entry params are required to be whole-life in their ABI arg
+/// register (the leaf hint), so the existing prologue setup is a no-op; anything else bails.
+fn translateAllocation(allocator: std.mem.Allocator, func: *const Function, walloc: *const wimmer.Allocation) Error!Allocation {
+    var alloc = Allocation{};
+    errdefer alloc.deinit(allocator);
+
+    // The emission's pos-coupling assert reads `alloc.def_pos[value]`. Reuse the backend's own
+    // `linearize` numbering, which is identical to the shared allocator's, so every def position
+    // matches the `ctx.pos` the emission advances through.
+    var lin = try linearize(allocator, func);
+    defer lin.deinit(allocator);
+    alloc.def_pos = try allocator.dupe(u32, lin.def_pos);
+
+    std.debug.assert(walloc.slot_count_per_class.len == 2);
+    const gpr_slots = walloc.slot_count_per_class[0];
+    const fpr_slots = walloc.slot_count_per_class[1];
+    alloc.spill_count = gpr_slots + fpr_slots;
+
+    // Entry params of a leaf: each is pinned by the hint to its ABI arg register, so the prologue
+    // needs no move. Collect them (and their ABI arg locations) to require exactly that shape below.
+    const eparams = func.blockParams(@enumFromInt(0));
+    const plocs = try allocator.alloc(ArgLoc, eparams.len);
+    defer allocator.free(plocs);
+    computeArgLocs(func, eparams, plocs);
+
+    var it = walloc.segments.iterator();
+    while (it.next()) |e| {
+        const value = e.key_ptr.*;
+        const wsegs = e.value_ptr.*;
+        std.debug.assert(wsegs.len > 0);
+        const class: u16 = @intFromEnum(regClass(func, value)); // 0 gpr, 1 fpr, matching desc classes
+        const param_loc = entryParamArgLoc(eparams, plocs, value);
+
+        // A split or slot-resident entry param would need prologue handling this task does not model.
+        if (param_loc != null and (wsegs.len != 1 or wsegs[0].loc != .reg)) return error.Unsupported;
+
+        if (wsegs.len == 1) {
+            switch (wsegs[0].loc) {
+                .reg => |ri| {
+                    // A leaf entry param passed in an ABI arg register (idx < 8) gets NO prologue
+                    // move: the incoming value already sits in its ABI register. The Wimmer register
+                    // hint is only a PREFERENCE, so if the allocator placed the param anywhere other
+                    // than its ABI arg register the prologue would leave the wrong value there. Guard
+                    // it (this is a JIT path with release safety off, so bail rather than assert).
+                    if (param_loc) |pl| {
+                        if (pl.idx < 8 and @as(usize, ri) != pl.idx) return error.Unsupported;
+                    }
+                    try alloc.reg.put(allocator, value, @enumFromInt(@as(u5, @intCast(ri))));
+                },
+                .slot => |s| try alloc.spill.put(allocator, value, aarch64Slot(class, s, gpr_slots)),
+            }
+            continue;
+        }
+
+        // A genuinely split value: build the aarch64 segment list AND the per-transition actions.
+        // Nothing between this `alloc` and the `put` can error (the fill loop and `translateLoc` are
+        // infallible), so there is NO errdefer freeing `segs` here: on a `put` failure the explicit
+        // catch below frees it, and after `put` succeeds `alloc.segments` OWNS it, so any later error
+        // (a slot->slot transition or an `actions.append` OOM) is freed exactly once by the
+        // function-level `errdefer alloc.deinit`. An errdefer here would double-free that owned slice.
+        const segs = try allocator.alloc(Segment, wsegs.len);
+        for (wsegs, 0..) |ws, i| {
+            segs[i] = .{ .from = ws.from, .loc = translateLoc(ws.loc, class, gpr_slots) };
+        }
+        alloc.segments.put(allocator, value, segs) catch |err| {
+            allocator.free(segs);
+            return err;
+        };
+        var i: usize = 0;
+        while (i + 1 < wsegs.len) : (i += 1) {
+            const act = try translateTransition(value, segs[i].loc, segs[i + 1].loc, segs[i + 1].from);
+            try alloc.actions.append(allocator, act);
+        }
+    }
+
+    // The emission drains actions at one position in a FIXED order (reload, move, store) with no
+    // parallel-move resolution. If two actions at the same position read-after-write the same
+    // register (one writes a register another reads, or two write the same register), that order can
+    // clobber a live value. This task does not model the parallel move, so bail rather than risk a
+    // silent miscompile. (Distinct-position actions, the tail-split spill/reload the tests produce,
+    // never trip this.)
+    if (hasSamePosRegHazard(alloc.actions.items)) return error.Unsupported;
+
+    // Callee-saved registers the shared allocation used, so the prologue saves them (empty for a
+    // leaf, whose pools are caller-saved, but populated for completeness).
+    for (walloc.used_callee_saved) |us| {
+        const reg: Reg = @enumFromInt(@as(u5, @intCast(us.reg)));
+        if (us.class == 0) try alloc.saved_gpr.append(allocator, reg) else try alloc.saved_fpr.append(allocator, reg);
+    }
+    std.mem.sort(Reg, alloc.saved_gpr.items, {}, regLessThan);
+    std.mem.sort(Reg, alloc.saved_fpr.items, {}, regLessThan);
+
+    // Control-flow-edge moves (Task 7 -> Task 8): the shared allocator already ordered each edge's
+    // moves into a valid parallel-move sequence, so translate each `wimmer.Location` into this
+    // backend's `Location` (per-class slot -> uniform 16-byte slot) keyed by the (pred, succ) block
+    // pair and hand the ordered list to emission verbatim. `edge_move_driven` makes emission replay
+    // these instead of deriving block-param moves, so a Wimmer function whose values change location
+    // across a block (or whose params spill) no longer bails.
+    var edge_sets: std.ArrayList(EdgeMoveSet) = .empty;
+    errdefer {
+        for (edge_sets.items) |es| allocator.free(es.moves);
+        edge_sets.deinit(allocator);
+    }
+    for (walloc.edge_moves) |wem| {
+        const moves = try allocator.alloc(EdgeMove, wem.moves.len);
+        errdefer allocator.free(moves);
+        for (wem.moves, 0..) |wm, i| {
+            std.debug.assert(wm.class == 0 or wm.class == 1);
+            // `translateLoc` maps a per-class slot through `aarch64Slot` (gpr base 0, fpr base
+            // `gpr_slots`), matching the segment/action translation, so both sides key the same frame.
+            moves[i] = .{
+                .src = translateLoc(wm.src, wm.class, gpr_slots),
+                .dst = translateLoc(wm.dst, wm.class, gpr_slots),
+                .class = wm.class,
+            };
+        }
+        try edge_sets.append(allocator, .{ .pred = wem.pred, .succ = wem.succ, .moves = moves });
+    }
+    alloc.edge_moves = try edge_sets.toOwnedSlice(allocator);
+    alloc.edge_move_driven = true;
+
+    return alloc;
+}
+
+fn regLessThan(_: void, a: Reg, b: Reg) bool {
+    return @intFromEnum(a) < @intFromEnum(b);
+}
+
+/// The register an action READS (`store`/`move` source), or null if it reads only memory.
+fn actionReadsReg(a: SplitAction) ?Reg {
+    return switch (a.kind) {
+        .store => a.reg,
+        .move => a.move_from,
+        .reload => null,
+    };
+}
+
+/// The register an action WRITES (`reload`/`move` destination), or null if it writes only memory.
+fn actionWritesReg(a: SplitAction) ?Reg {
+    return switch (a.kind) {
+        .store => null,
+        .reload, .move => a.reg,
+    };
+}
+
+/// Whether any two actions at the SAME position conflict on a register: one writes a register the
+/// other reads or writes. Such a set is not safe to drain in the emission's fixed order without a
+/// parallel-move resolver. O(n^2) over what is a short action list.
+fn hasSamePosRegHazard(actions: []const SplitAction) bool {
+    for (actions, 0..) |a, i| {
+        for (actions[i + 1 ..]) |b| {
+            if (a.at != b.at) continue;
+            const aw = actionWritesReg(a);
+            const bw = actionWritesReg(b);
+            if (aw) |w| {
+                if (bw != null and bw.? == w) return true; // two writes to one register
+                if (actionReadsReg(b)) |r| if (r == w) return true; // b reads what a writes
+            }
+            if (bw) |w| {
+                if (actionReadsReg(a)) |r| if (r == w) return true; // a reads what b writes
+            }
+        }
+    }
+    return false;
+}
+
+/// The ABI argument location of `v` if it is one of the entry block's parameters, else null.
+/// `plocs` is `computeArgLocs(eparams)`, so `plocs[k]` describes `eparams[k]`.
+fn entryParamArgLoc(eparams: []const Value, plocs: []const ArgLoc, v: Value) ?ArgLoc {
+    for (eparams, plocs) |p, l| if (p == v) return l;
+    return null;
+}
+
+/// Map a shared `wimmer.Location` to this backend's `Location`: a register index `n` names `x_n`
+/// (gpr) or `v_n` (fpr) via the shared enum, and a per-class slot maps through `aarch64Slot`.
+fn translateLoc(loc: wimmer.Location, class: u16, gpr_slots: u32) Location {
+    return switch (loc) {
+        .reg => |ri| .{ .reg = @enumFromInt(@as(u5, @intCast(ri))) },
+        .slot => |s| .{ .slot = aarch64Slot(class, s, gpr_slots) },
+    };
+}
+
+/// Build the drain action realizing `src -> dst` for `value` at `at`: register->slot is a `store`,
+/// slot->register a `reload`, register->register a `move`. A slot->slot move needs a scratch this
+/// translation does not model yet, so it bails.
+fn translateTransition(value: Value, src: Location, dst: Location, at: u32) Error!SplitAction {
+    return switch (src) {
+        .reg => |sr| switch (dst) {
+            .reg => |dr| SplitAction{ .at = at, .kind = .move, .value = value, .reg = dr, .move_from = sr },
+            .slot => |ds| SplitAction{ .at = at, .kind = .store, .value = value, .reg = sr, .slot = ds },
+        },
+        .slot => |ss| switch (dst) {
+            .reg => |dr| SplitAction{ .at = at, .kind = .reload, .value = value, .reg = dr, .slot = ss },
+            .slot => error.Unsupported,
+        },
+    };
+}
+
 fn allocate(allocator: std.mem.Allocator, func: *const Function, leaf: bool) Error!Allocation {
     const nval = func.valueCount();
     var alloc = Allocation{};
