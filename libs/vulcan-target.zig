@@ -36,6 +36,9 @@ pub const elf_read = @import("vulcan-target/elf_read.zig");
 /// Shared register-allocation support (target-independent live intervals).
 pub const regalloc = @import("vulcan-target/regalloc.zig");
 
+/// Shared, target-independent Wimmer-Franz register allocator (target abstraction + algorithm).
+pub const wimmer = @import("vulcan-target/wimmer.zig");
+
 /// Native target: the backend matching the host CPU, for in-process JIT.
 pub const native = @import("vulcan-target/native.zig");
 

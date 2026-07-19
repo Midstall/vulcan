@@ -15,6 +15,7 @@ pub const jit = @import("aarch64/jit.zig");
 /// backend is unavailable or incompatible.
 const tests = struct {
     pub const native = @import("aarch64/tests/native.zig");
+    pub const wimmer_native = @import("aarch64/tests/wimmer_native.zig");
     pub const qemu = @import("aarch64/tests/qemu.zig");
 };
 

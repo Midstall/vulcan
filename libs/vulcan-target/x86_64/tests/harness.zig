@@ -133,6 +133,22 @@ fn runProgram(io: std.Io, allocator: std.mem.Allocator, stub: []const u8, code: 
     };
 }
 
+/// Run raw compiled `code` (entered at offset 0) with integer `args`, returning the low byte of
+/// its result. Used by the shared-Wimmer differential tests, which compile through
+/// `isel.compileFunctionWimmerX86` (bytes, not a `Function`) and diff against `runFunc`.
+pub fn runCodeInt(io: std.Io, allocator: std.mem.Allocator, code: []const u8, args: []const i64, backend: Backend) !u8 {
+    return runCode(io, allocator, code, 0, args, backend);
+}
+
+/// Run raw compiled `code` with f32 `fargs` (loaded into xmm0.., result read from xmm0), returning
+/// the low byte of the f32 result's bits. qemu only, like `runFloatFunc`.
+pub fn runCodeFloat(io: std.Io, allocator: std.mem.Allocator, code: []const u8, fargs: []const f32, backend: Backend) !u8 {
+    if (backend.qemu_cmd == null) return error.SkipZigTest;
+    const stub = try buildFloatStub(allocator, fargs);
+    defer allocator.free(stub);
+    return runProgram(io, allocator, stub, code, backend);
+}
+
 /// The float entry stub: load each f32 argument's bits into xmm0,xmm1,..., `call` the code,
 /// move the f32 result (xmm0) back to a general register, and `exit` with its low byte.
 fn buildFloatStub(allocator: std.mem.Allocator, fargs: []const f32) std.mem.Allocator.Error![]u8 {

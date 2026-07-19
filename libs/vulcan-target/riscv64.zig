@@ -88,6 +88,7 @@ const tests = struct {
     pub const etsoc_sysemu = @import("riscv64/tests/etsoc_sysemu.zig");
     pub const float_spill = @import("riscv64/tests/float_spill.zig");
     pub const int_spill = @import("riscv64/tests/int_spill.zig");
+    pub const wimmer_diff = @import("riscv64/tests/wimmer_diff.zig");
     pub const f16_emulation = @import("riscv64/tests/f16.zig");
     pub const f16_native = @import("riscv64/tests/f16_native.zig");
 };
