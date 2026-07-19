@@ -408,7 +408,9 @@ test "codegen+disasm round-trip: a call emits the ABI frame and bl" {
     defer a.free(text);
 
     try std.testing.expect(std.mem.indexOf(u8, text, "sub sp, sp, #") != null); // prologue
-    try std.testing.expect(std.mem.indexOf(u8, text, "str x30, [sp") != null); // save the link register
+    // The link-register store fuses with the first callee-saved store into a single stp (the
+    // ldp/stp peephole), so the save now reads `stp x30, ...`. Still proves x30 is saved.
+    try std.testing.expect(std.mem.indexOf(u8, text, "stp x30, ") != null); // save the link register
     try std.testing.expect(std.mem.indexOf(u8, text, "bl .") != null); // the call
     try std.testing.expect(std.mem.indexOf(u8, text, "ldr x30, [sp") != null); // restore the link register
     try std.testing.expect(std.mem.indexOf(u8, text, "add sp, sp, #") != null); // epilogue
@@ -510,10 +512,12 @@ test "module disasm: linked functions get labels and a resolved, named call" {
     const text = try disasm.formatModule(a, linked.code, syms);
     defer a.free(text);
 
-    // The `bl` in main resolves back to helper and is annotated with its name.
+    // The `bl` in main resolves back to helper and is annotated with its name. The displacement
+    // is -40 (not -48): main's prologue fuses its link-register + callee-saved stores into stp
+    // pairs (the ldp/stp peephole), shrinking main so the backward branch to helper is shorter.
     try std.testing.expect(std.mem.indexOf(u8, text, "helper:\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "main:\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "bl .-48  <helper>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "bl .-40  <helper>") != null);
 }
 
 /// A named function for `runModule`. The entry must be first.
@@ -3780,5 +3784,595 @@ test "f32/f64 through the same memory paths are unchanged by the f16 work (regre
         var out: T = 0;
         @as(Fn, @ptrCast(buf.memory.ptr))(&a, &b, &out);
         try std.testing.expectEqual(@as(T, 3.75), out);
+    }
+}
+
+// --- ldp/stp peephole: targeted execution validation (Task 4) -----------------------------------
+//
+// The always-on `pairMemory` pass fuses adjacent same-base consecutive ldr/str into ldp/stp. These
+// tests originally forced fusion onto the callee-saved register runs a NON-LEAF function saves in its
+// prologue and restores in its epilogue (consecutive same-base 8-byte-spaced stores/loads), because
+// at the time the data-load/store path always addressed `[base, #0]`. Address folding (Task 3) now
+// also lets constant-index data loads/stores fold to `[base, #off]` and fuse, so the copy tests below
+// fuse their data accesses too. The callee-saved-run fusion still fires; the counts stay >= 1.
+//
+// ldp/stp are deliberately NOT `peephole.decodeMem` forms (that decoder returns null for them by
+// design, treating a fused word as opaque), so a fused pair is detected here by matching the exact
+// base opcodes of the four GPR ldp/stp encoders (ldpOffX/stpOffX/ldpOffW/stpOffW in encode.zig).
+// Their fixed class bits live in [31:22]. imm7/rt2/rn/rt1 are all below bit 22, so masking with
+// 0xFFC00000 isolates the class cleanly.
+const MemPairKind = enum { none, ldp, stp };
+
+fn memPairKind(word: u32) MemPairKind {
+    return switch (word & 0xFFC00000) {
+        0xA9400000, 0x29400000 => .ldp, // ldpOffX / ldpOffW
+        0xA9000000, 0x29000000 => .stp, // stpOffX / stpOffW
+        else => .none,
+    };
+}
+
+/// Count the fused ldp/stp words in a compiled function. Returns `.{ ldp, stp }`.
+fn countMemPairs(allocator: std.mem.Allocator, func: *const Function) ![2]usize {
+    const code = try isel.selectFunction(allocator, func);
+    defer allocator.free(code);
+    var counts = [2]usize{ 0, 0 };
+    for (code) |w| switch (memPairKind(w)) {
+        .none => {},
+        .ldp => counts[0] += 1,
+        .stp => counts[1] += 1,
+    };
+    return counts;
+}
+
+test "ldp/stp: memPairKind matches only the four GPR pair encoders and rejects ldr/str and non-mem" {
+    // Guards the emission probe itself: it must fire on real ldp/stp words and stay silent on the
+    // ldr/str forms it is meant to distinguish from, otherwise the emission assertions below are
+    // meaningless. (This is the by-construction check the brief asks for.)
+    try std.testing.expectEqual(MemPairKind.ldp, memPairKind(encode.ldpOffX(.x0, .x1, .x2, 16)));
+    try std.testing.expectEqual(MemPairKind.stp, memPairKind(encode.stpOffX(.x0, .x1, .x2, 16)));
+    try std.testing.expectEqual(MemPairKind.ldp, memPairKind(encode.ldpOffW(.x0, .x1, .x2, 8)));
+    try std.testing.expectEqual(MemPairKind.stp, memPairKind(encode.stpOffW(.x0, .x1, .x2, 8)));
+    // The individual (unfused) memory ops must NOT be miscounted as pairs.
+    try std.testing.expectEqual(MemPairKind.none, memPairKind(encode.ldrOff(.x0, .x1, 16)));
+    try std.testing.expectEqual(MemPairKind.none, memPairKind(encode.strOff(.x0, .x1, 16)));
+    try std.testing.expectEqual(MemPairKind.none, memPairKind(encode.ldrW(.x0, .x1, 8)));
+    try std.testing.expectEqual(MemPairKind.none, memPairKind(encode.strW(.x0, .x1, 8)));
+    try std.testing.expectEqual(MemPairKind.none, memPairKind(encode.add64(.x0, .x1, .x2)));
+    try std.testing.expectEqual(MemPairKind.none, memPairKind(encode.nop()));
+}
+
+test "ldp/stp: a leaf non-fusable function emits zero pairs" {
+    // Meaningfulness anchor for the emission counts below: a trivial leaf `x + 1` has no callee-saved
+    // run and no fusable adjacency, so the probe must count exactly zero pairs. If this were nonzero,
+    // the `>= 1` assertions in the fusing tests would prove nothing.
+    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const b = try func.appendBlock();
+    const x = try func.appendBlockParam(b, t);
+    const r = try func.appendArithImm(b, t, .add, x, 1);
+    func.setTerminator(b, .{ .ret = r });
+    const counts = try countMemPairs(allocator, &func);
+    try std.testing.expectEqual(@as(usize, 0), counts[0]);
+    try std.testing.expectEqual(@as(usize, 0), counts[1]);
+}
+
+test "ldp/stp: a spill/reload heavy function still computes correctly and emits ldp/stp" {
+    // f(x) = g(x) + sum_{i=1..24}(g(x) + i), with g(x) = 3x. `main` is non-leaf (it calls g), so
+    // its GPR pool is x19-x28 (callee-saved) from the start, not just on overflow. Those callee-saved
+    // registers get saved in the prologue and restored in the epilogue as consecutive same-base
+    // stores/loads, which pairMemory fuses into stp then ldp. The 24 live partials only decide how
+    // many registers (and so how many pairs) are needed, not whether fusion fires.
+    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const t_kind = ir.types.TypeKind{ .int = .{ .signedness = .signed, .bits = 32 } };
+
+    var g = Function.init(allocator);
+    defer g.deinit();
+    const gt = try g.types.intern(t_kind);
+    const gb = try g.appendBlock();
+    const gx = try g.appendBlockParam(gb, gt);
+    const gm = try g.appendArithImm(gb, gt, .mul, gx, 3);
+    g.setTerminator(gb, .{ .ret = gm });
+
+    var main = Function.init(allocator);
+    defer main.deinit();
+    const mt = try main.types.intern(t_kind);
+    const mb = try main.appendBlock();
+    const mx = try main.appendBlockParam(mb, mt);
+    const c = try main.appendCall(mb, mt, "g", &.{mx});
+    var vals: [24]ir.function.Value = undefined;
+    for (0..24) |i| vals[i] = try main.appendArithImm(mb, mt, .add, c, @intCast(i + 1));
+    var acc = vals[0];
+    for (1..24) |i| acc = try main.appendInst(mb, mt, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = vals[i] } });
+    main.setTerminator(mb, .{ .ret = acc });
+
+    // Emission: the always-on pass runs inside compileFunction, so a fused prologue/epilogue must be
+    // present. At least one stp (prologue) and one ldp (epilogue).
+    const counts = try countMemPairs(allocator, &main);
+    try std.testing.expect(counts[0] >= 1); // ldp
+    try std.testing.expect(counts[1] >= 1); // stp
+
+    // Correctness: link main+g so the `bl` resolves, then run across a sweep. Fusing the callee-saved
+    // save/restore is only correct if every paired register round-trips its bits, so a wrong fusion
+    // would corrupt the reduction and change the result. Expected = 24*(3x) + sum_{i=1..24} i.
+    const funcs = [_]NamedFunc{ .{ .name = "main", .func = &main }, .{ .name = "g", .func = &g } };
+    const inputs = [_]i32{ 0, 1, 2, 3, -1, 5, 10, -7 };
+    for (inputs) |x| {
+        var expected: i32 = 0;
+        var i: i32 = 1;
+        while (i <= 24) : (i += 1) expected +%= (3 *% x) +% i;
+        const got = try runModule(allocator, &funcs, &.{x});
+        try std.testing.expectEqual(expected, got);
+    }
+}
+
+test "ldp/stp: a struct-copy of consecutive words matches and emits ldp/stp" {
+    // Copy 12 consecutive i64 words in[j] -> out[j]. All 12 loaded values are held live across a call
+    // to a helper (making the function non-leaf), so they occupy callee-saved registers that the
+    // prologue saves and the epilogue restores as consecutive same-base runs. pairMemory fuses those
+    // into stp/ldp, and the copy is only correct if each paired save/restore preserves its 64 bits.
+    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const n = 12;
+    const i64_kind = ir.types.TypeKind{ .int = .{ .signedness = .signed, .bits = 64 } };
+
+    // Side-effect-free helper the copy calls purely to become non-leaf.
+    var g = Function.init(allocator);
+    defer g.deinit();
+    const gt = try g.types.intern(i64_kind);
+    const gb = try g.appendBlock();
+    const gz = try g.appendInst(gb, gt, .{ .iconst = 0 });
+    g.setTerminator(gb, .{ .ret = gz });
+
+    var main = Function.init(allocator);
+    defer main.deinit();
+    const t = try main.types.intern(i64_kind);
+    const ptr_t = try main.types.intern(.ptr);
+    const b = try main.appendBlock();
+    const out = try main.appendBlockParam(b, ptr_t);
+    const in = try main.appendBlockParam(b, ptr_t);
+    var loaded: [n]ir.function.Value = undefined;
+    for (0..n) |i| {
+        const p = if (i == 0) in else try main.appendInst(b, ptr_t, .{ .arith_imm = .{ .op = .add, .lhs = in, .imm = @intCast(i * 8) } });
+        loaded[i] = try main.appendInst(b, t, .{ .load = .{ .ptr = p } });
+    }
+    _ = try main.appendCall(b, t, "g", &.{});
+    for (0..n) |i| {
+        const p = if (i == 0) out else try main.appendInst(b, ptr_t, .{ .arith_imm = .{ .op = .add, .lhs = out, .imm = @intCast(i * 8) } });
+        try main.appendStore(b, loaded[i], p);
+    }
+    main.setTerminator(b, .{ .ret = null });
+
+    // Emission: at least one stp (prologue) and one ldp (epilogue).
+    const counts = try countMemPairs(allocator, &main);
+    try std.testing.expect(counts[0] >= 1); // ldp
+    try std.testing.expect(counts[1] >= 1); // stp
+
+    // Correctness: link main+g, map, and copy a distinctly-valued source. A dropped/lane-truncated
+    // fusion of the callee-saved run would corrupt one of the 12 in-flight words and mismatch here.
+    var module: link.Module = .{};
+    defer module.deinit(allocator);
+    try module.addFunction(allocator, "main", &main);
+    try module.addFunction(allocator, "g", &g);
+    var linked = try link.compileModule(allocator, &module);
+    defer linked.deinit(allocator);
+    var buf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(linked.code));
+    defer buf.deinit();
+    const Fn = *const fn (*[n]i64, *const [n]i64) callconv(.c) void;
+    var src: [n]i64 = undefined;
+    for (0..n) |i| src[i] = @as(i64, 0x1122_3344_0000_0000) + @as(i64, @intCast(i)) * 7 - 3;
+    var dst: [n]i64 = undefined;
+    @memset(&dst, -1);
+    @as(Fn, @ptrCast(buf.memory.ptr))(&dst, &src);
+    try std.testing.expectEqualSlices(i64, &src, &dst);
+}
+
+test "ldp/stp: adjacent scalar loads summed match" {
+    // Load a[0..4] (consecutive i32 words) and sum them. Under address folding the constant-index
+    // loads fold to `[base, #4j]` and the adjacent ones fuse to ldp, so this reconfirms that a plain
+    // adjacent-load kernel still computes the right value across a sweep of inputs after folding.
+    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr_t = try func.types.intern(.ptr);
+    const b = try func.appendBlock();
+    const base = try func.appendBlockParam(b, ptr_t);
+    var lanes: [4]ir.function.Value = undefined;
+    for (0..4) |i| {
+        const p = if (i == 0) base else try func.appendInst(b, ptr_t, .{ .arith_imm = .{ .op = .add, .lhs = base, .imm = @intCast(i * 4) } });
+        lanes[i] = try func.appendInst(b, t, .{ .load = .{ .ptr = p } });
+    }
+    var acc = lanes[0];
+    for (1..4) |i| acc = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = lanes[i] } });
+    func.setTerminator(b, .{ .ret = acc });
+
+    const code = try isel.selectFunction(allocator, &func);
+    defer allocator.free(code);
+    var buf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(code));
+    defer buf.deinit();
+    const Fn = *const fn (*const [4]i32) callconv(.c) i32;
+    const f: Fn = @ptrCast(buf.memory.ptr);
+    const cases = [_][4]i32{
+        .{ 1, 2, 3, 4 },
+        .{ 0, 0, 0, 0 },
+        .{ -10, 20, -30, 40 },
+        .{ 100, -1, -1, -1 },
+    };
+    for (cases) |arr| {
+        const expected = arr[0] +% arr[1] +% arr[2] +% arr[3];
+        try std.testing.expectEqual(expected, f(&arr));
+    }
+}
+
+// --- address-mode folding: execution validation (Task 3) ----------------------------------------
+//
+// A load/store whose pointer is a foldable `arith_imm.add(base, imm)` now addresses `[base, #imm]`
+// directly: the address-add is dropped and the now-adjacent offset-form loads/stores present the
+// shape `pairMemory` fuses into ldp/stp. These tests JIT-run the folded code on this Ampere host and
+// assert both the computed values AND that folding actually fired (address-adds gone, pairs emitted).
+
+/// Count the register-form add words (`add xd, xn, xm` and `add wd, wn, wm`, LSL #0) in a compiled
+/// function. `arith_imm.add` lowers to the register form (its immediate is materialized in a scratch),
+/// so an address-add shows up here; when it folds into a load/store displacement it disappears. A
+/// pure constant-index copy therefore has ZERO adds once folded. The add shifted-register family
+/// fixes every bit except Rm[20:16]/Rn[9:5]/Rd[4:0] (and shift 0 keeps imm6/shift-type clear), so
+/// masking those register fields off isolates the class (0x8B for 64-bit, 0x0B for 32-bit).
+fn countAdds(allocator: std.mem.Allocator, func: *const Function) !usize {
+    const code = try isel.selectFunction(allocator, func);
+    defer allocator.free(code);
+    var count: usize = 0;
+    for (code) |w| switch (w & 0xFFE0FC00) {
+        0x8B000000, 0x0B000000 => count += 1,
+        else => {},
+    };
+    return count;
+}
+
+test "addrfold: constant-index i64 copy folds and adjacent pairs emit ldp/stp" {
+    // out[j] = in[j] for j in 0..4, each addressed through `in + 8*j` / `out + 8*j`. Every address-add
+    // folds into the ldr/str displacement and dies, leaving four adjacent `ldr x,[in,#8j]` and four
+    // adjacent `str x,[out,#8j]`, which pairMemory fuses into ldp/stp. Proves the fold (no add words,
+    // pairs present) AND the data (the copy is correct across a sweep).
+    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const n = 4;
+    const i64_kind = ir.types.TypeKind{ .int = .{ .signedness = .signed, .bits = 64 } };
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(i64_kind);
+    const ptr_t = try func.types.intern(.ptr);
+    const b = try func.appendBlock();
+    const out = try func.appendBlockParam(b, ptr_t);
+    const in = try func.appendBlockParam(b, ptr_t);
+    var loaded: [n]ir.function.Value = undefined;
+    for (0..n) |i| {
+        const p = if (i == 0) in else try func.appendInst(b, ptr_t, .{ .arith_imm = .{ .op = .add, .lhs = in, .imm = @intCast(i * 8) } });
+        loaded[i] = try func.appendInst(b, t, .{ .load = .{ .ptr = p } });
+    }
+    for (0..n) |i| {
+        const p = if (i == 0) out else try func.appendInst(b, ptr_t, .{ .arith_imm = .{ .op = .add, .lhs = out, .imm = @intCast(i * 8) } });
+        try func.appendStore(b, loaded[i], p);
+    }
+    func.setTerminator(b, .{ .ret = null });
+
+    // The fold eliminated every address-add, so none survive in the machine code (this is a pure
+    // copy with no other arithmetic, so a nonzero count would mean an address-add failed to fold).
+    try std.testing.expectEqual(@as(usize, 0), try countAdds(allocator, &func));
+    // The folded, now-adjacent loads/stores fuse into at least one ldp and one stp.
+    const counts = try countMemPairs(allocator, &func);
+    try std.testing.expect(counts[0] >= 1); // ldp
+    try std.testing.expect(counts[1] >= 1); // stp
+
+    const code = try isel.selectFunction(allocator, &func);
+    defer allocator.free(code);
+    var buf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(code));
+    defer buf.deinit();
+    const Fn = *const fn (*[n]i64, *const [n]i64) callconv(.c) void;
+    const f: Fn = @ptrCast(buf.memory.ptr);
+    const cases = [_][n]i64{
+        .{ 1, 2, 3, 4 },
+        .{ 0, -1, 0x7FFF_FFFF_FFFF_FFFF, -0x8000_0000_0000_0000 },
+        .{ 0x1122_3344_5566_7788, -3, 42, 0x0102_0304_0506_0708 },
+    };
+    for (cases) |src| {
+        var dst: [n]i64 = undefined;
+        @memset(&dst, -1);
+        f(&dst, &src);
+        try std.testing.expectEqualSlices(i64, &src, &dst);
+    }
+}
+
+test "addrfold: byte and halfword constant-index loads fold and compute correctly" {
+    // Sum four consecutive i8 (offsets 0..3) then four consecutive i16 (offsets 0,2,4,6). The byte
+    // loads fold to `ldrsb [base,#off]` (Task-2 u12 unscaled encoders) and the halfword loads to
+    // `ldrsh [base,#off]` (Task-2 u13 scaled-by-2 encoders). A wrong offset scale would read the
+    // wrong element and mismatch.
+    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const i8_kind = ir.types.TypeKind{ .int = .{ .signedness = .signed, .bits = 8 } };
+    const i16_kind = ir.types.TypeKind{ .int = .{ .signedness = .signed, .bits = 16 } };
+    const i32_kind = ir.types.TypeKind{ .int = .{ .signedness = .signed, .bits = 32 } };
+
+    var byte_fn = Function.init(allocator);
+    defer byte_fn.deinit();
+    {
+        const i8_t = try byte_fn.types.intern(i8_kind);
+        const i32_t = try byte_fn.types.intern(i32_kind);
+        const ptr_t = try byte_fn.types.intern(.ptr);
+        const b = try byte_fn.appendBlock();
+        const base = try byte_fn.appendBlockParam(b, ptr_t);
+        var acc: ?ir.function.Value = null;
+        for (0..4) |i| {
+            const p = if (i == 0) base else try byte_fn.appendInst(b, ptr_t, .{ .arith_imm = .{ .op = .add, .lhs = base, .imm = @intCast(i) } });
+            const v = try byte_fn.appendInst(b, i8_t, .{ .load = .{ .ptr = p } });
+            const w = try byte_fn.appendInst(b, i32_t, .{ .convert = .{ .value = v } });
+            acc = if (acc) |a| try byte_fn.appendInst(b, i32_t, .{ .arith = .{ .op = .add, .lhs = a, .rhs = w } }) else w;
+        }
+        byte_fn.setTerminator(b, .{ .ret = acc.? });
+    }
+
+    var half_fn = Function.init(allocator);
+    defer half_fn.deinit();
+    {
+        const i16_t = try half_fn.types.intern(i16_kind);
+        const i32_t = try half_fn.types.intern(i32_kind);
+        const ptr_t = try half_fn.types.intern(.ptr);
+        const b = try half_fn.appendBlock();
+        const base = try half_fn.appendBlockParam(b, ptr_t);
+        var acc: ?ir.function.Value = null;
+        for (0..4) |i| {
+            const p = if (i == 0) base else try half_fn.appendInst(b, ptr_t, .{ .arith_imm = .{ .op = .add, .lhs = base, .imm = @intCast(i * 2) } });
+            const v = try half_fn.appendInst(b, i16_t, .{ .load = .{ .ptr = p } });
+            const w = try half_fn.appendInst(b, i32_t, .{ .convert = .{ .value = v } });
+            acc = if (acc) |a| try half_fn.appendInst(b, i32_t, .{ .arith = .{ .op = .add, .lhs = a, .rhs = w } }) else w;
+        }
+        half_fn.setTerminator(b, .{ .ret = acc.? });
+    }
+
+    const byte_code = try isel.selectFunction(allocator, &byte_fn);
+    defer allocator.free(byte_code);
+    var byte_buf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(byte_code));
+    defer byte_buf.deinit();
+    const ByteFn = *const fn (*const [4]i8) callconv(.c) i32;
+    const bf: ByteFn = @ptrCast(byte_buf.memory.ptr);
+    const byte_cases = [_][4]i8{ .{ 1, 2, 3, 4 }, .{ -1, -2, -3, -4 }, .{ 127, -128, 5, -5 } };
+    for (byte_cases) |arr| {
+        const expected: i32 = @as(i32, arr[0]) + arr[1] + arr[2] + arr[3];
+        try std.testing.expectEqual(expected, bf(&arr));
+    }
+
+    const half_code = try isel.selectFunction(allocator, &half_fn);
+    defer allocator.free(half_code);
+    var half_buf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(half_code));
+    defer half_buf.deinit();
+    const HalfFn = *const fn (*const [4]i16) callconv(.c) i32;
+    const hf: HalfFn = @ptrCast(half_buf.memory.ptr);
+    const half_cases = [_][4]i16{ .{ 10, 20, 30, 40 }, .{ -100, 200, -300, 400 }, .{ 32767, -32768, 1, -1 } };
+    for (half_cases) |arr| {
+        const expected: i32 = @as(i32, arr[0]) + arr[1] + arr[2] + arr[3];
+        try std.testing.expectEqual(expected, hf(&arr));
+    }
+}
+
+test "addrfold: fp32 and fp64 constant-index loads fold" {
+    // Read a float field at a constant byte offset: an f32 at +4 (folds to `ldr s,[base,#4]`) and an
+    // f64 at +8 (folds to `ldr d,[base,#8]`). Returns the field, so a wrong displacement mismatches.
+    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var f32_fn = Function.init(allocator);
+    defer f32_fn.deinit();
+    {
+        const f32_t = try f32_fn.types.intern(.{ .float = .f32 });
+        const ptr_t = try f32_fn.types.intern(.ptr);
+        const b = try f32_fn.appendBlock();
+        const base = try f32_fn.appendBlockParam(b, ptr_t);
+        const p = try f32_fn.appendInst(b, ptr_t, .{ .arith_imm = .{ .op = .add, .lhs = base, .imm = 4 } });
+        const v = try f32_fn.appendInst(b, f32_t, .{ .load = .{ .ptr = p } });
+        f32_fn.setTerminator(b, .{ .ret = v });
+    }
+
+    var f64_fn = Function.init(allocator);
+    defer f64_fn.deinit();
+    {
+        const f64_t = try f64_fn.types.intern(.{ .float = .f64 });
+        const ptr_t = try f64_fn.types.intern(.ptr);
+        const b = try f64_fn.appendBlock();
+        const base = try f64_fn.appendBlockParam(b, ptr_t);
+        const p = try f64_fn.appendInst(b, ptr_t, .{ .arith_imm = .{ .op = .add, .lhs = base, .imm = 8 } });
+        const v = try f64_fn.appendInst(b, f64_t, .{ .load = .{ .ptr = p } });
+        f64_fn.setTerminator(b, .{ .ret = v });
+    }
+
+    const f32_code = try isel.selectFunction(allocator, &f32_fn);
+    defer allocator.free(f32_code);
+    var f32_buf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(f32_code));
+    defer f32_buf.deinit();
+    const F32Fn = *const fn (*const [2]f32) callconv(.c) f32;
+    const ff: F32Fn = @ptrCast(f32_buf.memory.ptr);
+    const f32_cases = [_][2]f32{ .{ 1.5, -2.25 }, .{ 0.0, 3.14 }, .{ -7.0, 42.0 } };
+    for (f32_cases) |arr| try std.testing.expectEqual(arr[1], ff(&arr));
+
+    const f64_code = try isel.selectFunction(allocator, &f64_fn);
+    defer allocator.free(f64_code);
+    var f64_buf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(f64_code));
+    defer f64_buf.deinit();
+    const F64Fn = *const fn (*const [2]f64) callconv(.c) f64;
+    const df: F64Fn = @ptrCast(f64_buf.memory.ptr);
+    const f64_cases = [_][2]f64{ .{ 1.5, -2.25 }, .{ 0.0, 3.141592653589793 }, .{ -7.0, 42.0 } };
+    for (f64_cases) |arr| try std.testing.expectEqual(arr[1], df(&arr));
+}
+
+test "addrfold: a CROSS-BLOCK folded load computes correctly" {
+    // p = base + 16 is computed in the ENTRY block; a conditional branch reaches then_b, which under
+    // register pressure builds 20 simultaneously-live values BEFORE loading [p] and reducing them.
+    // The load folds to `[base,#16]`, so the reroute must attribute its pointer use to `base` in the
+    // SUCCESSOR block: only then does base stay live across then_b (spilled/kept off the reused pool)
+    // instead of being treated as dead after entry, whose register the 20 values would then steal,
+    // reading a garbage address. A missing cross-block reroute miscompiles here.
+    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const pressure = 20;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const ptr_t = try func.types.intern(.ptr);
+    const entry = try func.appendBlock();
+    const then_b = try func.appendBlock();
+    const else_b = try func.appendBlock();
+    const base = try func.appendBlockParam(entry, ptr_t);
+    const cond = try func.appendBlockParam(entry, t);
+    const p = try func.appendInst(entry, ptr_t, .{ .arith_imm = .{ .op = .add, .lhs = base, .imm = 16 } });
+    const zero = try func.appendInst(entry, t, .{ .iconst = 0 });
+    const c = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .gt, .lhs = cond, .rhs = zero } });
+    try func.appendIf(entry, c, .{ .target = then_b, .args = &.{} }, .{ .target = else_b, .args = &.{} });
+    // then_b: build the pressure BEFORE the folded load so a stolen base register is read by the load.
+    var vals: [pressure]ir.function.Value = undefined;
+    for (0..pressure) |i| vals[i] = try func.appendInst(then_b, t, .{ .arith_imm = .{ .op = .add, .lhs = cond, .imm = @intCast(i + 1) } });
+    const w = try func.appendInst(then_b, t, .{ .load = .{ .ptr = p } }); // folds to [base, #16]
+    var acc = w;
+    for (0..pressure) |i| acc = try func.appendInst(then_b, t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = vals[i] } });
+    func.setTerminator(then_b, .{ .ret = acc });
+    func.setTerminator(else_b, .{ .ret = cond });
+
+    const code = try isel.selectFunction(allocator, &func);
+    defer allocator.free(code);
+    var buf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(code));
+    defer buf.deinit();
+    const Fn = *const fn (*const [8]i32, i32) callconv(.c) i32;
+    const f: Fn = @ptrCast(buf.memory.ptr);
+    var arr = [8]i32{ 10, 20, 30, 40, 50, 60, 70, 80 }; // arr[4] sits at byte offset 16
+    const conds = [_]i32{ 1, 0, -1, 5, 100, -7 };
+    for (conds) |cv| {
+        // Perturb arr[4] per case so a stale (wrong) base address could not accidentally match.
+        arr[4] = 50 +% cv;
+        var expected: i32 = undefined;
+        if (cv > 0) {
+            expected = arr[4];
+            var k: i32 = 1;
+            while (k <= pressure) : (k += 1) expected +%= cv +% k;
+        } else {
+            expected = cv;
+        }
+        try std.testing.expectEqual(expected, f(&arr, cv));
+    }
+}
+
+test "addrfold: a loop-invariant base folded-loaded in the header survives the body across the back-edge" {
+    // base is loop-invariant (from entry) and folded-loaded in the LOOP HEADER (`w = [base+4]`), then
+    // the body builds 20 live values before jumping back. This specifically exercises the SECOND
+    // liveness reroute (markUsedBitset, feeding extendLiveRanges' backward dataflow): only if the
+    // header's folded load attributes its pointer use to `base` does base stay live across the body
+    // and the back-edge. Miss that reroute and the body reuses base's register, so the NEXT
+    // iteration's header load reads a garbage address and the accumulation diverges.
+    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const pressure = 20;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const ptr_t = try func.types.intern(.ptr);
+    const entry = try func.appendBlock();
+    const loop = try func.appendBlock();
+    const body = try func.appendBlock();
+    const done = try func.appendBlock();
+    const base = try func.appendBlockParam(entry, ptr_t);
+    const n = try func.appendBlockParam(entry, t);
+    // Compute the folded address in ENTRY. `p` is a dead add (its only use is the header load), so it
+    // claims no register. base's ONLY in-loop liveness therefore flows through the header load's
+    // baseOf reroute, which is precisely what markUsedBitset/extendLiveRanges must carry across the
+    // back-edge. (If p lived in the loop, its own operand scan would mark base and mask the reroute.)
+    const p = try func.appendInst(entry, ptr_t, .{ .arith_imm = .{ .op = .add, .lhs = base, .imm = 4 } });
+    const iv0 = try func.appendInst(entry, t, .{ .iconst = 0 });
+    const acc0 = try func.appendInst(entry, t, .{ .iconst = 0 });
+    try func.setJump(entry, loop, &.{ iv0, acc0 });
+    const i = try func.appendBlockParam(loop, t);
+    const acc = try func.appendBlockParam(loop, t);
+    const w = try func.appendInst(loop, t, .{ .load = .{ .ptr = p } }); // folds to [base, #4]
+    const cmp = try func.appendInst(loop, bool_t, .{ .icmp = .{ .op = .lt, .lhs = i, .rhs = n } });
+    try func.appendIf(loop, cmp, .{ .target = body, .args = &.{ i, acc, w } }, .{ .target = done, .args = &.{acc} });
+    const bi = try func.appendBlockParam(body, t);
+    const bacc = try func.appendBlockParam(body, t);
+    const bw = try func.appendBlockParam(body, t);
+    var s = bw;
+    for (0..pressure) |k| {
+        const vk = try func.appendInst(body, t, .{ .arith_imm = .{ .op = .add, .lhs = bi, .imm = @intCast(k + 1) } });
+        s = try func.appendInst(body, t, .{ .arith = .{ .op = .add, .lhs = s, .rhs = vk } });
+    }
+    const nacc = try func.appendInst(body, t, .{ .arith = .{ .op = .add, .lhs = bacc, .rhs = s } });
+    const ni = try func.appendArithImm(body, t, .add, bi, 1);
+    try func.setJump(body, loop, &.{ ni, nacc });
+    const racc = try func.appendBlockParam(done, t);
+    func.setTerminator(done, .{ .ret = racc });
+
+    const code = try isel.selectFunction(allocator, &func);
+    defer allocator.free(code);
+    var buf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(code));
+    defer buf.deinit();
+    const Fn = *const fn (*const [8]i32, i32) callconv(.c) i32;
+    const f: Fn = @ptrCast(buf.memory.ptr);
+    var arr = [8]i32{ 10, 20, 30, 40, 50, 60, 70, 80 }; // arr[1] sits at byte offset 4
+    const trips = [_]i32{ 0, 1, 2, 4, 7 };
+    for (trips) |nn| {
+        arr[1] = 20 +% nn; // vary the folded-load target per case
+        var expected: i32 = 0;
+        var it: i32 = 0;
+        while (it < nn) : (it += 1) {
+            var si: i32 = arr[1];
+            var k: i32 = 1;
+            while (k <= pressure) : (k += 1) si +%= it +% k;
+            expected +%= si;
+        }
+        try std.testing.expectEqual(expected, f(&arr, nn));
+    }
+}
+
+test "addrfold: a base used by a folded load AND another consumer keeps the add and still computes" {
+    // p = base + 8 feeds BOTH a folded load (`[base,#8]`) AND a second address-add p2 = p + 8. The
+    // load folds, but p has a surviving non-mem use (p2), so p is NOT dead: its add stays materialized
+    // (`add x,base,#8`). p2 IS dead (its only use is the second folded load `[p,#8]`). Returns
+    // arr[2] + arr[4]. Asserts both the not-dead add survives and the value is correct.
+    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr_t = try func.types.intern(.ptr);
+    const b = try func.appendBlock();
+    const base = try func.appendBlockParam(b, ptr_t);
+    const p = try func.appendInst(b, ptr_t, .{ .arith_imm = .{ .op = .add, .lhs = base, .imm = 8 } });
+    const w1 = try func.appendInst(b, t, .{ .load = .{ .ptr = p } }); // folds to [base, #8] -> arr[2]
+    const p2 = try func.appendInst(b, ptr_t, .{ .arith_imm = .{ .op = .add, .lhs = p, .imm = 8 } });
+    const w2 = try func.appendInst(b, t, .{ .load = .{ .ptr = p2 } }); // folds to [p, #8] -> arr[4]
+    const sum = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = w1, .rhs = w2 } });
+    func.setTerminator(b, .{ .ret = sum });
+
+    // p is NOT dead (p2 uses it beyond the folded load), so its address-add stays materialized. Two
+    // register-form adds survive: p's `base + 8` and the final `w1 + w2`. Were p wrongly dropped as
+    // dead, w2 would load through an uncomputed base, caught by the value sweep below. (Test 1, where
+    // every add is dead, folds to zero adds, so this count genuinely separates the two cases.)
+    try std.testing.expect(try countAdds(allocator, &func) >= 2);
+
+    const code = try isel.selectFunction(allocator, &func);
+    defer allocator.free(code);
+    var buf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(code));
+    defer buf.deinit();
+    const Fn = *const fn (*const [8]i32) callconv(.c) i32;
+    const f: Fn = @ptrCast(buf.memory.ptr);
+    const cases = [_][8]i32{
+        .{ 1, 2, 3, 4, 5, 6, 7, 8 },
+        .{ -10, -20, -30, -40, -50, -60, -70, -80 },
+        .{ 0, 0, 100, 0, 200, 0, 0, 0 },
+    };
+    for (cases) |arr| {
+        const expected = arr[2] +% arr[4];
+        try std.testing.expectEqual(expected, f(&arr));
     }
 }

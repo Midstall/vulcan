@@ -12,6 +12,7 @@ const loops = @import("vulcan-opt").loops;
 const dominators = @import("vulcan-opt").dominators;
 const mm = @import("vulcan-opt").microarch;
 const wimmer = @import("../wimmer.zig");
+const addrfold = @import("../addrfold.zig");
 
 const Function = ir.function.Function;
 const Value = ir.function.Value;
@@ -379,6 +380,44 @@ fn isFloatTempReg(reg: FReg) bool {
         if (t == reg) return true;
     }
     return false;
+}
+
+/// A shared no-fold analysis for the paths that must stay fold-agnostic (the shared Wimmer
+/// differential compile). Its `baseOf`/`offOf`/`isDeadAdd` behave as if nothing folded, so those
+/// paths emit byte-identical code to before address folding existed.
+const empty_fold: addrfold.Analysis = addrfold.Analysis.empty;
+
+/// The riscv64 fold predicate for `addrfold.analyze`: fold a load/store whose pointer is an
+/// `arith_imm.add(base, imm)` when `imm` fits the signed 12-bit displacement of the base+offset
+/// load/store forms (`ld`/`lw`/`flw`/`fld`/... and their stores), i.e. imm in [-2048, 2047]. Returns
+/// the byte offset (equal to the add's imm) when in range, else null. `analyze` calls this only after
+/// confirming the pointer is an `arith_imm.add`, so the unwraps below are guaranteed, still asserted.
+///
+/// NEVER folds a vector load/store, RVV OR VPU. RVV `vle32`/`vse32` have NO immediate operand, so a
+/// folded displacement would be impossible to encode; refusing the VPU `flw.ps`/`fsw.ps` too (they do
+/// carry an imm12) keeps the RVV constraint impossible to violate and costs only a marginal, here-
+/// unexecuted VPU win. So only SCALAR int and SCALAR float ever fold.
+fn riscv64FoldOffset(_: void, func: *const Function, mem_inst: ir.function.Inst) ?i64 {
+    const val = switch (func.opcode(mem_inst)) {
+        .load => func.instResult(mem_inst).?, // the loaded value decides the access class
+        .store => |st| st.value, // the stored value decides the access class
+        else => unreachable, // analyze only hands foldOffset a load or store
+    };
+    // Refuse every vector load/store unconditionally (see the doc comment).
+    if (isVector(func, func.valueType(val))) return null;
+    const ptr = switch (func.opcode(mem_inst)) {
+        .load => |l| l.ptr,
+        .store => |st| st.ptr,
+        else => unreachable,
+    };
+    const def = func.definingInst(ptr).?; // analyze confirmed ptr is defined by an arith_imm.add
+    const add = switch (func.opcode(def)) {
+        .arith_imm => |a| a,
+        else => unreachable,
+    };
+    std.debug.assert(add.op == .add);
+    if (add.imm < -2048 or add.imm > 2047) return null;
+    return add.imm;
 }
 
 fn isFloatTempRegVpu(reg: FReg) bool {
@@ -1477,7 +1516,7 @@ fn mark(allocator: std.mem.Allocator, last_use: *std.AutoHashMapUnmanaged(Value,
 }
 
 /// Record the position `pos` as a use of each of an instruction's operands.
-fn recordUses(allocator: std.mem.Allocator, func: *const Function, inst: ir.function.Inst, pos: usize, last_use: *std.AutoHashMapUnmanaged(Value, usize)) std.mem.Allocator.Error!void {
+fn recordUses(allocator: std.mem.Allocator, func: *const Function, inst: ir.function.Inst, pos: usize, last_use: *std.AutoHashMapUnmanaged(Value, usize), fold: *const addrfold.Analysis) std.mem.Allocator.Error!void {
     switch (func.opcode(inst)) {
         .iconst, .fconst, .alloca, .global_addr => {},
         .arith => |a| {
@@ -1494,10 +1533,14 @@ fn recordUses(allocator: std.mem.Allocator, func: *const Function, inst: ir.func
             try mark(allocator, last_use, s.then, pos);
             try mark(allocator, last_use, s.@"else", pos);
         },
-        .load => |l| try mark(allocator, last_use, l.ptr, pos),
+        // A folded load/store addresses `off(base)`, so its pointer USE is attributed to the fold
+        // base (the add's lhs), not the raw `ptr` operand (the now-dead add's result). `baseOf` is
+        // the raw ptr when nothing folds, so the non-folding case is byte-identical. This reroute
+        // is what keeps `base` live all the way to the mem op, cross-block included.
+        .load => try mark(allocator, last_use, fold.baseOf(func, inst), pos),
         .store => |st| {
             try mark(allocator, last_use, st.value, pos);
-            try mark(allocator, last_use, st.ptr, pos);
+            try mark(allocator, last_use, fold.baseOf(func, inst), pos);
         },
         .prefetch => |pf| try mark(allocator, last_use, pf.ptr, pos),
         .dot => |d| {
@@ -1538,7 +1581,7 @@ fn recordTermUses(allocator: std.mem.Allocator, func: *const Function, block: Bl
 /// recording every use position (not just the last one) so the eviction path can ask, at any point,
 /// where a value is next used. Because the numbering loop calls this with strictly increasing `pos`,
 /// each list stays ascending, so `nextUseAfter` can binary-search it.
-fn recordUsePositions(allocator: std.mem.Allocator, func: *const Function, inst: ir.function.Inst, pos: usize, use_lists: []std.ArrayList(usize)) std.mem.Allocator.Error!void {
+fn recordUsePositions(allocator: std.mem.Allocator, func: *const Function, inst: ir.function.Inst, pos: usize, use_lists: []std.ArrayList(usize), fold: *const addrfold.Analysis) std.mem.Allocator.Error!void {
     switch (func.opcode(inst)) {
         .iconst, .fconst, .alloca, .global_addr => {},
         .arith => |a| {
@@ -1555,10 +1598,12 @@ fn recordUsePositions(allocator: std.mem.Allocator, func: *const Function, inst:
             try appendUse(allocator, use_lists, s.then, pos);
             try appendUse(allocator, use_lists, s.@"else", pos);
         },
-        .load => |l| try appendUse(allocator, use_lists, l.ptr, pos),
+        // Same fold reroute as `recordUses`: the pointer use is attributed to the fold base so the
+        // eviction path sees the base's next use at the mem op (not the dead add's).
+        .load => try appendUse(allocator, use_lists, fold.baseOf(func, inst), pos),
         .store => |st| {
             try appendUse(allocator, use_lists, st.value, pos);
-            try appendUse(allocator, use_lists, st.ptr, pos);
+            try appendUse(allocator, use_lists, fold.baseOf(func, inst), pos);
         },
         .prefetch => |pf| try appendUse(allocator, use_lists, pf.ptr, pos),
         .dot => |d| {
@@ -1609,7 +1654,7 @@ fn markIntraUse(def_block: []const usize, is_intra: []bool, v: Value, bi: usize,
 
 /// The `is_intra` analogue of `recordUses`: walk an instruction's operands and disqualify any value
 /// used outside its def block or passed as an edge argument (an `if`'s successor block arguments).
-fn markIntraUses(func: *const Function, inst: ir.function.Inst, bi: usize, def_block: []const usize, is_intra: []bool) void {
+fn markIntraUses(func: *const Function, inst: ir.function.Inst, bi: usize, def_block: []const usize, is_intra: []bool, fold: *const addrfold.Analysis) void {
     switch (func.opcode(inst)) {
         .iconst, .fconst, .alloca, .global_addr => {},
         .arith => |a| {
@@ -1626,10 +1671,12 @@ fn markIntraUses(func: *const Function, inst: ir.function.Inst, bi: usize, def_b
             markIntraUse(def_block, is_intra, s.then, bi, false);
             markIntraUse(def_block, is_intra, s.@"else", bi, false);
         },
-        .load => |l| markIntraUse(def_block, is_intra, l.ptr, bi, false),
+        // Same fold reroute: attribute the pointer use to the fold base. A base used cross-block by a
+        // folded mem op is thereby correctly disqualified from intra-block splitting.
+        .load => markIntraUse(def_block, is_intra, fold.baseOf(func, inst), bi, false),
         .store => |st| {
             markIntraUse(def_block, is_intra, st.value, bi, false);
-            markIntraUse(def_block, is_intra, st.ptr, bi, false);
+            markIntraUse(def_block, is_intra, fold.baseOf(func, inst), bi, false);
         },
         .prefetch => |pf| markIntraUse(def_block, is_intra, pf.ptr, bi, false),
         .dot => |d| {
@@ -1911,7 +1958,7 @@ fn setUsed(row: []bool, v: Value) void {
 /// Mark every value an instruction READS into `row`, a per-block "used" bitset for the liveness
 /// fixpoint in `extendLiveRanges`. The mirror of `recordUses`, but recording a bitset instead of
 /// last-use positions (so the two never disagree about what an instruction reads).
-fn markUsedBitset(func: *const Function, inst: ir.function.Inst, row: []bool) void {
+fn markUsedBitset(func: *const Function, inst: ir.function.Inst, row: []bool, fold: *const addrfold.Analysis) void {
     switch (func.opcode(inst)) {
         .iconst, .fconst, .alloca, .global_addr => {},
         .arith => |a| {
@@ -1928,10 +1975,14 @@ fn markUsedBitset(func: *const Function, inst: ir.function.Inst, row: []bool) vo
             setUsed(row, s.then);
             setUsed(row, s.@"else");
         },
-        .load => |l| setUsed(row, l.ptr),
+        // Same fold reroute, in the backward liveness fixpoint (`extendLiveRanges`): a folded mem op
+        // marks the fold base used in its block, so a base whose only in-block use is a folded load
+        // is correctly carried live across a back-edge. Missing this reroute silently miscompiles a
+        // loop-invariant folded base.
+        .load => setUsed(row, fold.baseOf(func, inst)),
         .store => |st| {
             setUsed(row, st.value);
-            setUsed(row, st.ptr);
+            setUsed(row, fold.baseOf(func, inst));
         },
         .prefetch => |pf| setUsed(row, pf.ptr),
         .dot => |d| {
@@ -1989,6 +2040,7 @@ fn extendLiveRanges(
     last_use: *std.AutoHashMapUnmanaged(Value, usize),
     block_end: []const usize,
     reachable: []const bool,
+    fold: *const addrfold.Analysis,
 ) std.mem.Allocator.Error!void {
     const nblocks = func.blockCount();
     const nval = func.valueCount();
@@ -2016,7 +2068,7 @@ fn extendLiveRanges(
         const row = used[bi * nval ..][0..nval];
         for (func.blockParams(block)) |p| defined[bi * nval + @intFromEnum(p)] = true;
         for (func.blockInsts(block)) |inst| {
-            markUsedBitset(func, inst, row);
+            markUsedBitset(func, inst, row, fold);
             if (func.instResult(inst)) |r| defined[bi * nval + @intFromEnum(r)] = true;
             if (func.opcode(inst) == .@"if") {
                 const cf = func.opcode(inst).@"if";
@@ -3195,7 +3247,12 @@ pub fn compileFunctionWimmerRiscv(allocator: std.mem.Allocator, func: *Function,
     if (edgeMoveOnIfEdge(func, &alloc)) return error.Unsupported;
 
     const caps: ModelCaps = .{ .vpu = vpu };
-    return emitFromAllocation(allocator, func, caps, false, doms.reachable, &alloc);
+    // The Wimmer path does NOT fold addresses: the shared `wimmer.zig` liveness is fold-unaware, so
+    // feeding a real analysis would desync its intervals from emission. Pass the no-fold analysis so
+    // `baseOf`/`offOf`/`isDeadAdd` behave exactly as before folding existed (byte-identical). Note
+    // `compileFunctionWimmerRiscv` never calls `allocateRegisters` (it uses the shared allocator via
+    // `wimmer.allocate` + `translateAllocation`), so no fold reaches allocation here either.
+    return emitFromAllocation(allocator, func, caps, false, doms.reachable, &alloc, &empty_fold);
 }
 
 /// Assign a register to every value via a liveness-based linear scan over the
@@ -3208,7 +3265,7 @@ pub fn compileFunctionWimmerRiscv(allocator: std.mem.Allocator, func: *Function,
 /// left by an optimization) cannot inflate register pressure. When every block is reachable (the
 /// common case, and every case before reachability-aware isel existed) every guard below is a no-op
 /// and the linear position numbering is exactly what it was, so allocation is byte-identical.
-fn allocateRegisters(allocator: std.mem.Allocator, func: *const Function, vpu: bool, uses_f16: bool, reachable: []const bool) Error!Allocation {
+fn allocateRegisters(allocator: std.mem.Allocator, func: *const Function, vpu: bool, uses_f16: bool, reachable: []const bool, fold: *const addrfold.Analysis) Error!Allocation {
     var alloc: Allocation = .{
         .int = .empty,
         .float = .empty,
@@ -3304,9 +3361,9 @@ fn allocateRegisters(allocator: std.mem.Allocator, func: *const Function, vpu: b
         try is_call.append(allocator, false);
         pos += 1;
         for (func.blockInsts(block)) |inst| {
-            try recordUses(allocator, func, inst, pos, &last_use);
-            try recordUsePositions(allocator, func, inst, pos, use_lists);
-            markIntraUses(func, inst, bi, def_block, is_intra);
+            try recordUses(allocator, func, inst, pos, &last_use, fold);
+            try recordUsePositions(allocator, func, inst, pos, use_lists, fold);
+            markIntraUses(func, inst, bi, def_block, is_intra, fold);
             if (func.instResult(inst)) |r| {
                 def_pos_local[@intFromEnum(r)] = pos; // an instruction result is defined at its position
                 def_block[@intFromEnum(r)] = bi;
@@ -3330,7 +3387,7 @@ fn allocateRegisters(allocator: std.mem.Allocator, func: *const Function, vpu: b
     // where the value is live-out, so a loop-carried value keeps its register across the whole body.
     // It ONLY ever raises a last_use, so for forward-dominated code (where the forward scan already
     // holds the maximal use) it is a no-op and allocation stays byte-identical. See the function.
-    try extendLiveRanges(allocator, func, &last_use, block_end, reachable);
+    try extendLiveRanges(allocator, func, &last_use, block_end, reachable, fold);
 
     // call_prefix[p] = number of call positions strictly before p.
     const call_prefix = try allocator.alloc(usize, total + 1);
@@ -3504,6 +3561,17 @@ fn allocateRegisters(allocator: std.mem.Allocator, func: *const Function, vpu: b
         try secondChance(allocator, &alloc, use_lists, &last_use, &int_free, call_prefix, pos);
         pos += 1;
         for (func.blockInsts(block)) |inst| {
+            // A folded dead address-add claims NO register: every use of its result was rerouted to the
+            // fold base in the four liveness scans, so it has no real interval. Skipping the assignment
+            // (it still dies at its own def position, so `freeDying` below is a no-op for it) keeps a
+            // dead add from drawing a register or, under pressure, evicting a live value for a range it
+            // never really has. `pos` still advances, in lockstep with emission's dead-add skip.
+            if (fold.isDeadAdd(inst)) {
+                try freeDying(allocator, func, dying[pos].items, &alloc, &int_free, &float_free, &vector_free, &vpu_vector_free, vpu);
+                try secondChance(allocator, &alloc, use_lists, &last_use, &int_free, call_prefix, pos);
+                pos += 1;
+                continue;
+            }
             if (func.instResult(inst)) |r| {
                 const cross = crossesCall(call_prefix, pos, last_use.get(r).?);
                 if (isVector(func, func.valueType(r))) {
@@ -3631,7 +3699,9 @@ pub const ModelCaps = struct {
 pub fn splitCountForTest(allocator: std.mem.Allocator, func: *const Function) Error!usize {
     var doms = try dominators.compute(allocator, func);
     defer doms.deinit(allocator);
-    var alloc = try allocateRegisters(allocator, func, false, false, doms.reachable);
+    var fold = try addrfold.analyze(allocator, func, {}, riscv64FoldOffset);
+    defer fold.deinit(allocator);
+    var alloc = try allocateRegisters(allocator, func, false, false, doms.reachable, &fold);
     defer alloc.deinit(allocator);
     return alloc.segments.count();
 }
@@ -3642,7 +3712,9 @@ pub fn splitCountForTest(allocator: std.mem.Allocator, func: *const Function) Er
 pub fn debugReHomeCount(allocator: std.mem.Allocator, func: *const Function) Error!u32 {
     var doms = try dominators.compute(allocator, func);
     defer doms.deinit(allocator);
-    var alloc = try allocateRegisters(allocator, func, false, false, doms.reachable);
+    var fold = try addrfold.analyze(allocator, func, {}, riscv64FoldOffset);
+    defer fold.deinit(allocator);
+    var alloc = try allocateRegisters(allocator, func, false, false, doms.reachable, &fold);
     defer alloc.deinit(allocator);
     var count: u32 = 0;
     var it = alloc.segments.valueIterator();
@@ -3664,7 +3736,9 @@ pub fn debugReHomeCount(allocator: std.mem.Allocator, func: *const Function) Err
 pub fn debugDeclineCount(allocator: std.mem.Allocator, func: *const Function) Error!u32 {
     var doms = try dominators.compute(allocator, func);
     defer doms.deinit(allocator);
-    var alloc = try allocateRegisters(allocator, func, false, false, doms.reachable);
+    var fold = try addrfold.analyze(allocator, func, {}, riscv64FoldOffset);
+    defer fold.deinit(allocator);
+    var alloc = try allocateRegisters(allocator, func, false, false, doms.reachable, &fold);
     defer alloc.deinit(allocator);
     return alloc.rehome_declines;
 }
@@ -3796,10 +3870,19 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
     defer doms.deinit(allocator);
     const reachable = doms.reachable;
 
-    var alloc = try allocateRegisters(allocator, func, caps.vpu, reserve_f16_scratch, reachable);
+    // Address-mode fold analysis: a load/store whose pointer is a foldable `arith_imm.add(base, imm)`
+    // addresses `imm(base)` directly, and the now-dead address-add is dropped. Threaded through
+    // allocation (liveness attributes the pointer use to the base, the dead add claims no register)
+    // and emission (the base+offset form is emitted, the dead add is skipped). A function with nothing
+    // foldable yields an empty analysis, keeping its output byte-identical. riscv64 has no load-pair,
+    // so the win is add-elision plus a folded displacement (no ldp/stp).
+    var fold = try addrfold.analyze(allocator, func, {}, riscv64FoldOffset);
+    defer fold.deinit(allocator);
+
+    var alloc = try allocateRegisters(allocator, func, caps.vpu, reserve_f16_scratch, reachable, &fold);
     defer alloc.deinit(allocator);
 
-    return emitFromAllocation(allocator, func, caps, uses_f16, reachable, &alloc);
+    return emitFromAllocation(allocator, func, caps, uses_f16, reachable, &alloc, &fold);
 }
 
 /// Emit machine code from a finished `Allocation` (the second half of `compileFunction`, split out
@@ -3811,7 +3894,7 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
 /// `uses_f16` and `reachable` are what `compileFunction` computed. `alloc` is consumed read-only
 /// except for the defensive sort of its action list. Byte-identical for every existing caller (the
 /// full riscv64 suite proves it).
-fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps: ModelCaps, uses_f16: bool, reachable: []const bool, alloc: *Allocation) Error!Compiled {
+fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps: ModelCaps, uses_f16: bool, reachable: []const bool, alloc: *Allocation, fold: *const addrfold.Analysis) Error!Compiled {
     const fetch_align = caps.fetch_align;
     const vpu = caps.vpu;
     const zicbop = caps.zicbop;
@@ -4405,6 +4488,10 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     }
                 },
                 .arith_imm => |a| {
+                    // A folded address-add is dead: every use of its result was rerouted to the fold
+                    // base, so it claims no register and emits nothing (mirrors the mul/icmp fusion
+                    // skips above). `inst_pos` still advanced from `inst_idx`, so numbering holds.
+                    if (fold.isDeadAdd(inst)) continue;
                     if (isFloat(func, func.valueType(a.lhs))) return error.Unsupported;
                     const result = func.instResult(inst).?;
                     const rs1 = try reloadInt(allocator, &code, alloc, spill_base, a.lhs, inst_pos, spill_scratch1);
@@ -4682,21 +4769,28 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                         }
                     }
                 },
-                .load => |l| {
+                .load => {
                     const result = func.instResult(inst).?;
-                    // A spilled base (a spilled int block param used as a load address) has no reload
-                    // path here yet, so reject cleanly rather than panic on the unwrap. Resident in
-                    // every currently-compiling case, so this is byte-identical there.
-                    const base = switch (intLocationAt(alloc, l.ptr, inst_pos)) {
+                    // A folded load addresses `disp(base)` directly: `baseOf` yields the fold base (the
+                    // add's lhs) and `offOf` the displacement; both are the raw ptr and 0 when unfolded,
+                    // so the non-folding case is byte-identical. foldOffset never folds a vector, so a
+                    // vector load's `offOf` is 0 and its `vle32`/`flw.ps` addressing stays base-only.
+                    const base_val = fold.baseOf(func, inst);
+                    // A spilled base (a spilled int value used as a load address) has no reload path
+                    // here yet, so reject cleanly rather than panic on the unwrap. Resident in every
+                    // currently-compiling case, so this is byte-identical there.
+                    const base = switch (intLocationAt(alloc, base_val, inst_pos)) {
                         .reg => |r| r,
                         .slot => return error.Unsupported,
                     };
+                    const disp: i12 = @intCast(fold.offOf(inst)); // foldOffset guarantees the i12 range
                     if (isVector(func, func.valueType(result))) {
                         if (vpu) {
                             // `flw.ps`, like scalar `flw`, carries its own displacement, so
-                            // (unlike RVV's vle32) no separate address register is needed.
+                            // (unlike RVV's vle32) no separate address register is needed. `disp` is 0
+                            // here (vectors never fold), so the addressing is byte-identical.
                             const rd = dstVpuVector(alloc, result, inst_pos, vpu_vec_work);
-                            try code.append(allocator, encode.flw_ps(rd, base, 0));
+                            try code.append(allocator, encode.flw_ps(rd, base, disp));
                             try storeVpuVector(allocator, &code, alloc, vpu_vspill_base, result, inst_pos, rd);
                         } else {
                             const rd = dstVector(alloc, result, inst_pos, vec_work);
@@ -4708,12 +4802,12 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                         if (zfh) {
                             // In the native path, load the 2-byte IEEE half straight into the float register
                             // (`flh`, NaN-boxed), no software widen.
-                            try code.append(allocator, encode.flh(rd, base, 0));
+                            try code.append(allocator, encode.flh(rd, base, disp));
                         } else {
                             // In the software path, f16 memory is a 2-byte IEEE half, so zero-extend it with `lhu`,
                             // widen to f32 in software (exact), then move into the float register as
                             // the held-as-f32 value. `base` is disjoint from the convert scratch.
-                            try code.append(allocator, encode.lhu(scratch_reg, base, 0));
+                            try code.append(allocator, encode.lhu(scratch_reg, base, disp));
                             try emitHalfToFloat(allocator, &code, spill_scratch1, scratch_reg, fspill0, fspill1);
                             try code.append(allocator, encode.fmv_w_x(rd, spill_scratch1));
                         }
@@ -4721,7 +4815,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     } else if (isFloat(func, func.valueType(result))) {
                         const d = is64Float(func, func.valueType(result));
                         const rd = dstFloat(alloc, result, inst_pos, fspill0);
-                        try code.append(allocator, if (d) encode.fld(rd, base, 0) else encode.flw(rd, base, 0));
+                        try code.append(allocator, if (d) encode.fld(rd, base, disp) else encode.flw(rd, base, disp));
                         try storeFloat(allocator, &code, alloc, float_spill_base, result, inst_pos, d, rd);
                     } else {
                         const rd = switch (intLocationAt(alloc, result, inst_pos)) {
@@ -4730,7 +4824,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                         };
                         const ty = func.valueType(result);
                         const word = isWord(func, ty);
-                        try code.append(allocator, intLoadInsn(func, ty, rd, base, 0));
+                        try code.append(allocator, intLoadInsn(func, ty, rd, base, disp));
                         // Swap a big-endian 64-bit load to native order.
                         if (!word and endianBig(func, .{ .value = result })) {
                             try code.append(allocator, encode.rev8(rd, rd));
@@ -4740,16 +4834,21 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     }
                 },
                 .store => |st| {
+                    // A folded store addresses `disp(base)` directly (see the `.load` arm). `baseOf`/
+                    // `offOf` are the raw ptr and 0 when unfolded, and never fold a vector, so both the
+                    // non-folding case and every vector store are byte-identical.
+                    const base_val = fold.baseOf(func, inst);
                     // A spilled store address has no reload path here yet: reject cleanly rather
                     // than panic. Resident in every currently-compiling case (byte-identical there).
-                    const base = switch (intLocationAt(alloc, st.ptr, inst_pos)) {
+                    const base = switch (intLocationAt(alloc, base_val, inst_pos)) {
                         .reg => |r| r,
                         .slot => return error.Unsupported,
                     };
+                    const disp: i12 = @intCast(fold.offOf(inst)); // foldOffset guarantees the i12 range
                     if (isVector(func, func.valueType(st.value))) {
                         if (vpu) {
                             const vr = try reloadVpuVector(allocator, &code, alloc, vpu_vspill_base, st.value, inst_pos, vpu_vec_op0);
-                            try code.append(allocator, encode.fsw_ps(vr, base, 0));
+                            try code.append(allocator, encode.fsw_ps(vr, base, disp)); // disp is 0 (vectors never fold)
                         } else {
                             const vr = try reloadVector(allocator, &code, alloc, vspill_base, st.value, inst_pos, vec_op0, spill_scratch1);
                             try code.append(allocator, encode.vse32(vr, base));
@@ -4758,7 +4857,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                         const vr = try reloadFloat(allocator, &code, alloc, float_spill_base, st.value, inst_pos, false, fspill0);
                         if (zfh) {
                             // In the native path, store the native half's 2 bytes straight to memory (`fsh`).
-                            try code.append(allocator, encode.fsh(vr, base, 0));
+                            try code.append(allocator, encode.fsh(vr, base, disp));
                         } else {
                             // Software f16 store: move the held-as-f32 value into a GPR, truncate to
                             // the 2-byte IEEE half in software (exact, since the value is already a
@@ -4766,12 +4865,12 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                             // the scratch.
                             try code.append(allocator, encode.fmv_x_w(scratch_reg, vr));
                             try emitFloatToHalf(allocator, &code, spill_scratch1, scratch_reg, fspill0, fspill1);
-                            try code.append(allocator, encode.sh(spill_scratch1, base, 0));
+                            try code.append(allocator, encode.sh(spill_scratch1, base, disp));
                         }
                     } else if (isFloat(func, func.valueType(st.value))) {
                         const d = is64Float(func, func.valueType(st.value));
                         const vr = try reloadFloat(allocator, &code, alloc, float_spill_base, st.value, inst_pos, d, fspill0);
-                        try code.append(allocator, if (d) encode.fsd(vr, base, 0) else encode.fsw(vr, base, 0));
+                        try code.append(allocator, if (d) encode.fsd(vr, base, disp) else encode.fsw(vr, base, disp));
                     } else {
                         // A spilled int store value has no reload path here yet: reject cleanly
                         // rather than panic. Resident in every currently-compiling case.
@@ -4784,11 +4883,11 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                         // Reverse a big-endian 64-bit value before storing.
                         if (!word and endianBig(func, .{ .inst = inst })) {
                             try code.append(allocator, encode.rev8(scratch_reg, vr));
-                            try code.append(allocator, encode.sd(scratch_reg, base, 0));
+                            try code.append(allocator, encode.sd(scratch_reg, base, disp));
                         } else if (word and endianBig(func, .{ .inst = inst })) {
                             return error.Unsupported; // sub-word byte-swap not yet handled
                         } else {
-                            try code.append(allocator, intStoreInsn(func, ty, vr, base, 0));
+                            try code.append(allocator, intStoreInsn(func, ty, vr, base, disp));
                         }
                     }
                 },
@@ -6071,7 +6170,7 @@ test "int eviction spills the value whose next use is furthest, not the current 
     defer allocator.free(reachable);
     @memset(reachable, true);
 
-    var alloc = try allocateRegisters(allocator, &func, false, false, reachable);
+    var alloc = try allocateRegisters(allocator, &func, false, false, reachable, &empty_fold);
     defer alloc.deinit(allocator);
 
     // Belady victim: c[0] (furthest next use) gives up its register to `w`. It is tail-split (register
@@ -6905,7 +7004,7 @@ test "intLocationAt returns the whole-life register for an unsplit int value" {
     var doms = try dominators.compute(allocator, &func);
     defer doms.deinit(allocator);
 
-    var alloc = try allocateRegisters(allocator, &func, false, false, doms.reachable);
+    var alloc = try allocateRegisters(allocator, &func, false, false, doms.reachable, &empty_fold);
     defer alloc.deinit(allocator);
 
     // This tiny function spills or splits nothing: `segments` stays empty, so `intLocationAt` must

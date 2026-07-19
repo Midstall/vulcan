@@ -594,3 +594,15 @@ test "round-trips i386 flags, stack, branches" {
     try expectOne(encode.stackLoad(.eax, 16), "mov eax, dword ptr [esp + 16]");
     try expectOne(encode.stackStore(16, .ebx), "mov dword ptr [esp + 16], ebx");
 }
+
+test "round-trips i386 reg+disp32 memory encoders" {
+    try expectOne(encode.movFromMem32(.eax, .ecx, 4), "mov eax, dword ptr [ecx + 4]");
+    try expectOne(encode.movToMem32(.ecx, 8, .edx), "mov dword ptr [ecx + 8], edx");
+    try expectOne(encode.movFromMem32(.eax, .esp, 16), "mov eax, dword ptr [esp + 16]");
+    try expectOne(encode.movToMem16(.ebx, 2, .esi), "mov word ptr [ebx + 2], si");
+    try expectOne(encode.movToMem8(.ebx, 1, .eax), "mov byte ptr [ebx + 1], al");
+    try expectOne(encode.movzxByteFromMem(.eax, .ecx, 0), "movzx eax, byte ptr [ecx]");
+    try expectOne(encode.movsxByteFromMem(.edx, .ebx, -4), "movsx edx, byte ptr [ebx - 4]");
+    try expectOne(encode.movzxWordFromMem(.eax, .ecx, 0), "movzx eax, word ptr [ecx]");
+    try expectOne(encode.movsxWordFromMem(.edx, .ebx, -4), "movsx edx, word ptr [ebx - 4]");
+}

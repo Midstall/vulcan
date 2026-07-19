@@ -79,6 +79,84 @@ pub fn stackStore(disp: i32, src: Reg) Inst {
     return Inst.of(&.{ 0x89, 0x84 | (n(src) << 3), 0x24, b[0], b[1], b[2], b[3] });
 }
 
+/// A `[base + disp32]` memory access (mod=10, disp32 always explicit so any base register,
+/// including ebp, is safe). `data` is the ModRM `reg` field (dst for a load, src for a store).
+/// A base of esp (rm low bits = 100) is not directly encodable and needs the 0x24 SIB byte.
+/// `prefix` is an optional operand-size override (0x66), `opc` the one or two opcode bytes.
+fn memOp(comptime prefix: []const u8, comptime opc: []const u8, data: Reg, base: Reg, disp: i32) Inst {
+    const b = imm32(disp);
+    const modrm_byte: u8 = 0x80 | ((n(data) & 7) << 3) | (n(base) & 7);
+    const sib = (n(base) & 7) == 4; // esp base needs SIB 0x24
+    var buf: [prefix.len + opc.len + 2 + 4]u8 = undefined;
+    var i: usize = 0;
+    inline for (prefix) |p| {
+        buf[i] = p;
+        i += 1;
+    }
+    inline for (opc) |o| {
+        buf[i] = o;
+        i += 1;
+    }
+    buf[i] = modrm_byte;
+    i += 1;
+    if (sib) {
+        buf[i] = 0x24;
+        i += 1;
+    }
+    buf[i] = b[0];
+    buf[i + 1] = b[1];
+    buf[i + 2] = b[2];
+    buf[i + 3] = b[3];
+    i += 4;
+    return Inst.of(buf[0..i]);
+}
+
+/// `mov dst, [base + disp32]` (8B /r): 32-bit load.
+pub fn movFromMem32(dst: Reg, base: Reg, disp: i32) Inst {
+    return memOp(&.{}, &.{0x8B}, dst, base, disp);
+}
+
+/// `mov [base + disp32], src` (89 /r): 32-bit store.
+pub fn movToMem32(base: Reg, disp: i32, src: Reg) Inst {
+    return memOp(&.{}, &.{0x89}, src, base, disp);
+}
+
+/// `mov word ptr [base + disp32], src` (66 89 /r): 16-bit store (writes the low 16 bits).
+pub fn movToMem16(base: Reg, disp: i32, src: Reg) Inst {
+    return memOp(&.{0x66}, &.{0x89}, src, base, disp);
+}
+
+/// `mov byte ptr [base + disp32], src` (88 /r): 8-bit store (writes the low byte). The caller
+/// is responsible for `src` being a byte-addressable register (eax/ecx/edx/ebx).
+pub fn movToMem8(base: Reg, disp: i32, src: Reg) Inst {
+    return memOp(&.{}, &.{0x88}, src, base, disp);
+}
+
+/// `movzx dst, byte ptr [base + disp32]` (0F B6 /r): load a byte, zero-extend into r32.
+pub fn movzxByteFromMem(dst: Reg, base: Reg, disp: i32) Inst {
+    return memOp(&.{}, &.{ 0x0F, 0xB6 }, dst, base, disp);
+}
+
+/// `movsx dst, byte ptr [base + disp32]` (0F BE /r): load a byte, sign-extend into r32.
+pub fn movsxByteFromMem(dst: Reg, base: Reg, disp: i32) Inst {
+    return memOp(&.{}, &.{ 0x0F, 0xBE }, dst, base, disp);
+}
+
+/// `movzx dst, word ptr [base + disp32]` (0F B7 /r): load 16 bits, zero-extend into r32.
+pub fn movzxWordFromMem(dst: Reg, base: Reg, disp: i32) Inst {
+    return memOp(&.{}, &.{ 0x0F, 0xB7 }, dst, base, disp);
+}
+
+/// `movsx dst, word ptr [base + disp32]` (0F BF /r): load 16 bits, sign-extend into r32.
+pub fn movsxWordFromMem(dst: Reg, base: Reg, disp: i32) Inst {
+    return memOp(&.{}, &.{ 0x0F, 0xBF }, dst, base, disp);
+}
+
+/// `lea dst, [esp + disp32]` (8D /r): materialize a stack address (e.g. an alloca slot).
+pub fn leaFromStack(dst: Reg, disp: i32) Inst {
+    return memOp(&.{}, &.{0x8D}, dst, .esp, disp);
+}
+
 /// `add dst, src` (01 /r).
 pub fn add(dst: Reg, src: Reg) Inst {
     return aluRR(0x01, src, dst);
@@ -239,4 +317,23 @@ test "known i386 encodings" {
     try std.testing.expectEqualSlices(u8, &.{ 0x8B, 0x44, 0x24, 0x04 }, movFromStack(.eax, 4).slice()); // mov eax, [esp+4]
     try std.testing.expectEqualSlices(u8, &.{0xC3}, ret().slice());
     try std.testing.expectEqualSlices(u8, &.{ 0xCD, 0x80 }, int80().slice());
+}
+
+test "x86-32 reg+disp32 load and store encoders match known bytes" {
+    // mov eax, [ecx+4]: modrm = 0x80 | (eax<<3) | ecx = 0x80 | 0 | 1 = 0x81, no SIB (ecx isn't esp)
+    try std.testing.expectEqualSlices(u8, &.{ 0x8B, 0x81, 0x04, 0x00, 0x00, 0x00 }, movFromMem32(.eax, .ecx, 4).slice());
+    // mov [ecx+8], edx: modrm = 0x80 | (edx<<3) | ecx = 0x80 | 0x10 | 1 = 0x91
+    try std.testing.expectEqualSlices(u8, &.{ 0x89, 0x91, 0x08, 0x00, 0x00, 0x00 }, movToMem32(.ecx, 8, .edx).slice());
+    // mov eax, [esp+16]: esp base (rm=100) needs the 0x24 SIB byte, modrm = 0x80 | 0 | 4 = 0x84
+    try std.testing.expectEqualSlices(u8, &.{ 0x8B, 0x84, 0x24, 0x10, 0x00, 0x00, 0x00 }, movFromMem32(.eax, .esp, 16).slice());
+    // mov word ptr [ebx+2], si: 0x66 operand-size prefix, modrm = 0x80 | (esi<<3) | ebx = 0x80 | 0x30 | 3 = 0xB3
+    try std.testing.expectEqualSlices(u8, &.{ 0x66, 0x89, 0xB3, 0x02, 0x00, 0x00, 0x00 }, movToMem16(.ebx, 2, .esi).slice());
+    // mov byte ptr [ebx+1], al: modrm = 0x80 | (eax<<3) | ebx = 0x80 | 0 | 3 = 0x83
+    try std.testing.expectEqualSlices(u8, &.{ 0x88, 0x83, 0x01, 0x00, 0x00, 0x00 }, movToMem8(.ebx, 1, .eax).slice());
+    // movzx eax, byte ptr [ecx]: modrm = 0x80 | (eax<<3) | ecx = 0x80 | 0 | 1 = 0x81
+    try std.testing.expectEqualSlices(u8, &.{ 0x0F, 0xB6, 0x81, 0x00, 0x00, 0x00, 0x00 }, movzxByteFromMem(.eax, .ecx, 0).slice());
+    // movsx edx, word ptr [ebx-4]: modrm = 0x80 | (edx<<3) | ebx = 0x80 | 0x10 | 3 = 0x93, disp -4 as u32 LE
+    try std.testing.expectEqualSlices(u8, &.{ 0x0F, 0xBF, 0x93, 0xFC, 0xFF, 0xFF, 0xFF }, movsxWordFromMem(.edx, .ebx, -4).slice());
+    // lea eax, [esp+16]: esp base needs the SIB byte, modrm = 0x80 | (eax<<3) | esp = 0x84
+    try std.testing.expectEqualSlices(u8, &.{ 0x8D, 0x84, 0x24, 0x10, 0x00, 0x00, 0x00 }, leaFromStack(.eax, 16).slice());
 }

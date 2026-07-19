@@ -12,6 +12,8 @@
 const std = @import("std");
 const ir = @import("vulcan-ir");
 const encode = @import("encode.zig");
+const peephole = @import("peephole.zig");
+const addrfold = @import("../addrfold.zig");
 const wimmer = @import("../wimmer.zig");
 const loops = @import("vulcan-opt").loops;
 const mm = @import("vulcan-opt").microarch;
@@ -25,6 +27,58 @@ const RegMap = std.AutoHashMapUnmanaged(Value, Reg);
 pub const Error = std.mem.Allocator.Error || error{Unsupported};
 
 const sp: Reg = .zr; // register 31 is the stack pointer in load/store/frame context
+
+/// A shared no-fold analysis for the paths that must stay fold-agnostic (a Wimmer differential
+/// compile, the debug/liveness hooks): its `baseOf`/`offOf`/`isDeadAdd` behave as if nothing folded,
+/// so those paths emit byte-identical code to before address folding existed.
+const empty_fold: addrfold.Analysis = addrfold.Analysis.empty;
+
+/// The byte-scaled access granule of `v`'s memory form, matching EXACTLY the encoder bucket that
+/// `emitLoad`/`emitStore` select for it. A folded displacement must be a whole multiple of this
+/// granule (the base+offset encoders scale the immediate by it), so `aarch64FoldOffset` uses it for
+/// both the divisibility and the range check. Vector is a 16-byte Q access, an fp half a 2-byte H,
+/// fp single/double a 4/8-byte S/D, and an integer its 1/2/4/8-byte bucket.
+fn aarch64AccessScale(func: *const Function, v: Value) usize {
+    if (isVector(func, v)) return 16;
+    if (regClass(func, v) == .fpr) {
+        if (isHalf(func, v)) return 2;
+        return if (isDouble(func, v)) 8 else 4;
+    }
+    const sz = typeSize(func, func.valueType(v));
+    if (sz <= 1) return 1;
+    if (sz <= 2) return 2;
+    if (sz <= 4) return 4;
+    return 8;
+}
+
+/// The aarch64 fold predicate for `addrfold.analyze`: fold a load/store whose pointer is an
+/// `arith_imm.add(base, imm)` when `imm` fits the u12 scaled unsigned-offset addressing form for the
+/// op's access granule (imm >= 0, imm a multiple of the granule, imm / granule <= 4095). Returns the
+/// byte offset (equal to the add's imm) when in range, else null. `analyze` calls this only after
+/// confirming the pointer is an `arith_imm.add`, so the unwraps below are guaranteed, still asserted.
+fn aarch64FoldOffset(_: void, func: *const Function, mem_inst: ir.function.Inst) ?i64 {
+    const val = switch (func.opcode(mem_inst)) {
+        .load => func.instResult(mem_inst).?, // the loaded value decides the access size
+        .store => |st| st.value, // the stored value decides the access size
+        else => unreachable, // analyze only hands foldOffset a load or store
+    };
+    const ptr = switch (func.opcode(mem_inst)) {
+        .load => |l| l.ptr,
+        .store => |st| st.ptr,
+        else => unreachable,
+    };
+    const def = func.definingInst(ptr).?; // analyze confirmed ptr is defined by an arith_imm.add
+    const add = switch (func.opcode(def)) {
+        .arith_imm => |a| a,
+        else => unreachable,
+    };
+    std.debug.assert(add.op == .add);
+    const scale: i64 = @intCast(aarch64AccessScale(func, val));
+    if (add.imm < 0) return null;
+    if (@rem(add.imm, scale) != 0) return null;
+    if (@divExact(add.imm, scale) > 4095) return null;
+    return add.imm;
+}
 
 /// Emit `rd = rn -/+ amount` via the add/sub-immediate form, splitting amounts
 /// wider than the 12-bit immediate across the unshifted and `LSL #12` forms (up to
@@ -125,7 +179,7 @@ fn computeArgLocs(func: *const Function, values: []const Value, out: []ArgLoc) v
 }
 
 const Move = struct { src: Reg, dst: Reg };
-const Fixup = struct { at: usize, target: u32 };
+pub const Fixup = struct { at: usize, target: u32 };
 
 /// A relocation: the word index of a `bl` whose target is the named symbol.
 pub const Reloc = struct { offset: usize, symbol: []const u8 };
@@ -364,10 +418,18 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
     if (func.blockCount() == 0) return error.Unsupported;
     const leaf = isLeaf(func);
 
-    var alloc = try allocate(allocator, func, leaf);
+    // Address-mode fold analysis: a load/store whose pointer is a foldable `arith_imm.add(base, imm)`
+    // addresses `[base, #imm]` directly, and the now-dead address-add is dropped. Threaded through
+    // allocation (liveness attributes the pointer use to the base, the dead add claims no register)
+    // and emission (the base+offset form is emitted, the dead add is skipped). A function with nothing
+    // foldable yields an empty analysis, keeping its output byte-identical.
+    var fold = try addrfold.analyze(allocator, func, {}, aarch64FoldOffset);
+    defer fold.deinit(allocator);
+
+    var alloc = try allocate(allocator, func, leaf, &fold);
     defer alloc.deinit(allocator);
 
-    return emitFromAllocation(allocator, func, caps, &alloc);
+    return emitFromAllocation(allocator, func, caps, &alloc, &fold);
 }
 
 /// Emit one split-boundary action's machine code: a `store` writes `reg` to its slot, a `reload`
@@ -422,7 +484,7 @@ fn emitSplitAction(allocator: std.mem.Allocator, code: *std.ArrayList(u32), func
 /// (`fetch_align`, `fp16`); an inert `.{}` reproduces `selectFunction`'s output exactly. `nblocks`
 /// and `leaf` are recomputed from `func` (identical to the values `compileFunction` passed to
 /// `allocate`), so the extraction is byte-identical for every existing caller.
-fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps: ModelCaps, alloc: *Allocation) Error!Compiled {
+fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps: ModelCaps, alloc: *Allocation, fold: *const addrfold.Analysis) Error!Compiled {
     const fetch_align = caps.fetch_align;
     // Native half arithmetic (FEAT_FP16) vs the base-ISA emulation, gated on the model feature.
     // `fp16 == false` (every non-model caller) keeps the emulation, byte-identical to before this
@@ -678,6 +740,10 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     try ctx.binary(allocator, &code, result, a.op, a.lhs, a.rhs);
                 },
                 .arith_imm => |a| {
+                    // A folded address-add is dead: every use of its result was rerouted to the base
+                    // by the fold, so it claims no register and emits nothing (mirrors the mul/icmp
+                    // fusion skips). `ctx.pos` still advances from `inst_idx`, so numbering holds.
+                    if (fold.isDeadAdd(inst)) continue;
                     const result = func.instResult(inst).?;
                     const rl = try ctx.loadOp(allocator, &code, a.lhs, spill_op[0]);
                     try loadConst(allocator, &code, spill_op[1], a.imm); // imm in x14, x16 stays free for rem
@@ -899,17 +965,20 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     try emitFrameImm(allocator, &code, false, rd, sp, off);
                     try storeResult(allocator, &code, ctx, result, rd);
                 },
-                .load => |l| {
+                .load => {
+                    // A folded load addresses `[base, #off]` directly: `baseOf` yields the fold base
+                    // (the add's lhs) and `offOf` the displacement; both are the raw ptr and 0 when
+                    // unfolded, so the non-folding case is byte-identical.
                     const result = func.instResult(inst).?;
-                    const base = try ctx.loadOp(allocator, &code, l.ptr, spill_op[0]); // ptr is a gpr
+                    const base = try ctx.loadOp(allocator, &code, fold.baseOf(func, inst), spill_op[0]); // ptr is a gpr
                     const rd = ctx.resultReg(result);
-                    try emitLoad(allocator, &code, func, result, rd, base, fp16);
+                    try emitLoad(allocator, &code, func, result, rd, base, @intCast(fold.offOf(inst)), fp16);
                     try storeResult(allocator, &code, ctx, result, rd);
                 },
                 .store => |st| {
                     const val = try ctx.loadOp(allocator, &code, st.value, if (regClass(func, st.value) == .fpr) fp_spill_op[0] else spill_op[0]);
-                    const base = try ctx.loadOp(allocator, &code, st.ptr, spill_op[1]);
-                    try emitStore(allocator, &code, func, st.value, val, base, fp16);
+                    const base = try ctx.loadOp(allocator, &code, fold.baseOf(func, inst), spill_op[1]);
+                    try emitStore(allocator, &code, func, st.value, val, base, @intCast(fold.offOf(inst)), fp16);
                 },
                 .prefetch => |pf| {
                     // A software prefetch hint: bring [ptr] into L1, no result, no
@@ -1094,6 +1163,12 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
     // terminator-position drain above. A leftover action means an `at` no emission position reached: a
     // numbering bug that would silently drop a store/reload. Fail loudly instead of miscompiling.
     std.debug.assert(action_cursor == alloc.actions.items.len);
+
+    // Fuse adjacent ldr/str pairs into ldp/stp and remap the side tables to the shrunk layout
+    // BEFORE resolving fixups, so the branch-displacement loop below computes correct offsets
+    // against the paired `code` and remapped `block_start`/`fixups`. A function with no fusable
+    // pair is left byte-identical.
+    try peephole.pairMemory(allocator, &code, block_start, fixups.items, relocs.items, lines.items);
 
     for (fixups.items) |f| {
         const off: i28 = @intCast((@as(i64, @intCast(block_start[f.target])) - @as(i64, @intCast(f.at))) * 4);
@@ -1540,7 +1615,7 @@ const Liveness = struct {
 /// position), and whether it is intra-block-splittable. Also records each block's terminator
 /// position and every call position, then extends live ranges. This is exactly the linearization
 /// `allocate` used to do inline, plus the split-liveness data (`use_positions`, `is_intra`).
-fn linearize(allocator: std.mem.Allocator, func: *const Function) Error!Liveness {
+fn linearize(allocator: std.mem.Allocator, func: *const Function, fold: *const addrfold.Analysis) Error!Liveness {
     const nval = func.valueCount();
     const nblocks = func.blockCount();
 
@@ -1628,7 +1703,7 @@ fn linearize(allocator: std.mem.Allocator, func: *const Function) Error!Liveness
                 .pos = pos,
                 .bi = @intCast(bi),
             };
-            forEachOperand(func, inst, &col, Collector.visit);
+            forEachOperand(func, inst, fold, &col, Collector.visit);
             if (col.err) |e| return e;
             if (func.instResult(inst)) |r| {
                 def_pos[@intFromEnum(r)] = pos;
@@ -1660,7 +1735,7 @@ fn linearize(allocator: std.mem.Allocator, func: *const Function) Error!Liveness
     // Liveness: a value live-out of a block stays live to that block's end. A loop back-edge makes
     // the header's live-in flow into the body's live-out, extending loop-carried values across the
     // body so their registers are not reused inside it.
-    try extendLiveRanges(allocator, func, last_use, block_end);
+    try extendLiveRanges(allocator, func, last_use, block_end, fold);
 
     // Transfer the temporary use lists into owned slices. Blocks were walked in order with
     // increasing positions, so each list is already ascending.
@@ -1805,8 +1880,9 @@ pub fn aarch64RegDescription(allocator: std.mem.Allocator, func: *const Function
     const entry_fixed = try ef.toOwnedSlice(allocator);
     errdefer allocator.free(entry_fixed);
 
-    // Call sites: one per call position, using `linearize`'s numbering so it matches emission.
-    var lin = try linearize(allocator, func);
+    // Call sites: one per call position, using `linearize`'s numbering so it matches emission. The
+    // Wimmer path is fold-agnostic, so linearize under the empty analysis (no rerouting).
+    var lin = try linearize(allocator, func, &empty_fold);
     defer lin.deinit(allocator);
     const call_sites = try allocator.alloc(wimmer.CallSite, lin.call_positions.items.len);
     var built: usize = 0;
@@ -1886,7 +1962,9 @@ pub fn compileFunctionWimmer(allocator: std.mem.Allocator, func: *Function) Erro
 
     var alloc = try translateAllocation(allocator, func, &walloc);
     defer alloc.deinit(allocator);
-    return emitFromAllocation(allocator, func, .{}, &alloc);
+    // The Wimmer differential path never folds addresses, so it emits through the empty analysis and
+    // stays byte-identical to the pre-fold emission.
+    return emitFromAllocation(allocator, func, .{}, &alloc, &empty_fold);
 }
 
 /// The aarch64 (uniform 16-byte) spill-slot index for a Wimmer per-class slot: GPR (class 0) slots
@@ -1913,8 +1991,8 @@ fn translateAllocation(allocator: std.mem.Allocator, func: *const Function, wall
 
     // The emission's pos-coupling assert reads `alloc.def_pos[value]`. Reuse the backend's own
     // `linearize` numbering, which is identical to the shared allocator's, so every def position
-    // matches the `ctx.pos` the emission advances through.
-    var lin = try linearize(allocator, func);
+    // matches the `ctx.pos` the emission advances through. This path is fold-agnostic (empty analysis).
+    var lin = try linearize(allocator, func, &empty_fold);
     defer lin.deinit(allocator);
     alloc.def_pos = try allocator.dupe(u32, lin.def_pos);
 
@@ -2103,7 +2181,7 @@ fn translateTransition(value: Value, src: Location, dst: Location, at: u32) Erro
     };
 }
 
-fn allocate(allocator: std.mem.Allocator, func: *const Function, leaf: bool) Error!Allocation {
+fn allocate(allocator: std.mem.Allocator, func: *const Function, leaf: bool, fold: *const addrfold.Analysis) Error!Allocation {
     const nval = func.valueCount();
     var alloc = Allocation{};
     errdefer alloc.deinit(allocator);
@@ -2111,7 +2189,7 @@ fn allocate(allocator: std.mem.Allocator, func: *const Function, leaf: bool) Err
     // Linearize the function into positions and per-value liveness (def/last-use/param rows, call
     // positions, and the split-liveness data), then extend live ranges. This is the single source
     // of truth for what each instruction reads and where each value is live. See `linearize`.
-    var lin = try linearize(allocator, func);
+    var lin = try linearize(allocator, func, fold);
     defer lin.deinit(allocator);
     const def_pos = lin.def_pos;
     const last_use = lin.last_use;
@@ -2146,10 +2224,26 @@ fn allocate(allocator: std.mem.Allocator, func: *const Function, leaf: bool) Err
         for (8..16) |r| try pools[1].append(allocator, @enumFromInt(@as(u5, @intCast(r))));
     }
 
+    // Build one interval per value, EXCLUDING dead address-adds. A dead add's result had every use
+    // rerouted to the fold base, so its `last_use` stayed at the unused init (0), which is below its
+    // def position: a malformed end-before-start interval. It also must claim no register (nothing
+    // reads it, the emission skips it). Filtering it out entirely is the clean fix: it never enters
+    // the scan, so it can neither corrupt another value's allocation nor read as end-before-start.
+    // Non-folding functions have no dead adds, so `ivals` is identical to before and the scan output
+    // is byte-identical.
     var ivals = try allocator.alloc(Interval, nval);
     defer allocator.free(ivals);
-    for (0..nval) |i| ivals[i] = .{ .value = @enumFromInt(i), .start = def_pos[i], .end = last_use[i], .is_param = is_param[i] };
-    std.mem.sort(Interval, ivals, {}, lessByStart);
+    var n_iv: usize = 0;
+    for (0..nval) |i| {
+        const v: Value = @enumFromInt(i);
+        if (func.definingInst(v)) |di| {
+            if (fold.isDeadAdd(di)) continue; // dead address-add: excluded from allocation entirely
+        }
+        ivals[n_iv] = .{ .value = v, .start = def_pos[i], .end = last_use[i], .is_param = is_param[i] };
+        n_iv += 1;
+    }
+    const live_ivals = ivals[0..n_iv];
+    std.mem.sort(Interval, live_ivals, {}, lessByStart);
 
     // A leaf keeps its register parameters in the incoming argument registers
     // (x0..x7 / v0..v7). A non-leaf lets them flow through the scan into
@@ -2167,7 +2261,7 @@ fn allocate(allocator: std.mem.Allocator, func: *const Function, leaf: bool) Err
     var actives = [_]std.ArrayList(Active){ .empty, .empty };
     defer for (&actives) |*a| a.deinit(allocator);
 
-    for (ivals) |iv| {
+    for (live_ivals) |iv| {
         const cls: usize = @intFromEnum(regClass(func, iv.value));
         // Placement of `iv` itself. A labeled block (rather than `continue`) so every branch that
         // places `iv` falls through to the `secondChance` call below: second-chance must run AFTER
@@ -2459,6 +2553,7 @@ fn markUse(last_use: []u32, v: Value, pos: u32) void {
 fn forEachOperand(
     func: *const Function,
     inst: ir.function.Inst,
+    fold: *const addrfold.Analysis,
     ctx: anytype,
     comptime f: fn (@TypeOf(ctx), Value, bool) void,
 ) void {
@@ -2481,10 +2576,14 @@ fn forEachOperand(
         .extract => |e| f(ctx, e.aggregate, false),
         .convert => |cv| f(ctx, cv.value, false),
         .unary => |u| f(ctx, u.value, false),
-        .load => |l| f(ctx, l.ptr, false),
+        // A folded load/store attributes its POINTER use to the fold BASE (the add's lhs), not the
+        // raw ptr, so the base's live range reaches the mem op (including cross-block) and the dead
+        // add's own result gets no use. `baseOf` returns the raw ptr when unfolded, so the
+        // non-folding case is byte-identical.
+        .load => f(ctx, fold.baseOf(func, inst), false),
         .store => |st| {
             f(ctx, st.value, false);
-            f(ctx, st.ptr, false);
+            f(ctx, fold.baseOf(func, inst), false);
         },
         .prefetch => |pf| f(ctx, pf.ptr, false),
         .dot => |d| {
@@ -2535,8 +2634,8 @@ fn markOperand(ctx: MarkCtx, v: Value, is_edge_arg: bool) void {
 
 /// Thin wrapper over `forEachOperand` that only extends `last_use`. Kept so callers that need
 /// nothing but the last-use marking read clearly.
-fn forEachUse(func: *const Function, inst: ir.function.Inst, last_use: []u32, pos: u32) void {
-    forEachOperand(func, inst, MarkCtx{ .last_use = last_use, .pos = pos }, markOperand);
+fn forEachUse(func: *const Function, inst: ir.function.Inst, fold: *const addrfold.Analysis, last_use: []u32, pos: u32) void {
+    forEachOperand(func, inst, fold, MarkCtx{ .last_use = last_use, .pos = pos }, markOperand);
 }
 
 fn forEachTermUse(func: *const Function, term: Terminator, last_use: []u32, pos: u32) void {
@@ -2742,7 +2841,7 @@ fn setUsed(row: []bool, v: Value) void {
     row[@intFromEnum(v)] = true;
 }
 
-fn markUsedBitset(func: *const Function, inst: ir.function.Inst, row: []bool) void {
+fn markUsedBitset(func: *const Function, inst: ir.function.Inst, fold: *const addrfold.Analysis, row: []bool) void {
     switch (func.opcode(inst)) {
         .iconst, .fconst, .alloca, .global_addr => {},
         .arith => |a| {
@@ -2762,10 +2861,12 @@ fn markUsedBitset(func: *const Function, inst: ir.function.Inst, row: []bool) vo
         .extract => |e| setUsed(row, e.aggregate),
         .convert => |cv| setUsed(row, cv.value),
         .unary => |u| setUsed(row, u.value),
-        .load => |l| setUsed(row, l.ptr),
+        // Same fold reroute as `forEachOperand`: a folded mem op's pointer use is the fold base, so
+        // the base's cross-block liveness reaches the mem op. `baseOf` is the raw ptr when unfolded.
+        .load => setUsed(row, fold.baseOf(func, inst)),
         .store => |st| {
             setUsed(row, st.value);
-            setUsed(row, st.ptr);
+            setUsed(row, fold.baseOf(func, inst));
         },
         .prefetch => |pf| setUsed(row, pf.ptr),
         .dot => |d| {
@@ -2801,7 +2902,7 @@ fn markUsedTermBitset(func: *const Function, term: Terminator, row: []bool) void
 
 /// Backward liveness dataflow. Extends `last_use[v]` to the end position of every
 /// block where `v` is live-out, so a value live across a loop keeps its register.
-fn extendLiveRanges(allocator: std.mem.Allocator, func: *const Function, last_use: []u32, block_end: []const u32) Error!void {
+fn extendLiveRanges(allocator: std.mem.Allocator, func: *const Function, last_use: []u32, block_end: []const u32, fold: *const addrfold.Analysis) Error!void {
     const nblocks = func.blockCount();
     const nval = func.valueCount();
     if (nblocks == 0 or nval == 0) return;
@@ -2824,7 +2925,7 @@ fn extendLiveRanges(allocator: std.mem.Allocator, func: *const Function, last_us
         const row = used[bi * nval ..][0..nval];
         for (func.blockParams(block)) |p| defined[bi * nval + @intFromEnum(p)] = true;
         for (func.blockInsts(block)) |inst| {
-            markUsedBitset(func, inst, row);
+            markUsedBitset(func, inst, fold, row);
             if (func.instResult(inst)) |r| defined[bi * nval + @intFromEnum(r)] = true;
             if (func.opcode(inst) == .@"if") {
                 const cf = func.opcode(inst).@"if";
@@ -2968,10 +3069,14 @@ fn emitLoad(
     result: Value,
     rd: Reg,
     base: Reg,
+    off: u32,
     fp16: bool,
 ) Error!void {
+    // A folded load addresses `[base, #off]`; a non-folded load passes off = 0, which every encoder
+    // below reproduces byte-identically to its old zero-displacement form. `aarch64FoldOffset`
+    // guarantees off fits the per-size scaled range, so the `@intCast`es cannot truncate.
     if (isVector(func, result)) {
-        try code.append(allocator, encode.ldrQ(rd, base, 0)); // 128-bit NEON load
+        try code.append(allocator, encode.ldrQ(rd, base, @intCast(off))); // 128-bit NEON load
         return;
     }
     if (regClass(func, result) == .fpr) {
@@ -2979,23 +3084,23 @@ fn emitLoad(
             // Load a 16-bit IEEE-half memory object. NOT `ldr s`, which would read 32 bits from a
             // 2-byte object. NATIVE (fp16): `ldr h` leaves the value in the H view ready to use.
             // In the emulation path, also widen it to the S-held f32 form with `fcvt s,h`.
-            try code.append(allocator, encode.ldrHfp(rd, base, 0));
+            try code.append(allocator, encode.ldrHfp(rd, base, @intCast(off)));
             if (!fp16) try code.append(allocator, encode.fcvtSfromH(rd, rd));
             return;
         }
-        try code.append(allocator, encode.ldrFp(rd, base, 0, isDouble(func, result)));
+        try code.append(allocator, encode.ldrFp(rd, base, @intCast(off), isDouble(func, result)));
         return;
     }
     const sz = typeSize(func, func.valueType(result));
     const signed = isSignedInt(func, result);
     if (sz <= 1) {
-        try code.append(allocator, if (signed) encode.ldrsb(rd, base) else encode.ldrb(rd, base));
+        try code.append(allocator, if (signed) encode.ldrsbOff(rd, base, @intCast(off)) else encode.ldrbOff(rd, base, @intCast(off)));
     } else if (sz <= 2) {
-        try code.append(allocator, if (signed) encode.ldrsh(rd, base) else encode.ldrh(rd, base));
+        try code.append(allocator, if (signed) encode.ldrshOff(rd, base, @intCast(off)) else encode.ldrhOff(rd, base, @intCast(off)));
     } else if (sz <= 4) {
-        try code.append(allocator, encode.ldrW(rd, base, 0));
+        try code.append(allocator, encode.ldrW(rd, base, @intCast(off)));
     } else {
-        try code.append(allocator, encode.ldrOff(rd, base, 0));
+        try code.append(allocator, encode.ldrOff(rd, base, @intCast(off)));
     }
 }
 
@@ -3006,10 +3111,14 @@ fn emitStore(
     value: Value,
     val: Reg,
     base: Reg,
+    off: u32,
     fp16: bool,
 ) Error!void {
+    // A folded store addresses `[base, #off]`; a non-folded store passes off = 0, which every encoder
+    // below reproduces byte-identically to its old zero-displacement form. `aarch64FoldOffset`
+    // guarantees off fits the per-size scaled range, so the `@intCast`es cannot truncate.
     if (isVector(func, value)) {
-        try code.append(allocator, encode.strQ(val, base, 0)); // 128-bit NEON store
+        try code.append(allocator, encode.strQ(val, base, @intCast(off))); // 128-bit NEON store
         return;
     }
     if (regClass(func, value) == .fpr) {
@@ -3021,25 +3130,25 @@ fn emitStore(
             // (fcvt h zeroes the upper bits of its destination register); the narrow is lossless
             // since the S value is already an exact half.
             if (fp16) {
-                try code.append(allocator, encode.strHfp(val, base, 0));
+                try code.append(allocator, encode.strHfp(val, base, @intCast(off)));
             } else {
                 try code.append(allocator, encode.fcvtHfromS(fp_move, val));
-                try code.append(allocator, encode.strHfp(fp_move, base, 0));
+                try code.append(allocator, encode.strHfp(fp_move, base, @intCast(off)));
             }
             return;
         }
-        try code.append(allocator, encode.strFp(val, base, 0, isDouble(func, value)));
+        try code.append(allocator, encode.strFp(val, base, @intCast(off), isDouble(func, value)));
         return;
     }
     const sz = typeSize(func, func.valueType(value));
     if (sz <= 1) {
-        try code.append(allocator, encode.strb(val, base));
+        try code.append(allocator, encode.strbOff(val, base, @intCast(off)));
     } else if (sz <= 2) {
-        try code.append(allocator, encode.strh(val, base));
+        try code.append(allocator, encode.strhOff(val, base, @intCast(off)));
     } else if (sz <= 4) {
-        try code.append(allocator, encode.strW(val, base, 0));
+        try code.append(allocator, encode.strW(val, base, @intCast(off)));
     } else {
-        try code.append(allocator, encode.strOff(val, base, 0));
+        try code.append(allocator, encode.strOff(val, base, @intCast(off)));
     }
 }
 
@@ -3162,7 +3271,7 @@ fn loadConst64(allocator: std.mem.Allocator, code: *std.ArrayList(u32), rd: Reg,
 /// were spilled. Exists so a test (or the uarch-bench tool) can confirm a register-pressure-heavy
 /// kernel actually spills without threading `Allocation` through `compileFunction`'s public API.
 pub fn debugSpillCount(allocator: std.mem.Allocator, func: *const Function) Error!u32 {
-    var alloc = try allocate(allocator, func, isLeaf(func));
+    var alloc = try allocate(allocator, func, isLeaf(func), &empty_fold);
     defer alloc.deinit(allocator);
     return alloc.spill_count;
 }
@@ -3172,7 +3281,7 @@ pub fn debugSpillCount(allocator: std.mem.Allocator, func: *const Function) Erro
 /// actually forces a live-range split, making the differential meaningful (a whole-spill would still
 /// return the right value, so the count is the only observable proof a split happened).
 pub fn debugSegmentCount(allocator: std.mem.Allocator, func: *const Function) Error!u32 {
-    var alloc = try allocate(allocator, func, isLeaf(func));
+    var alloc = try allocate(allocator, func, isLeaf(func), &empty_fold);
     defer alloc.deinit(allocator);
     return @intCast(alloc.segments.count());
 }
@@ -3183,7 +3292,7 @@ pub fn debugSegmentCount(allocator: std.mem.Allocator, func: *const Function) Er
 /// execution test can prove second-chance reload actually fired, not merely that a tail split
 /// happened (which a plain per-use reload would also satisfy).
 pub fn debugReHomeCount(allocator: std.mem.Allocator, func: *const Function) Error!u32 {
-    var alloc = try allocate(allocator, func, isLeaf(func));
+    var alloc = try allocate(allocator, func, isLeaf(func), &empty_fold);
     defer alloc.deinit(allocator);
     var count: u32 = 0;
     var it = alloc.segments.valueIterator();
@@ -3204,7 +3313,7 @@ pub fn debugReHomeCount(allocator: std.mem.Allocator, func: *const Function) Err
 /// the returned `Liveness` and must `deinit` it. Exists so tests can assert the liveness data
 /// without threading it through the allocator's public API.
 pub fn debugLiveness(allocator: std.mem.Allocator, func: *const Function) Error!Liveness {
-    return linearize(allocator, func);
+    return linearize(allocator, func, &empty_fold);
 }
 
 test "selects a straight-line arithmetic function" {
@@ -3359,7 +3468,7 @@ test "locationAt returns the whole-life register for an unsplit value" {
     const sum = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = prod, .rhs = x } });
     func.setTerminator(b, .{ .ret = sum });
 
-    var alloc = try allocate(allocator, &func, isLeaf(&func));
+    var alloc = try allocate(allocator, &func, isLeaf(&func), &empty_fold);
     defer alloc.deinit(allocator);
 
     // No value was split: the segment map is empty and every lookup falls back to reg/spill.
@@ -3430,7 +3539,7 @@ test "spill victim is the value whose next use is furthest, not whose interval e
     acc = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = far_end } });
     func.setTerminator(b, .{ .ret = acc });
 
-    var alloc = try allocate(allocator, &func, isLeaf(&func));
+    var alloc = try allocate(allocator, &func, isLeaf(&func), &empty_fold);
     defer alloc.deinit(allocator);
 
     // Exactly the next-use victim is chosen: far_use (furthest next use), not far_end (furthest

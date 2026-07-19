@@ -21,6 +21,7 @@ const tests = struct {
     pub const cases = @import("x86/tests/cases.zig");
     pub const qemu = @import("x86/tests/qemu.zig");
     pub const native = @import("x86/tests/native.zig");
+    pub const addrfold = @import("x86/tests/addrfold.zig");
 };
 
 test {

@@ -222,6 +222,32 @@ pub fn ldpPost(rt1: Reg, rt2: Reg, rn: Reg, imm: i10) u32 {
     return 0xA8C00000 | (imm7 << 15) | (n(rt2) << 10) | (n(rn) << 5) | n(rt1);
 }
 
+/// `ldp rt1, rt2, [rn, #imm]` (64-bit x-regs, signed offset, no writeback). `imm` is a byte offset, a
+/// multiple of 8 in the range [-512, 504] (imm7 = imm/8 in [-64, 63]).
+pub fn ldpOffX(rt1: Reg, rt2: Reg, rn: Reg, imm: i16) u32 {
+    const imm7: u32 = @as(u32, @bitCast(@as(i32, imm) >> 3)) & 0x7F;
+    return 0xA9400000 | (imm7 << 15) | (n(rt2) << 10) | (n(rn) << 5) | n(rt1);
+}
+
+/// `stp rt1, rt2, [rn, #imm]` (64-bit x-regs, signed offset, no writeback). Same imm range as `ldpOffX`.
+pub fn stpOffX(rt1: Reg, rt2: Reg, rn: Reg, imm: i16) u32 {
+    const imm7: u32 = @as(u32, @bitCast(@as(i32, imm) >> 3)) & 0x7F;
+    return 0xA9000000 | (imm7 << 15) | (n(rt2) << 10) | (n(rn) << 5) | n(rt1);
+}
+
+/// `ldp rt1, rt2, [rn, #imm]` (32-bit w-regs, signed offset, no writeback). `imm` a multiple of 4 in
+/// [-256, 252] (imm7 = imm/4).
+pub fn ldpOffW(rt1: Reg, rt2: Reg, rn: Reg, imm: i16) u32 {
+    const imm7: u32 = @as(u32, @bitCast(@as(i32, imm) >> 2)) & 0x7F;
+    return 0x29400000 | (imm7 << 15) | (n(rt2) << 10) | (n(rn) << 5) | n(rt1);
+}
+
+/// `stp rt1, rt2, [rn, #imm]` (32-bit w-regs, signed offset, no writeback). Same imm range as `ldpOffW`.
+pub fn stpOffW(rt1: Reg, rt2: Reg, rn: Reg, imm: i16) u32 {
+    const imm7: u32 = @as(u32, @bitCast(@as(i32, imm) >> 2)) & 0x7F;
+    return 0x29000000 | (imm7 << 15) | (n(rt2) << 10) | (n(rn) << 5) | n(rt1);
+}
+
 /// `str xt, [xn, #off]` (64-bit unsigned offset, `off` a multiple of 8).
 pub fn strOff(rt: Reg, rn: Reg, off: u15) u32 {
     return 0xF9000000 | ((@as(u32, off) >> 3) << 10) | (n(rn) << 5) | n(rt);
@@ -303,6 +329,36 @@ pub fn ldrh(rt: Reg, rn: Reg) u32 {
 /// `ldrsh wt, [xn]` (load a halfword, sign-extended into the 32-bit register).
 pub fn ldrsh(rt: Reg, rn: Reg) u32 {
     return 0x79C00000 | (n(rn) << 5) | n(rt);
+}
+
+/// `strb wt, [xn, #off]` (store low byte, unsigned byte offset 0..4095, unscaled).
+pub fn strbOff(rt: Reg, rn: Reg, off: u12) u32 {
+    return 0x39000000 | (@as(u32, off) << 10) | (n(rn) << 5) | n(rt);
+}
+
+/// `ldrb wt, [xn, #off]` (load byte, zero-extended, unscaled offset).
+pub fn ldrbOff(rt: Reg, rn: Reg, off: u12) u32 {
+    return 0x39400000 | (@as(u32, off) << 10) | (n(rn) << 5) | n(rt);
+}
+
+/// `ldrsb wt, [xn, #off]` (load byte, sign-extended into the 32-bit register, unscaled offset).
+pub fn ldrsbOff(rt: Reg, rn: Reg, off: u12) u32 {
+    return 0x39C00000 | (@as(u32, off) << 10) | (n(rn) << 5) | n(rt);
+}
+
+/// `strh wt, [xn, #off]` (store low halfword, off a multiple of 2, scaled by 2).
+pub fn strhOff(rt: Reg, rn: Reg, off: u13) u32 {
+    return 0x79000000 | ((@as(u32, off) >> 1) << 10) | (n(rn) << 5) | n(rt);
+}
+
+/// `ldrh wt, [xn, #off]` (load halfword, zero-extended, scaled by 2).
+pub fn ldrhOff(rt: Reg, rn: Reg, off: u13) u32 {
+    return 0x79400000 | ((@as(u32, off) >> 1) << 10) | (n(rn) << 5) | n(rt);
+}
+
+/// `ldrsh wt, [xn, #off]` (load halfword, sign-extended into the 32-bit register, scaled by 2).
+pub fn ldrshOff(rt: Reg, rn: Reg, off: u13) u32 {
+    return 0x79C00000 | ((@as(u32, off) >> 1) << 10) | (n(rn) << 5) | n(rt);
 }
 
 /// `sdiv wd, wn, wm` (32-bit signed divide).
@@ -881,4 +937,78 @@ test "shifted add/sub immediate (LSL #12) for large stack frames" {
     // A 5000-byte frame splits as hi=1 (×4096) + lo=904, reconstructing exactly.
     const frame: usize = 5000;
     try std.testing.expectEqual(@as(usize, 4096 * (frame >> 12) + (frame & 0xFFF)), frame);
+}
+
+test "ldp/stp offset-form encoders match known bytes" {
+    // Hand-computed from the field layout (imm7 in bits[21:15], rt2 in [14:10],
+    // rn in [9:5], rt1 in [4:0]), then cross-checked below against the disassembler.
+    try std.testing.expectEqual(@as(u32, 0xA9000440), stpOffX(.x0, .x1, .x2, 0));
+    try std.testing.expectEqual(@as(u32, 0xA9410440), ldpOffX(.x0, .x1, .x2, 16));
+    try std.testing.expectEqual(@as(u32, 0x29010440), stpOffW(.x0, .x1, .x2, 8));
+    try std.testing.expectEqual(@as(u32, 0x297F10A3), ldpOffW(.x3, .x4, .x5, -8));
+
+    const disasm = @import("disasm.zig");
+    const a = std.testing.allocator;
+
+    const s1 = try disasm.one(a, stpOffX(.x0, .x1, .x2, 0));
+    defer a.free(s1);
+    try std.testing.expectEqualStrings("stp x0, x1, [x2]", s1);
+
+    const s2 = try disasm.one(a, ldpOffX(.x0, .x1, .x2, 16));
+    defer a.free(s2);
+    try std.testing.expectEqualStrings("ldp x0, x1, [x2, #16]", s2);
+
+    const s3 = try disasm.one(a, stpOffW(.x0, .x1, .x2, 8));
+    defer a.free(s3);
+    try std.testing.expectEqualStrings("stp w0, w1, [x2, #8]", s3);
+
+    const s4 = try disasm.one(a, ldpOffW(.x3, .x4, .x5, -8));
+    defer a.free(s4);
+    try std.testing.expectEqualStrings("ldp w3, w4, [x5, #-8]", s4);
+}
+
+test "aarch64 byte and halfword offset-form load/store encoders match the disassembler" {
+    // Hand-computed from the field layout (imm12 in bits[21:10], rn in [9:5], rt in [4:0]).
+    // Byte forms are unscaled. Halfword forms are scaled by 2 (imm12 = off / 2).
+    try std.testing.expectEqual(@as(u32, 0x39000C20), strbOff(.x0, .x1, 3));
+    try std.testing.expectEqual(@as(u32, 0x39401C20), ldrbOff(.x0, .x1, 7));
+    try std.testing.expectEqual(@as(u32, 0x39C00420), ldrsbOff(.x0, .x1, 1));
+    try std.testing.expectEqual(@as(u32, 0x79000C20), strhOff(.x0, .x1, 6));
+    try std.testing.expectEqual(@as(u32, 0x79401420), ldrhOff(.x0, .x1, 10));
+    try std.testing.expectEqual(@as(u32, 0x79C00862), ldrshOff(.x2, .x3, 4));
+
+    const disasm = @import("disasm.zig");
+    const a = std.testing.allocator;
+
+    const s1 = try disasm.one(a, strbOff(.x0, .x1, 3));
+    defer a.free(s1);
+    try std.testing.expectEqualStrings("strb w0, [x1, #3]", s1);
+
+    const s2 = try disasm.one(a, ldrbOff(.x0, .x1, 7));
+    defer a.free(s2);
+    try std.testing.expectEqualStrings("ldrb w0, [x1, #7]", s2);
+
+    const s3 = try disasm.one(a, ldrsbOff(.x0, .x1, 1));
+    defer a.free(s3);
+    try std.testing.expectEqualStrings("ldrsb w0, [x1, #1]", s3);
+
+    const s5 = try disasm.one(a, strhOff(.x0, .x1, 6));
+    defer a.free(s5);
+    try std.testing.expectEqualStrings("strh w0, [x1, #6]", s5);
+
+    const s6 = try disasm.one(a, ldrhOff(.x0, .x1, 10));
+    defer a.free(s6);
+    try std.testing.expectEqualStrings("ldrh w0, [x1, #10]", s6);
+
+    const s7 = try disasm.one(a, ldrshOff(.x2, .x3, 4));
+    defer a.free(s7);
+    try std.testing.expectEqualStrings("ldrsh w2, [x3, #4]", s7);
+
+    // Folding at offset 0 must be byte-identical to the existing offset-0 encoders.
+    try std.testing.expectEqual(strb(.x0, .x1), strbOff(.x0, .x1, 0));
+    try std.testing.expectEqual(ldrb(.x0, .x1), ldrbOff(.x0, .x1, 0));
+    try std.testing.expectEqual(ldrsb(.x0, .x1), ldrsbOff(.x0, .x1, 0));
+    try std.testing.expectEqual(strh(.x0, .x1), strhOff(.x0, .x1, 0));
+    try std.testing.expectEqual(ldrh(.x0, .x1), ldrhOff(.x0, .x1, 0));
+    try std.testing.expectEqual(ldrsh(.x0, .x1), ldrshOff(.x0, .x1, 0));
 }

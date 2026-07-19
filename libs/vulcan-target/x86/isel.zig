@@ -14,11 +14,42 @@ const std = @import("std");
 const ir = @import("vulcan-ir");
 const encode = @import("encode.zig");
 const regalloc = @import("../regalloc.zig");
+const addrfold = @import("../addrfold.zig");
 
 const Function = ir.function.Function;
 const Value = ir.function.Value;
 const Block = ir.function.Block;
 const Reg = encode.Reg;
+
+/// A shared no-fold analysis: its `baseOf`/`offOf`/`isDeadAdd` behave as if nothing folded, so any
+/// path that never overrides `Ctx.fold` stays byte-identical to before address folding existed.
+/// Holds no allocation (see `addrfold.Analysis.empty`), so it never needs `deinit`.
+const empty_fold: addrfold.Analysis = addrfold.Analysis.empty;
+
+/// The x86-32 fold predicate for `addrfold.analyze`: fold a load/store whose pointer is an
+/// `arith_imm.add(base, imm)` into a `[base + disp32]` addressing mode, for ANY access size (x86
+/// mem operands carry a 32-bit signed displacement regardless of width). Foldable exactly when the
+/// add's imm fits a signed 32-bit displacement. The isel already assumes an `arith_imm` imm fits i32
+/// (`@intCast(a.imm)` when it emits the add), so this matches an existing invariant. Returns the
+/// byte offset (equal to the add's imm) when in range, else null. `analyze` calls this only after
+/// confirming the pointer is an `arith_imm.add`, so the unwraps below are guaranteed, still asserted.
+/// The fold is analyzed over ALL loads/stores incl fp/vector, but x86-32 rejects those at emit anyway
+/// (`error.Unsupported`), so folding their address is harmless: the whole compile fails regardless.
+fn x86FoldOffset(_: void, func: *const Function, mem_inst: ir.function.Inst) ?i64 {
+    const ptr = switch (func.opcode(mem_inst)) {
+        .load => |l| l.ptr,
+        .store => |st| st.ptr,
+        else => unreachable, // analyze only hands foldOffset a load or store
+    };
+    const def = func.definingInst(ptr).?; // analyze confirmed ptr is defined by an arith_imm.add
+    const add = switch (func.opcode(def)) {
+        .arith_imm => |a| a,
+        else => unreachable,
+    };
+    std.debug.assert(add.op == .add);
+    if (std.math.cast(i32, add.imm) == null) return null;
+    return add.imm;
+}
 
 pub const Error = std.mem.Allocator.Error || error{Unsupported};
 
@@ -51,6 +82,11 @@ const Ctx = struct {
     code: std.ArrayList(u8) = .empty,
     fixups: std.ArrayList(Fixup) = .empty,
     relocs: std.ArrayList(Reloc) = .empty,
+    alloca_base: i32 = 0, // esp offset of the alloca region (sits above the spill slots)
+    alloca_off: std.AutoHashMapUnmanaged(Value, u32) = .{}, // each alloca result -> its byte offset in that region
+    // Address-mode-fold analysis, consulted by the load/store emit arms and the dead-add skip.
+    // Defaults to the empty analysis (nothing folds). `compile` overrides it with a real one.
+    fold: *const addrfold.Analysis = &empty_fold,
 
     fn loc(self: *const Ctx, v: Value) Loc {
         return self.loc_of.get(v).?;
@@ -101,14 +137,26 @@ pub fn compile(allocator: std.mem.Allocator, func: *const Function) Error!Compil
     const nblocks = func.blockCount();
     if (nblocks == 0) return error.Unsupported;
 
-    var ctx = Ctx{ .func = func };
+    // Address-mode fold analysis: a load/store whose pointer is a foldable `arith_imm.add(base,
+    // imm)` addresses `[base + disp32]` directly, and the now-dead add is dropped. Nothing
+    // foldable yields an empty analysis, keeping its output byte-identical.
+    var fold = try addrfold.analyze(allocator, func, {}, x86FoldOffset);
+    defer fold.deinit(allocator);
+
+    var ctx = Ctx{ .func = func, .fold = &fold };
     defer ctx.loc_of.deinit(allocator);
     defer ctx.code.deinit(allocator);
     defer ctx.fixups.deinit(allocator);
     defer ctx.relocs.deinit(allocator);
+    defer ctx.alloca_off.deinit(allocator);
     var num_slots: u32 = 0;
-    try assignRegs(allocator, func, &ctx.loc_of, &num_slots);
-    const frame: i32 = @intCast((@as(u64, num_slots) * 4 + 15) & ~@as(u64, 15));
+    try assignRegs(allocator, func, &ctx.loc_of, &num_slots, &fold);
+    // The alloca region sits right above the spill slots. `computeAllocaSlots` assigns each
+    // alloca a byte offset within it before any code is emitted, so `.alloca` lowering below
+    // can just look its offset up.
+    ctx.alloca_base = @intCast(num_slots * 4);
+    const alloca_bytes = try computeAllocaSlots(allocator, func, &ctx.alloca_off);
+    const frame: i32 = @intCast((@as(u64, num_slots) * 4 + alloca_bytes + 15) & ~@as(u64, 15));
 
     const block_start = try allocator.alloc(usize, nblocks);
     defer allocator.free(block_start);
@@ -164,6 +212,37 @@ pub fn compile(allocator: std.mem.Allocator, func: *const Function) Error!Compil
 
 fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Error!void {
     const func = ctx.func;
+    // A folded address-add is dead: every use of its result was rerouted to the base by the fold,
+    // so the add itself must not be emitted (its result is never read). No-op when nothing folded.
+    if (ctx.fold.isDeadAdd(inst)) return;
+    if (func.opcode(inst) == .store) {
+        // `store` produces no result, so handle it before the result-unwrap below.
+        const st = func.opcode(inst).store;
+        if (func.types.type_kind(func.valueType(st.value)) != .int) return error.Unsupported; // x86-32 is integer-only
+        const bits = intBits(func, st.value);
+        if (bits > 32) return error.Unsupported; // no multi-register wide-int support here
+        // A folded store addresses `[base + disp32]`: `baseOf` yields the fold base (the add's
+        // lhs) and `offOf` the displacement. Both are the raw ptr and 0 when unfolded, so the
+        // non-folding case is byte-identical.
+        const base = try ctx.use(allocator, ctx.fold.baseOf(func, inst), scratch2);
+        const disp: i32 = @intCast(ctx.fold.offOf(inst));
+        if (bits <= 16) {
+            // movToMem8/movToMem16 need a byte-addressable source (al/cl/dl/bl). edi/esi have
+            // no 8-bit form, so unconditionally stage the value through scratch1 (ebx, which
+            // does have one) rather than special-casing which registers happen to qualify.
+            var val = try ctx.use(allocator, st.value, scratch1);
+            if (val != scratch1) {
+                try ctx.put(allocator, encode.movReg(scratch1, val));
+                val = scratch1;
+            }
+            std.debug.assert(base != scratch1); // ptr (scratch2) and the staged value never collide
+            try ctx.put(allocator, if (bits <= 8) encode.movToMem8(base, disp, val) else encode.movToMem16(base, disp, val));
+        } else {
+            const val = try ctx.use(allocator, st.value, scratch1);
+            try ctx.put(allocator, encode.movToMem32(base, disp, val));
+        }
+        return;
+    }
     const result = func.instResult(inst).?;
     switch (func.opcode(inst)) {
         .iconst => |c| {
@@ -270,6 +349,39 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
             if (args.len > 0) try ctx.put(allocator, encode.aluImm(0, .esp, @intCast(args.len * 4))); // add esp, n*4
             const rd = ctx.dst(result, scratch1);
             if (rd != .eax) try ctx.put(allocator, encode.movReg(rd, .eax));
+            try ctx.store(allocator, result, rd);
+        },
+        .alloca => {
+            // The result is the address of its reserved stack slot: lea it from esp. Slot
+            // offsets were assigned by `computeAllocaSlots`, in `compile`, before any code
+            // (including the `sub esp, frame` that reserves the region) was emitted.
+            const off = ctx.alloca_base + @as(i32, @intCast(ctx.alloca_off.get(result).?));
+            const rd = ctx.dst(result, scratch1);
+            try ctx.put(allocator, encode.leaFromStack(rd, off));
+            try ctx.store(allocator, result, rd);
+        },
+        .load => {
+            // x86-32 is integer-only: reject a float/vector/bool/ptr load result cleanly
+            // rather than misreading its bytes.
+            if (func.types.type_kind(func.valueType(result)) != .int) return error.Unsupported;
+            const bits = intBits(func, result);
+            if (bits > 32) return error.Unsupported; // no multi-register wide-int support here
+            // A folded load addresses `[base + disp32]`: `baseOf` yields the fold base (the add's
+            // lhs) and `offOf` the displacement. Both are the raw ptr and 0 when unfolded, so the
+            // non-folding case is byte-identical.
+            const base = try ctx.use(allocator, ctx.fold.baseOf(func, inst), scratch2);
+            const disp: i32 = @intCast(ctx.fold.offOf(inst));
+            const rd = ctx.dst(result, scratch1);
+            // Load exactly the value's own width so no bytes beyond the object are read (a
+            // wider load would pull garbage from the next array element into the register). A
+            // narrow load sign-extends a signed value and zero-extends an unsigned one into the
+            // full 32-bit destination, matching x86-64's isel.
+            const signed = isSigned(func, result);
+            try ctx.put(allocator, switch (bits) {
+                0...8 => if (signed) encode.movsxByteFromMem(rd, base, disp) else encode.movzxByteFromMem(rd, base, disp),
+                9...16 => if (signed) encode.movsxWordFromMem(rd, base, disp) else encode.movzxWordFromMem(rd, base, disp),
+                else => encode.movFromMem32(rd, base, disp),
+            });
             try ctx.store(allocator, result, rd);
         },
         else => return error.Unsupported,
@@ -408,6 +520,52 @@ fn isSigned(func: *const Function, v: Value) bool {
     };
 }
 
+/// A value's bit width. The caller has already checked its type is `.int`.
+fn intBits(func: *const Function, v: Value) u16 {
+    return switch (func.types.type_kind(func.valueType(v))) {
+        .int => |i| i.bits,
+        else => unreachable, // caller checked type_kind == .int first
+    };
+}
+
+/// Lay out the alloca region: each `alloca` result gets a naturally-aligned byte offset
+/// (relative to the region base), recorded in `map`. Returns the region's total size. x86-32
+/// is integer-only, so a non-integer `elem` (float/vector/aggregate) is rejected.
+fn computeAllocaSlots(allocator: std.mem.Allocator, func: *const Function, map: *std.AutoHashMapUnmanaged(Value, u32)) Error!u32 {
+    var cur: u32 = 0;
+    for (0..func.blockCount()) |bi| {
+        for (func.blockInsts(@enumFromInt(bi))) |inst| {
+            switch (func.opcode(inst)) {
+                .alloca => |al| {
+                    const size = try typeSize(func, al.elem);
+                    cur = alignUp(cur, typeAlign(size));
+                    try map.put(allocator, func.instResult(inst).?, cur);
+                    cur += size;
+                },
+                else => {},
+            }
+        }
+    }
+    return cur;
+}
+
+fn alignUp(v: u32, a: u32) u32 {
+    return (v + a - 1) & ~(a - 1);
+}
+
+/// The storage size of an alloca's element type, in bytes. x86-32 is integer-only.
+fn typeSize(func: *const Function, ty: ir.types.Type) Error!u32 {
+    return switch (func.types.type_kind(ty)) {
+        .int => |i| (@as(u32, i.bits) + 7) / 8,
+        else => error.Unsupported,
+    };
+}
+
+/// The natural alignment for a storage size, capped at 4 (the widest x86-32 GPR load/store).
+fn typeAlign(size: u32) u32 {
+    return if (size <= 1) 1 else if (size <= 2) 2 else 4;
+}
+
 fn fixedRegNeeds(func: *const Function) struct { div: bool, shift: bool } {
     var div = false;
     var shift = false;
@@ -448,7 +606,7 @@ fn callPositions(allocator: std.mem.Allocator, func: *const Function) Error![]u3
 /// Linear-scan allocation with reuse and spilling over the pool {EAX,ECX,EDX,ESI} (EBX/EDI
 /// are scratch). The pool registers are byte-addressable, so any boolean lands in a
 /// setcc-able register. Values live across a call are force-spilled (caller-saved clobber).
-fn assignRegs(allocator: std.mem.Allocator, func: *const Function, loc_of: *std.AutoHashMapUnmanaged(Value, Loc), num_slots: *u32) Error!void {
+fn assignRegs(allocator: std.mem.Allocator, func: *const Function, loc_of: *std.AutoHashMapUnmanaged(Value, Loc), num_slots: *u32, fold: *const addrfold.Analysis) Error!void {
     const needs = fixedRegNeeds(func);
     var pool: std.ArrayList(Reg) = .empty;
     defer pool.deinit(allocator);
@@ -459,7 +617,7 @@ fn assignRegs(allocator: std.mem.Allocator, func: *const Function, loc_of: *std.
         try pool.append(allocator, r);
     }
 
-    const ivals = try regalloc.computeLiveIntervals(allocator, func);
+    const ivals = try regalloc.computeLiveIntervals(allocator, func, fold);
     defer allocator.free(ivals);
     const calls = try callPositions(allocator, func);
     defer allocator.free(calls);

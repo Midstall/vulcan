@@ -120,3 +120,71 @@ test "codegen+disasm round-trip: control flow (max via if/else)" {
         \\
     , text);
 }
+
+test "codegen+disasm round-trip: alloca/store/load at displacement 0 (no qemu needed)" {
+    // Smoke-checks the new load/store lowering by disassembly, so it runs even where
+    // qemu-i386 is unavailable: alloca an i32 slot, store the argument, load it back, return
+    // it. Confirms the [reg+0] mov encoders (Task 5) are actually wired into `.alloca`/
+    // `.load`/`.store` (Task 6), not just callable.
+    const a = std.testing.allocator;
+    var func = ir.function.Function.init(a);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr_t = try func.types.intern(.ptr);
+    const e = try func.appendBlock();
+    const x = try func.appendBlockParam(e, i32_t);
+    const slot = try func.appendInst(e, ptr_t, .{ .alloca = .{ .elem = i32_t } });
+    try func.appendStore(e, x, slot);
+    const r = try func.appendInst(e, i32_t, .{ .load = .{ .ptr = slot } });
+    func.setTerminator(e, .{ .ret = r });
+
+    const code = try isel.selectFunction(a, &func);
+    defer a.free(code);
+    const text = try disasm.format(a, code);
+    defer a.free(text);
+    try std.testing.expectEqualStrings(
+        \\0000: sub esp, 16
+        \\0006: mov esi, dword ptr [esp + 20]
+        \\000d: lea edx, [esp]
+        \\0014: mov dword ptr [edx], esi
+        \\001a: mov esi, dword ptr [edx]
+        \\0020: mov eax, esi
+        \\0022: add esp, 16
+        \\0028: ret
+        \\
+    , text);
+}
+
+test "codegen+disasm round-trip: an 8-bit store stages through ebx (byte-addressability)" {
+    // esi (the value's assigned register here) has no 8-bit form, so an i8 store must move
+    // it into ebx (bl) before `mov byte ptr [...], bl`. Confirms the byte-addressability
+    // staging described in Task 6, not just the [reg+0] store path in isolation.
+    const a = std.testing.allocator;
+    var func = ir.function.Function.init(a);
+    defer func.deinit();
+    const i8_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 8 } });
+    const ptr_t = try func.types.intern(.ptr);
+    const e = try func.appendBlock();
+    const x = try func.appendBlockParam(e, i8_t);
+    const slot = try func.appendInst(e, ptr_t, .{ .alloca = .{ .elem = i8_t } });
+    try func.appendStore(e, x, slot);
+    const r = try func.appendInst(e, i8_t, .{ .load = .{ .ptr = slot } });
+    func.setTerminator(e, .{ .ret = r });
+
+    const code = try isel.selectFunction(a, &func);
+    defer a.free(code);
+    const text = try disasm.format(a, code);
+    defer a.free(text);
+    try std.testing.expectEqualStrings(
+        \\0000: sub esp, 16
+        \\0006: mov esi, dword ptr [esp + 20]
+        \\000d: lea edx, [esp]
+        \\0014: mov ebx, esi
+        \\0016: mov byte ptr [edx], bl
+        \\001c: movsx esi, byte ptr [edx]
+        \\0023: mov eax, esi
+        \\0025: add esp, 16
+        \\002b: ret
+        \\
+    , text);
+}
