@@ -191,6 +191,20 @@ pub fn cmp(rn: Reg, rm: Reg) u32 {
     return 0x6B00001F | (n(rm) << 16) | (n(rn) << 5);
 }
 
+/// `cmp xn, xm` (64-bit compare, i.e. `subs xzr, xn, xm`): sets the flags from the full 64-bit
+/// difference. The 64-bit counterpart of `cmp`, used for i64 and pointer icmp operands (a 32-bit
+/// `cmp` would only test the low 32 bits, mismeasuring values whose high 32 bits differ).
+pub fn cmp64(rn: Reg, rm: Reg) u32 {
+    return sf64 | cmp(rn, rm);
+}
+
+test "cmp64 encoding (64-bit icmp compare)" {
+    // cmp x0, x1 == 0xEB00001F | (1 << 16) == 0xEB01001F
+    try std.testing.expectEqual(@as(u32, 0xEB01001F), cmp64(.x0, .x1));
+    // cmp64 is subs64 into the zero register, matching how cmp is subs into wzr
+    try std.testing.expectEqual(cmp64(.x3, .x9), subs64(.zr, .x3, .x9));
+}
+
 /// `subs wd, wn, wm` (32-bit subtract, setting NZCV). Like `cmp` but writes a real Rd, so
 /// the Z flag reads (wn - wm == 0) while the difference lands in `rd` (the arith-branch fold
 /// uses this to fuse a `sub; icmp ==0; if` into one flag-setting subtract plus `b.cc`).
