@@ -51,7 +51,16 @@ pub const Features = union(Arch) {
         /// clear (every model that does not set it), the software emulation is unchanged.
         zfh: bool = false,
     },
-    x86_64: struct {},
+    x86_64: struct {
+        avx2: bool = false,
+        fma: bool = false,
+        avx512f: bool = false,
+        avx512vl: bool = false,
+        avx512dq: bool = false,
+        avx512bw: bool = false,
+        avx512vnni: bool = false,
+        bmi2: bool = false,
+    },
 };
 
 /// An abstract fusible pair category. A backend maps each to its concrete instruction pattern.
@@ -68,6 +77,7 @@ pub const Microarch = enum {
     @"river-rc1.s",
     @"river-rc1.f",
     @"river-rc1.ma",
+    @"cascadelake-sp",
 
     pub fn parse(name_: []const u8) ?Microarch {
         return std.meta.stringToEnum(Microarch, name_);
@@ -383,6 +393,13 @@ test "Model.vpu is true only for a riscv64 model with the vpu feature bit set" {
         .fusion = &.{},
     };
     try std.testing.expect(!altra_like.vpu());
+}
+
+test "cascadelake-sp tag parses and x86_64 Features carries the avx512 gating flags" {
+    try std.testing.expectEqual(Microarch.@"cascadelake-sp", Microarch.parse("cascadelake-sp").?);
+    const f: Features = .{ .x86_64 = .{ .avx512vnni = true, .fma = true } };
+    try std.testing.expect(f.x86_64.avx512vnni and f.x86_64.fma);
+    try std.testing.expect(!f.x86_64.avx2); // defaults false
 }
 
 fn testLatency(op: ir.function.Opcode) u32 {

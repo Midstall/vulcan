@@ -600,25 +600,27 @@ fn customModelExample(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Write
     try benchModel(allocator, io, &custom_model, w);
 }
 
-/// Whether this tool can actually JIT and run `model`'s arch on this host. Only aarch64 and
-/// riscv64 have a model-aware `selectFunctionForModel` today, and JIT output only runs on its own
-/// ISA, so both conditions are required. x86_64 (and anything else) always falls to the IR
-/// transform-stats path, regardless of host.
+/// Whether this tool can actually JIT and run `model`'s arch on this host. aarch64, riscv64, and
+/// x86_64 each have a model-aware `selectFunctionForModel` today, and JIT output only runs on its
+/// own ISA, so both conditions are required (anything else always falls to the IR
+/// transform-stats path, regardless of host).
 fn canJit(model: *const Model) bool {
     return switch (model.arch) {
         .aarch64 => builtin.cpu.arch == .aarch64,
         .riscv64 => builtin.cpu.arch == .riscv64,
-        .x86_64 => false,
+        .x86_64 => builtin.cpu.arch == .x86_64,
     };
 }
 
-/// One of the two backends' mapped executable buffers. A tagged union rather than a common type
-/// because `target.aarch64.jit.CodeBuffer` and `target.riscv64.jit.CodeBuffer` are distinct
-/// instantiations of the same generic (see jit_platform.zig's `Buffer`), each carrying its own
-/// arch-specific instruction-cache sync function baked in at comptime.
+/// One of the three backends' mapped executable buffers. A tagged union rather than a common type
+/// because `target.aarch64.jit.CodeBuffer`, `target.riscv64.jit.CodeBuffer`, and
+/// `target.x86_64.jit.CodeBuffer` are distinct instantiations of the same generic (see
+/// jit_platform.zig's `Buffer`), each carrying its own arch-specific instruction-cache sync
+/// function baked in at comptime.
 const HostBuffer = union(enum) {
     aarch64: target.aarch64.jit.CodeBuffer,
     riscv64: target.riscv64.jit.CodeBuffer,
+    x86_64: target.x86_64.jit.CodeBuffer,
 
     fn deinit(self: *HostBuffer) void {
         switch (self.*) {
@@ -656,7 +658,14 @@ fn selectAndMap(allocator: std.mem.Allocator, func: *const Function, model: ?*co
             defer allocator.free(code);
             break :blk .{ .riscv64 = try target.riscv64.jit.CodeBuffer.map(std.mem.sliceAsBytes(code)) };
         },
-        .x86_64 => error.Unsupported,
+        .x86_64 => blk: {
+            const code = if (model) |m|
+                try target.x86_64.isel.selectFunctionForModel(allocator, func, m)
+            else
+                try target.x86_64.isel.selectFunction(allocator, func);
+            defer allocator.free(code);
+            break :blk .{ .x86_64 = try target.x86_64.jit.CodeBuffer.map(std.mem.sliceAsBytes(code)) };
+        },
     };
 }
 
