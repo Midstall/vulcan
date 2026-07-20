@@ -218,6 +218,15 @@ fn runCmpBranchOn(io: std.Io, allocator: std.mem.Allocator, code: []const u8, ar
     };
 }
 
+/// Like `runCmpBranchOn`, but returns the FULL i64 result (no mod-256 truncation): used by the
+/// reduction-loop differential, whose sums grow past 255.
+fn runCmpBranchOnFull(io: std.Io, allocator: std.mem.Allocator, code: []const u8, args: []const i64, backend: harness.Backend) !?i64 {
+    return harness.runCodeIntFull(io, allocator, code, args, backend) catch |e| switch (e) {
+        error.SkipZigTest => null,
+        else => return e,
+    };
+}
+
 /// Compile `func` PLAIN and tuned to cascadelake-sp (cmp_branch on), then run BOTH builds with
 /// `args` under every available backend (native in-process on an x86-64 host, qemu-x86_64
 /// elsewhere), asserting both equal `want` (a 100/200 low byte, per `buildCmpBranchIf`). Comparing
@@ -591,6 +600,84 @@ test "x86_64 arith_branch fold: a multi-use arith result does NOT fuse (cmp surv
 }
 
 // ---------------------------------------------------------------------------
+// Full-width runners: `...Full` carries the WHOLE result via stdout (no mod-256 limit),
+// unlike the plain runners above whose result is only the exit code's low byte.
+// ---------------------------------------------------------------------------
+
+test "x86_64 expectRunFull asserts the full 64-bit result, not just the low byte" {
+    const a = std.testing.allocator;
+    var f = ir.function.Function.init(a);
+    defer f.deinit();
+    const i64_t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
+    const b = try f.appendBlock();
+    const c = try f.appendInst(b, i64_t, .{ .iconst = 0x1_0000_0100 });
+    f.setTerminator(b, .{ .ret = c });
+
+    // 0x1_0000_0100 and 0x0000_0100 share the low byte (0x00) but are very different i64
+    // values: the OLD low-byte runner cannot tell them apart, the Full runner must.
+    try std.testing.expectEqual(@as(u8, 0x00), @as(u8, @truncate(@as(u64, @bitCast(@as(i64, 0x1_0000_0100))))));
+    try std.testing.expectEqual(@as(u8, 0x00), @as(u8, @truncate(@as(u64, @bitCast(@as(i64, 0x0000_0100))))));
+
+    var ran = false;
+    for ([_]harness.Backend{ harness.native, harness.qemu }) |backend| {
+        const byte = harness.runFunc(std.testing.io, a, &f, &.{}, backend) catch |e| switch (e) {
+            error.SkipZigTest => continue,
+            else => return e,
+        };
+        try std.testing.expectEqual(@as(u8, 0x00), byte); // the old runner's low byte is ambiguous
+        try harness.expectRunFull(std.testing.io, a, &f, &.{}, 0x1_0000_0100, backend); // the Full runner is not
+        ran = true;
+    }
+    try std.testing.expect(ran);
+}
+
+test "x86_64 expectRunFloatFull asserts the exact f32 bits, not just the low byte" {
+    const a = std.testing.allocator;
+    // 0x3F80_0100 and 0x0000_0100 (as f32 bit patterns) share the low byte (0x00) but are very
+    // different f32 values.
+    const full: f32 = @bitCast(@as(u32, 0x3F80_0100));
+    const collide: f32 = @bitCast(@as(u32, 0x0000_0100));
+    try std.testing.expectEqual(@as(u8, 0x00), @as(u8, @truncate(@as(u32, @bitCast(full)))));
+    try std.testing.expectEqual(@as(u8, 0x00), @as(u8, @truncate(@as(u32, @bitCast(collide)))));
+    try std.testing.expect(full != collide);
+
+    var f = ir.function.Function.init(a);
+    defer f.deinit();
+    const t = try f.types.intern(.{ .float = .f32 });
+    const b = try f.appendBlock();
+    const x = try f.appendBlockParam(b, t);
+    f.setTerminator(b, .{ .ret = x });
+
+    // The OLD low-byte runner cannot tell `full` from `collide`: both truncate to 0x00.
+    try std.testing.expectEqual(@as(u8, 0x00), try harness.runFloatFunc(std.testing.io, a, &f, &.{full}, harness.qemu));
+    // The new Full runner asserts the exact bits.
+    try harness.expectRunFloatFull(std.testing.io, a, &f, &.{full}, full, harness.qemu);
+}
+
+test "x86_64 expectRunDoubleFull asserts the exact f64 bits, not just the low byte" {
+    const a = std.testing.allocator;
+    // 0x3FF0_0000_0000_0100 and 0x0000_0000_0000_0100 (as f64 bit patterns) share the low byte
+    // (0x00) but are very different f64 values.
+    const full: f64 = @bitCast(@as(u64, 0x3FF0_0000_0000_0100));
+    const collide: f64 = @bitCast(@as(u64, 0x0000_0000_0000_0100));
+    try std.testing.expectEqual(@as(u8, 0x00), @as(u8, @truncate(@as(u64, @bitCast(full)))));
+    try std.testing.expectEqual(@as(u8, 0x00), @as(u8, @truncate(@as(u64, @bitCast(collide)))));
+    try std.testing.expect(full != collide);
+
+    var f = ir.function.Function.init(a);
+    defer f.deinit();
+    const t = try f.types.intern(.{ .float = .f64 });
+    const b = try f.appendBlock();
+    const x = try f.appendBlockParam(b, t);
+    f.setTerminator(b, .{ .ret = x });
+
+    // The OLD low-byte runner cannot tell `full` from `collide`: both truncate to 0x00.
+    try std.testing.expectEqual(@as(u8, 0x00), try harness.runDoubleFunc(std.testing.io, a, &f, &.{full}, harness.qemu));
+    // The new Full runner asserts the exact bits.
+    try harness.expectRunDoubleFull(std.testing.io, a, &f, &.{full}, full, harness.qemu);
+}
+
+// ---------------------------------------------------------------------------
 // Whole-pipeline differential: optimize(cascadelake-sp) -> x86_64 isel vs. the plain compile.
 // ---------------------------------------------------------------------------
 
@@ -662,8 +749,9 @@ test "x86_64: optimize(cascadelake) then selectFunctionForModel is execution-equ
     try std.testing.expect(diags.ok());
 
     // Compile PLAIN (untouched original) and TUNED (optimized IR, model-aware isel), then run both
-    // under every available backend across the sweep, each checked against the independently
-    // computed golden sum (not just against each other), so a shared miscompile is still caught.
+    // under every available backend across the sweep, each checked EXACTLY (via the Full runner,
+    // not mod 256: the sums grow past 255) against the independently computed golden sum (not
+    // just against each other), so a shared miscompile is still caught.
     const plain = try isel.selectFunction(a, &orig);
     defer a.free(plain);
     const tuned_code = try isel.selectFunctionForModel(a, &tuned, mm.modelFor(.@"cascadelake-sp"));
@@ -671,11 +759,11 @@ test "x86_64: optimize(cascadelake) then selectFunctionForModel is execution-equ
 
     const ns = [_]i64{ 0, 1, 5, 17, 64, 100 };
     for (ns) |n| {
-        const want: u8 = @truncate(@as(u64, @bitCast(expectedReductionSum(n))));
+        const want = expectedReductionSum(n);
         var ran = false;
         for ([_]harness.Backend{ harness.native, harness.qemu }) |backend| {
-            const p = try runCmpBranchOn(std.testing.io, a, plain, &.{n}, backend);
-            const t = try runCmpBranchOn(std.testing.io, a, tuned_code, &.{n}, backend);
+            const p = try runCmpBranchOnFull(std.testing.io, a, plain, &.{n}, backend);
+            const t = try runCmpBranchOnFull(std.testing.io, a, tuned_code, &.{n}, backend);
             if (p) |pv| {
                 try std.testing.expectEqual(want, pv);
                 ran = true;
