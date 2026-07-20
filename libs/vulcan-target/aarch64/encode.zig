@@ -156,6 +156,7 @@ pub const Cond = enum(u4) {
     hs = 2, // unsigned >=
     lo = 3, // unsigned <
     mi = 4, // negative (used for float <)
+    pl = 5, // non-negative (the inverse of `mi`, bit 0 toggles `mi`)
     hi = 8, // unsigned >
     ls = 9, // unsigned <=
     ge = 10, // signed >=
@@ -163,6 +164,27 @@ pub const Cond = enum(u4) {
     gt = 12, // signed >
     le = 13, // signed <=
 };
+
+/// The logical inverse of a condition. In the AArch64 4-bit condition encoding bit 0 toggles the
+/// sense, so the inverse is the paired code: eq<->ne, hs<->lo, mi<->pl, hi<->ls, ge<->lt, gt<->le.
+/// Used to fall through the ELSE edge of an `if` by branching to the else label on the inverted
+/// predicate. Exhaustive over `Cond` so a newly added condition forces a matching inverse here.
+pub fn invertCond(cond: Cond) Cond {
+    return switch (cond) {
+        .eq => .ne,
+        .ne => .eq,
+        .hs => .lo,
+        .lo => .hs,
+        .mi => .pl,
+        .pl => .mi,
+        .hi => .ls,
+        .ls => .hi,
+        .ge => .lt,
+        .lt => .ge,
+        .gt => .le,
+        .le => .gt,
+    };
+}
 
 /// `cmp wn, wm` (32-bit compare, i.e. `subs wzr, wn, wm`): sets the flags.
 pub fn cmp(rn: Reg, rm: Reg) u32 {
@@ -235,6 +257,14 @@ pub fn cset(rd: Reg, cond: Cond) u32 {
 pub fn cbnz(rt: Reg, off: i21) u32 {
     const imm19: u32 = @as(u32, @bitCast(@as(i32, off) >> 2)) & 0x7FFFF;
     return 0x35000000 | (imm19 << 5) | n(rt);
+}
+
+/// `cbz wt, label` (32-bit): branch if `wt` is zero. Same encoding as `cbnz` with bit 24 cleared
+/// (base `0x34000000` vs cbnz's `0x35000000`). `off` is the signed byte displacement (a multiple
+/// of 4). Used to fall through the ELSE edge when the boolean condition is false.
+pub fn cbz(rt: Reg, off: i21) u32 {
+    const imm19: u32 = @as(u32, @bitCast(@as(i32, off) >> 2)) & 0x7FFFF;
+    return 0x34000000 | (imm19 << 5) | n(rt);
 }
 
 /// `b.cond label` (conditional branch): branch if `cond` holds. `off` is the signed

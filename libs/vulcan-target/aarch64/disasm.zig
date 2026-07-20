@@ -1094,7 +1094,28 @@ test "round-trips flags, selects, and branches" {
     try expectOne(encode.b(16), "b .+16");
     try expectOne(encode.bl(-8), "bl .-8");
     try expectOne(encode.cbnz(.x3, 12), "cbnz w3, .+12");
+    try expectOne(encode.cbz(.x0, 8), "cbz w0, .+8");
     try expectOne(encode.svc(0), "svc #0");
+}
+
+test "invertCond pairs each condition with its logical inverse" {
+    // Bit 0 of the AArch64 condition encoding toggles the sense, so every inverse is the paired code.
+    try std.testing.expectEqual(encode.Cond.ne, encode.invertCond(.eq));
+    try std.testing.expectEqual(encode.Cond.eq, encode.invertCond(.ne));
+    try std.testing.expectEqual(encode.Cond.lo, encode.invertCond(.hs));
+    try std.testing.expectEqual(encode.Cond.hs, encode.invertCond(.lo));
+    try std.testing.expectEqual(encode.Cond.pl, encode.invertCond(.mi));
+    try std.testing.expectEqual(encode.Cond.mi, encode.invertCond(.pl));
+    try std.testing.expectEqual(encode.Cond.ls, encode.invertCond(.hi));
+    try std.testing.expectEqual(encode.Cond.hi, encode.invertCond(.ls));
+    try std.testing.expectEqual(encode.Cond.lt, encode.invertCond(.ge));
+    try std.testing.expectEqual(encode.Cond.ge, encode.invertCond(.lt));
+    try std.testing.expectEqual(encode.Cond.le, encode.invertCond(.gt));
+    try std.testing.expectEqual(encode.Cond.gt, encode.invertCond(.le));
+    // invertCond is an involution: inverting twice returns the original.
+    inline for (std.enums.values(encode.Cond)) |cond| {
+        try std.testing.expectEqual(cond, encode.invertCond(encode.invertCond(cond)));
+    }
 }
 
 test "round-trips memory access" {

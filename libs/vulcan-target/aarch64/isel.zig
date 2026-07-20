@@ -1156,7 +1156,10 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     }
                 },
                 .@"if" => |cf| {
-                    try ctx.emitIf(allocator, &code, &fixups, cf, insts, inst_idx);
+                    // The block emitted immediately after this one, in array order. An `if` edge to it
+                    // can fall through (elide its branch) instead of jumping around one instruction.
+                    const next_block: ?Block = if (bi + 1 < nblocks) @enumFromInt(bi + 1) else null;
+                    try ctx.emitIf(allocator, &code, &fixups, cf, insts, inst_idx, next_block);
                     terminated = true;
                 },
                 .dot => |d| {
@@ -1227,7 +1230,12 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     if (frame > 0) try emitFrameImm(allocator, &code, false, sp, sp, frame);
                     try code.append(allocator, encode.ret());
                 },
-                .jump => |j| try ctx.emitJump(allocator, &code, &fixups, j),
+                .jump => |j| {
+                    // The block emitted immediately after this one, in array order. A jump to it needs
+                    // no branch (fall through), which `emitJump` elides.
+                    const next_block: ?Block = if (bi + 1 < nblocks) @enumFromInt(bi + 1) else null;
+                    try ctx.emitJump(allocator, &code, &fixups, j, next_block);
+                },
             }
         }
         pos += 1; // the terminator's own position slot (mirrors linearize's per-block final increment)
@@ -1548,6 +1556,16 @@ const Ctx = struct {
         }
     }
 
+    /// The conditional branch an `if` reduces to after its SETUP has emitted the flag-setting compare
+    /// (or arith S-form) or materialized the boolean. `cc` branches on a `Cond` (the fused
+    /// compare-and-branch path), `reg` branches on a boolean register being non-zero (the plain path).
+    /// The two layouts below emit either the not-inverted form (branch to THEN) or the inverted form
+    /// (branch to ELSE) from this single descriptor.
+    const IfBranch = union(enum) {
+        cc: encode.Cond,
+        reg: Reg,
+    };
+
     fn emitIf(
         self: Ctx,
         allocator: std.mem.Allocator,
@@ -1556,15 +1574,16 @@ const Ctx = struct {
         cf: ir.function.If,
         insts: []const ir.function.Inst,
         if_idx: usize,
+        next_block: ?Block,
     ) Error!void {
-        // Fused compare-and-branch: when the immediately-preceding instruction is a
-        // single-use integer icmp that is exactly this if's condition (the SAME predicate
-        // the icmp case used to skip its materialization), load the icmp's operands, set
-        // the flags with `cmp`, and branch to the then-edge with `b.cc` on the icmp's
-        // condition instead of materializing a boolean and re-testing it with `cbnz`. The
-        // edge-move / fixup structure is identical to the plain path, only the branch and
-        // its operand load differ. condFor here mirrors the icmp lowering's cset condition,
-        // so the fused branch takes the then-edge under exactly the same condition.
+        // SETUP (shared by both layouts): emit the test that decides the branch and yield the branch
+        // descriptor. Fused compare-and-branch: when the immediately-preceding instruction is a
+        // single-use integer icmp that is exactly this if's condition (the SAME predicate the icmp case
+        // used to skip its materialization), load the icmp's operands, set the flags with `cmp`, and
+        // branch on the icmp's condition instead of materializing a boolean and re-testing it with
+        // `cbnz`. condFor here mirrors the icmp lowering's cset condition, so the branch takes the
+        // then-edge under exactly the same condition.
+        var branch: IfBranch = undefined;
         if (if_idx >= 1 and self.fuse_cmp_branch and fusesIntoNextIf(self.func, insts, if_idx - 1)) {
             const cmp = self.func.opcode(insts[if_idx - 1]).icmp;
             const cond = condFor(cmp.op, isSignedInt(self.func, cmp.lhs));
@@ -1581,28 +1600,83 @@ const Ctx = struct {
                 const rr = try self.loadOp(allocator, code, cmp.rhs, spill_op[1]);
                 try code.append(allocator, encode.cmp(rl, rr));
             }
+            branch = .{ .cc = cond };
+        } else {
+            const cond = try self.loadOp(allocator, code, cf.cond, spill_op[0]);
+            branch = .{ .reg = cond };
+        }
+
+        // Layout selection. THEN and ELSE are the two successor blocks; NEXT is the block emitted right
+        // after this one (or null at the last block). Whichever edge targets NEXT can fall through, so
+        // its branch is elided. THEN is checked first, so a degenerate `if` with THEN == ELSE == NEXT
+        // takes the THEN-fall-through layout (elides one branch, both edges still reach the same block).
+        const then_target = cf.then.target;
+        const else_target = cf.@"else".target;
+        const then_next = next_block != null and then_target == next_block.?;
+        const else_next = next_block != null and else_target == next_block.?;
+
+        if (then_next) {
+            // THEN falls through. Keep the not-inverted branch to the then-label, emit the ELSE-moves +
+            // `b ELSE` inline, then the THEN-moves last and FALL THROUGH to THEN (elide the trailing
+            // `b THEN`). The conditional's forward displacement targets the then-label as before.
             const bcc_at = code.items.len;
-            try code.append(allocator, encode.bcc(cond, 0));
-            try self.emitMoves(allocator, code, cf.@"else");
-            try fixups.append(allocator, .{ .at = code.items.len, .target = @intFromEnum(cf.@"else".target) });
+            try code.append(allocator, switch (branch) {
+                .cc => |cond| encode.bcc(cond, 0),
+                .reg => |reg| encode.cbnz(reg, 0),
+            });
+            try self.emitMoves(allocator, code, cf.@"else"); // ELSE-moves on the else path
+            try fixups.append(allocator, .{ .at = code.items.len, .target = @intFromEnum(else_target) });
             try code.append(allocator, encode.b(0));
             const then_at = code.items.len;
-            code.items[bcc_at] = encode.bcc(cond, @intCast((@as(i64, @intCast(then_at)) - @as(i64, @intCast(bcc_at))) * 4));
-            try self.emitMoves(allocator, code, cf.then);
-            try fixups.append(allocator, .{ .at = code.items.len, .target = @intFromEnum(cf.then.target) });
-            try code.append(allocator, encode.b(0));
+            const disp: i21 = @intCast((@as(i64, @intCast(then_at)) - @as(i64, @intCast(bcc_at))) * 4);
+            code.items[bcc_at] = switch (branch) {
+                .cc => |cond| encode.bcc(cond, disp),
+                .reg => |reg| encode.cbnz(reg, disp),
+            };
+            try self.emitMoves(allocator, code, cf.then); // THEN-moves, then fall through to THEN
             return;
         }
-        const cond = try self.loadOp(allocator, code, cf.cond, spill_op[0]);
-        const cbnz_at = code.items.len;
-        try code.append(allocator, encode.cbnz(cond, 0));
+
+        if (else_next) {
+            // ELSE falls through. INVERT the branch so it targets the else-label when the ELSE edge is
+            // taken (bcc on invertCond, or `cbz` for the boolean path), emit the THEN-moves + `b THEN`
+            // inline (the not-taken path), then the ELSE-moves last and FALL THROUGH to ELSE. The
+            // conditional's forward displacement targets the else-label.
+            const bcc_at = code.items.len;
+            try code.append(allocator, switch (branch) {
+                .cc => |cond| encode.bcc(encode.invertCond(cond), 0),
+                .reg => |reg| encode.cbz(reg, 0),
+            });
+            try self.emitMoves(allocator, code, cf.then); // THEN-moves on the then (not-taken) path
+            try fixups.append(allocator, .{ .at = code.items.len, .target = @intFromEnum(then_target) });
+            try code.append(allocator, encode.b(0));
+            const else_at = code.items.len;
+            const disp: i21 = @intCast((@as(i64, @intCast(else_at)) - @as(i64, @intCast(bcc_at))) * 4);
+            code.items[bcc_at] = switch (branch) {
+                .cc => |cond| encode.bcc(encode.invertCond(cond), disp),
+                .reg => |reg| encode.cbz(reg, disp),
+            };
+            try self.emitMoves(allocator, code, cf.@"else"); // ELSE-moves, then fall through to ELSE
+            return;
+        }
+
+        // Neither edge is NEXT (or this is the last block): emit both branches as before.
+        const bcc_at = code.items.len;
+        try code.append(allocator, switch (branch) {
+            .cc => |cond| encode.bcc(cond, 0),
+            .reg => |reg| encode.cbnz(reg, 0),
+        });
         try self.emitMoves(allocator, code, cf.@"else");
-        try fixups.append(allocator, .{ .at = code.items.len, .target = @intFromEnum(cf.@"else".target) });
+        try fixups.append(allocator, .{ .at = code.items.len, .target = @intFromEnum(else_target) });
         try code.append(allocator, encode.b(0));
         const then_at = code.items.len;
-        code.items[cbnz_at] = encode.cbnz(cond, @intCast((@as(i64, @intCast(then_at)) - @as(i64, @intCast(cbnz_at))) * 4));
+        const disp: i21 = @intCast((@as(i64, @intCast(then_at)) - @as(i64, @intCast(bcc_at))) * 4);
+        code.items[bcc_at] = switch (branch) {
+            .cc => |cond| encode.bcc(cond, disp),
+            .reg => |reg| encode.cbnz(reg, disp),
+        };
         try self.emitMoves(allocator, code, cf.then);
-        try fixups.append(allocator, .{ .at = code.items.len, .target = @intFromEnum(cf.then.target) });
+        try fixups.append(allocator, .{ .at = code.items.len, .target = @intFromEnum(then_target) });
         try code.append(allocator, encode.b(0));
     }
 
@@ -1612,8 +1686,12 @@ const Ctx = struct {
         code: *std.ArrayList(u32),
         fixups: *std.ArrayList(Fixup),
         jump: ir.function.Jump,
+        next_block: ?Block,
     ) Error!void {
         try self.emitMoves(allocator, code, jump);
+        // A jump to the block emitted immediately after this one falls through: the edge-moves above
+        // still run, but the `b` (and its fixup) is elided.
+        if (next_block != null and jump.target == next_block.?) return;
         try fixups.append(allocator, .{ .at = code.items.len, .target = @intFromEnum(jump.target) });
         try code.append(allocator, encode.b(0));
     }

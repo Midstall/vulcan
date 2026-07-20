@@ -570,7 +570,11 @@ fn emitFromAllocation(allocator: std.mem.Allocator, ctx: *Ctx, func: *const Func
                 action_cursor += 1;
             }
             if (func.opcode(inst) == .@"if") {
-                try emitIf(allocator, ctx, func.opcode(inst).@"if", block);
+                // NEXT is the block emitted immediately after this one (x86_64 emits ALL blocks in
+                // order, so bi+1 is always the emitted-next), or null at the last block. Whichever
+                // successor edge targets NEXT can fall through, so emitIf elides that branch.
+                const next_block: ?Block = if (bi + 1 < nblocks) @enumFromInt(bi + 1) else null;
+                try emitIf(allocator, ctx, func.opcode(inst).@"if", block, next_block);
                 terminated = true;
             } else {
                 try lowerInst(allocator, ctx, inst);
@@ -614,7 +618,12 @@ fn emitFromAllocation(allocator: std.mem.Allocator, ctx: *Ctx, func: *const Func
                 }
                 try ctx.put(allocator, encode.ret());
             },
-            .jump => |j| try emitJump(allocator, ctx, j, block),
+            .jump => |j| {
+                // NEXT is the emitted-next block (bi+1) or null at the last block; a jump to it
+                // falls through, so emitJump elides the `jmp`.
+                const next_block: ?Block = if (bi + 1 < nblocks) @enumFromInt(bi + 1) else null;
+                try emitJump(allocator, ctx, j, block, next_block);
+            },
         };
         // Advance to the next block's param row: param row (1) + one slot per instruction + one
         // terminator slot (reserved unconditionally, matching computeLocalLiveness's per-block
@@ -1382,11 +1391,49 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
     }
 }
 
-fn emitIf(allocator: std.mem.Allocator, ctx: *Ctx, cf: ir.function.If, pred: Block) Error!void {
+fn emitIf(allocator: std.mem.Allocator, ctx: *Ctx, cf: ir.function.If, pred: Block, next_block: ?Block) Error!void {
     const func = ctx.func;
     const cond = try ctx.use(allocator, cf.cond, scratch1);
     // Test at the condition's width so a dirty upper half of a raw i32 cond is ignored.
     try ctx.put(allocator, encode.testReg(cond, cond, intBits(func, cf.cond) > 32));
+
+    // Layout selection. THEN and ELSE are the two successor blocks; NEXT is the block emitted right
+    // after this one (or null at the last block). Whichever edge targets NEXT can fall through, so
+    // its branch is elided. THEN is checked first, so a degenerate `if` with THEN == ELSE == NEXT
+    // takes the THEN-fall-through layout (elides one branch, both edges still reach the same block).
+    const then_next = next_block != null and cf.then.target == next_block.?;
+    const else_next = next_block != null and cf.@"else".target == next_block.?;
+
+    if (then_next) {
+        // THEN falls through. Keep `jnz -> then_start`, emit the ELSE-moves + `jmp ELSE` inline,
+        // then the THEN-moves last and FALL THROUGH to THEN (elide the trailing `jmp THEN`). The jnz
+        // still jumps forward over the else section to then_start, so its displacement is unchanged.
+        const jnz = try emitBranch(allocator, ctx, encode.jcc(.ne, 0));
+        try emitMoves(allocator, ctx, cf.@"else", pred); // ELSE-moves on the else path
+        try emitBranchTo(allocator, ctx, encode.jmp(0), @intFromEnum(cf.@"else".target));
+        const then_start = ctx.code.items.len;
+        const rel: i32 = @intCast(@as(i64, @intCast(then_start)) - @as(i64, @intCast(jnz + 4)));
+        std.mem.writeInt(u32, ctx.code.items[jnz..][0..4], @bitCast(rel), .little);
+        try emitMoves(allocator, ctx, cf.then, pred); // THEN-moves, then fall through to THEN
+        return;
+    }
+
+    if (else_next) {
+        // ELSE falls through. INVERT the branch (jnz -> jz) so it jumps to else_start when the cond
+        // is FALSE (the else edge), and falls through to the THEN-moves when the cond is TRUE. Emit
+        // the THEN-moves + `jmp THEN` inline, then the ELSE-moves last and FALL THROUGH to ELSE. The
+        // jz's forward displacement targets else_start.
+        const jz = try emitBranch(allocator, ctx, encode.jcc(encode.invertCond(.ne), 0));
+        try emitMoves(allocator, ctx, cf.then, pred); // THEN-moves on the then (not-taken) path
+        try emitBranchTo(allocator, ctx, encode.jmp(0), @intFromEnum(cf.then.target));
+        const else_start = ctx.code.items.len;
+        const rel: i32 = @intCast(@as(i64, @intCast(else_start)) - @as(i64, @intCast(jz + 4)));
+        std.mem.writeInt(u32, ctx.code.items[jz..][0..4], @bitCast(rel), .little);
+        try emitMoves(allocator, ctx, cf.@"else", pred); // ELSE-moves, then fall through to ELSE
+        return;
+    }
+
+    // Neither edge is NEXT (or this is the last block): emit both branches as before.
     const jnz = try emitBranch(allocator, ctx, encode.jcc(.ne, 0));
     try emitMoves(allocator, ctx, cf.@"else", pred);
     try emitBranchTo(allocator, ctx, encode.jmp(0), @intFromEnum(cf.@"else".target));
@@ -1397,8 +1444,11 @@ fn emitIf(allocator: std.mem.Allocator, ctx: *Ctx, cf: ir.function.If, pred: Blo
     try emitBranchTo(allocator, ctx, encode.jmp(0), @intFromEnum(cf.then.target));
 }
 
-fn emitJump(allocator: std.mem.Allocator, ctx: *Ctx, jump: ir.function.Jump, pred: Block) Error!void {
+fn emitJump(allocator: std.mem.Allocator, ctx: *Ctx, jump: ir.function.Jump, pred: Block, next_block: ?Block) Error!void {
+    // The block-param edge-moves ALWAYS run. A jump to the block emitted immediately after this one
+    // then falls through: the `jmp` (and its fixup) is elided.
     try emitMoves(allocator, ctx, jump, pred);
+    if (next_block != null and jump.target == next_block.?) return;
     try emitBranchTo(allocator, ctx, encode.jmp(0), @intFromEnum(jump.target));
 }
 

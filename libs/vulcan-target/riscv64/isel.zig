@@ -4325,6 +4325,11 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
         // an unreachable block (valid SSA), and the relaxation loops below skip it in lockstep.
         if (!reachable[bi]) continue;
         const block: Block = @enumFromInt(bi);
+        // The block emitted immediately after this one falls through, so a branch or jump to it can be
+        // elided. Blocks emit in index order and only reachable ones emit, so the next emitted block is
+        // `bi + 1` exactly when that index exists AND is reachable. A terminator only ever targets a
+        // reachable block, so when `bi + 1` is unreachable no edge names it and no elision is missed.
+        const next_block: ?Block = if (bi + 1 < func.blockCount() and reachable[bi + 1]) @enumFromInt(bi + 1) else null;
         if (fetch_align > 4 and is_loop_header[bi]) {
             var pad = alignPadWords(code.items.len, fetch_align);
             while (pad > 0) : (pad -= 1) try code.append(allocator, encode.nop());
@@ -5155,8 +5160,25 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                         const sel = branchFor(cmp.op, isUnsignedInt(func, func.valueType(cmp.lhs)));
                         const rs1 = if (sel.swap) rr else rl;
                         const rs2 = if (sel.swap) rl else rr;
+                        // Fall-through elision. THEN is checked first so a degenerate `if` whose THEN and
+                        // ELSE are BOTH the next block still resolves (branch to THEN, fall through to
+                        // ELSE, both reach the same block). When THEN is next, INVERT the branch to target
+                        // ELSE and fall through to THEN, dropping the `jal`. When ELSE is next, keep the
+                        // branch to THEN and drop the `jal` (falling through to ELSE). Relaxation expands
+                        // the (possibly inverted) `.cbranch` on its own if the target is far.
+                        if (next_block != null and cf.then.target == next_block.?) {
+                            const inv = sel.kind.invert();
+                            try fixups.append(allocator, .{ .index = code.items.len, .target = cf.@"else".target, .kind = .{ .cbranch = .{ .kind = inv, .rs1 = rs1, .rs2 = rs2 } } });
+                            try code.append(allocator, inv.emit(rs1, rs2, 0));
+                            exited = true;
+                            break;
+                        }
                         try fixups.append(allocator, .{ .index = code.items.len, .target = cf.then.target, .kind = .{ .cbranch = .{ .kind = sel.kind, .rs1 = rs1, .rs2 = rs2 } } });
                         try code.append(allocator, sel.kind.emit(rs1, rs2, 0));
+                        if (next_block != null and cf.@"else".target == next_block.?) {
+                            exited = true;
+                            break;
+                        }
                         try fixups.append(allocator, .{ .index = code.items.len, .target = cf.@"else".target, .kind = .jal });
                         try code.append(allocator, encode.jal(.x0, 0));
                         exited = true;
@@ -5169,9 +5191,24 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                         .reg => |r| r,
                         .slot => return error.Unsupported,
                     };
-                    // bne cond, x0, then  /  jal x0, else  (offsets patched later)
+                    // bne cond, x0, then  /  jal x0, else  (offsets patched later). Fall-through elision
+                    // mirrors the fused path. When THEN is next, invert `bne cond, x0` to `beq cond, x0`
+                    // targeting ELSE and fall through to THEN, dropping the `jal`. A `.cbranch{ .beq }`
+                    // fixup carries it so relaxation can expand a far ELSE (beq.invert = bne, so the long
+                    // form is `bne cond, x0, +8; jal else`, the original skip-and-jump). When ELSE is
+                    // next, keep the `bne` to THEN and drop the `jal`.
+                    if (next_block != null and cf.then.target == next_block.?) {
+                        try fixups.append(allocator, .{ .index = code.items.len, .target = cf.@"else".target, .kind = .{ .cbranch = .{ .kind = .beq, .rs1 = cond_reg, .rs2 = .x0 } } });
+                        try code.append(allocator, encode.beq(cond_reg, .x0, 0));
+                        exited = true;
+                        break;
+                    }
                     try fixups.append(allocator, .{ .index = code.items.len, .target = cf.then.target, .kind = .{ .branch = cond_reg } });
                     try code.append(allocator, encode.bne(cond_reg, .x0, 0));
+                    if (next_block != null and cf.@"else".target == next_block.?) {
+                        exited = true;
+                        break;
+                    }
                     try fixups.append(allocator, .{ .index = code.items.len, .target = cf.@"else".target, .kind = .jal });
                     try code.append(allocator, encode.jal(.x0, 0));
                     exited = true;
@@ -5930,6 +5967,9 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     // for every default caller, so the derivation below runs unchanged there.
                     if (alloc.edge_move_driven) {
                         try emitEdgeMoves(allocator, &code, alloc, spill_base, float_spill_base, vspill_base, vpu_vspill_base, vpu_pack_base, block, j.target);
+                        // A jump to the block emitted immediately after this one falls through: the edge
+                        // moves above still run, but the `jal` (and its fixup) is elided.
+                        if (next_block != null and j.target == next_block.?) break :jump_blk;
                         try fixups.append(allocator, .{ .index = code.items.len, .target = j.target, .kind = .jal });
                         try code.append(allocator, encode.jal(.x0, 0));
                         break :jump_blk;
@@ -6082,6 +6122,9 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                         if (ar != r.dst) try code.append(allocator, encode.vmv_v_v(r.dst, ar));
                     }
 
+                    // A jump to the block emitted immediately after this one falls through: the arg
+                    // moves above still run (block-param assignments), but the `jal` is elided.
+                    if (next_block != null and j.target == next_block.?) break :jump_blk;
                     try fixups.append(allocator, .{ .index = code.items.len, .target = j.target, .kind = .jal });
                     try code.append(allocator, encode.jal(.x0, 0));
                 },
@@ -6711,10 +6754,11 @@ test "selects float block arguments on a jump edge" {
     const code = try selectFunction(std.testing.allocator, &func);
     defer std.testing.allocator.free(code);
 
+    // block1 is emitted right after block0, so the jump falls through: the parallel-move copy still
+    // runs, but the `jal` is elided.
     try std.testing.expectEqualSlices(u32, &.{
         encode.fmv_d(.f0, .f10), // fmv.d ft0, fa0  (parallel-move copies the whole float reg;
         // a full 64-bit copy carries the f32 value's exact bits, NaN-box included, across the edge)
-        encode.jal(.x0, 4), // jal block1
         encode.fmv_s(.f10, .f0), // fmv.s fa0, ft0  (return v1)
         encode.jalr(.x0, .x1, 0), // ret
     }, code);
@@ -6736,11 +6780,11 @@ test "selects block arguments on a jump edge" {
     const code = try selectFunction(std.testing.allocator, &func);
     defer std.testing.allocator.free(code);
 
-    // block0: mv t0, a0  (pass v0 into v1's register) then jal block1.
+    // block0: mv t0, a0  (pass v0 into v1's register); block1 is emitted next so the jump falls
+    // through (the edge move stays, the `jal` is elided).
     // block1: mv a0, t0  (return v1) then ret.
     try std.testing.expectEqualSlices(u32, &.{
         encode.addi(.x5, .x10, 0), // mv t0, a0
-        encode.jal(.x0, 4), // jal block1
         encode.addi(.x10, .x5, 0), // mv a0, t0
         encode.jalr(.x0, .x1, 0), // ret
     }, code);
@@ -6828,10 +6872,11 @@ test "selects a conditional branch" {
     const code = try selectFunction(std.testing.allocator, &func);
     defer std.testing.allocator.free(code);
 
-    // Layout: block0 [bne, jal], block1 [ret], block2 [ret].
+    // Layout: block0 [beq], block1 [ret], block2 [ret]. THEN (block1) is the block emitted next, so
+    // fall-through elision inverts the non-fused test `bne c, x0 -> block1` to `beq c, x0 -> block2`
+    // and drops the `jal`, falling through to block1. block2's `ret` sits two words after the branch.
     try std.testing.expectEqualSlices(u32, &.{
-        encode.bne(.x10, .x0, 8), // bne c, x0, block1
-        encode.jal(.x0, 8), // jal x0, block2
+        encode.beq(.x10, .x0, 8), // beq c, x0, block2 (inverted; fall through to block1)
         encode.jalr(.x0, .x1, 0), // block1: ret
         encode.jalr(.x0, .x1, 0), // block2: ret
     }, code);
@@ -7720,7 +7765,14 @@ test "selectFunctionAligned pads a loop header with nops but never changes fetch
     const racc = try func.appendBlockParam(done, t);
 
     const zero = try func.appendInst(entry, t, .{ .iconst = 0 });
-    try func.setJump(entry, loop, &.{ zero, zero });
+    // Seed the accumulator with a WIDE constant (lui + addi = two entry words) rather than 0 so the
+    // loop header lands on an odd word offset and genuinely needs an alignment pad. Fall-through
+    // elision now drops the entry's `jal` into the header, so a plain zero seed would leave the header
+    // already aligned and the padding hook a no-op, which is not what these tests exercise. The
+    // function is never executed here (structural padding + seam-equivalence checks only), so the seed
+    // value is immaterial.
+    const wide = try func.appendInst(entry, t, .{ .iconst = 0x12345 });
+    try func.setJump(entry, loop, &.{ zero, wide });
     const cmp = try func.appendInst(loop, bool_t, .{ .icmp = .{ .op = .lt, .lhs = i, .rhs = n } });
     try func.appendIf(loop, cmp, .{ .target = body, .args = &.{ i, acc } }, .{ .target = done, .args = &.{acc} });
     const ni = try func.appendArithImm(body, t, .add, bi, 1);
@@ -7770,7 +7822,14 @@ test "selectFunctionForModel fires the alignment hook from river-rc1.ma, matches
     const racc = try func.appendBlockParam(done, t);
 
     const zero = try func.appendInst(entry, t, .{ .iconst = 0 });
-    try func.setJump(entry, loop, &.{ zero, zero });
+    // Seed the accumulator with a WIDE constant (lui + addi = two entry words) rather than 0 so the
+    // loop header lands on an odd word offset and genuinely needs an alignment pad. Fall-through
+    // elision now drops the entry's `jal` into the header, so a plain zero seed would leave the header
+    // already aligned and the padding hook a no-op, which is not what these tests exercise. The
+    // function is never executed here (structural padding + seam-equivalence checks only), so the seed
+    // value is immaterial.
+    const wide = try func.appendInst(entry, t, .{ .iconst = 0x12345 });
+    try func.setJump(entry, loop, &.{ zero, wide });
     const cmp = try func.appendInst(loop, bool_t, .{ .icmp = .{ .op = .lt, .lhs = i, .rhs = n } });
     try func.appendIf(loop, cmp, .{ .target = body, .args = &.{ i, acc } }, .{ .target = done, .args = &.{acc} });
     const ni = try func.appendArithImm(body, t, .add, bi, 1);
