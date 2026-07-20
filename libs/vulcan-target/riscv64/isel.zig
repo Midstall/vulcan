@@ -801,7 +801,12 @@ fn emitSplitAction(allocator: std.mem.Allocator, code: *std.ArrayList(u32), func
     }
 }
 
-/// Materialize a 32-bit value into integer register `rd`.
+/// Materialize a 32-bit value into integer register `rd`. When `bits` does not fit a 12-bit
+/// signed immediate this emits `lui rd, hi` immediately followed by `addi rd, rd, lo`, adjacent
+/// by construction (the same hi/lo address-pair shape `caps.fuse_addr_hi_lo` guards for
+/// `.global_addr`), but this helper is a free function called from ~25 sites with no `ModelCaps`
+/// in scope, so it carries no adjacency assert of its own: threading `caps` through every call
+/// site just for an assert is not worth it, and the invariant holds unconditionally regardless.
 fn loadImm32(allocator: std.mem.Allocator, code: *std.ArrayList(u32), rd: Reg, bits: u32) std.mem.Allocator.Error!void {
     const signed: i32 = @bitCast(bits);
     if (signed >= -2048 and signed <= 2047) {
@@ -2140,6 +2145,11 @@ fn extendLiveRanges(
 /// single-use make skipping the boolean register-safe: nothing runs between the icmp and
 /// the if, so the operand registers still hold their values at the if, and no other
 /// reader needs the boolean.
+///
+/// This predicate itself carries no model gate; both call sites in `emitFromAllocation` (the
+/// icmp-skip and the fused `.@"if"`) additionally require the local `fuse_cmp_branch` (threaded
+/// from `caps.fuse_cmp_branch`) before honoring it, so a model without the fusion falls back to
+/// the materialize-then-test path unchanged.
 fn fusesIntoNextIf(func: *const Function, insts: []const ir.function.Inst, idx: usize) bool {
     const cmp = switch (func.opcode(insts[idx])) {
         .icmp => |c| c,
@@ -2253,6 +2263,48 @@ fn fusesScalarFloatArith(func: *const Function, alloc: *const Allocation, insts:
     const res = func.instResult(insts[idx + 1]).?;
     return alloc.float.get(mul.lhs) != null and alloc.float.get(mul.rhs) != null and
         alloc.float.get(acc) != null and alloc.float.get(res) != null;
+}
+
+/// Whether the `arith_imm{.shl, b, k}` at index `idx` fuses with the next `arith{.add}` into one
+/// Zba `sh{k}add rd, b, x` (rd = x + (b << k), a 64-bit result). This is the ONE eligibility
+/// predicate shared by the shl-skip (in the `.arith_imm` arm) and the fused emit (in the `.arith`
+/// add arm), so they never disagree (no dangling or doubled shift). `enabled` carries
+/// `caps.fuse_shift_add`, which is FALSE by default and TRUE only for a Zba model, so without it
+/// both sites fall back to the plain `slli`+`add` path and stay byte-identical.
+///
+/// Conditions: `sh{k}add` exists only for k in {1, 2, 3}, so the shift amount must be one of those.
+/// The result is 64-bit (`sh{k}add` produces a full 64-bit sum: a 32-bit add would need `sh{k}add.uw`,
+/// deferred). Only `.add` folds (there is no sh-sub form), and it is commutative, so the shl result
+/// may be either add operand. Integer / GPR operands only (a float or vector shl routes elsewhere).
+/// The shl result is SINGLE-USE (its only reader is this add, so skipping the standalone shifted value
+/// is safe). The shl must immediately precede the add so nothing runs between them and `b` still holds
+/// its value at the add (loaded fresh there), exactly as `fusesIntoNextArith` relies on for the fused
+/// product's operands.
+fn fusesIntoNextShiftAdd(func: *const Function, insts: []const ir.function.Inst, idx: usize, enabled: bool) bool {
+    if (!enabled) return false;
+    const shl = switch (func.opcode(insts[idx])) {
+        .arith_imm => |a| a,
+        else => return false,
+    };
+    if (shl.op != .shl) return false;
+    // sh{k}add supports only k in {1, 2, 3}. Any other shift amount stays on the plain path.
+    if (shl.imm < 1 or shl.imm > 3) return false;
+    // Integer / GPR operands only: sh-add is a GPR ALU form. A float or vector shl is served elsewhere.
+    if (isVector(func, func.valueType(shl.lhs)) or isFloat(func, func.valueType(shl.lhs))) return false;
+    if (idx + 1 >= insts.len) return false; // must be immediately followed by the add
+    const add = switch (func.opcode(insts[idx + 1])) {
+        .arith => |a| a,
+        else => return false,
+    };
+    if (add.op != .add) return false; // only `.add` folds (no sh-sub form)
+    const result = func.instResult(insts[idx]) orelse return false;
+    if (add.lhs != result and add.rhs != result) return false; // must consume the shl's result
+    // 64-bit result only: sh{k}add is a full 64-bit add. A 32-bit result would need sh{k}add.uw.
+    if (intBits(func, func.valueType(func.instResult(insts[idx + 1]) orelse return false)) != 64) return false;
+    // Single-use: the shifted value is read only by this add. Since the shl immediately precedes it
+    // and is one of its operands, a total use-count of exactly 1 means this is the sole use, so
+    // skipping the materialization harms nothing.
+    return countUses(func, result) == 1;
 }
 
 /// Total operand uses of `v` across the whole function (instruction operands, if/jump
@@ -3670,11 +3722,14 @@ pub const Compiled = struct {
 
 /// Capabilities a model-aware call site threads into `compileFunction`. Grouped into one struct
 /// (rather than growing `compileFunction`'s parameter list one flag per model feature) so adding
-/// the next capability never touches every existing call site. Every field defaults off, so `.{}`
-/// is exactly today's behavior for every non-model caller (`selectFunction`,
-/// `selectFunctionWithLines`, and the direct `compileFunction` callers in `link.zig`/
-/// `object.zig`): no loop-header alignment padding, RVV (not VPU) vector lowering, and a dropped
-/// `.prefetch` hint.
+/// the next capability never touches every existing call site. Every field defaults off (except
+/// `fuse_cmp_branch`, always available with no extension), so `.{}` is exactly today's behavior
+/// for every non-model caller (`selectFunction`, `selectFunctionWithLines`, and the direct
+/// `compileFunction` callers in `link.zig`/`object.zig`): no loop-header alignment padding, RVV
+/// (not VPU) vector lowering, a dropped `.prefetch` hint, and the `fuse_*` flags at their
+/// no-extension-required defaults. `fuse_cmp_branch` gates the compare-into-branch fold (see
+/// `fusesIntoNextIf`); the rest are foundation only (no fold reads them yet, so they are inert
+/// either way).
 pub const ModelCaps = struct {
     /// Loop-header alignment in bytes (0 disables it). See `compileFunction`'s doc comment.
     fetch_align: u16 = 0,
@@ -3691,6 +3746,28 @@ pub const ModelCaps = struct {
     /// true (see `selectFunctionForModel`). Every non-model caller passes `.{}` (zfh = false), so
     /// the emulation path is unchanged and byte-identical.
     zfh: bool = false,
+    /// Fuse a compare into its consumer branch. riscv64's `beq`/`bne`/`blt`/... already compare-
+    /// and-branch in one instruction with no extension, so true by default. Gates
+    /// `fusesIntoNextIf` (see its doc comment); false falls back to materializing the boolean
+    /// with `slt`/`sltu` then testing it with `bne`, exactly as if the icmp/if pair were never
+    /// eligible to fuse.
+    fuse_cmp_branch: bool = true,
+    /// Fuse an arithmetic op's result-setting form into its consumer branch. riscv64 has no
+    /// flags register (unlike aarch64), so this fold has no riscv64 instruction to target: off
+    /// unconditionally, even if a model mistakenly declared it.
+    fuse_arith_branch: bool = false,
+    /// Fuse a shift into a following add (sh1add/sh2add/sh3add). Needs the Zba extension, so off
+    /// unless the model both declares the fusion and sets `features.riscv64.zba` (see
+    /// `selectFunctionForModel`). Gates `fusesIntoNextShiftAdd`; false leaves the plain slli-then-add
+    /// path, so a non-Zba compile is byte-identical.
+    fuse_shift_add: bool = false,
+    /// Fuse a high/low address-pair computation (auipc+addi) into one microarch-recognized
+    /// macro-op. Microarch-specific, so off unless the model declares it. The `.global_addr` arm
+    /// already emits the `auipc`/`addi` pair back-to-back by construction (there is no separate
+    /// transform to gate), so this flag's only reader is an adjacency `std.debug.assert` in that
+    /// arm: a forward regression guard proving the invariant the macro-op fusion depends on holds,
+    /// not a byte-changing fold. False (or true) never changes emission.
+    fuse_addr_hi_lo: bool = false,
 };
 
 /// Test-only: allocate `func` and report how many integer values were live-range split (their tail
@@ -3766,24 +3843,55 @@ pub fn selectFunctionAligned(allocator: std.mem.Allocator, func: *const Function
 /// (loop-header alignment), `vpu()` (whether to lower vectorized f32 arithmetic to the CORE-ET
 /// VPU packed-single unit instead of RVV; only et-soc sets this), and `features.riscv64.zicbop`
 /// (whether to lower the IR `.prefetch` hint to a real Zicbop `prefetch.r` instead of dropping
-/// it; only river-rc1.f/.ma set this, see registry.zig). Fusion is already unconditional, so
-/// these are the model-aware seams a caller needs. An inert model (fetch_align 0, vpu false,
-/// zicbop false) makes this byte-identical to `selectFunction`. Builds the full `ModelCaps` and
-/// calls `compileFunction` directly rather than through `selectFunctionAligned`, since that
-/// narrower entry point only ever carries `fetch_align`.
+/// it; only river-rc1.f/.ma set this, see registry.zig), and `fuse_cmp_branch` (whether the
+/// compare-into-branch fold runs). An inert model (fetch_align 0, vpu false, zicbop false,
+/// fuse_cmp_branch true - the no-extension-required default) makes this byte-identical to
+/// `selectFunction`. Builds the full `ModelCaps` and calls `compileFunction` directly rather than
+/// through `selectFunctionAligned`, since that narrower entry point only ever carries
+/// `fetch_align`.
 pub fn selectFunctionForModel(allocator: std.mem.Allocator, func: *const Function, model: *const mm.Model) Error![]u32 {
     // Passing a foreign-arch model here is a caller bug, not a runtime fault.
     std.debug.assert(model.arch == .riscv64);
-    const caps: ModelCaps = .{
+    const compiled = try compileFunction(allocator, func, capsForModel(model));
+    allocator.free(compiled.relocs);
+    allocator.free(compiled.lines);
+    return compiled.code;
+}
+
+/// The `ModelCaps` `selectFunctionForModel` builds for `model`. Split out so the model-to-caps
+/// mapping is unit-testable without compiling a whole function. Asserts `model.arch == .riscv64`,
+/// same as the caller above.
+pub fn capsForModel(model: *const mm.Model) ModelCaps {
+    std.debug.assert(model.arch == .riscv64);
+    return .{
         .fetch_align = model.fetch_align,
         .vpu = model.vpu(),
         .zicbop = model.arch == .riscv64 and model.features.riscv64.zicbop,
         .zfh = model.arch == .riscv64 and model.features.riscv64.zfh,
+        .fuse_cmp_branch = model.fuses(.cmp_branch),
+        // riscv64 has no flags register, so no fold will ever target a fused arith-branch here:
+        // keep this false unconditionally even if a model wrongly declared the fusion.
+        .fuse_arith_branch = false,
+        // Belt-and-suspenders with model.zig's validate rule: shift_add needs Zba.
+        .fuse_shift_add = model.fuses(.shift_add) and model.features.riscv64.zba,
+        .fuse_addr_hi_lo = model.fuses(.addr_hi_lo),
     };
-    const compiled = try compileFunction(allocator, func, caps);
-    allocator.free(compiled.relocs);
-    allocator.free(compiled.lines);
-    return compiled.code;
+}
+
+test "capsForModel reads river-rc1.ma's fusion table: cmp/shift/addr_hi_lo on, arith off" {
+    const caps = capsForModel(mm.modelFor(.@"river-rc1.ma"));
+    try std.testing.expect(caps.fuse_cmp_branch);
+    try std.testing.expect(!caps.fuse_arith_branch);
+    try std.testing.expect(caps.fuse_shift_add);
+    try std.testing.expect(caps.fuse_addr_hi_lo);
+}
+
+test "capsForModel withholds shift_add for et-soc: cmp on, shift/addr off (no Zba)" {
+    const caps = capsForModel(mm.modelFor(.@"et-soc"));
+    try std.testing.expect(caps.fuse_cmp_branch);
+    try std.testing.expect(!caps.fuse_arith_branch);
+    try std.testing.expect(!caps.fuse_shift_add);
+    try std.testing.expect(!caps.fuse_addr_hi_lo);
 }
 
 /// Compiled code plus its source-line table (from the `debug.line` IR attributes), for DWARF.
@@ -3899,6 +4007,18 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
     const vpu = caps.vpu;
     const zicbop = caps.zicbop;
     const zfh = caps.zfh;
+    // Whether the compare-into-branch fold runs (see `fusesIntoNextIf`). Threaded to both the
+    // icmp-skip site and the fused `.@"if"` site below so they agree (the dual-check pair): a
+    // model without the fusion falls back to the slt/sltu-then-branch path unchanged.
+    const fuse_cmp_branch = caps.fuse_cmp_branch;
+    // Whether the Zba sh-add fold runs (see `fusesIntoNextShiftAdd`). Threaded to both the shl-skip
+    // site (the `.arith_imm` arm) and the fused emit site (the `.arith` add arm) below so they agree:
+    // FALSE by default (no Zba), so both fall back to the plain slli-then-add path unchanged.
+    const fuse_shift_add = caps.fuse_shift_add;
+    // Whether the `.global_addr` arm's adjacency assert runs (see its site below). The auipc+addi
+    // pair is emitted back-to-back unconditionally, so this never changes emission either way, it
+    // only gates whether the invariant is asserted.
+    const fuse_addr_hi_lo = caps.fuse_addr_hi_lo;
 
     // Split-boundary actions are appended in monotonic `at` order already; sort defensively so the
     // per-instruction drain below can advance a single cursor. At the SAME position a `.reload` must
@@ -4462,6 +4582,36 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                         try storeFloat(allocator, &code, alloc, float_spill_base, result, inst_pos, d, rd);
                     } else {
                         const result = func.instResult(inst).?;
+                        // Zba sh-add fold, the add side: when the immediately-preceding instruction is
+                        // a single-use `shl` by 1/2/3 whose result is one of this 64-bit add's operands
+                        // (the SAME predicate the `.arith_imm` shl-skip below uses), emit one
+                        // `sh{k}add rd, b, x` (rd = x + (b << k)) instead of a separate slli then add.
+                        // The shl was skipped, so load `b` (the shifted operand) and `x` (the addend)
+                        // directly here (both still resident, nothing ran between them and this add).
+                        if (a.op == .add and inst_idx >= 1 and fusesIntoNextShiftAdd(func, block_insts, inst_idx - 1, fuse_shift_add)) {
+                            const shl = func.opcode(block_insts[inst_idx - 1]).arith_imm;
+                            const shl_result = func.instResult(block_insts[inst_idx - 1]).?;
+                            const x_val = if (a.lhs == shl_result) a.rhs else a.lhs; // the add's non-shl operand, x
+                            const rs1 = try reloadInt(allocator, &code, alloc, spill_base, shl.lhs, inst_pos, spill_scratch0); // b, the shifted operand
+                            const rs2 = try reloadInt(allocator, &code, alloc, spill_base, x_val, inst_pos, spill_scratch1); // x, the addend
+                            const rd_loc = intLocationAt(alloc, result, inst_pos);
+                            const rd = switch (rd_loc) {
+                                .reg => |r| r,
+                                .slot => spill_scratch0,
+                            };
+                            const word = switch (shl.imm) {
+                                1 => encode.sh1add(rd, rs1, rs2),
+                                2 => encode.sh2add(rd, rs1, rs2),
+                                3 => encode.sh3add(rd, rs1, rs2),
+                                else => unreachable, // fusesIntoNextShiftAdd only accepts k in 1..3
+                            };
+                            try code.append(allocator, word);
+                            switch (rd_loc) {
+                                .reg => {},
+                                .slot => |slot| try code.append(allocator, encode.sd(rd, .x2, @intCast(spill_base + slot * 8))),
+                            }
+                            continue;
+                        }
                         const rs1 = try reloadInt(allocator, &code, alloc, spill_base, a.lhs, inst_pos, spill_scratch0);
                         const rs2 = try reloadInt(allocator, &code, alloc, spill_base, a.rhs, inst_pos, spill_scratch1);
                         const rd_loc = intLocationAt(alloc, result, inst_pos);
@@ -4492,6 +4642,12 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     // base, so it claims no register and emits nothing (mirrors the mul/icmp fusion
                     // skips above). `inst_pos` still advanced from `inst_idx`, so numbering holds.
                     if (fold.isDeadAdd(inst)) continue;
+                    // Zba sh-add fold, the shl side: when this `shl` by 1/2/3 is the single-use,
+                    // immediately-preceding operand of the next 64-bit add, skip its materialization.
+                    // The `.arith` add arm re-checks the SAME `fusesIntoNextShiftAdd` gate and emits
+                    // the fused `sh{k}add`, so the shift is emitted exactly once (mirrors the mul/fma
+                    // skip above). `inst_pos` still advanced from `inst_idx`, so numbering holds.
+                    if (a.op == .shl and fusesIntoNextShiftAdd(func, block_insts, inst_idx, fuse_shift_add)) continue;
                     if (isFloat(func, func.valueType(a.lhs))) return error.Unsupported;
                     const result = func.instResult(inst).?;
                     const rs1 = try reloadInt(allocator, &code, alloc, spill_base, a.lhs, inst_pos, spill_scratch1);
@@ -4623,6 +4779,11 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     try code.append(allocator, encode.auipc(rd, 0));
                     try relocs.append(allocator, .{ .offset = code.items.len, .symbol = "", .kind = .pcrel_lo12, .pair = hi });
                     try code.append(allocator, encode.addi(rd, rd, 0));
+                    // The addr_hi_lo macro-op fusion (`caps.fuse_addr_hi_lo`) relies on the addi
+                    // landing exactly one word after its auipc; the two `code.append`s above
+                    // guarantee that unconditionally, so this only asserts the invariant a fusing
+                    // microarch depends on rather than changing anything.
+                    if (fuse_addr_hi_lo) std.debug.assert(code.items.len == hi + 2);
                 },
                 .select => |sel| {
                     // `cond ? then : else`, lowered to a short forward branch. The
@@ -4908,7 +5069,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                 },
                 // Without Zicbop, this hint has nothing to lower to: dropping it here is a
                 // correct (if suboptimal) no-op.
-                .icmp => |cmp| if (fusesIntoNextIf(func, block_insts, inst_idx)) {
+                .icmp => |cmp| if (fuse_cmp_branch and fusesIntoNextIf(func, block_insts, inst_idx)) {
                     // Fused compare-and-branch: this integer icmp is the single-use
                     // condition of the immediately-following if, so skip its slt/sltu
                     // materialization entirely. The `.@"if"` case re-checks the SAME
@@ -4987,7 +5148,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     // The else edge falls through to the jal as usual, and the fixup carries
                     // the chosen branch encoder + both source registers so the offset patch
                     // re-encodes the right instruction.
-                    if (inst_idx >= 1 and fusesIntoNextIf(func, block_insts, inst_idx - 1)) {
+                    if (inst_idx >= 1 and fuse_cmp_branch and fusesIntoNextIf(func, block_insts, inst_idx - 1)) {
                         const cmp = func.opcode(block_insts[inst_idx - 1]).icmp;
                         const rl = try reloadInt(allocator, &code, alloc, spill_base, cmp.lhs, inst_pos, spill_scratch0);
                         const rr = try reloadInt(allocator, &code, alloc, spill_base, cmp.rhs, inst_pos, spill_scratch1);

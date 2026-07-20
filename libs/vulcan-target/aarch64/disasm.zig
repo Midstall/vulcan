@@ -262,6 +262,10 @@ fn condName(v: u4) []const u8 {
 /// the w and x forms.
 const rrr_mask: u32 = 0x7FE0FC00;
 
+/// `rrr_mask` with the imm6 shift-amount field (bits[15:10]) dropped, for the add/sub
+/// shifted-register form where that field is a real operand and not part of the opcode.
+const rrr_no_imm6_mask: u32 = rrr_mask & ~@as(u32, 0xFC00);
+
 const RRR = struct { match: u32, mnem: []const u8 };
 
 /// The 32-bit-base opcodes of the shared three-register form (sf dropped).
@@ -269,6 +273,7 @@ const rrr_table = [_]RRR{
     .{ .match = 0x0B000000, .mnem = "add" },
     .{ .match = 0x4B000000, .mnem = "sub" },
     .{ .match = 0x0A000000, .mnem = "and" },
+    .{ .match = 0x6A000000, .mnem = "ands" }, // flag-setting and (shift 0), the arith-branch fold's `ands`
     .{ .match = 0x2A000000, .mnem = "orr" },
     .{ .match = 0x4A000000, .mnem = "eor" },
     .{ .match = 0x1AC00C00, .mnem = "sdiv" },
@@ -315,6 +320,22 @@ fn decode(a: std.mem.Allocator, buf: *std.ArrayList(u8), w: u32, ctx: ?Context) 
             try gp(buf, a, sf(w), rm(w));
             return;
         }
+    }
+
+    // add/sub, shifted-register form with a nonzero LSL shift amount (imm6 at bits[15:10]).
+    // The shift-0 case is already handled by rrr_table above, so this covers the same add/sub
+    // opcodes but with the imm6 field dropped from the match mask, and prints the ", lsl #N"
+    // suffix the encoder's `addShifted`/`subShifted` family produces.
+    if (w & rrr_no_imm6_mask == 0x0B000000 or w & rrr_no_imm6_mask == 0x4B000000) {
+        const is_sub = w & rrr_no_imm6_mask == 0x4B000000;
+        try buf.print(a, "{s} ", .{if (is_sub) "sub" else "add"});
+        try gp(buf, a, sf(w), rd(w));
+        try buf.appendSlice(a, ", ");
+        try gp(buf, a, sf(w), rn(w));
+        try buf.appendSlice(a, ", ");
+        try gp(buf, a, sf(w), rm(w));
+        try buf.print(a, ", lsl #{d}", .{(w >> 10) & 0x3F});
+        return;
     }
 
     // madd/msub (mul is madd with ra == 31).

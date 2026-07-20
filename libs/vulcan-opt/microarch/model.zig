@@ -155,6 +155,12 @@ pub const Model = struct {
         };
     }
 
+    /// Whether this model's macro-op fusion table declares `kind`.
+    pub fn fuses(self: *const Model, kind: FuseKind) bool {
+        for (self.fusion) |r| if (r.kind == kind) return true;
+        return false;
+    }
+
     /// Compile-time consistency check. Call from a `comptime` block on every model constant so a
     /// malformed model fails the build, not a device.
     pub fn validate(comptime m: Model) void {
@@ -170,8 +176,14 @@ pub const Model = struct {
         switch (m.features) {
             .aarch64 => |f| if (m.units.fpsimd == 0 and (f.neon or f.fp16))
                 @compileError("aarch64 model claims neon/fp16 but has no fpsimd ports"),
-            .riscv64 => |f| if (m.units.fpsimd == 0 and (f.f or f.d or f.v or f.vpu))
-                @compileError("riscv64 model claims f/d/v/vpu but has no fpsimd ports"),
+            .riscv64 => |f| {
+                if (m.units.fpsimd == 0 and (f.f or f.d or f.v or f.vpu))
+                    @compileError("riscv64 model claims f/d/v/vpu but has no fpsimd ports");
+                // sh1add/sh2add/sh3add (the shift_add fusion's concrete instructions) are Zba,
+                // so a riscv64 model cannot declare the fusion without the extension bit.
+                if (m.fuses(.shift_add) and !f.zba)
+                    @compileError("riscv64 model declares shift_add fusion but lacks Zba");
+            },
             .x86_64 => {},
         }
         // The throughput <= latency invariant, checked over the ops the cost model actually weights:

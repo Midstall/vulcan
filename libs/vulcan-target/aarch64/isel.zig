@@ -281,11 +281,13 @@ const Allocation = struct {
 
 /// Capabilities a model-aware call site threads into `compileFunction`. Grouped into one struct
 /// (rather than growing `compileFunction`'s parameter list one flag per model feature) so adding
-/// the next capability never touches every existing call site. Every field defaults off, so `.{}`
-/// is exactly today's behavior for every non-model caller (`selectFunction`,
-/// `selectFunctionWithLines`, and the direct `compileFunction` callers in `link.zig`/`object.zig`):
-/// no loop-header alignment padding, and the base-ISA f16 EMULATION (an f16 held as its f32
-/// widening in an S register, rounded per-op with `fcvt`).
+/// the next capability never touches every existing call site. `.{}` is exactly today's behavior
+/// for every non-model caller (`selectFunction`, `selectFunctionWithLines`, and the direct
+/// `compileFunction` callers in `link.zig`/`object.zig`): no loop-header alignment padding, the
+/// base-ISA f16 EMULATION (an f16 held as its f32 widening in an S register, rounded per-op with
+/// `fcvt`), and the `fuse_*` flags at their base-ISA-available defaults. `fuse_cmp_branch` gates
+/// the compare-into-branch fold (see `fusesIntoNextIf`); the rest are foundation only (no fold
+/// reads them yet, so they are inert either way).
 pub const ModelCaps = struct {
     /// Loop-header alignment in bytes (0 disables it). See `compileFunction`'s doc comment.
     fetch_align: u16 = 0,
@@ -294,6 +296,25 @@ pub const ModelCaps = struct {
     /// `features.aarch64.fp16` (FEAT_FP16) is true (see `selectFunctionForModel`). When false the
     /// f16 lowering is byte-identical to the pre-FEAT_FP16 emulation.
     fp16: bool = false,
+    /// Fuse a compare into its consumer branch (CMP+Bcc -> a single conditional branch on flags).
+    /// Base-ISA on every aarch64 core, so true by default. Gates `fusesIntoNextIf` (see its doc
+    /// comment); false falls back to materializing the boolean with `cset` then testing it with
+    /// `cbnz`, exactly as if the icmp/if pair were never eligible to fuse.
+    fuse_cmp_branch: bool = true,
+    /// Fuse an arithmetic op's flag-setting form into its consumer branch (e.g. ADDS+Bcc). Base-
+    /// ISA on every aarch64 core, so true by default. Gates `Ctx.fuse_arith_branch`, which the
+    /// arith-branch fold (`fusesArithIntoBranch`) reads at both the arith-skip site and the S-form
+    /// emit site; false falls back to materializing the arith plainly and keeping the separate
+    /// `cmp` in the fused compare-and-branch path, exactly as if the arith/icmp/if triple were
+    /// never eligible to fold.
+    fuse_arith_branch: bool = true,
+    /// Fuse a shift into a following add (ADD Xd, Xn, Xm, LSL #imm). Base-ISA on every aarch64
+    /// core, so true by default. No fold reads this yet.
+    fuse_shift_add: bool = true,
+    /// Fuse a high/low address-pair computation (ADRP+ADD) into one microarch-recognized macro-op.
+    /// Microarch-specific (not every core's front end recognizes the pair), so off unless the
+    /// model declares it. No fold reads this yet.
+    fuse_addr_hi_lo: bool = false,
 };
 
 /// Select A64 words for `func`, discarding relocations. The caller owns the slice.
@@ -315,23 +336,42 @@ pub fn selectFunctionAligned(allocator: std.mem.Allocator, func: *const Function
 }
 
 /// Compile `func` tuned to `model`: the machine-level hooks read the model's `fetch_align`
-/// (loop-header alignment) and `features.aarch64.fp16` (whether to use native FEAT_FP16 half
-/// arithmetic instead of the emulation). Fusion is already unconditional, so these are the
-/// model-aware seams a caller needs. An inert model (fetch_align 0, fp16 false) makes this
-/// byte-identical to `selectFunction`. Builds the full `ModelCaps` and calls `compileFunction`
-/// directly rather than through `selectFunctionAligned`, since that narrower entry point only
-/// ever carries `fetch_align`.
+/// (loop-header alignment), `features.aarch64.fp16` (whether to use native FEAT_FP16 half
+/// arithmetic instead of the emulation), and `fuse_cmp_branch` (whether the compare-into-branch
+/// fold runs). An inert model (fetch_align 0, fp16 false, fuse_cmp_branch true - the base-ISA
+/// default) makes this byte-identical to `selectFunction`. Builds the full `ModelCaps` and calls
+/// `compileFunction` directly rather than through `selectFunctionAligned`, since that narrower
+/// entry point only ever carries `fetch_align`.
 pub fn selectFunctionForModel(allocator: std.mem.Allocator, func: *const Function, model: *const mm.Model) Error![]u32 {
     // Passing a foreign-arch model here is a caller bug, not a runtime fault.
     std.debug.assert(model.arch == .aarch64);
-    const caps: ModelCaps = .{
-        .fetch_align = model.fetch_align,
-        .fp16 = model.arch == .aarch64 and model.features.aarch64.fp16,
-    };
-    const compiled = try compileFunction(allocator, func, caps);
+    const compiled = try compileFunction(allocator, func, capsForModel(model));
     allocator.free(compiled.relocs);
     allocator.free(compiled.lines);
     return compiled.code;
+}
+
+/// The `ModelCaps` `selectFunctionForModel` builds for `model`. Split out so the model-to-caps
+/// mapping is unit-testable without compiling a whole function. Asserts `model.arch == .aarch64`,
+/// same as the caller above.
+pub fn capsForModel(model: *const mm.Model) ModelCaps {
+    std.debug.assert(model.arch == .aarch64);
+    return .{
+        .fetch_align = model.fetch_align,
+        .fp16 = model.arch == .aarch64 and model.features.aarch64.fp16,
+        .fuse_cmp_branch = model.fuses(.cmp_branch),
+        .fuse_arith_branch = model.fuses(.arith_branch),
+        .fuse_shift_add = model.fuses(.shift_add),
+        .fuse_addr_hi_lo = model.fuses(.addr_hi_lo),
+    };
+}
+
+test "capsForModel reads ampere-altra's fusion table: cmp/arith/shift on, addr_hi_lo off" {
+    const caps = capsForModel(mm.modelFor(.@"ampere-altra"));
+    try std.testing.expect(caps.fuse_cmp_branch);
+    try std.testing.expect(caps.fuse_arith_branch);
+    try std.testing.expect(caps.fuse_shift_add);
+    try std.testing.expect(!caps.fuse_addr_hi_lo);
 }
 
 /// Compiled code plus its source-line table (from the `debug.line` IR attributes).
@@ -622,6 +662,8 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
         .alloca_base = alloca_base,
         .alloca_off = &alloca_off,
         .fp16 = fp16,
+        .fuse_cmp_branch = caps.fuse_cmp_branch,
+        .fuse_arith_branch = caps.fuse_arith_branch,
         .pos = 0,
     };
 
@@ -737,6 +779,28 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                         try ctx.emitFusedArith(allocator, &code, result, a.op, a.lhs, a.rhs, mul, mul_result);
                         continue;
                     }
+                    // Shift-add fold: when the previous inst is the single-use, immediately-
+                    // preceding constant shift this add/sub consumes, emit ONE shifted-register
+                    // add/sub (`add xd, xn, xm, lsl #k`) on the shift's operand instead of a
+                    // separate shift + add. The shl's own materialization was skipped in the
+                    // `.arith_imm` arm under the SAME `fusesIntoNextShiftAdd` gate, so the shift
+                    // is emitted exactly once (mirrors the fma/icmp fusions). An add is at most
+                    // one of fma / shift-add / plain: the previous inst is a mul, a shl, or
+                    // neither, so this is checked after the fma case and before the plain form.
+                    if ((a.op == .add or a.op == .sub) and inst_idx >= 1 and fusesIntoNextShiftAdd(func, insts, inst_idx - 1, caps.fuse_shift_add)) {
+                        const shl = func.opcode(insts[inst_idx - 1]).arith_imm;
+                        const shl_result = func.instResult(insts[inst_idx - 1]).?;
+                        try ctx.emitShiftAdd(allocator, &code, result, a.op, a.lhs, a.rhs, shl, shl_result);
+                        continue;
+                    }
+                    // Arith-branch fold: this add/sub/and is the single-use operand of an
+                    // immediately-following icmp eq/ne 0 that feeds the next if. Skip its
+                    // materialization here; `emitIf` re-checks the SAME `fusesArithIntoBranch`
+                    // predicate and emits the flag-setting S-form (adds/subs/ands) whose Z flag is
+                    // (result == 0) plus the `b.cc`, so the arith is emitted exactly once. Checked
+                    // after the fma/shift consumer folds (an integer add is never an fma consumer,
+                    // and a shift_add consumer is rejected by the predicate, so this never doubles).
+                    if (isArithBranchProducer(func, insts, inst_idx, caps.fuse_arith_branch and caps.fuse_cmp_branch)) continue;
                     try ctx.binary(allocator, &code, result, a.op, a.lhs, a.rhs);
                 },
                 .arith_imm => |a| {
@@ -744,6 +808,16 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     // by the fold, so it claims no register and emits nothing (mirrors the mul/icmp
                     // fusion skips). `ctx.pos` still advances from `inst_idx`, so numbering holds.
                     if (fold.isDeadAdd(inst)) continue;
+                    // Skip a constant shift that folds into the next add/sub as a shifted-
+                    // register operand (the fused `add xd, xn, xm, lsl #k` is emitted at the
+                    // consumer in the `.arith` arm). Same `fusesIntoNextShiftAdd` gate as that
+                    // emit site, so the shift is never both skipped-and-unfused nor fused-and-
+                    // kept.
+                    if (a.op == .shl and fusesIntoNextShiftAdd(func, insts, inst_idx, caps.fuse_shift_add)) continue;
+                    // Arith-branch fold (immediate form): this add/sub of a u12 immediate is the
+                    // single-use operand of an icmp eq/ne 0 feeding the next if. Skip it; `emitIf`
+                    // emits the flag-setting `addsImm`/`subsImm` + `b.cc` under the SAME predicate.
+                    if (isArithBranchProducer(func, insts, inst_idx, caps.fuse_arith_branch and caps.fuse_cmp_branch)) continue;
                     const result = func.instResult(inst).?;
                     const rl = try ctx.loadOp(allocator, &code, a.lhs, spill_op[0]);
                     try loadConst(allocator, &code, spill_op[1], a.imm); // imm in x14, x16 stays free for rem
@@ -757,7 +831,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     // materialization entirely. `emitIf` re-checks the SAME predicate and
                     // emits the fused `cmp; b.cc` on these operands, so the compare is
                     // emitted exactly once.
-                    if (fusesIntoNextIf(func, insts, inst_idx)) continue;
+                    if (caps.fuse_cmp_branch and fusesIntoNextIf(func, insts, inst_idx)) continue;
                     const result = func.instResult(inst).?;
                     if (isVector(func, cmp.lhs)) {
                         // Vectorized compare (widened FS): produce a per-lane MASK
@@ -1195,6 +1269,20 @@ const Ctx = struct {
     /// Whether to lower f16 with NATIVE FEAT_FP16 H-form ops instead of the emulation. Threaded
     /// from `compileFunction`'s `caps.fp16`; false for every non-model caller (byte-identical).
     fp16: bool = false,
+    /// Whether to fuse a compare into its consumer branch (`cmp; b.cc` instead of `cmp; cset` then
+    /// a separate test-and-branch). Threaded from `compileFunction`'s `caps.fuse_cmp_branch`; true
+    /// for every non-model caller (byte-identical to before this capability existed). Must agree
+    /// with the icmp-skip site's `caps.fuse_cmp_branch` check in `emitFromAllocation` (the dual-check
+    /// pair around `fusesIntoNextIf`), so the two never disagree on whether a given icmp/if fuses.
+    fuse_cmp_branch: bool = true,
+    /// Whether to fold a flag-setting arithmetic op into its consumer branch (the arith-branch
+    /// fold: `arith; icmp ==/!= 0; if` -> one S-form `adds`/`subs`/`ands` plus `b.cc`). Threaded
+    /// from `compileFunction`'s `caps.fuse_arith_branch`; true for every non-model caller. This
+    /// fold lives INSIDE the fused compare-and-branch path, so it also requires `fuse_cmp_branch`.
+    /// Must agree with the arith-skip site's `caps.fuse_arith_branch and caps.fuse_cmp_branch`
+    /// check in `emitFromAllocation` (both gate `fusesArithIntoBranch`), so the two never disagree
+    /// on whether a given arith/icmp/if triple folds (else a dangling or doubled arith).
+    fuse_arith_branch: bool = true,
     /// The current instruction position, mirrored from the allocator's `linearize` numbering and
     /// advanced by the emission loop. `locationAt` reads it to pick a split value's active segment.
     pos: u32 = 0,
@@ -1316,6 +1404,48 @@ const Ctx = struct {
         try storeResult(allocator, code, self, result, rd);
     }
 
+    /// Emit the fused shifted-register add/sub for an integer `add`/`sub` (`op`, `lhs`,
+    /// `rhs`) whose single-use, immediately-preceding operand is the constant left shift
+    /// `arith_imm{.shl, b, k}` (`shl`, defining `shl_result`) - see `fusesIntoNextShiftAdd`
+    /// for the shared eligibility check. Folds `a + (b << k)` / `a - (b << k)` into one
+    /// `add`/`sub xd, xn, xm, lsl #k`. Loads the add/sub's OTHER operand (`rn`, the addend
+    /// or minuend) and the shift's own operand `b` (`rm`) directly, since the shl's
+    /// materialization was skipped by the caller.
+    ///
+    /// `rn` is the add/sub's non-shl operand. For `.sub` the shl result is always the RHS
+    /// (subtrahend, guaranteed by the predicate), so `subShifted` computes `rn - (rm << k)`,
+    /// matching `a - (b << k)`. `.add` is commutative, so `rn` is whichever operand is not
+    /// the shift.
+    ///
+    /// Nothing runs between the (skipped) shl and this add/sub, so `b` still holds its value
+    /// here exactly as `emitFusedArith` relies on for the skipped product's operands.
+    fn emitShiftAdd(
+        self: Ctx,
+        allocator: std.mem.Allocator,
+        code: *std.ArrayList(u32),
+        result: Value,
+        op: ir.function.BinOp,
+        lhs: Value,
+        rhs: Value,
+        shl: ir.function.ArithImm,
+        shl_result: Value,
+    ) Error!void {
+        const rn_val = if (lhs == shl_result) rhs else lhs; // the add/sub's non-shl operand
+        const rn = try self.loadOp(allocator, code, rn_val, spill_op[0]);
+        const rm = try self.loadOp(allocator, code, shl.lhs, spill_op[1]);
+        const rd = self.resultReg(result);
+        // The predicate range-checked `shl.imm` to 0..63 (64-bit) / 0..31 (32-bit), so it
+        // always fits the imm6 field.
+        const k: u6 = @intCast(shl.imm);
+        const wide = isWide(self.func, result);
+        try code.append(allocator, switch (op) {
+            .add => if (wide) encode.addShifted64(rd, rn, rm, k) else encode.addShifted(rd, rn, rm, k),
+            .sub => if (wide) encode.subShifted64(rd, rn, rm, k) else encode.subShifted(rd, rn, rm, k),
+            else => unreachable, // the caller only routes .add/.sub here (see the switch above)
+        });
+        try storeResult(allocator, code, self, result, rd);
+    }
+
     fn binary(
         self: Ctx,
         allocator: std.mem.Allocator,
@@ -1368,6 +1498,56 @@ const Ctx = struct {
         }
     }
 
+    /// Emit the flag-setting S-form of the arith at `if_idx-2` for the fused arith-branch (the
+    /// caller has confirmed `fusesArithIntoBranch` at `if_idx`). Writes the arith's own result
+    /// register (`resultReg`), so the Z flag it sets equals (result == 0), which the eq/ne `b.cc`
+    /// the caller emits next tests. The register form emits `adds`/`subs`/`ands`, the immediate
+    /// form `addsImm`/`subsImm` (imm gated to u12 by the predicate). `fusesArithIntoBranch` admits
+    /// only non-wide (32-bit-or-narrower) results, so this always emits the w-form: a wide result
+    /// would set Z from all 64 bits, which disagrees with the surrounding 32-bit `encode.cmp` (see
+    /// the predicate's doc comment), so it is asserted rather than switched on here. The operands
+    /// are loaded fresh here: the arith's own materialization was skipped and nothing runs between
+    /// it and this if, so they still hold their values, exactly as the fused compare-and-branch
+    /// relies on. The S-form reads both operands before writing Rd, so Rd aliasing an operand (the
+    /// natural in-place update) is correct.
+    fn emitArithBranch(
+        self: Ctx,
+        allocator: std.mem.Allocator,
+        code: *std.ArrayList(u32),
+        insts: []const ir.function.Inst,
+        if_idx: usize,
+    ) Error!void {
+        const arith_inst = insts[if_idx - 2];
+        const result = self.func.instResult(arith_inst).?;
+        const rd = self.resultReg(result);
+        std.debug.assert(!isWide(self.func, result)); // fusesArithIntoBranch admits only non-wide results
+        switch (self.func.opcode(arith_inst)) {
+            .arith => |a| {
+                const rl = try self.loadOp(allocator, code, a.lhs, spill_op[0]);
+                const rr = try self.loadOp(allocator, code, a.rhs, spill_op[1]);
+                try code.append(allocator, switch (a.op) {
+                    .add => encode.adds(rd, rl, rr),
+                    .sub => encode.subs(rd, rl, rr),
+                    .bit_and => encode.ands(rd, rl, rr),
+                    // fusesArithIntoBranch admits only add/sub/bit_and in the register form.
+                    else => unreachable,
+                });
+            },
+            .arith_imm => |a| {
+                const rl = try self.loadOp(allocator, code, a.lhs, spill_op[0]);
+                const imm: u12 = @intCast(a.imm); // gated to [0, 0xFFF] by fusesArithIntoBranch
+                try code.append(allocator, switch (a.op) {
+                    .add => encode.addsImm(rd, rl, imm),
+                    .sub => encode.subsImm(rd, rl, imm),
+                    // fusesArithIntoBranch admits only add/sub in the immediate form.
+                    else => unreachable,
+                });
+            },
+            // fusesArithIntoBranch requires an arith / arith_imm at if_idx-2.
+            else => unreachable,
+        }
+    }
+
     fn emitIf(
         self: Ctx,
         allocator: std.mem.Allocator,
@@ -1385,12 +1565,22 @@ const Ctx = struct {
         // edge-move / fixup structure is identical to the plain path, only the branch and
         // its operand load differ. condFor here mirrors the icmp lowering's cset condition,
         // so the fused branch takes the then-edge under exactly the same condition.
-        if (if_idx >= 1 and fusesIntoNextIf(self.func, insts, if_idx - 1)) {
+        if (if_idx >= 1 and self.fuse_cmp_branch and fusesIntoNextIf(self.func, insts, if_idx - 1)) {
             const cmp = self.func.opcode(insts[if_idx - 1]).icmp;
-            const rl = try self.loadOp(allocator, code, cmp.lhs, spill_op[0]);
-            const rr = try self.loadOp(allocator, code, cmp.rhs, spill_op[1]);
-            try code.append(allocator, encode.cmp(rl, rr));
             const cond = condFor(cmp.op, isSignedInt(self.func, cmp.lhs));
+            // Arith-branch fold: when the arith at if_idx-2 is a single-use add/sub/and whose
+            // result the icmp compares eq/ne against 0, emit its flag-setting S-form (which sets
+            // Z = (result == 0)) instead of loading the icmp operands and doing a `cmp #0`. The
+            // eq/ne `b.cc` below then branches on that Z flag. The SAME predicate skipped the
+            // arith's own materialization, so it is emitted exactly once. Otherwise fall back to
+            // the plain compare-and-branch (load the icmp operands, `cmp`).
+            if (fusesArithIntoBranch(self.func, insts, if_idx, self.fuse_arith_branch and self.fuse_cmp_branch)) {
+                try self.emitArithBranch(allocator, code, insts, if_idx);
+            } else {
+                const rl = try self.loadOp(allocator, code, cmp.lhs, spill_op[0]);
+                const rr = try self.loadOp(allocator, code, cmp.rhs, spill_op[1]);
+                try code.append(allocator, encode.cmp(rl, rr));
+            }
             const bcc_at = code.items.len;
             try code.append(allocator, encode.bcc(cond, 0));
             try self.emitMoves(allocator, code, cf.@"else");
@@ -2652,6 +2842,11 @@ fn forEachTermUse(func: *const Function, term: Terminator, last_use: []u32, pos:
 /// single-use conditions make skipping the boolean register-safe: nothing runs between
 /// the icmp and the if, so the icmp's operand registers still hold their values at the
 /// if, and no other reader needs the boolean.
+///
+/// This predicate itself carries no model gate; both call sites (the icmp-skip in
+/// `emitFromAllocation` and the fused branch in `Ctx.emitIf`) additionally require
+/// `caps.fuse_cmp_branch` (threaded onto `Ctx` as `fuse_cmp_branch`) before honoring it, so a
+/// model without the fusion falls back to the materialize-then-test path unchanged.
 fn fusesIntoNextIf(func: *const Function, insts: []const ir.function.Inst, idx: usize) bool {
     const cmp = switch (func.opcode(insts[idx])) {
         .icmp => |c| c,
@@ -2671,6 +2866,95 @@ fn fusesIntoNextIf(func: *const Function, insts: []const ir.function.Inst, idx: 
     // immediately precedes the if and equals cf.cond, a total use-count of exactly 1
     // means the if's cond is the sole use, so skipping the boolean harms nothing.
     return countUses(func, result) == 1;
+}
+
+/// Whether the `if` at `insts[if_idx]` folds a flag-setting arithmetic op into its branch: the
+/// arith at `if_idx-2` is a single-use `add`/`sub`/`bit_and` (register form) or `add`/`sub`
+/// (u12-immediate form) whose result is compared eq/ne against a literal `0` by the icmp at
+/// `if_idx-1`, which is itself the single-use condition of this if (i.e. the compare-and-branch
+/// fold already applies). When it holds, the arith emits its flag-setting S-form
+/// (`adds`/`subs`/`ands`, or `addsImm`/`subsImm`) whose Z flag is exactly (result == 0), and the
+/// fused `b.cc` branches on eq/ne, eliding the separate `cmp #0`. This is the ONE eligibility
+/// predicate shared by BOTH the arith-skip (in the `.arith`/`.arith_imm` arms, via
+/// `isArithBranchProducer`) and the S-form emit (in `Ctx.emitIf`), so the two never disagree (no
+/// dangling or doubled arith, no stale-flags branch) - mirrors `fusesIntoNextIf`/`fusesIntoNextArith`.
+///
+/// `enabled` carries `caps.fuse_arith_branch and caps.fuse_cmp_branch` (the fold requires both:
+/// it lives inside the compare-and-branch path, so a model without either falls back to the plain
+/// arith + cmp + branch at both sites and stays byte-identical).
+///
+/// Scope (bounded for correctness): eq/ne ONLY (the S-form's Z flag is exactly (result == 0), the
+/// eq/ne-against-0 relation; lt/le/gt/ge need N/V reasoning and stay on the plain cmp path). The
+/// icmp RHS must be a literal `iconst 0`. Register `add`/`sub`/`bit_and`, or `add`/`sub` with an
+/// immediate that fits u12 (a `bit_and` immediate would need a bitmask-encoded `ands` immediate,
+/// too complex, so it falls back). Integer / GPR only, all three adjacent in one block, and the
+/// arith result single-use (only the icmp reads it, so overwriting its register via the S-form
+/// harms nothing).
+fn fusesArithIntoBranch(func: *const Function, insts: []const ir.function.Inst, if_idx: usize, enabled: bool) bool {
+    if (!enabled) return false;
+    if (if_idx < 2) return false; // need the arith at if_idx-2 and the icmp at if_idx-1
+    // The compare-and-branch fold must already apply: the icmp at if_idx-1 is a single-use,
+    // integer/GPR icmp that is exactly this if's condition (see `fusesIntoNextIf`).
+    if (!fusesIntoNextIf(func, insts, if_idx - 1)) return false;
+    const cmp = func.opcode(insts[if_idx - 1]).icmp; // an icmp, per fusesIntoNextIf
+    // eq/ne only: the S-form's Z flag equals (result == 0), exactly these two relations.
+    if (cmp.op != .eq and cmp.op != .ne) return false;
+    // The icmp RHS must be a literal 0 (its defining instruction is `iconst 0`).
+    const rhs_def = func.definingInst(cmp.rhs) orelse return false;
+    switch (func.opcode(rhs_def)) {
+        .iconst => |c| if (c != 0) return false,
+        else => return false,
+    }
+    // The icmp LHS must be the result of the arith at if_idx-2.
+    const arith_inst = insts[if_idx - 2];
+    const arith_result = func.instResult(arith_inst) orelse return false;
+    if (cmp.lhs != arith_result) return false;
+    // Integer / GPR only (the S-forms are GPR ALU ops; a float/vector arith routes elsewhere).
+    if (isVector(func, arith_result) or regClass(func, arith_result) != .gpr) return false;
+    // 32-bit-or-narrower only. The surrounding icmp lowering (both the unfused icmp path and the
+    // fused compare-and-branch path this fold lives inside) always compares with `encode.cmp`,
+    // which is a 32-bit-only comparison (there is no 64-bit `cmp` here). A wide (64-bit or ptr)
+    // S-form would set Z from all 64 bits, disagreeing with that 32-bit `cmp` on values whose low
+    // 32 bits are zero but high bits are not (e.g. 0x1_0000_0000: equal to 0 under a 32-bit `cmp`,
+    // not-equal under a 64-bit `subs`/`adds`/`ands`). Restricting the fold to non-wide results
+    // keeps the two provably in agreement: a 32-bit S-form's Z flag equals a 32-bit `cmp`'s Z flag.
+    if (isWide(func, arith_result)) return false;
+    // Single-use: the arith result is read only by the icmp. Since the arith immediately precedes
+    // the icmp and is its LHS, a total use-count of exactly 1 means the icmp is the sole reader, so
+    // the S-form overwriting the arith's result register (nothing else reads it) is safe.
+    if (countUses(func, arith_result) != 1) return false;
+    switch (func.opcode(arith_inst)) {
+        .arith => |a| {
+            // A shift that fuses into this add/sub (shift_add) is skipped and folded into a
+            // shifted-register add, so its shifted operand is never materialized in a register.
+            // Reject the arith-branch fold there so the S-form never reads an unmaterialized
+            // operand (the two folds are mutually exclusive; fall back to plain arith + cmp +
+            // branch). Checked with shift_add enabled unconditionally since it is on by default:
+            // when it is off the shl IS materialized and this is merely conservative, and both
+            // fold sites share this predicate so they still agree.
+            if (if_idx >= 3 and fusesIntoNextShiftAdd(func, insts, if_idx - 3, true)) return false;
+            return a.op == .add or a.op == .sub or a.op == .bit_and;
+        },
+        .arith_imm => |a| {
+            // Only add/sub in the immediate form: `bit_and` immediate would need a bitmask-
+            // encoded `ands` immediate (complex), so it falls back to the plain path.
+            if (a.op != .add and a.op != .sub) return false;
+            // The immediate must fit the 12-bit arith-immediate field (else addsImm/subsImm
+            // cannot express it). A negative immediate has no unsigned-12 form here either.
+            return a.imm >= 0 and a.imm <= 0xFFF;
+        },
+        else => return false,
+    }
+}
+
+/// Whether the arith at `insts[inst_idx]` is the producer of an arith-branch fold, i.e. the `if`
+/// two instructions later folds it (with the icmp between). The arith-skip sites in the
+/// `.arith`/`.arith_imm` arms call this to `continue` past the arith's materialization; the S-form
+/// is then emitted by `Ctx.emitIf` under the SAME `fusesArithIntoBranch` predicate, so the arith
+/// is emitted exactly once. `enabled` carries `caps.fuse_arith_branch and caps.fuse_cmp_branch`.
+fn isArithBranchProducer(func: *const Function, insts: []const ir.function.Inst, inst_idx: usize, enabled: bool) bool {
+    if (inst_idx + 2 >= insts.len) return false; // need the icmp at +1 and the if at +2
+    return fusesArithIntoBranch(func, insts, inst_idx + 2, enabled);
 }
 
 /// Whether `v`'s type is a vector over a float element (the only vector shape arith
@@ -2733,6 +3017,58 @@ fn fusesIntoNextArith(func: *const Function, insts: []const ir.function.Inst, id
     // both call sites (the mul-skip and the fused emit) agree and fall back to fmul+fsub.
     if (vector and addsub.op == .sub and addsub.lhs == result) return false;
     // Single-use: the product is read only by this add/sub. Since the mul immediately
+    // precedes it and is one of its operands, a total use-count of exactly 1 means this is
+    // the sole use, so skipping the materialization harms nothing.
+    return countUses(func, result) == 1;
+}
+
+/// Whether the constant left shift `arith_imm{.shl, b, k}` at `insts[idx]` fuses into an
+/// immediately-following integer `add`/`sub` that consumes its result, folding
+/// `a + (b << k)` / `a - (b << k)` into ONE shifted-register add/sub
+/// (`add xd, xn, xm, lsl #k`, see `Ctx.emitShiftAdd`). This is the ONE eligibility predicate
+/// shared by the shl-skip (in the `.arith_imm` arm) and the fused emit (in the `.arith`
+/// arm), so they never disagree (no dangling or doubled shift) - mirrors `fusesIntoNextArith`.
+/// `enabled` carries `caps.fuse_shift_add`, so a model without the fusion (or the flag off)
+/// falls back to the plain shift-then-add path at BOTH sites and stays byte-identical.
+///
+/// Conditions: integer / GPR operands only (a shifted-register add is a GPR-only ALU form,
+/// never fpr or vector). The shl result is SINGLE-USE (its only reader is this add/sub, so
+/// skipping the standalone shifted value is safe). The shift amount `k` fits the add's
+/// result width (0..63 for a 64-bit result, 0..31 for 32-bit, so the imm6 is
+/// architecturally valid) and is at least 1 (k == 0 is a degenerate shift left to the plain
+/// path). For `.sub` the shl result must be the RHS, the subtrahend: `subShifted` computes
+/// `rn - (rm << k)`, so `a - (b << k)` folds but `(b << k) - a` cannot and stays on the plain
+/// path. `.add` is commutative, so the shl result may be either operand.
+///
+/// The immediately-preceding + single-use conditions make skipping the shift register-safe:
+/// nothing runs between the shl and the add/sub, so the shl's operand `b` still holds its
+/// value there (loaded fresh at the add), exactly as `fusesIntoNextArith` relies on for the
+/// fused product's operands.
+fn fusesIntoNextShiftAdd(func: *const Function, insts: []const ir.function.Inst, idx: usize, enabled: bool) bool {
+    if (!enabled) return false;
+    const shl = switch (func.opcode(insts[idx])) {
+        .arith_imm => |a| a,
+        else => return false,
+    };
+    if (shl.op != .shl) return false;
+    // Integer / GPR operands only: a shifted-register add/sub is a GPR ALU form. A vector or
+    // non-gpr class routes elsewhere.
+    if (isVector(func, shl.lhs) or regClass(func, shl.lhs) != .gpr) return false;
+    if (idx + 1 >= insts.len) return false; // must be immediately followed by the add/sub
+    const addsub = switch (func.opcode(insts[idx + 1])) {
+        .arith => |a| a,
+        else => return false,
+    };
+    if (addsub.op != .add and addsub.op != .sub) return false;
+    const result = func.instResult(insts[idx]) orelse return false;
+    if (addsub.lhs != result and addsub.rhs != result) return false; // must consume the shl's result
+    // `.sub` folds only when the shl result is the subtrahend (rhs): subShifted computes
+    // rn - (rm << k), so `(b << k) - a` has no shifted form and stays on the plain path.
+    if (addsub.op == .sub and addsub.lhs == result) return false;
+    // `k` must fit the result width's imm6 range and be a real (at least 1) shift.
+    const max_shift: i64 = if (isWide(func, result)) 63 else 31;
+    if (shl.imm < 1 or shl.imm > max_shift) return false;
+    // Single-use: the shifted value is read only by this add/sub. Since the shl immediately
     // precedes it and is one of its operands, a total use-count of exactly 1 means this is
     // the sole use, so skipping the materialization harms nothing.
     return countUses(func, result) == 1;

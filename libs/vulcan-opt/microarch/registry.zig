@@ -292,7 +292,9 @@ const altra = Model{
     .latency = altraLatency,
     .throughput = altraThroughput,
     .unitOf = unitOfShared,
-    .fusion = &.{ .{ .kind = .cmp_branch }, .{ .kind = .arith_branch } },
+    // add-shift (ADD Xd, Xn, Xm, LSL #imm) is base-ISA on every aarch64 core, so shift_add is
+    // always available here, unlike the riscv64 tiers where it needs Zba.
+    .fusion = &.{ .{ .kind = .cmp_branch }, .{ .kind = .arith_branch }, .{ .kind = .shift_add } },
 };
 
 const etsoc = Model{
@@ -309,7 +311,9 @@ const etsoc = Model{
     .latency = etsocLatency,
     .throughput = etsocThroughput,
     .unitOf = unitOfShared,
-    .fusion = &.{},
+    // cmp_branch (compare fused into the branch) needs no extension. Shift_add is withheld
+    // because et-soc has no Zba.
+    .fusion = &.{.{ .kind = .cmp_branch }},
 };
 
 fn riverInorder(comptime tag: Microarch, comptime feats: @FieldType(model.Features, "riscv64")) Model {
@@ -327,7 +331,8 @@ fn riverInorder(comptime tag: Microarch, comptime feats: @FieldType(model.Featur
         .latency = riverInorderLatency,
         .throughput = riverInorderThroughput,
         .unitOf = unitOfShared,
-        .fusion = &.{},
+        // cmp_branch needs no extension. These embedded tiers have no Zba, so no shift_add.
+        .fusion = &.{.{ .kind = .cmp_branch }},
     };
 }
 
@@ -358,11 +363,13 @@ const river_f = Model{
     // Zfh (native f16) rides with the application-class FP profile (per River's RVA23 baseline,
     // where Zfh is mandatory): it flips the riscv64 backend to native half instructions instead of
     // the software f32-widening emulation. The embedded tiers (n/mi/s) have no float at all.
-    .features = .{ .riscv64 = .{ .m = true, .a = true, .f = true, .d = true, .c = true, .zicbop = true, .zfh = true } },
+    // Zba (sh1/2/3add) is also mandatory in River's RVA22 profile, which is what makes shift_add
+    // fusion available on this tier.
+    .features = .{ .riscv64 = .{ .m = true, .a = true, .f = true, .d = true, .c = true, .zicbop = true, .zfh = true, .zba = true } },
     .latency = riverInorderLatency,
     .throughput = riverPipelinedThroughput,
     .unitOf = unitOfShared,
-    .fusion = &.{},
+    .fusion = &.{ .{ .kind = .cmp_branch }, .{ .kind = .shift_add } },
 };
 const river_ma = Model{
     .tag = .@"river-rc1.ma",
@@ -374,12 +381,12 @@ const river_ma = Model{
     .vector_bits = 0,
     .cache_line = 64,
     .fetch_align = 8,
-    // See river_f: the application-class FP profile carries Zfh (native f16) too.
-    .features = .{ .riscv64 = .{ .m = true, .a = true, .f = true, .d = true, .c = true, .zicbop = true, .zfh = true } },
+    // See river_f: the application-class FP profile carries Zfh (native f16) and Zba (shift_add) too.
+    .features = .{ .riscv64 = .{ .m = true, .a = true, .f = true, .d = true, .c = true, .zicbop = true, .zfh = true, .zba = true } },
     .latency = riverMacroLatency,
     .throughput = riverPipelinedThroughput,
     .unitOf = unitOfShared,
-    .fusion = &.{ .{ .kind = .addr_hi_lo }, .{ .kind = .shift_add } },
+    .fusion = &.{ .{ .kind = .cmp_branch }, .{ .kind = .addr_hi_lo }, .{ .kind = .shift_add } },
 };
 
 comptime {
