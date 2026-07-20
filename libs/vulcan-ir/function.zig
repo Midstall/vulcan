@@ -930,6 +930,106 @@ pub const Function = struct {
         }
     }
 
+    /// Clone `src`'s params and instructions into a NEW appended block with ALL-FRESH values,
+    /// remapping every internal reference old->new. The terminator is copied (Block targets
+    /// unchanged, Value args remapped). Fills `map` (old Value -> new Value) for every param and
+    /// inst-result of `src`, so the caller can remap any reference from OUTSIDE `src` that should
+    /// now point at the clone (e.g. rewiring one predecessor's edge onto the fresh copy). Does NOT
+    /// modify `src`. Foundation for tail duplication in general jump threading: cloning a shared
+    /// block gives one predecessor a private copy it can specialize.
+    pub fn cloneBlock(self: *Function, allocator: std.mem.Allocator, src: Block, map: *std.AutoHashMapUnmanaged(Value, Value)) std.mem.Allocator.Error!Block {
+        const dst = try self.appendBlock();
+
+        for (self.blockParams(src)) |p| {
+            const np = try self.appendBlockParam(dst, self.valueType(p));
+            try map.put(allocator, p, np);
+        }
+
+        for (self.blockInsts(src)) |inst| {
+            const op = try self.remapOpcode(allocator, self.opcode(inst), map);
+            if (self.instResult(inst)) |result| {
+                const nr = try self.appendInst(dst, self.valueType(result), op);
+                try map.put(allocator, result, nr);
+            } else {
+                // @"if", store, prefetch, matmul: result-less statements.
+                try self.appendStmt(dst, op);
+            }
+        }
+
+        if (self.terminator(src)) |term| {
+            const new_term: Terminator = switch (term) {
+                .ret => |v| .{ .ret = if (v) |vv| remapValue(map, vv) else null },
+                .jump => |j| .{
+                    .jump = .{
+                        .target = j.target, // block targets are never remapped, only values are
+                        .args = try self.remapValueList(allocator, j.args, map),
+                    },
+                },
+            };
+            self.setTerminator(dst, new_term);
+        }
+
+        return dst;
+    }
+
+    /// Copy `op`, replacing every `Value` operand that is a key of `map` with its mapped value (an
+    /// operand not in `map`, i.e. defined outside the block being cloned, is left as-is). Non-Value
+    /// fields (immediates, types, block targets, `matmul`'s shape/dtype metadata) are copied
+    /// unchanged. Exhaustive over every `Opcode` variant (no `else` prong) so a newly added
+    /// Value-carrying field cannot silently escape the remap. It mirrors the operand walks in
+    /// `replaceAllUses` and `verify.zig`'s dominance check above.
+    fn remapOpcode(self: *Function, allocator: std.mem.Allocator, op: Opcode, map: *const std.AutoHashMapUnmanaged(Value, Value)) std.mem.Allocator.Error!Opcode {
+        return switch (op) {
+            .iconst, .fconst, .alloca, .global_addr => op,
+            .arith => |a| .{ .arith = .{ .op = a.op, .lhs = remapValue(map, a.lhs), .rhs = remapValue(map, a.rhs) } },
+            .arith_imm => |a| .{ .arith_imm = .{ .op = a.op, .lhs = remapValue(map, a.lhs), .imm = a.imm } },
+            .icmp => |c| .{ .icmp = .{ .op = c.op, .lhs = remapValue(map, c.lhs), .rhs = remapValue(map, c.rhs) } },
+            .select => |s| .{ .select = .{
+                .cond = remapValue(map, s.cond),
+                .then = remapValue(map, s.then),
+                .@"else" = remapValue(map, s.@"else"),
+            } },
+            .struct_new => |sn| .{ .struct_new = .{ .fields = try self.remapValueList(allocator, sn.fields, map) } },
+            .extract => |ex| .{ .extract = .{ .aggregate = remapValue(map, ex.aggregate), .index = ex.index } },
+            .convert => |cv| .{ .convert = .{ .value = remapValue(map, cv.value) } },
+            .unary => |u| .{ .unary = .{ .op = u.op, .value = remapValue(map, u.value) } },
+            .call => |c| .{ .call = .{ .symbol = c.symbol, .args = try self.remapValueList(allocator, c.args, map) } },
+            .call_indirect => |c| .{ .call_indirect = .{
+                .target = remapValue(map, c.target),
+                .args = try self.remapValueList(allocator, c.args, map),
+            } },
+            .load => |ld| .{ .load = .{ .ptr = remapValue(map, ld.ptr) } },
+            .store => |st| .{ .store = .{ .value = remapValue(map, st.value), .ptr = remapValue(map, st.ptr) } },
+            .prefetch => |pf| .{ .prefetch = .{ .ptr = remapValue(map, pf.ptr) } },
+            .dot => |d| .{ .dot = .{ .acc = remapValue(map, d.acc), .a = remapValue(map, d.a), .b = remapValue(map, d.b) } },
+            .matmul => |mm| blk: {
+                // Only a/b/c are Values. The m/n/k/dtype/accumulate/embedded/quant/input_signs are
+                // compile-time metadata, copied unchanged.
+                var remapped = mm;
+                remapped.a = remapValue(map, mm.a);
+                remapped.b = remapValue(map, mm.b);
+                remapped.c = remapValue(map, mm.c);
+                break :blk .{ .matmul = remapped };
+            },
+            .@"if" => |cond| .{ .@"if" = .{
+                .cond = remapValue(map, cond.cond),
+                .then = .{ .target = cond.then.target, .args = try self.remapValueList(allocator, cond.then.args, map) },
+                .@"else" = .{ .target = cond.@"else".target, .args = try self.remapValueList(allocator, cond.@"else".args, map) },
+            } },
+        };
+    }
+
+    /// Remap a `ValueList`'s values through `map` (an unmapped value passes through unchanged) and
+    /// intern the result as a fresh list. Used for every variadic operand `cloneBlock` touches
+    /// (`struct_new`/`call`/`call_indirect` args, `if`/jump edge args).
+    fn remapValueList(self: *Function, allocator: std.mem.Allocator, list: ValueList, map: *const std.AutoHashMapUnmanaged(Value, Value)) std.mem.Allocator.Error!ValueList {
+        const src_vals = self.valueList(list);
+        const scratch = try allocator.alloc(Value, src_vals.len);
+        defer allocator.free(scratch);
+        for (src_vals, 0..) |v, i| scratch[i] = remapValue(map, v);
+        return self.internValues(scratch);
+    }
+
     /// Intern a run of values into the value-list pool (for variadic operands).
     pub fn internValueList(self: *Function, vals: []const Value) std.mem.Allocator.Error!ValueList {
         return self.internValues(vals);
@@ -1060,6 +1160,13 @@ pub const Function = struct {
         return false;
     }
 };
+
+/// Look `v` up in a value remap built by `Function.cloneBlock`: a mapped value (defined inside the
+/// block being cloned) resolves to its fresh clone, an unmapped value (defined outside the block)
+/// passes through unchanged.
+fn remapValue(map: *const std.AutoHashMapUnmanaged(Value, Value), v: Value) Value {
+    return map.get(v) orelse v;
+}
 
 /// True when `ty` is f16 itself, or a vector/array/slice/struct that contains f16 anywhere in
 /// its structure. Recursion always terminates: a composite can only reference an already-
@@ -1916,6 +2023,159 @@ test "reorderBlocks identity permutation leaves the function unchanged" {
     defer std.testing.allocator.free(after);
 
     try std.testing.expectEqualStrings(before, after);
+
+    var d = try verify.verify(std.testing.allocator, &func, .high);
+    defer d.deinit();
+    try std.testing.expect(d.ok());
+}
+
+test "cloneBlock copies params and instructions with fresh values" {
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+
+    // src(p): a = p + p; c = a > p; if c { then_b(a) } else { else_b }
+    const then_b = try func.appendBlock();
+    const else_b = try func.appendBlock();
+    const src = try func.appendBlock();
+    const p = try func.appendBlockParam(src, i32_t);
+    const a = try func.appendInst(src, i32_t, .{ .arith = .{ .op = .add, .lhs = p, .rhs = p } });
+    const c = try func.appendInst(src, bool_t, .{ .icmp = .{ .op = .gt, .lhs = a, .rhs = p } });
+    try func.appendIf(src, c, .{ .target = then_b, .args = &.{a} }, .{ .target = else_b });
+
+    var map: std.AutoHashMapUnmanaged(Value, Value) = .empty;
+    defer map.deinit(std.testing.allocator);
+    const dst = try func.cloneBlock(std.testing.allocator, src, &map);
+
+    // Every param and inst-result of src is mapped to a FRESH value.
+    const fresh_p = map.get(p).?;
+    const fresh_a = map.get(a).?;
+    const fresh_c = map.get(c).?;
+    try std.testing.expect(fresh_p != p);
+    try std.testing.expect(fresh_a != a);
+    try std.testing.expect(fresh_c != c);
+
+    // The clone's arith references the fresh param, not the original.
+    try std.testing.expectEqualSlices(Value, &.{fresh_p}, func.blockParams(dst));
+    const dst_insts = func.blockInsts(dst);
+    try std.testing.expectEqual(@as(usize, 3), dst_insts.len); // arith, icmp, if (a stmt too)
+    const dst_arith = func.opcode(dst_insts[0]).arith;
+    try std.testing.expectEqual(fresh_p, dst_arith.lhs);
+    try std.testing.expectEqual(fresh_p, dst_arith.rhs);
+
+    // The clone's if uses the fresh cond and the fresh then-edge argument.
+    const dst_if_inst = func.blockInsts(dst)[func.blockInsts(dst).len - 1];
+    const dst_if = func.opcode(dst_if_inst).@"if";
+    try std.testing.expectEqual(fresh_c, dst_if.cond);
+    try std.testing.expectEqual(then_b, dst_if.then.target); // block targets are unchanged
+    try std.testing.expectEqualSlices(Value, &.{fresh_a}, func.blockArgs(dst_if.then));
+    try std.testing.expectEqual(else_b, dst_if.@"else".target);
+
+    // src is untouched: its instructions still reference the original values.
+    const src_insts = func.blockInsts(src);
+    try std.testing.expectEqualSlices(Value, &.{p}, func.blockParams(src));
+    const src_arith = func.opcode(src_insts[0]).arith;
+    try std.testing.expectEqual(p, src_arith.lhs);
+    try std.testing.expectEqual(p, src_arith.rhs);
+    const src_if = func.opcode(src_insts[src_insts.len - 1]).@"if";
+    try std.testing.expectEqual(c, src_if.cond);
+    try std.testing.expectEqualSlices(Value, &.{a}, func.blockArgs(src_if.then));
+}
+
+test "cloneBlock leaves external references unchanged" {
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+
+    // ext is defined in another block, not in src, so it must never appear in `map` and must
+    // survive the clone identically.
+    const other = try func.appendBlock();
+    const ext = try func.appendInst(other, i32_t, .{ .iconst = 5 });
+
+    const src = try func.appendBlock();
+    const p = try func.appendBlockParam(src, i32_t);
+    const mixed = try func.appendInst(src, i32_t, .{ .arith = .{ .op = .add, .lhs = p, .rhs = ext } });
+    func.setTerminator(src, .{ .ret = mixed });
+
+    var map: std.AutoHashMapUnmanaged(Value, Value) = .empty;
+    defer map.deinit(std.testing.allocator);
+    const dst = try func.cloneBlock(std.testing.allocator, src, &map);
+
+    try std.testing.expectEqual(@as(?Value, null), map.get(ext)); // never mapped: defined outside src
+
+    const dst_arith = func.opcode(func.blockInsts(dst)[0]).arith;
+    try std.testing.expectEqual(map.get(p).?, dst_arith.lhs); // in-src operand: remapped
+    try std.testing.expectEqual(ext, dst_arith.rhs); // external operand: identical, unchanged
+}
+
+test "cloneBlock remaps a ret terminator's value" {
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const src = try func.appendBlock();
+    const p = try func.appendBlockParam(src, i32_t);
+    const x = try func.appendInst(src, i32_t, .{ .arith = .{ .op = .add, .lhs = p, .rhs = p } });
+    func.setTerminator(src, .{ .ret = x });
+
+    var map: std.AutoHashMapUnmanaged(Value, Value) = .empty;
+    defer map.deinit(std.testing.allocator);
+    const dst = try func.cloneBlock(std.testing.allocator, src, &map);
+
+    try std.testing.expectEqual(Terminator{ .ret = map.get(x).? }, func.terminator(dst).?);
+    try std.testing.expectEqual(Terminator{ .ret = x }, func.terminator(src).?); // src unchanged
+}
+
+test "cloneBlock remaps a jump terminator's args" {
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const target = try func.appendBlock();
+    _ = try func.appendBlockParam(target, i32_t);
+    func.setTerminator(target, .{ .ret = null });
+
+    const src = try func.appendBlock();
+    const p = try func.appendBlockParam(src, i32_t);
+    const x = try func.appendInst(src, i32_t, .{ .arith = .{ .op = .add, .lhs = p, .rhs = p } });
+    try func.setJump(src, target, &.{x});
+
+    var map: std.AutoHashMapUnmanaged(Value, Value) = .empty;
+    defer map.deinit(std.testing.allocator);
+    const dst = try func.cloneBlock(std.testing.allocator, src, &map);
+
+    const dst_term = func.terminator(dst).?;
+    try std.testing.expectEqual(target, dst_term.jump.target); // block target is unchanged
+    try std.testing.expectEqualSlices(Value, &.{map.get(x).?}, func.blockArgs(dst_term.jump));
+
+    const src_term = func.terminator(src).?; // src unchanged
+    try std.testing.expectEqualSlices(Value, &.{x}, func.blockArgs(src_term.jump));
+}
+
+test "cloneBlock produces a block verify accepts once wired into the CFG" {
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+
+    const entry = try func.appendBlock(); // block 0: the entry, dominates everything below
+    const src = try func.appendBlock();
+    const p = try func.appendBlockParam(src, i32_t);
+    const y = try func.appendInst(src, i32_t, .{ .arith = .{ .op = .add, .lhs = p, .rhs = p } });
+    func.setTerminator(src, .{ .ret = y });
+
+    var map: std.AutoHashMapUnmanaged(Value, Value) = .empty;
+    defer map.deinit(std.testing.allocator);
+    const dst = try func.cloneBlock(std.testing.allocator, src, &map);
+
+    // entry conditionally jumps into either the original or the clone, both fed the same argument.
+    const cond = try func.appendBlockParam(entry, bool_t);
+    const v = try func.appendInst(entry, i32_t, .{ .iconst = 7 });
+    try func.appendIf(entry, cond, .{ .target = src, .args = &.{v} }, .{ .target = dst, .args = &.{v} });
 
     var d = try verify.verify(std.testing.allocator, &func, .high);
     defer d.deinit();
