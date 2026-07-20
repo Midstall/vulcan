@@ -4973,15 +4973,13 @@ test "aarch64 arith_branch: a function without the pattern is byte-identical fla
     try std.testing.expectEqualSlices(u32, on.code, off.code);
 }
 
-test "aarch64 arith_branch: 64-bit decrement is NOT folded (encode.cmp is 32-bit only), computes correctly" {
+test "aarch64 arith_branch: 64-bit decrement folds to subs64+b.ne and computes correctly" {
     const allocator = std.testing.allocator;
-    // The surrounding icmp lowering (both the unfused icmp path and the fused compare-and-branch
-    // path this fold lives inside) always compares with `encode.cmp`, which is 32-bit only. A
-    // 64-bit S-form here would set Z from all 64 bits, disagreeing with that 32-bit `cmp` on
-    // values whose low 32 bits are zero but high bits are not (e.g. 0x1_0000_0000: equal to 0
-    // under a 32-bit `cmp`, not-equal under a 64-bit `subs`). `fusesArithIntoBranch` declines
-    // whenever the arith result is wide (see its doc comment), so the decrement materializes with
-    // a plain `sub x..` and the compare-and-branch fold keeps its separate `cmp`.
+    // Task 1 width-selected the surrounding icmp lowering (`encode.cmp` vs `encode.cmp64` by
+    // operand width), so the reason this fold used to decline on wide results no longer holds:
+    // `emitArithBranch` now emits the 64-bit `subsImm64` here, whose Z flag is (n-1 == 0) over all
+    // 64 bits, agreeing with the width-selected compare path. So the decrement folds, exactly like
+    // the 32-bit case above, with NO separate `cmp` before the `b.ne`.
     var func = try buildArithBranchImm(allocator, 64, .sub, 1, .ne, 100, 200); // (n-1) != 0 ? 100 : 200
     defer func.deinit();
 
@@ -4989,9 +4987,8 @@ test "aarch64 arith_branch: 64-bit decrement is NOT folded (encode.cmp is 32-bit
     defer allocator.free(code);
     const text = try disasm.format(allocator, code);
     defer allocator.free(text);
-    try std.testing.expect(std.mem.indexOf(u8, text, "subs") == null); // no flag-setting S-form
-    try std.testing.expect(std.mem.indexOf(u8, text, "sub x") != null); // plain 64-bit materialization
-    try std.testing.expect(std.mem.indexOf(u8, text, "cmp") != null); // compare-and-branch keeps its cmp
+    try std.testing.expect(std.mem.indexOf(u8, text, "subs") != null); // folded flag-setting S-form
+    try std.testing.expect(std.mem.indexOf(u8, text, "cmp") == null); // no separate compare
     try std.testing.expect(std.mem.indexOf(u8, text, "b.ne ") != null);
 
     if (builtin.cpu.arch == .aarch64) {
@@ -5003,6 +5000,258 @@ test "aarch64 arith_branch: 64-bit decrement is NOT folded (encode.cmp is 32-bit
         try std.testing.expectEqual(@as(i64, 100), f(0)); // 0-1 == -1 != 0 -> then
         try std.testing.expectEqual(@as(i64, 100), f(-3));
     }
+}
+
+test "aarch64 arith_branch: 64-bit fold uses the full-64 Z flag (low-32-zero high-nonzero difference)" {
+    const allocator = std.testing.allocator;
+    // The whole reason the S-form width must match the compare width: n = 0x1_0000_0001 gives
+    // n-1 = 0x1_0000_0000, whose low 32 bits are zero but whose full 64-bit value is nonzero. A
+    // 32-bit Z flag (or a 32-bit `cmp`) would read this as == 0 and take the else edge; the
+    // correct full-64 answer is != 0, taking the then edge. This pins that the folded 64-bit
+    // `subs64`/`subsImm64` sets Z from all 64 bits, not just the low 32.
+    var func = try buildArithBranchImm(allocator, 64, .sub, 1, .ne, 100, 200); // (n-1) != 0 ? 100 : 200
+    defer func.deinit();
+
+    const code = try isel.selectFunction(allocator, &func);
+    defer allocator.free(code);
+    const text = try disasm.format(allocator, code);
+    defer allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "subs") != null); // folded
+    try std.testing.expect(std.mem.indexOf(u8, text, "cmp") == null); // no separate compare
+
+    if (builtin.cpu.arch == .aarch64) {
+        var buf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(code));
+        defer buf.deinit();
+        const f: *const fn (i64) callconv(.c) i64 = @ptrCast(buf.memory.ptr);
+        // n - 1 = 0x1_0000_0000: low 32 bits zero, full 64-bit value nonzero -> != 0 -> then (100).
+        try std.testing.expectEqual(@as(i64, 100), f(0x1_0000_0001));
+    }
+}
+
+test "aarch64 arith_branch: 64-bit fold is execution-equivalent to the flag-off compile" {
+    const allocator = std.testing.allocator;
+    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+    // Same pattern as the 32-bit execution-equivalence test above, but at i64 width: compile the
+    // fold on and off and JIT-run both side by side, including the low-32-zero/high-nonzero input
+    // that distinguishes a full-64 Z flag from a 32-bit one. The two compiles must agree on every
+    // input even though their machine code differs (folded S-form vs plain arith + separate cmp).
+    var func = try buildArithBranchImm(allocator, 64, .sub, 1, .ne, 100, 200); // (n-1) != 0 ? 100 : 200
+    defer func.deinit();
+
+    const on = try compileWithCaps(allocator, &func, .{ .fuse_arith_branch = true });
+    defer allocator.free(on.relocs);
+    defer allocator.free(on.lines);
+    defer allocator.free(on.code);
+    const off = try compileWithCaps(allocator, &func, .{ .fuse_arith_branch = false });
+    defer allocator.free(off.relocs);
+    defer allocator.free(off.lines);
+    defer allocator.free(off.code);
+
+    var buf_on = try jit.CodeBuffer.map(std.mem.sliceAsBytes(on.code));
+    defer buf_on.deinit();
+    var buf_off = try jit.CodeBuffer.map(std.mem.sliceAsBytes(off.code));
+    defer buf_off.deinit();
+    const f_on: *const fn (i64) callconv(.c) i64 = @ptrCast(buf_on.memory.ptr);
+    const f_off: *const fn (i64) callconv(.c) i64 = @ptrCast(buf_off.memory.ptr);
+
+    for ([_]i64{ 0x1_0000_0001, 1, 5, 0, -3 }) |n| {
+        try std.testing.expectEqual(f_off(n), f_on(n));
+    }
+}
+
+test "aarch64 arith_branch: 64-bit and-and-branch folds to ands64+b.ne" {
+    const allocator = std.testing.allocator;
+    // A register-form 64-bit fold (the immediate-form tests above only exercise subsImm64), so
+    // adds64/subs64/ands64 get exercised too. 0x1_0000_0001 & 0x1_0000_0000 = 0x1_0000_0000: != 0
+    // over the full 64 bits (low 32 alone would read 0), pinning the full-64 register-form Z flag.
+    var func = try buildArithBranchReg(allocator, 64, .bit_and, .ne, 100, 200); // (a&b) != 0 ? 100 : 200
+    defer func.deinit();
+
+    const code = try isel.selectFunction(allocator, &func);
+    defer allocator.free(code);
+    const text = try disasm.format(allocator, code);
+    defer allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "ands") != null); // folded flag-setting S-form
+    try std.testing.expect(std.mem.indexOf(u8, text, "cmp") == null); // no separate compare
+    try std.testing.expect(std.mem.indexOf(u8, text, "b.ne ") != null);
+
+    if (builtin.cpu.arch == .aarch64) {
+        var buf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(code));
+        defer buf.deinit();
+        const f: *const fn (i64, i64) callconv(.c) i64 = @ptrCast(buf.memory.ptr);
+        try std.testing.expectEqual(@as(i64, 100), f(0x1_0000_0001, 0x1_0000_0000)); // high bit set -> then
+        try std.testing.expectEqual(@as(i64, 200), f(4, 1)); // 4&1 == 0 -> else
+        try std.testing.expectEqual(@as(i64, 100), f(7, 7));
+    }
+}
+
+// -- i64/pointer icmp width-select (cmp vs cmp64) ----------------------------------------------
+// Integer icmp must compare at the OPERAND width: a 32-bit `cmp` on an i64 or pointer operand only
+// tests the low 32 bits, so two values that differ only in their high 32 bits would wrongly
+// compare equal (or order backwards). isel.zig width-selects `encode.cmp`/`encode.cmp64` by
+// `isWide(func, cmp.lhs)` at both the unfused icmp site (plain GPR `.icmp` case) and the fused
+// compare-and-branch site inside `emitIf`. These build both shapes at i64/ptr width with operand
+// pairs whose low-32 ordering DISAGREES with their full-64 ordering, so a 32-bit cmp gets them
+// wrong and the fix (cmp64) gets them right, JIT-run on this aarch64 host.
+
+/// `f(a, b) -> bool` computing `icmp op (a, b)` at the given integer width, the icmp's ONLY use
+/// being the return (not feeding an `if`), so isel takes the UNFUSED GPR `.icmp` path
+/// (`cmp`/`cmp64; cset`).
+fn buildIcmpUnfused(allocator: std.mem.Allocator, bits: u16, signedness: std.builtin.Signedness, op: ir.function.CmpOp) !Function {
+    var func = Function.init(allocator);
+    errdefer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = signedness, .bits = bits } });
+    const bool_t = try func.types.intern(.bool);
+    const blk = try func.appendBlock();
+    const a = try func.appendBlockParam(blk, t);
+    const b = try func.appendBlockParam(blk, t);
+    const r = try func.appendInst(blk, bool_t, .{ .icmp = .{ .op = op, .lhs = a, .rhs = b } });
+    func.setTerminator(blk, .{ .ret = r });
+    return func;
+}
+
+/// JIT-compile and run `buildIcmpUnfused` at 64-bit width, returning the boolean result read from
+/// the low bit of the w0 result register. Skips off aarch64.
+fn runIcmpUnfused64(allocator: std.mem.Allocator, signedness: std.builtin.Signedness, op: ir.function.CmpOp, a: i64, b: i64) !bool {
+    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+    var func = try buildIcmpUnfused(allocator, 64, signedness, op);
+    defer func.deinit();
+    const code = try isel.selectFunction(allocator, &func);
+    defer allocator.free(code);
+    var buf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(code));
+    defer buf.deinit();
+    const f: *const fn (i64, i64) callconv(.c) i32 = @ptrCast(buf.memory.ptr);
+    return f(a, b) != 0;
+}
+
+test "native: i64 icmp eq/ne differing only in high bits (unfused path), correct at full 64-bit width" {
+    const allocator = std.testing.allocator;
+    // 0x1_0000_0000 and 0 share the same low 32 bits (both zero) but differ in the high 32 bits: a
+    // 32-bit cmp would (wrongly) call them equal. This is the exact miscompile this task fixes.
+    try std.testing.expect(!try runIcmpUnfused64(allocator, .signed, .eq, 0x1_0000_0000, 0));
+    try std.testing.expect(try runIcmpUnfused64(allocator, .signed, .ne, 0x1_0000_0000, 0));
+    try std.testing.expect(!try runIcmpUnfused64(allocator, .signed, .eq, 0x2_0000_0001, 0x1_0000_0001));
+    try std.testing.expect(try runIcmpUnfused64(allocator, .signed, .ne, 0x2_0000_0001, 0x1_0000_0001));
+}
+
+test "native: i64 icmp signed lt/le/gt/ge disagree with a low-32 compare (unfused path), full 64-bit correct" {
+    const allocator = std.testing.allocator;
+    // lhs = 0x1_0000_0000 (low32 = 0), rhs = 1 (low32 = 1): the low-32 halves say lhs < rhs, but
+    // the full 64-bit values say lhs > rhs. A 32-bit `cmp` gets every one of these backwards.
+    const lhs: i64 = 0x1_0000_0000;
+    const rhs: i64 = 1;
+    try std.testing.expect(try runIcmpUnfused64(allocator, .signed, .gt, lhs, rhs));
+    try std.testing.expect(!try runIcmpUnfused64(allocator, .signed, .lt, lhs, rhs));
+    try std.testing.expect(try runIcmpUnfused64(allocator, .signed, .ge, lhs, rhs));
+    try std.testing.expect(!try runIcmpUnfused64(allocator, .signed, .le, lhs, rhs));
+}
+
+test "native: u64 icmp unsigned lt/le/gt/ge disagree with a low-32 compare (unfused path), full 64-bit correct" {
+    const allocator = std.testing.allocator;
+    // Same shape as the signed test above, unsigned typed: lhs (as u64) is far larger than rhs,
+    // even though the low 32 bits alone would order them the other way.
+    const lhs: i64 = 0x1_0000_0000;
+    const rhs: i64 = 1;
+    try std.testing.expect(try runIcmpUnfused64(allocator, .unsigned, .gt, lhs, rhs));
+    try std.testing.expect(!try runIcmpUnfused64(allocator, .unsigned, .lt, lhs, rhs));
+    try std.testing.expect(try runIcmpUnfused64(allocator, .unsigned, .ge, lhs, rhs));
+    try std.testing.expect(!try runIcmpUnfused64(allocator, .unsigned, .le, lhs, rhs));
+}
+
+/// `f(a, b) -> then_val/else_val` where the branch condition is `icmp op (a, b)` at 64-bit width,
+/// immediately preceding the `if` and its only use, so isel fuses it into the compare-and-branch
+/// path (`cmp`/`cmp64; b.cc`), exercising `emitIf`'s fallback site.
+fn buildIcmpFusedIf64(allocator: std.mem.Allocator, signedness: std.builtin.Signedness, op: ir.function.CmpOp, then_val: i64, els_val: i64) !Function {
+    var func = Function.init(allocator);
+    errdefer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = signedness, .bits = 64 } });
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const then_b = try func.appendBlock();
+    const els_b = try func.appendBlock();
+    const a = try func.appendBlockParam(entry, t);
+    const b = try func.appendBlockParam(entry, t);
+    const c = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = op, .lhs = a, .rhs = b } });
+    try func.appendIf(entry, c, .{ .target = then_b }, .{ .target = els_b });
+    const tv = try func.appendInst(then_b, t, .{ .iconst = then_val });
+    func.setTerminator(then_b, .{ .ret = tv });
+    const ev = try func.appendInst(els_b, t, .{ .iconst = els_val });
+    func.setTerminator(els_b, .{ .ret = ev });
+    return func;
+}
+
+fn runIcmpFusedIf64(allocator: std.mem.Allocator, signedness: std.builtin.Signedness, op: ir.function.CmpOp, a: i64, b: i64) !i64 {
+    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+    var func = try buildIcmpFusedIf64(allocator, signedness, op, 100, 200);
+    defer func.deinit();
+    const code = try isel.selectFunction(allocator, &func);
+    defer allocator.free(code);
+    var buf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(code));
+    defer buf.deinit();
+    const f: *const fn (i64, i64) callconv(.c) i64 = @ptrCast(buf.memory.ptr);
+    return f(a, b);
+}
+
+test "native: i64 icmp feeding an if (fused compare-and-branch) picks the full-64-bit-correct edge" {
+    const allocator = std.testing.allocator;
+    const lhs: i64 = 0x1_0000_0000; // low32 = 0
+    const rhs: i64 = 1; // low32 = 1
+    // Full 64-bit: lhs > rhs, so `if (lhs > rhs)` takes THEN even though the low 32 bits alone
+    // would say lhs < rhs (which would wrongly take ELSE under a 32-bit cmp).
+    try std.testing.expectEqual(@as(i64, 100), try runIcmpFusedIf64(allocator, .signed, .gt, lhs, rhs));
+    try std.testing.expectEqual(@as(i64, 200), try runIcmpFusedIf64(allocator, .signed, .lt, lhs, rhs));
+    try std.testing.expectEqual(@as(i64, 100), try runIcmpFusedIf64(allocator, .signed, .ge, lhs, rhs));
+    try std.testing.expectEqual(@as(i64, 200), try runIcmpFusedIf64(allocator, .signed, .le, lhs, rhs));
+}
+
+test "native: pointer icmp ==0 with a high bit set is correctly not-equal (aarch64 64-bit cmp)" {
+    const allocator = std.testing.allocator;
+    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ptr_t = try func.types.intern(.ptr);
+    const bool_t = try func.types.intern(.bool);
+    const blk = try func.appendBlock();
+    const p = try func.appendBlockParam(blk, ptr_t);
+    const z = try func.appendInst(blk, ptr_t, .{ .iconst = 0 });
+    const r = try func.appendInst(blk, bool_t, .{ .icmp = .{ .op = .eq, .lhs = p, .rhs = z } });
+    func.setTerminator(blk, .{ .ret = r });
+
+    const code = try isel.selectFunction(allocator, &func);
+    defer allocator.free(code);
+    var buf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(code));
+    defer buf.deinit();
+    const f: *const fn (usize) callconv(.c) i32 = @ptrCast(buf.memory.ptr);
+    try std.testing.expectEqual(@as(i32, 1), f(0)); // null == 0 -> true
+    // High bit set, low 32 bits zero: a 32-bit cmp would (wrongly) call this equal to 0.
+    try std.testing.expectEqual(@as(i32, 0), f(0x1_0000_0000));
+}
+
+test "native: i32 icmp is unaffected (still lowers to the 32-bit encode.cmp), byte-identical" {
+    const allocator = std.testing.allocator;
+    var func = try buildIcmpUnfused(allocator, 32, .signed, .lt);
+    defer func.deinit();
+    const code = try isel.selectFunction(allocator, &func);
+    defer allocator.free(code);
+    const text = try disasm.format(allocator, code);
+    defer allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "cmp w") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "cmp x") == null);
+
+    try expectRun(allocator, &func, &.{ 3, 4 }, 1); // 3 < 4 -> true
+    try expectRun(allocator, &func, &.{ 4, 3 }, 0);
+}
+
+test "native: i64 icmp now emits the 64-bit encode.cmp64 (cmp x..), not the 32-bit form" {
+    const allocator = std.testing.allocator;
+    var func = try buildIcmpUnfused(allocator, 64, .signed, .lt);
+    defer func.deinit();
+    const code = try isel.selectFunction(allocator, &func);
+    defer allocator.free(code);
+    const text = try disasm.format(allocator, code);
+    defer allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "cmp x") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "cmp w") == null);
 }
 
 /// Count non-overlapping occurrences of `needle` in `haystack`. Used to assert how many branches of

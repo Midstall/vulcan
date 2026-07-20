@@ -868,7 +868,10 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                         const rl = try ctx.loadOp(allocator, &code, cmp.lhs, spill_op[0]);
                         const rr = try ctx.loadOp(allocator, &code, cmp.rhs, spill_op[1]);
                         const rd = ctx.resultReg(result);
-                        try code.append(allocator, encode.cmp(rl, rr));
+                        // Compare at the operand width: a 32-bit cmp on an i64/ptr operand would
+                        // only test the low 32 bits, mismeasuring values whose high bits differ.
+                        const wide = isWide(func, cmp.lhs);
+                        try code.append(allocator, if (wide) encode.cmp64(rl, rr) else encode.cmp(rl, rr));
                         try code.append(allocator, encode.cset(rd, condFor(cmp.op, isSignedInt(func, cmp.lhs))));
                         try storeResult(allocator, &code, ctx, result, rd);
                     }
@@ -1509,15 +1512,16 @@ const Ctx = struct {
     /// Emit the flag-setting S-form of the arith at `if_idx-2` for the fused arith-branch (the
     /// caller has confirmed `fusesArithIntoBranch` at `if_idx`). Writes the arith's own result
     /// register (`resultReg`), so the Z flag it sets equals (result == 0), which the eq/ne `b.cc`
-    /// the caller emits next tests. The register form emits `adds`/`subs`/`ands`, the immediate
-    /// form `addsImm`/`subsImm` (imm gated to u12 by the predicate). `fusesArithIntoBranch` admits
-    /// only non-wide (32-bit-or-narrower) results, so this always emits the w-form: a wide result
-    /// would set Z from all 64 bits, which disagrees with the surrounding 32-bit `encode.cmp` (see
-    /// the predicate's doc comment), so it is asserted rather than switched on here. The operands
-    /// are loaded fresh here: the arith's own materialization was skipped and nothing runs between
-    /// it and this if, so they still hold their values, exactly as the fused compare-and-branch
-    /// relies on. The S-form reads both operands before writing Rd, so Rd aliasing an operand (the
-    /// natural in-place update) is correct.
+    /// the caller emits next tests. The register form emits `adds`/`subs`/`ands` (or their 64-bit
+    /// `adds64`/`subs64`/`ands64` counterparts), the immediate form `addsImm`/`subsImm` (or
+    /// `addsImm64`/`subsImm64`), imm gated to u12 by the predicate. The S-form width is selected by
+    /// `isWide(self.func, result)`: a wide result emits the 64-bit S-form, whose Z flag is (result
+    /// == 0) over all 64 bits, matching the surrounding icmp lowering's width-selected
+    /// `encode.cmp`/`encode.cmp64`, so the two stay in agreement at every width. The operands are
+    /// loaded fresh here: the arith's own materialization was skipped and nothing runs between it
+    /// and this if, so they still hold their values, exactly as the fused compare-and-branch relies
+    /// on. The S-form reads both operands before writing Rd, so Rd aliasing an operand (the natural
+    /// in-place update) is correct.
     fn emitArithBranch(
         self: Ctx,
         allocator: std.mem.Allocator,
@@ -1528,15 +1532,15 @@ const Ctx = struct {
         const arith_inst = insts[if_idx - 2];
         const result = self.func.instResult(arith_inst).?;
         const rd = self.resultReg(result);
-        std.debug.assert(!isWide(self.func, result)); // fusesArithIntoBranch admits only non-wide results
+        const wide = isWide(self.func, result);
         switch (self.func.opcode(arith_inst)) {
             .arith => |a| {
                 const rl = try self.loadOp(allocator, code, a.lhs, spill_op[0]);
                 const rr = try self.loadOp(allocator, code, a.rhs, spill_op[1]);
                 try code.append(allocator, switch (a.op) {
-                    .add => encode.adds(rd, rl, rr),
-                    .sub => encode.subs(rd, rl, rr),
-                    .bit_and => encode.ands(rd, rl, rr),
+                    .add => if (wide) encode.adds64(rd, rl, rr) else encode.adds(rd, rl, rr),
+                    .sub => if (wide) encode.subs64(rd, rl, rr) else encode.subs(rd, rl, rr),
+                    .bit_and => if (wide) encode.ands64(rd, rl, rr) else encode.ands(rd, rl, rr),
                     // fusesArithIntoBranch admits only add/sub/bit_and in the register form.
                     else => unreachable,
                 });
@@ -1545,8 +1549,8 @@ const Ctx = struct {
                 const rl = try self.loadOp(allocator, code, a.lhs, spill_op[0]);
                 const imm: u12 = @intCast(a.imm); // gated to [0, 0xFFF] by fusesArithIntoBranch
                 try code.append(allocator, switch (a.op) {
-                    .add => encode.addsImm(rd, rl, imm),
-                    .sub => encode.subsImm(rd, rl, imm),
+                    .add => if (wide) encode.addsImm64(rd, rl, imm) else encode.addsImm(rd, rl, imm),
+                    .sub => if (wide) encode.subsImm64(rd, rl, imm) else encode.subsImm(rd, rl, imm),
                     // fusesArithIntoBranch admits only add/sub in the immediate form.
                     else => unreachable,
                 });
@@ -1598,7 +1602,10 @@ const Ctx = struct {
             } else {
                 const rl = try self.loadOp(allocator, code, cmp.lhs, spill_op[0]);
                 const rr = try self.loadOp(allocator, code, cmp.rhs, spill_op[1]);
-                try code.append(allocator, encode.cmp(rl, rr));
+                // Compare at the operand width: a 32-bit cmp on an i64/ptr operand would only
+                // test the low 32 bits, mismeasuring values whose high bits differ.
+                const wide = isWide(self.func, cmp.lhs);
+                try code.append(allocator, if (wide) encode.cmp64(rl, rr) else encode.cmp(rl, rr));
             }
             branch = .{ .cc = cond };
         } else {
@@ -2989,14 +2996,11 @@ fn fusesArithIntoBranch(func: *const Function, insts: []const ir.function.Inst, 
     if (cmp.lhs != arith_result) return false;
     // Integer / GPR only (the S-forms are GPR ALU ops; a float/vector arith routes elsewhere).
     if (isVector(func, arith_result) or regClass(func, arith_result) != .gpr) return false;
-    // 32-bit-or-narrower only. The surrounding icmp lowering (both the unfused icmp path and the
-    // fused compare-and-branch path this fold lives inside) always compares with `encode.cmp`,
-    // which is a 32-bit-only comparison (there is no 64-bit `cmp` here). A wide (64-bit or ptr)
-    // S-form would set Z from all 64 bits, disagreeing with that 32-bit `cmp` on values whose low
-    // 32 bits are zero but high bits are not (e.g. 0x1_0000_0000: equal to 0 under a 32-bit `cmp`,
-    // not-equal under a 64-bit `subs`/`adds`/`ands`). Restricting the fold to non-wide results
-    // keeps the two provably in agreement: a 32-bit S-form's Z flag equals a 32-bit `cmp`'s Z flag.
-    if (isWide(func, arith_result)) return false;
+    // Wide (64-bit or ptr) results are admitted too: `Ctx.emitArithBranch` width-selects the
+    // S-form (64-bit `subs64`/`adds64`/`ands64` when the result is wide, the 32-bit forms
+    // otherwise), and the surrounding icmp lowering now width-selects `encode.cmp`/`encode.cmp64`
+    // by operand width as well, so the S-form's Z flag (result == 0 over the result's full width)
+    // agrees with the compare path at every width. No width gate is needed here.
     // Single-use: the arith result is read only by the icmp. Since the arith immediately precedes
     // the icmp and is its LHS, a total use-count of exactly 1 means the icmp is the sole reader, so
     // the S-form overwriting the arith's result register (nothing else reads it) is safe.
