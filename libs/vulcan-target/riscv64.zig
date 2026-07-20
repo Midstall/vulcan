@@ -92,6 +92,8 @@ const tests = struct {
     pub const wimmer_diff = @import("riscv64/tests/wimmer_diff.zig");
     pub const f16_emulation = @import("riscv64/tests/f16.zig");
     pub const f16_native = @import("riscv64/tests/f16_native.zig");
+    pub const shift_add = @import("riscv64/tests/shift_add.zig");
+    pub const addr_hi_lo = @import("riscv64/tests/addr_hi_lo.zig");
 };
 
 test {

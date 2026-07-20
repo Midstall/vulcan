@@ -284,6 +284,15 @@ fn opReg(a: std.mem.Allocator, b: *std.ArrayList(u8), w: u32) !void {
         if (f3(w) == 0b000 and f7(w) == 0b0100000) return b.print(a, "neg x{d}, x{d}", .{ rd(w), rs2(w) });
         if (f3(w) == 0b011) return b.print(a, "snez x{d}, x{d}", .{ rd(w), rs2(w) });
     }
+    if (f7(w) == 0b0010000) { // Zba sh-add family (funct3 selects the shift amount 1/2/3)
+        const zba_mnem: []const u8 = switch (f3(w)) {
+            0b010 => "sh1add",
+            0b100 => "sh2add",
+            0b110 => "sh3add",
+            else => "unknown",
+        };
+        return b.print(a, "{s} x{d}, x{d}, x{d}", .{ zba_mnem, rd(w), rs1(w), rs2(w) });
+    }
     const mnem: []const u8 = switch (f3(w)) {
         0b000 => if (f7(w) == 0b0100000) "sub" else if (m) "mul" else "add",
         0b001 => if (m) "mulh" else "sll",

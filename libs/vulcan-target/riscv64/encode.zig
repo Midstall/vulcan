@@ -975,6 +975,21 @@ pub fn sra(rd: Reg, rs1: Reg, rs2: Reg) u32 {
     return rType(0b0110011, 0b101, 0b0100000, rd, rs1, rs2);
 }
 
+/// `sh1add rd, rs1, rs2` (Zba): rd = rs2 + (rs1 << 1).
+pub fn sh1add(rd: Reg, rs1: Reg, rs2: Reg) u32 {
+    return rType(0b0110011, 0b010, 0b0010000, rd, rs1, rs2);
+}
+
+/// `sh2add rd, rs1, rs2` (Zba): rd = rs2 + (rs1 << 2).
+pub fn sh2add(rd: Reg, rs1: Reg, rs2: Reg) u32 {
+    return rType(0b0110011, 0b100, 0b0010000, rd, rs1, rs2);
+}
+
+/// `sh3add rd, rs1, rs2` (Zba): rd = rs2 + (rs1 << 3).
+pub fn sh3add(rd: Reg, rs1: Reg, rs2: Reg) u32 {
+    return rType(0b0110011, 0b110, 0b0010000, rd, rs1, rs2);
+}
+
 /// `slt rd, rs1, rs2` (set if rs1 < rs2, signed)
 pub fn slt(rd: Reg, rs1: Reg, rs2: Reg) u32 {
     return rType(0b0110011, 0b010, 0b0000000, rd, rs1, rs2);
@@ -1586,6 +1601,15 @@ test "encodes B-type branches" {
 test "encodes rev8" {
     // rev8 x1, x2 (byte-reverse, Zbb)
     try std.testing.expectEqual(@as(u32, 0x6b815093), rev8(.x1, .x2));
+}
+
+test "encodes Zba sh-add family" {
+    // Base encodings (rd/rs1/rs2 all x0): funct7 0b0010000, funct3 010/100/110, opcode 0x33.
+    try std.testing.expectEqual(@as(u32, 0x20002033), sh1add(.x0, .x0, .x0));
+    try std.testing.expectEqual(@as(u32, 0x20004033), sh2add(.x0, .x0, .x0));
+    try std.testing.expectEqual(@as(u32, 0x20006033), sh3add(.x0, .x0, .x0));
+    // With registers: sh2add x1, x2, x3 = base | rs2<<20 | rs1<<15 | rd<<7.
+    try std.testing.expectEqual(@as(u32, 0x20004033 | (3 << 20) | (2 << 15) | (1 << 7)), sh2add(.x1, .x2, .x3));
 }
 
 test "encodes csrrs" {

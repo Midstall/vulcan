@@ -156,6 +156,69 @@ test "codegen+disasm round-trip: fused compare-and-branch for if(icmp)" {
     try std.testing.expect(std.mem.indexOf(u8, text, "bnez") == null);
 }
 
+/// A single-use icmp immediately preceding an if (unsigned min(a, b) via `a < b`), the same
+/// shape `compileFuncWithCaps`'s caller below needs to prove both the flag-off fallback and the
+/// flag-on (default) fused form, built once so both tests share it.
+fn buildUnsignedMinIf(allocator: std.mem.Allocator) !Function {
+    var func = Function.init(allocator);
+    const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const e = try func.appendBlock();
+    const x = try func.appendBlockParam(e, u32_t);
+    const y = try func.appendBlockParam(e, u32_t);
+    const tb = try func.appendBlock();
+    const eb = try func.appendBlock();
+    const c = try func.appendInst(e, bool_t, .{ .icmp = .{ .op = .lt, .lhs = x, .rhs = y } });
+    try func.appendIf(e, c, .{ .target = tb, .args = &.{} }, .{ .target = eb, .args = &.{} });
+    func.setTerminator(tb, .{ .ret = x }); // x < y -> x is the min
+    func.setTerminator(eb, .{ .ret = y });
+    return func;
+}
+
+test "caps.fuse_cmp_branch = false falls back to sltu;bnez, not the fused bltu (correct result)" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var func = try buildUnsignedMinIf(a);
+    defer func.deinit();
+
+    // Compile ONCE (compileFuncWithCaps legalizes/splits-critical-edges in place, so compiling
+    // the same func object twice would double-apply those passes); run the one resulting image
+    // for every input via `runCode`, mirroring the relaxation tests above.
+    var words = try harness.compileFuncWithCaps(a, &func, .{ .fuse_cmp_branch = false });
+    defer words.deinit(a);
+    const text = try disasm.format(a, words.items);
+    defer a.free(text);
+    // The gate declined the fusion: the icmp materializes its boolean (`sltu`) and the if
+    // re-tests it (`bnez`), NOT the fused `bltu` this same shape produces when the flag is on
+    // (see the byte-identical-default test right below).
+    try std.testing.expect(std.mem.indexOf(u8, text, "sltu") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "bnez") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "bltu") == null);
+
+    try std.testing.expectEqual(@as(i64, 3), try harness.runCode(io, a, words.items, &.{ 7, 3 }, harness.qemu_user));
+    try std.testing.expectEqual(@as(i64, 1), try harness.runCode(io, a, words.items, &.{ 1, 2 }, harness.qemu_user));
+    try std.testing.expectEqual(@as(i64, 9), try harness.runCode(io, a, words.items, &.{ 9, 9 }, harness.qemu_user)); // equal -> else (y)
+}
+
+test "caps.fuse_cmp_branch = true (the default) emits the fused bltu with no sltu" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var func = try buildUnsignedMinIf(a);
+    defer func.deinit();
+
+    var words = try harness.compileFuncWithCaps(a, &func, .{ .fuse_cmp_branch = true });
+    defer words.deinit(a);
+    const text = try disasm.format(a, words.items);
+    defer a.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "bltu") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "sltu") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "bnez") == null);
+
+    try std.testing.expectEqual(@as(i64, 3), try harness.runCode(io, a, words.items, &.{ 7, 3 }, harness.qemu_user));
+    try std.testing.expectEqual(@as(i64, 1), try harness.runCode(io, a, words.items, &.{ 1, 2 }, harness.qemu_user));
+    try std.testing.expectEqual(@as(i64, 9), try harness.runCode(io, a, words.items, &.{ 9, 9 }, harness.qemu_user));
+}
+
 /// Compile `func`, map it executable, and call it natively. Skips off RISC-V.
 fn runNative(allocator: std.mem.Allocator, func: *Function, args: []const i64) !i64 {
     if (builtin.cpu.arch != .riscv64) return error.SkipZigTest;

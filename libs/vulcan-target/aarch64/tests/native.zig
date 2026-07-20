@@ -1150,6 +1150,265 @@ test "fused: an icmp not immediately before the if does NOT fuse (intervening in
     try expectRun(allocator, &func, &.{ 3, 7 }, 10);
 }
 
+/// A single-use icmp immediately preceding an if (min(a, b) via `a < b`), the same shape as
+/// the "fused: structural" test above but built once so both the `caps.fuse_cmp_branch = false`
+/// and `= true` tests below share it. Returns the compiled `Compiled` so callers can disassemble
+/// and JIT-run with an explicit `ModelCaps`.
+fn compileMinIfWithCaps(allocator: std.mem.Allocator, func: *Function, caps: isel.ModelCaps) !isel.Compiled {
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const then_b = try func.appendBlock();
+    const else_b = try func.appendBlock();
+    const a = try func.appendBlockParam(entry, t);
+    const b = try func.appendBlockParam(entry, t);
+    const c = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = a, .rhs = b } });
+    try func.appendIf(entry, c, .{ .target = then_b }, .{ .target = else_b });
+    func.setTerminator(then_b, .{ .ret = a }); // a < b -> a is the min
+    func.setTerminator(else_b, .{ .ret = b });
+    return isel.compileFunction(allocator, func, caps);
+}
+
+test "caps.fuse_cmp_branch = false falls back to cset;cbnz, not the fused cmp;b.lt (correct result)" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+
+    const compiled = try compileMinIfWithCaps(allocator, &func, .{ .fuse_cmp_branch = false });
+    defer allocator.free(compiled.relocs);
+    defer allocator.free(compiled.lines);
+    defer allocator.free(compiled.code);
+
+    const text = try disasm.format(allocator, compiled.code);
+    defer allocator.free(text);
+    // The gate declined the fusion: the icmp materializes its boolean (`cset`) and the if
+    // re-tests it (`cbnz`), NOT the fused `cmp; b.lt` this same shape produces when the flag
+    // is on (see the byte-identical-default test right below).
+    try std.testing.expect(std.mem.indexOf(u8, text, "cset") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "cbnz") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "b.lt ") == null);
+
+    if (builtin.cpu.arch == .aarch64) {
+        var buf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(compiled.code));
+        defer buf.deinit();
+        try std.testing.expectEqual(@as(i32, 3), try callI32(&buf, &.{ 7, 3 }));
+        try std.testing.expectEqual(@as(i32, -5), try callI32(&buf, &.{ -5, 2 }));
+        try std.testing.expectEqual(@as(i32, 4), try callI32(&buf, &.{ 4, 4 })); // equal -> else (b)
+    }
+}
+
+test "caps.fuse_cmp_branch = true (the default) emits the fused cmp;b.lt with no cset" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+
+    const compiled = try compileMinIfWithCaps(allocator, &func, .{ .fuse_cmp_branch = true });
+    defer allocator.free(compiled.relocs);
+    defer allocator.free(compiled.lines);
+    defer allocator.free(compiled.code);
+
+    const text = try disasm.format(allocator, compiled.code);
+    defer allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "b.lt ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "cset") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "cbnz") == null);
+
+    if (builtin.cpu.arch == .aarch64) {
+        var buf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(compiled.code));
+        defer buf.deinit();
+        try std.testing.expectEqual(@as(i32, 3), try callI32(&buf, &.{ 7, 3 }));
+        try std.testing.expectEqual(@as(i32, -5), try callI32(&buf, &.{ -5, 2 }));
+        try std.testing.expectEqual(@as(i32, 4), try callI32(&buf, &.{ 4, 4 }));
+    }
+}
+
+/// Build `f(a, b) -> i(bits)` computing an `add`/`sub` whose one operand is `b << k`, with
+/// the shift immediately preceding the add/sub and used exactly once - the exact shape
+/// `fusesIntoNextShiftAdd` folds into a single `add/sub xd, xn, xm, lsl #k`. `shift_on_lhs`
+/// puts the `(b << k)` operand on the left of the add/sub (`(b << k) op a`), else on the
+/// right (`a op (b << k)`).
+fn buildShiftAdd(allocator: std.mem.Allocator, bits: u16, op: ir.function.BinOp, k: i64, shift_on_lhs: bool) !Function {
+    var func = Function.init(allocator);
+    errdefer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = bits } });
+    const blk = try func.appendBlock();
+    const a = try func.appendBlockParam(blk, t);
+    const b = try func.appendBlockParam(blk, t);
+    const sh = try func.appendInst(blk, t, .{ .arith_imm = .{ .op = .shl, .lhs = b, .imm = k } });
+    const r = if (shift_on_lhs)
+        try func.appendInst(blk, t, .{ .arith = .{ .op = op, .lhs = sh, .rhs = a } })
+    else
+        try func.appendInst(blk, t, .{ .arith = .{ .op = op, .lhs = a, .rhs = sh } });
+    func.setTerminator(blk, .{ .ret = r });
+    return func;
+}
+
+test "aarch64 shift_add: x + (b<<3) folds to add-shift and computes correctly" {
+    const allocator = std.testing.allocator;
+    var func = try buildShiftAdd(allocator, 32, .add, 3, false); // a + (b << 3)
+    defer func.deinit();
+
+    const code = try isel.selectFunction(allocator, &func);
+    defer allocator.free(code);
+    const text = try disasm.format(allocator, code);
+    defer allocator.free(text);
+    // Folded: one shifted-register add, and NO separate register shift (a plain-path `lslv`
+    // would disassemble as `lsl w.., w.., w..` with no `#` immediate).
+    try std.testing.expect(std.mem.indexOf(u8, text, ", lsl #3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "lsl w") == null);
+
+    try expectRun(allocator, &func, &.{ 5, 4 }, 5 + (4 << 3)); // 37
+    try expectRun(allocator, &func, &.{ 0, 1 }, 8);
+    try expectRun(allocator, &func, &.{ -10, 2 }, -10 + (2 << 3)); // 6
+}
+
+test "aarch64 shift_add: x - (b<<2) folds to sub-shift (shl is the subtrahend)" {
+    const allocator = std.testing.allocator;
+    var func = try buildShiftAdd(allocator, 32, .sub, 2, false); // a - (b << 2)
+    defer func.deinit();
+
+    const code = try isel.selectFunction(allocator, &func);
+    defer allocator.free(code);
+    const text = try disasm.format(allocator, code);
+    defer allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "sub w") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, ", lsl #2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "lsl w") == null);
+
+    try expectRun(allocator, &func, &.{ 100, 4 }, 100 - (4 << 2)); // 84
+    try expectRun(allocator, &func, &.{ 0, 3 }, -(3 << 2)); // -12
+}
+
+test "aarch64 shift_add: (b<<3) + x also folds (add is commutative in the shl operand)" {
+    const allocator = std.testing.allocator;
+    var func = try buildShiftAdd(allocator, 32, .add, 3, true); // (b << 3) + a
+    defer func.deinit();
+
+    const code = try isel.selectFunction(allocator, &func);
+    defer allocator.free(code);
+    const text = try disasm.format(allocator, code);
+    defer allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, ", lsl #3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "lsl w") == null);
+
+    try expectRun(allocator, &func, &.{ 5, 4 }, (4 << 3) + 5); // 37
+    try expectRun(allocator, &func, &.{ 7, 0 }, 7);
+}
+
+/// Compile `func` with an explicit `ModelCaps` and return the `Compiled` so a caller can
+/// disassemble and JIT-run it under a chosen `fuse_shift_add` setting (mirrors
+/// `compileMinIfWithCaps`).
+fn compileWithCaps(allocator: std.mem.Allocator, func: *const Function, caps: isel.ModelCaps) !isel.Compiled {
+    return isel.compileFunction(allocator, func, caps);
+}
+
+test "aarch64 shift_add off (caps flag false) emits plain shift+add byte-identically and stays correct" {
+    const allocator = std.testing.allocator;
+    var func = try buildShiftAdd(allocator, 32, .add, 3, false); // a + (b << 3)
+    defer func.deinit();
+
+    const compiled = try compileWithCaps(allocator, &func, .{ .fuse_shift_add = false });
+    defer allocator.free(compiled.relocs);
+    defer allocator.free(compiled.lines);
+    defer allocator.free(compiled.code);
+
+    const text = try disasm.format(allocator, compiled.code);
+    defer allocator.free(text);
+    // The gate declined the fold: a separate register shift (`lsl w..`) materializes the
+    // shifted value and a plain `add` sums it, so NO shifted-register form appears.
+    try std.testing.expect(std.mem.indexOf(u8, text, "lsl w") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, ", lsl #") == null);
+
+    if (builtin.cpu.arch == .aarch64) {
+        var buf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(compiled.code));
+        defer buf.deinit();
+        try std.testing.expectEqual(@as(i32, 5 + (4 << 3)), try callI32(&buf, &.{ 5, 4 }));
+        try std.testing.expectEqual(@as(i32, -10 + (2 << 3)), try callI32(&buf, &.{ -10, 2 }));
+    }
+}
+
+test "aarch64 shift_add: shl result used twice is not folded (plain shift+add), correct result" {
+    const allocator = std.testing.allocator;
+    // t = b << 3; r = (a + t) + t = a + 2*(b << 3). The first add immediately follows the
+    // shl, but `t` has two uses, so the single-use gate declines and both adds take the
+    // plain path.
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const blk = try func.appendBlock();
+    const a = try func.appendBlockParam(blk, t);
+    const b = try func.appendBlockParam(blk, t);
+    const sh = try func.appendInst(blk, t, .{ .arith_imm = .{ .op = .shl, .lhs = b, .imm = 3 } });
+    const s1 = try func.appendInst(blk, t, .{ .arith = .{ .op = .add, .lhs = a, .rhs = sh } });
+    const s2 = try func.appendInst(blk, t, .{ .arith = .{ .op = .add, .lhs = s1, .rhs = sh } });
+    func.setTerminator(blk, .{ .ret = s2 });
+
+    const code = try isel.selectFunction(allocator, &func);
+    defer allocator.free(code);
+    const text = try disasm.format(allocator, code);
+    defer allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, ", lsl #") == null); // not folded
+    try std.testing.expect(std.mem.indexOf(u8, text, "lsl w") != null); // plain register shift
+
+    try expectRun(allocator, &func, &.{ 5, 4 }, 5 + 2 * (4 << 3)); // 69
+}
+
+test "aarch64 shift_add: (b<<2) - x is NOT folded (subShifted cannot express it), correct result" {
+    const allocator = std.testing.allocator;
+    var func = try buildShiftAdd(allocator, 32, .sub, 2, true); // (b << 2) - a, shl on the LHS
+    defer func.deinit();
+
+    const code = try isel.selectFunction(allocator, &func);
+    defer allocator.free(code);
+    const text = try disasm.format(allocator, code);
+    defer allocator.free(text);
+    // subShifted computes rn - (rm << k), so the subtrahend must be the shifted operand.
+    // Here the shift is the minuend, so the fold is declined and a plain shift + sub is used.
+    try std.testing.expect(std.mem.indexOf(u8, text, ", lsl #") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "lsl w") != null);
+
+    try expectRun(allocator, &func, &.{ 5, 4 }, (4 << 2) - 5); // 11
+}
+
+test "aarch64 shift_add: 32-bit shift beyond the width (k>31) is not folded" {
+    const allocator = std.testing.allocator;
+    var func = try buildShiftAdd(allocator, 32, .add, 32, false); // a + (b << 32), out of imm6 range for w-form
+    defer func.deinit();
+
+    const code = try isel.selectFunction(allocator, &func);
+    defer allocator.free(code);
+    const text = try disasm.format(allocator, code);
+    defer allocator.free(text);
+    // k = 32 exceeds a 32-bit result's 0..31 range, so the fold is declined (no shifted-
+    // register add) and the plain shift + add path is used.
+    try std.testing.expect(std.mem.indexOf(u8, text, ", lsl #") == null);
+}
+
+test "aarch64 shift_add: a function without the pattern is byte-identical flag-on vs flag-off" {
+    const allocator = std.testing.allocator;
+    // A shl feeding a MUL (not an add/sub) is never foldable, so both flag settings must
+    // produce byte-identical code.
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const blk = try func.appendBlock();
+    const a = try func.appendBlockParam(blk, t);
+    const b = try func.appendBlockParam(blk, t);
+    const sh = try func.appendInst(blk, t, .{ .arith_imm = .{ .op = .shl, .lhs = b, .imm = 3 } });
+    const r = try func.appendInst(blk, t, .{ .arith = .{ .op = .mul, .lhs = sh, .rhs = a } });
+    func.setTerminator(blk, .{ .ret = r });
+
+    const on = try compileWithCaps(allocator, &func, .{ .fuse_shift_add = true });
+    defer allocator.free(on.relocs);
+    defer allocator.free(on.lines);
+    defer allocator.free(on.code);
+    const off = try compileWithCaps(allocator, &func, .{ .fuse_shift_add = false });
+    defer allocator.free(off.relocs);
+    defer allocator.free(off.lines);
+    defer allocator.free(off.code);
+    try std.testing.expectEqualSlices(u32, on.code, off.code);
+}
+
 /// The three fused shapes `fusesIntoNextArith` recognizes: `add`: a*b+c -> fmadd. `sub`:
 /// a*b-c -> fnmsub. `csub`: c-a*b -> fmsub (see isel.zig's `Ctx.emitFusedArith`).
 const FmaShape = enum { add, sub, csub };
@@ -4374,5 +4633,373 @@ test "addrfold: a base used by a folded load AND another consumer keeps the add 
     for (cases) |arr| {
         const expected = arr[2] +% arr[4];
         try std.testing.expectEqual(expected, f(&arr));
+    }
+}
+
+// -- arith-branch fold (flag-setting arith + b.cc) ---------------------------------------------
+// The fold rewrites `s = arith(a, b); c = icmp ==/!= (s, 0); if (c)` into one flag-setting S-form
+// (`adds`/`subs`/`ands`, or the immediate `addsImm`/`subsImm`) whose Z flag is (s == 0) plus a
+// `b.eq`/`b.ne`, eliding the separate `cmp #0`. The icmp is skipped by the compare-and-branch
+// fold it composes with. These build the exact adjacent triple and JIT-run it on this aarch64 host.
+
+/// `f(a, b) -> i(bits)` computing `s = a <arith_op> b; if (s <cmp_op> 0) then_val else els_val`,
+/// with the constant 0 materialized first so the arith sits immediately before the icmp, which
+/// sits immediately before the if (the exact adjacency `fusesArithIntoBranch` folds). `s` is
+/// read only by the icmp (single-use), so the fold is eligible.
+fn buildArithBranchReg(
+    allocator: std.mem.Allocator,
+    bits: u16,
+    arith_op: ir.function.BinOp,
+    cmp_op: ir.function.CmpOp,
+    then_val: i64,
+    els_val: i64,
+) !Function {
+    var func = Function.init(allocator);
+    errdefer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = bits } });
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const then_b = try func.appendBlock();
+    const els_b = try func.appendBlock();
+    const a = try func.appendBlockParam(entry, t);
+    const b = try func.appendBlockParam(entry, t);
+    const zero = try func.appendInst(entry, t, .{ .iconst = 0 });
+    const s = try func.appendInst(entry, t, .{ .arith = .{ .op = arith_op, .lhs = a, .rhs = b } });
+    const c = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = cmp_op, .lhs = s, .rhs = zero } });
+    try func.appendIf(entry, c, .{ .target = then_b }, .{ .target = els_b });
+    const tv = try func.appendInst(then_b, t, .{ .iconst = then_val });
+    func.setTerminator(then_b, .{ .ret = tv });
+    const ev = try func.appendInst(els_b, t, .{ .iconst = els_val });
+    func.setTerminator(els_b, .{ .ret = ev });
+    return func;
+}
+
+/// Like `buildArithBranchReg` but the arith is the immediate form `s = n <arith_op> imm`
+/// (the loop `n - 1` decrement), so the fold emits `subsImm`/`addsImm`.
+fn buildArithBranchImm(
+    allocator: std.mem.Allocator,
+    bits: u16,
+    arith_op: ir.function.BinOp,
+    imm: i64,
+    cmp_op: ir.function.CmpOp,
+    then_val: i64,
+    els_val: i64,
+) !Function {
+    var func = Function.init(allocator);
+    errdefer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = bits } });
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const then_b = try func.appendBlock();
+    const els_b = try func.appendBlock();
+    const n = try func.appendBlockParam(entry, t);
+    const zero = try func.appendInst(entry, t, .{ .iconst = 0 });
+    const s = try func.appendInst(entry, t, .{ .arith_imm = .{ .op = arith_op, .lhs = n, .imm = imm } });
+    const c = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = cmp_op, .lhs = s, .rhs = zero } });
+    try func.appendIf(entry, c, .{ .target = then_b }, .{ .target = els_b });
+    const tv = try func.appendInst(then_b, t, .{ .iconst = then_val });
+    func.setTerminator(then_b, .{ .ret = tv });
+    const ev = try func.appendInst(els_b, t, .{ .iconst = els_val });
+    func.setTerminator(els_b, .{ .ret = ev });
+    return func;
+}
+
+test "aarch64 arith_branch: decrement-and-branch (n-1; if n!=0) folds to subs+b.ne and computes correctly" {
+    const allocator = std.testing.allocator;
+    var func = try buildArithBranchImm(allocator, 32, .sub, 1, .ne, 100, 200); // (n-1) != 0 ? 100 : 200
+    defer func.deinit();
+
+    const code = try isel.selectFunction(allocator, &func);
+    defer allocator.free(code);
+    const text = try disasm.format(allocator, code);
+    defer allocator.free(text);
+    // Folded: the immediate S-form sets Z = (n-1 == 0) and `b.ne` branches on it, with NO
+    // separate `cmp` (the plain compare-and-branch would emit `cmp` before the `b.ne`).
+    try std.testing.expect(std.mem.indexOf(u8, text, "subs w") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "b.ne ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "cmp") == null);
+
+    try expectRun(allocator, &func, &.{1}, 200); // 1-1 == 0 -> else
+    try expectRun(allocator, &func, &.{5}, 100); // 5-1 != 0 -> then
+    try expectRun(allocator, &func, &.{0}, 100); // 0-1 == -1 != 0 -> then
+    try expectRun(allocator, &func, &.{-3}, 100);
+}
+
+test "aarch64 arith_branch: 32-bit decrement fold is execution-equivalent to the flag-off compile" {
+    const allocator = std.testing.allocator;
+    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+    // Same pattern as the fold test above, compiled BOTH ways (S-form fold vs plain arith + a
+    // separate `cmp`) and JIT-run side by side: the two must agree on every input even though
+    // their machine code differs, i.e. the fold changes instruction selection, never behavior.
+    var func = try buildArithBranchImm(allocator, 32, .sub, 1, .ne, 100, 200); // (n-1) != 0 ? 100 : 200
+    defer func.deinit();
+
+    const on = try compileWithCaps(allocator, &func, .{ .fuse_arith_branch = true });
+    defer allocator.free(on.relocs);
+    defer allocator.free(on.lines);
+    defer allocator.free(on.code);
+    const off = try compileWithCaps(allocator, &func, .{ .fuse_arith_branch = false });
+    defer allocator.free(off.relocs);
+    defer allocator.free(off.lines);
+    defer allocator.free(off.code);
+
+    var buf_on = try jit.CodeBuffer.map(std.mem.sliceAsBytes(on.code));
+    defer buf_on.deinit();
+    var buf_off = try jit.CodeBuffer.map(std.mem.sliceAsBytes(off.code));
+    defer buf_off.deinit();
+
+    for ([_]i32{ 1, 5, 0, -3, 100 }) |n| {
+        const got_on = try callI32(&buf_on, &.{n});
+        const got_off = try callI32(&buf_off, &.{n});
+        try std.testing.expectEqual(got_off, got_on);
+    }
+}
+
+test "aarch64 arith_branch: add-and-branch (a+b; if ==0) folds to adds+b.eq" {
+    const allocator = std.testing.allocator;
+    var func = try buildArithBranchReg(allocator, 32, .add, .eq, 100, 200); // (a+b) == 0 ? 100 : 200
+    defer func.deinit();
+
+    const code = try isel.selectFunction(allocator, &func);
+    defer allocator.free(code);
+    const text = try disasm.format(allocator, code);
+    defer allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "adds w") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "b.eq ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "cmp") == null);
+
+    try expectRun(allocator, &func, &.{ 3, -3 }, 100); // sum 0 -> then
+    try expectRun(allocator, &func, &.{ 1, 1 }, 200); // sum 2 -> else
+    try expectRun(allocator, &func, &.{ 0, 0 }, 100);
+}
+
+test "aarch64 arith_branch: and-and-branch (a&b; if !=0) folds to ands+b.ne" {
+    const allocator = std.testing.allocator;
+    var func = try buildArithBranchReg(allocator, 32, .bit_and, .ne, 100, 200); // (a&b) != 0 ? 100 : 200
+    defer func.deinit();
+
+    const code = try isel.selectFunction(allocator, &func);
+    defer allocator.free(code);
+    const text = try disasm.format(allocator, code);
+    defer allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "ands w") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "b.ne ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "cmp") == null);
+
+    try expectRun(allocator, &func, &.{ 6, 3 }, 100); // 6&3 == 2 != 0 -> then
+    try expectRun(allocator, &func, &.{ 4, 1 }, 200); // 4&1 == 0 -> else
+    try expectRun(allocator, &func, &.{ 7, 7 }, 100);
+}
+
+test "aarch64 arith_branch off (flag false) emits arith+cmp+branch, no S-form for the branch" {
+    const allocator = std.testing.allocator;
+    var func = try buildArithBranchImm(allocator, 32, .sub, 1, .ne, 100, 200);
+    defer func.deinit();
+
+    const compiled = try compileWithCaps(allocator, &func, .{ .fuse_arith_branch = false });
+    defer allocator.free(compiled.relocs);
+    defer allocator.free(compiled.lines);
+    defer allocator.free(compiled.code);
+
+    const text = try disasm.format(allocator, compiled.code);
+    defer allocator.free(text);
+    // The gate declined the arith-branch fold: the decrement materializes with a plain `sub`
+    // (no flag-setting `subs` Rd), and the compare-and-branch fold still fires with a separate
+    // `cmp` before the `b.ne`. So NO S-form is used for the branch.
+    try std.testing.expect(std.mem.indexOf(u8, text, "subs") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "sub w") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "cmp") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "b.ne ") != null);
+
+    if (builtin.cpu.arch == .aarch64) {
+        var buf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(compiled.code));
+        defer buf.deinit();
+        try std.testing.expectEqual(@as(i32, 200), try callI32(&buf, &.{1}));
+        try std.testing.expectEqual(@as(i32, 100), try callI32(&buf, &.{5}));
+        try std.testing.expectEqual(@as(i32, 100), try callI32(&buf, &.{0}));
+    }
+}
+
+test "aarch64 arith_branch: arith result used twice is NOT folded (plain add + cmp), correct result" {
+    const allocator = std.testing.allocator;
+    // `s = a + b` feeds the icmp AND is returned on both edges, so it has more than one use and
+    // the single-use gate declines: `s` materializes plainly and the compare-and-branch keeps a
+    // separate `cmp`. The result is `a + b` regardless of which edge is taken.
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const then_b = try func.appendBlock();
+    const els_b = try func.appendBlock();
+    const a = try func.appendBlockParam(entry, t);
+    const b = try func.appendBlockParam(entry, t);
+    const zero = try func.appendInst(entry, t, .{ .iconst = 0 });
+    const s = try func.appendInst(entry, t, .{ .arith = .{ .op = .add, .lhs = a, .rhs = b } });
+    const c = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .eq, .lhs = s, .rhs = zero } });
+    try func.appendIf(entry, c, .{ .target = then_b, .args = &.{s} }, .{ .target = els_b, .args = &.{s} });
+    const xt = try func.appendBlockParam(then_b, t);
+    func.setTerminator(then_b, .{ .ret = xt });
+    const xe = try func.appendBlockParam(els_b, t);
+    func.setTerminator(els_b, .{ .ret = xe });
+
+    const code = try isel.selectFunction(allocator, &func);
+    defer allocator.free(code);
+    const text = try disasm.format(allocator, code);
+    defer allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "adds w") == null); // not folded
+    try std.testing.expect(std.mem.indexOf(u8, text, "cmp") != null); // separate compare kept
+
+    try expectRun(allocator, &func, &.{ 3, 4 }, 7);
+    try expectRun(allocator, &func, &.{ 3, -3 }, 0);
+}
+
+test "aarch64 arith_branch: lt comparison is NOT folded (needs N/V), plain cmp;b.lt, correct result" {
+    const allocator = std.testing.allocator;
+    var func = try buildArithBranchReg(allocator, 32, .sub, .lt, 100, 200); // (a-b) < 0 ? 100 : 200
+    defer func.deinit();
+
+    const code = try isel.selectFunction(allocator, &func);
+    defer allocator.free(code);
+    const text = try disasm.format(allocator, code);
+    defer allocator.free(text);
+    // Only eq/ne fold (the S-form's Z flag is exactly result==0). `lt` stays on the plain
+    // compare-and-branch path (`cmp; b.lt`), so no flag-setting `subs` Rd is used for the branch.
+    try std.testing.expect(std.mem.indexOf(u8, text, "subs") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "cmp") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "b.lt ") != null);
+
+    try expectRun(allocator, &func, &.{ 1, 5 }, 100); // 1-5 = -4 < 0 -> then
+    try expectRun(allocator, &func, &.{ 5, 1 }, 200); // 5-1 = 4 -> else
+    try expectRun(allocator, &func, &.{ 4, 4 }, 200); // 0 -> else
+}
+
+test "aarch64 arith_branch: an instruction between the arith and the icmp blocks the fold, correct result" {
+    const allocator = std.testing.allocator;
+    // `mid = a - b` sits between `s = a + b` and the icmp, so the arith is no longer at if_idx-2:
+    // the adjacency gate declines and `s` materializes plainly. `s` is still single-use, `mid` is
+    // returned on both edges, so the result is `a - b`.
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const then_b = try func.appendBlock();
+    const els_b = try func.appendBlock();
+    const a = try func.appendBlockParam(entry, t);
+    const b = try func.appendBlockParam(entry, t);
+    const zero = try func.appendInst(entry, t, .{ .iconst = 0 });
+    const s = try func.appendInst(entry, t, .{ .arith = .{ .op = .add, .lhs = a, .rhs = b } });
+    const mid = try func.appendInst(entry, t, .{ .arith = .{ .op = .sub, .lhs = a, .rhs = b } }); // intervening
+    const c = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .eq, .lhs = s, .rhs = zero } });
+    try func.appendIf(entry, c, .{ .target = then_b, .args = &.{mid} }, .{ .target = els_b, .args = &.{mid} });
+    const xt = try func.appendBlockParam(then_b, t);
+    func.setTerminator(then_b, .{ .ret = xt });
+    const xe = try func.appendBlockParam(els_b, t);
+    func.setTerminator(els_b, .{ .ret = xe });
+
+    const code = try isel.selectFunction(allocator, &func);
+    defer allocator.free(code);
+    const text = try disasm.format(allocator, code);
+    defer allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "adds w") == null); // not folded (non-adjacent)
+    try std.testing.expect(std.mem.indexOf(u8, text, "cmp") != null);
+
+    try expectRun(allocator, &func, &.{ 5, 3 }, 2); // returns a - b
+    try expectRun(allocator, &func, &.{ 2, 10 }, -8);
+}
+
+test "aarch64 arith_branch: arith result live past the branch stays correct (not folded)" {
+    const allocator = std.testing.allocator;
+    // `s = a + b` is compared against 0 AND consumed in the then-block (`s + 1`), so it is live
+    // past the branch (multi-use). The fold declines, but the value must remain correct either
+    // way. Returns `a+b+1` when `a+b != 0`, else 0.
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const then_b = try func.appendBlock();
+    const els_b = try func.appendBlock();
+    const a = try func.appendBlockParam(entry, t);
+    const b = try func.appendBlockParam(entry, t);
+    const zero = try func.appendInst(entry, t, .{ .iconst = 0 });
+    const s = try func.appendInst(entry, t, .{ .arith = .{ .op = .add, .lhs = a, .rhs = b } });
+    const c = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .ne, .lhs = s, .rhs = zero } });
+    try func.appendIf(entry, c, .{ .target = then_b, .args = &.{s} }, .{ .target = els_b });
+    const xt = try func.appendBlockParam(then_b, t);
+    const r = try func.appendInst(then_b, t, .{ .arith_imm = .{ .op = .add, .lhs = xt, .imm = 1 } });
+    func.setTerminator(then_b, .{ .ret = r });
+    const ev = try func.appendInst(els_b, t, .{ .iconst = 0 });
+    func.setTerminator(els_b, .{ .ret = ev });
+
+    const code = try isel.selectFunction(allocator, &func);
+    defer allocator.free(code);
+    const text = try disasm.format(allocator, code);
+    defer allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "adds w") == null); // multi-use -> not folded
+
+    try expectRun(allocator, &func, &.{ 3, 4 }, 8); // 7 != 0 -> 7 + 1
+    try expectRun(allocator, &func, &.{ 3, -3 }, 0); // 0 -> else
+}
+
+test "aarch64 arith_branch: a function without the pattern is byte-identical flag-on vs flag-off" {
+    const allocator = std.testing.allocator;
+    // A compare-and-branch whose icmp compares two params (no arith feeding it) is never an
+    // arith-branch, so both flag settings must produce byte-identical code.
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const then_b = try func.appendBlock();
+    const els_b = try func.appendBlock();
+    const a = try func.appendBlockParam(entry, t);
+    const b = try func.appendBlockParam(entry, t);
+    const c = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = a, .rhs = b } });
+    try func.appendIf(entry, c, .{ .target = then_b }, .{ .target = els_b });
+    func.setTerminator(then_b, .{ .ret = a });
+    func.setTerminator(els_b, .{ .ret = b });
+
+    const on = try compileWithCaps(allocator, &func, .{ .fuse_arith_branch = true });
+    defer allocator.free(on.relocs);
+    defer allocator.free(on.lines);
+    defer allocator.free(on.code);
+    const off = try compileWithCaps(allocator, &func, .{ .fuse_arith_branch = false });
+    defer allocator.free(off.relocs);
+    defer allocator.free(off.lines);
+    defer allocator.free(off.code);
+    try std.testing.expectEqualSlices(u32, on.code, off.code);
+}
+
+test "aarch64 arith_branch: 64-bit decrement is NOT folded (encode.cmp is 32-bit only), computes correctly" {
+    const allocator = std.testing.allocator;
+    // The surrounding icmp lowering (both the unfused icmp path and the fused compare-and-branch
+    // path this fold lives inside) always compares with `encode.cmp`, which is 32-bit only. A
+    // 64-bit S-form here would set Z from all 64 bits, disagreeing with that 32-bit `cmp` on
+    // values whose low 32 bits are zero but high bits are not (e.g. 0x1_0000_0000: equal to 0
+    // under a 32-bit `cmp`, not-equal under a 64-bit `subs`). `fusesArithIntoBranch` declines
+    // whenever the arith result is wide (see its doc comment), so the decrement materializes with
+    // a plain `sub x..` and the compare-and-branch fold keeps its separate `cmp`.
+    var func = try buildArithBranchImm(allocator, 64, .sub, 1, .ne, 100, 200); // (n-1) != 0 ? 100 : 200
+    defer func.deinit();
+
+    const code = try isel.selectFunction(allocator, &func);
+    defer allocator.free(code);
+    const text = try disasm.format(allocator, code);
+    defer allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "subs") == null); // no flag-setting S-form
+    try std.testing.expect(std.mem.indexOf(u8, text, "sub x") != null); // plain 64-bit materialization
+    try std.testing.expect(std.mem.indexOf(u8, text, "cmp") != null); // compare-and-branch keeps its cmp
+    try std.testing.expect(std.mem.indexOf(u8, text, "b.ne ") != null);
+
+    if (builtin.cpu.arch == .aarch64) {
+        var buf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(code));
+        defer buf.deinit();
+        const f: *const fn (i64) callconv(.c) i64 = @ptrCast(buf.memory.ptr);
+        try std.testing.expectEqual(@as(i64, 200), f(1)); // 1-1 == 0 -> else
+        try std.testing.expectEqual(@as(i64, 100), f(5)); // 5-1 != 0 -> then
+        try std.testing.expectEqual(@as(i64, 100), f(0)); // 0-1 == -1 != 0 -> then
+        try std.testing.expectEqual(@as(i64, 100), f(-3));
     }
 }

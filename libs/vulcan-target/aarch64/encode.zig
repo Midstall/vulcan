@@ -169,6 +169,60 @@ pub fn cmp(rn: Reg, rm: Reg) u32 {
     return 0x6B00001F | (n(rm) << 16) | (n(rn) << 5);
 }
 
+/// `subs wd, wn, wm` (32-bit subtract, setting NZCV). Like `cmp` but writes a real Rd, so
+/// the Z flag reads (wn - wm == 0) while the difference lands in `rd` (the arith-branch fold
+/// uses this to fuse a `sub; icmp ==0; if` into one flag-setting subtract plus `b.cc`).
+pub fn subs(rd: Reg, rn: Reg, rm: Reg) u32 {
+    return 0x6B000000 | (n(rm) << 16) | (n(rn) << 5) | n(rd);
+}
+
+/// `subs xd, xn, xm` (64-bit register subtract, setting NZCV).
+pub fn subs64(rd: Reg, rn: Reg, rm: Reg) u32 {
+    return sf64 | subs(rd, rn, rm);
+}
+
+/// `adds wd, wn, wm` (32-bit register add, setting NZCV).
+pub fn adds(rd: Reg, rn: Reg, rm: Reg) u32 {
+    return 0x2B000000 | (n(rm) << 16) | (n(rn) << 5) | n(rd);
+}
+
+/// `adds xd, xn, xm` (64-bit register add, setting NZCV).
+pub fn adds64(rd: Reg, rn: Reg, rm: Reg) u32 {
+    return sf64 | adds(rd, rn, rm);
+}
+
+/// `ands wd, wn, wm` (32-bit register bitwise and, setting NZCV). The Z flag reads
+/// (wn & wm == 0), exactly the eq/ne-against-0 relation the arith-branch fold folds away.
+pub fn ands(rd: Reg, rn: Reg, rm: Reg) u32 {
+    return 0x6A000000 | (n(rm) << 16) | (n(rn) << 5) | n(rd);
+}
+
+/// `ands xd, xn, xm` (64-bit register bitwise and, setting NZCV).
+pub fn ands64(rd: Reg, rn: Reg, rm: Reg) u32 {
+    return sf64 | ands(rd, rn, rm);
+}
+
+/// `subs wd, wn, #imm12` (32-bit subtract of an unsigned 12-bit immediate, setting NZCV).
+/// imm12 sits at bits [21:10].
+pub fn subsImm(rd: Reg, rn: Reg, imm: u12) u32 {
+    return 0x71000000 | (@as(u32, imm) << 10) | (n(rn) << 5) | n(rd);
+}
+
+/// `subs xd, xn, #imm12` (64-bit subtract immediate, setting NZCV).
+pub fn subsImm64(rd: Reg, rn: Reg, imm: u12) u32 {
+    return sf64 | subsImm(rd, rn, imm);
+}
+
+/// `adds wd, wn, #imm12` (32-bit add of an unsigned 12-bit immediate, setting NZCV).
+pub fn addsImm(rd: Reg, rn: Reg, imm: u12) u32 {
+    return 0x31000000 | (@as(u32, imm) << 10) | (n(rn) << 5) | n(rd);
+}
+
+/// `adds xd, xn, #imm12` (64-bit add immediate, setting NZCV).
+pub fn addsImm64(rd: Reg, rn: Reg, imm: u12) u32 {
+    return sf64 | addsImm(rd, rn, imm);
+}
+
 /// `cset wd, cond` (32-bit): wd = 1 if `cond` holds, else 0. Encoded as
 /// `csinc wd, wzr, wzr, invert(cond)`.
 pub fn cset(rd: Reg, cond: Cond) u32 {
@@ -403,6 +457,27 @@ pub fn add64(rd: Reg, rn: Reg, rm: Reg) u32 {
 /// `sub xd, xn, xm` (64-bit register subtract).
 pub fn sub64(rd: Reg, rn: Reg, rm: Reg) u32 {
     return sf64 | sub(rd, rn, rm);
+}
+
+/// `add wd, wn, wm, lsl #shift` (32-bit register add with a logical-left shift on the second
+/// operand, shift in 0..63). imm6 sits at bits [15:10].
+pub fn addShifted(rd: Reg, rn: Reg, rm: Reg, shift: u6) u32 {
+    return add(rd, rn, rm) | (@as(u32, shift) << 10);
+}
+
+/// `add xd, xn, xm, lsl #shift` (64-bit).
+pub fn addShifted64(rd: Reg, rn: Reg, rm: Reg, shift: u6) u32 {
+    return sf64 | addShifted(rd, rn, rm, shift);
+}
+
+/// `sub wd, wn, wm, lsl #shift` (32-bit).
+pub fn subShifted(rd: Reg, rn: Reg, rm: Reg, shift: u6) u32 {
+    return sub(rd, rn, rm) | (@as(u32, shift) << 10);
+}
+
+/// `sub xd, xn, xm, lsl #shift` (64-bit).
+pub fn subShifted64(rd: Reg, rn: Reg, rm: Reg, shift: u6) u32 {
+    return sf64 | subShifted(rd, rn, rm, shift);
 }
 
 /// `mul xd, xn, xm` (64-bit), i.e. `madd xd, xn, xm, xzr`.
@@ -924,6 +999,33 @@ test "64-bit ALU sets the sf bit (bit 31) over the 32-bit form" {
     try std.testing.expectEqual(@as(u32, 0x9AC22020), lslv64(.x0, .x1, .x2)); // lsl x0, x1, x2
 }
 
+test "aarch64 shifted-register add/sub encoders match the disassembler" {
+    const disasm = @import("disasm.zig");
+    const a = std.testing.allocator;
+
+    // add x0, x1, x2, lsl #3: add64 base 0x8B020020 with imm6=3 at bits[15:10] (3 << 10 = 0xC00).
+    try std.testing.expectEqual(@as(u32, 0x8B020C20), addShifted64(.x0, .x1, .x2, 3));
+    const s1 = try disasm.one(a, addShifted64(.x0, .x1, .x2, 3));
+    defer a.free(s1);
+    try std.testing.expectEqualStrings("add x0, x1, x2, lsl #3", s1);
+
+    // sub x5, x6, x7, lsl #1.
+    const s2 = try disasm.one(a, subShifted64(.x5, .x6, .x7, 1));
+    defer a.free(s2);
+    try std.testing.expectEqualStrings("sub x5, x6, x7, lsl #1", s2);
+
+    // A shift of 0 has no lsl suffix, it just reads as the plain 32-bit register form.
+    const s3 = try disasm.one(a, addShifted(.x0, .x1, .x2, 0));
+    defer a.free(s3);
+    try std.testing.expectEqualStrings("add w0, w1, w2", s3);
+
+    // Shift 0 is byte-identical to the existing unshifted encoders (the fold's identity case).
+    try std.testing.expectEqual(add64(.x0, .x1, .x2), addShifted64(.x0, .x1, .x2, 0));
+    try std.testing.expectEqual(sub64(.x0, .x1, .x2), subShifted64(.x0, .x1, .x2, 0));
+    try std.testing.expectEqual(add(.x0, .x1, .x2), addShifted(.x0, .x1, .x2, 0));
+    try std.testing.expectEqual(sub(.x0, .x1, .x2), subShifted(.x0, .x1, .x2, 0));
+}
+
 test "shifted add/sub immediate (LSL #12) for large stack frames" {
     // The sh=1 form scales imm12 by 4096, so a frame wider than 12 bits opens in
     // two instructions. Rn/Rd 31 stays SP here (add/sub-immediate form).
@@ -937,6 +1039,43 @@ test "shifted add/sub immediate (LSL #12) for large stack frames" {
     // A 5000-byte frame splits as hi=1 (×4096) + lo=904, reconstructing exactly.
     const frame: usize = 5000;
     try std.testing.expectEqual(@as(usize, 4096 * (frame >> 12) + (frame & 0xFFF)), frame);
+}
+
+test "flag-setting S-form encoders (subs/adds/ands + immediate) match the disassembler" {
+    const disasm = @import("disasm.zig");
+    const a = std.testing.allocator;
+
+    // The register forms are the plain add/sub/and opcodes with the setflags bit set (bit 29
+    // for add/sub, bit 29 for the logical family), writing a real Rd (unlike `cmp`, which
+    // targets XZR). The exact words below match objdump and the existing disasm expectations.
+    try std.testing.expectEqual(@as(u32, 0x6B090108), subs(.x8, .x8, .x9)); // subs w8, w8, w9
+    try std.testing.expectEqual(@as(u32, 0xEB090108), subs64(.x8, .x8, .x9)); // subs x8, x8, x9
+    try std.testing.expectEqual(@as(u32, 0xAB090108), adds64(.x8, .x8, .x9)); // adds x8, x8, x9
+    try std.testing.expectEqual(@as(u32, 0x71000508), subsImm(.x8, .x8, 1)); // subs w8, w8, #1
+    try std.testing.expectEqual(@as(u32, 0xF1000508), subsImm64(.x8, .x8, 1)); // subs x8, x8, #1
+    try std.testing.expectEqual(@as(u32, 0xB1000508), addsImm64(.x8, .x8, 1)); // adds x8, x8, #1
+
+    // The S-forms are the base op with the setflags opcode bit set (bit 29 toggles the family).
+    try std.testing.expectEqual(add(.x0, .x1, .x2) | (@as(u32, 1) << 29), adds(.x0, .x1, .x2));
+    try std.testing.expectEqual(sub(.x0, .x1, .x2) | (@as(u32, 1) << 29), subs(.x0, .x1, .x2));
+    try std.testing.expectEqual(andr(.x0, .x1, .x2) | (@as(u32, 3) << 29), ands(.x0, .x1, .x2));
+
+    // Round-trip through the disassembler so a wrong operand field is caught, not just the word.
+    const d1 = try disasm.one(a, subs(.x0, .x1, .x2));
+    defer a.free(d1);
+    try std.testing.expectEqualStrings("subs w0, w1, w2", d1);
+    const d2 = try disasm.one(a, adds64(.x3, .x4, .x5));
+    defer a.free(d2);
+    try std.testing.expectEqualStrings("adds x3, x4, x5", d2);
+    const d3 = try disasm.one(a, ands64(.x0, .x1, .x2));
+    defer a.free(d3);
+    try std.testing.expectEqualStrings("ands x0, x1, x2", d3);
+    const d4 = try disasm.one(a, subsImm(.x0, .x1, 1));
+    defer a.free(d4);
+    try std.testing.expectEqualStrings("subs w0, w1, #1", d4);
+    const d5 = try disasm.one(a, addsImm64(.x8, .x8, 1));
+    defer a.free(d5);
+    try std.testing.expectEqualStrings("adds x8, x8, #1", d5);
 }
 
 test "ldp/stp offset-form encoders match known bytes" {

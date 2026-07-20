@@ -67,6 +67,13 @@ fn qemuUserArgv(allocator: std.mem.Allocator, elf_path: []const u8) std.mem.Allo
     return allocator.dupe([]const u8, &.{ "qemu-riscv64", elf_path });
 }
 
+fn qemuUserZbaArgv(allocator: std.mem.Allocator, elf_path: []const u8) std.mem.Allocator.Error![]const []const u8 {
+    // `-cpu rv64,zba=true` explicitly enables the Zba extension (the sh1add/sh2add/sh3add family)
+    // on the generic RV64GC base, so the fused sh-add executes rather than trapping as illegal on a
+    // CPU that omits Zba. Used only by the Zba sh-add fold tests.
+    return allocator.dupe([]const u8, &.{ "qemu-riscv64", "-cpu", "rv64,zba=true", elf_path });
+}
+
 fn qemuUserCpuMaxArgv(allocator: std.mem.Allocator, elf_path: []const u8) std.mem.Allocator.Error![]const []const u8 {
     // `-cpu max` turns on every optional extension qemu implements, including Zfh (native f16). The
     // default (no `-cpu`) is RV64GC with NO Zfh, so the native half instructions would fault there;
@@ -85,6 +92,10 @@ pub const qemu_user = Backend{ .name = "qemu-riscv64", .user_mode = true, .build
 /// Like `qemu_user`, but adds `-cpu max` so Zfh (native f16) is enabled. Used by the native f16
 /// differential tests, which emit real half instructions that the default RV64GC CPU rejects.
 pub const qemu_user_cpumax = Backend{ .name = "qemu-riscv64 -cpu max", .user_mode = true, .buildArgv = qemuUserCpuMaxArgv };
+
+/// Like `qemu_user`, but adds `-cpu rv64,zba=true` so the Zba sh-add family is enabled. Used by the
+/// Zba sh-add fold tests, whose fused `sh{k}add` instructions a CPU without Zba would reject.
+pub const qemu_user_zba = Backend{ .name = "qemu-riscv64 -cpu rv64,zba=true", .user_mode = true, .buildArgv = qemuUserZbaArgv };
 
 /// Like `qemu_user`, but RVC-compresses every self-contained case first, so the whole corpus doubles
 /// as an execution test of the compressor on real, diverse codegen. Skips if qemu is absent.
@@ -324,6 +335,23 @@ pub fn compileFuncForModel(allocator: std.mem.Allocator, func: *Function, model:
     defer allocator.free(code);
     var list: std.ArrayList(u32) = .empty;
     try list.appendSlice(allocator, code);
+    return list;
+}
+
+/// Like `compileFunc`, but calls `isel.compileFunction` directly with an explicit `ModelCaps`
+/// (rather than deriving one from a whole `Model` via `selectFunctionForModel`), so a test can
+/// flip a single fold flag (e.g. `fuse_cmp_branch`) in isolation. The pipeline is otherwise
+/// identical.
+pub fn compileFuncWithCaps(allocator: std.mem.Allocator, func: *Function, caps: isel.ModelCaps) !std.ArrayList(u32) {
+    try ir.legalize.legalize(allocator, func);
+    try isel.splitCriticalEdges(allocator, func);
+    try schedule.scheduleFunction(allocator, func);
+    const compiled = try isel.compileFunction(allocator, func, caps);
+    defer allocator.free(compiled.relocs);
+    defer allocator.free(compiled.lines);
+    defer allocator.free(compiled.code);
+    var list: std.ArrayList(u32) = .empty;
+    try list.appendSlice(allocator, compiled.code);
     return list;
 }
 
