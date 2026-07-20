@@ -81,6 +81,51 @@ fn altraThroughput(op: ir.function.Opcode, elem_float: bool) u32 {
     };
 }
 
+fn cascadelakeArith(op: ir.function.BinOp) u32 {
+    return switch (op) {
+        .mul, .mulh => 3, // imul, measured ~2.79
+        .div, .rem => 26, // idiv, unmeasured public estimate (doc's probe was defeated)
+        .add, .sub, .bit_and, .bit_or, .bit_xor, .shl, .shr => 1,
+    };
+}
+
+fn cascadelakeLatency(op: ir.function.Opcode) u32 {
+    return switch (op) {
+        .arith => |a| cascadelakeArith(a.op),
+        .arith_imm => |a| cascadelakeArith(a.op),
+        .load => 5, // L1 ~4.7 corrected
+        .convert, .unary => 4,
+        .dot => 3, // mul-class
+        .matmul => 64, // non-native placeholder
+        .iconst, .fconst, .icmp, .select, .struct_new, .extract, .alloca, .call, .call_indirect, .global_addr, .store, .prefetch, .@"if" => 1,
+    };
+}
+
+// Cascade Lake-SP imul is fully pipelined (~1 per cycle on the single multiplier port), and the FP
+// mul/fma path is likewise ~1 per cycle. The divider is non-pipelined, so its throughput approaches
+// its latency: fp fdiv about 8, integer idiv about 6, rem shares the divider.
+fn cascadelakeArithThroughput(op: ir.function.BinOp, elem_float: bool) u32 {
+    return switch (op) {
+        // imul is fully pipelined (~1/cycle, single multiplier port), and fp mul/fma is also ~1/cycle.
+        .mul, .mulh => 1,
+        // Divide is non-pipelined: throughput approaches latency. fp fdiv ~8, integer idiv ~6.
+        .div, .rem => if (elem_float) 8 else 6,
+        .add, .sub, .bit_and, .bit_or, .bit_xor, .shl, .shr => 1,
+    };
+}
+
+fn cascadelakeThroughput(op: ir.function.Opcode, elem_float: bool) u32 {
+    return switch (op) {
+        .arith => |a| cascadelakeArithThroughput(a.op, elem_float),
+        .arith_imm => |a| cascadelakeArithThroughput(a.op, elem_float),
+        .load => 1,
+        .convert, .unary => 1,
+        .dot => 1,
+        .matmul => 64,
+        .iconst, .fconst, .icmp, .select, .struct_new, .extract, .alloca, .call, .call_indirect, .global_addr, .store, .prefetch, .@"if" => 1,
+    };
+}
+
 fn etsocArith(op: ir.function.BinOp) u32 {
     return switch (op) {
         .mul, .mulh => 8,
@@ -389,6 +434,44 @@ const river_ma = Model{
     .fusion = &.{ .{ .kind = .cmp_branch }, .{ .kind = .addr_hi_lo }, .{ .kind = .shift_add } },
 };
 
+const cascadelake_fusion = [_]model.FusionRule{
+    .{ .kind = .cmp_branch },
+    .{ .kind = .arith_branch },
+};
+
+// Intel Cascade Lake-SP (Skylake-SP family, stepping 7). Numbers are ASSEMBLY-benchmarked inside a
+// Claude-web sandbox (KVM guest, 1 vCPU, host model masked): the corrected core-cycle figures from
+// the uArch doc, so they describe the microarchitecture, not a specific Midstall CI part. rob_size,
+// mem/fpsimd port counts, and the divide latencies are public Skylake-SP values, not measured here.
+// fetch_align and vector_bits are truthful data but NOT yet consumed: there is no x86_64 loop-align
+// hook and vectorize.runModel gates x86_64 off, so today only the fusion table (Layer B) and the
+// scalar optimize() passes act on this model.
+const cascadelake = Model{
+    .tag = .@"cascadelake-sp",
+    .arch = .x86_64,
+    .exec = .out_of_order,
+    .issue_width = 4,
+    .rob_size = 224,
+    .units = .{ .alu = 4, .muldiv = 1, .mem = 2, .branch = 1, .fpsimd = 2 },
+    .vector_bits = 512,
+    .cache_line = 64,
+    .fetch_align = 32,
+    .features = .{ .x86_64 = .{
+        .avx2 = true,
+        .fma = true,
+        .avx512f = true,
+        .avx512vl = true,
+        .avx512dq = true,
+        .avx512bw = true,
+        .avx512vnni = true,
+        .bmi2 = true,
+    } },
+    .latency = cascadelakeLatency,
+    .throughput = cascadelakeThroughput,
+    .unitOf = unitOfShared,
+    .fusion = &cascadelake_fusion,
+};
+
 comptime {
     Model.validate(altra);
     Model.validate(etsoc);
@@ -397,6 +480,7 @@ comptime {
     Model.validate(river_s);
     Model.validate(river_f);
     Model.validate(river_ma);
+    Model.validate(cascadelake);
 }
 
 /// The model for a predefined part. Total, one arm per Microarch.
@@ -409,6 +493,7 @@ pub fn modelFor(tag: Microarch) *const Model {
         .@"river-rc1.s" => &river_s,
         .@"river-rc1.f" => &river_f,
         .@"river-rc1.ma" => &river_ma,
+        .@"cascadelake-sp" => &cascadelake,
     };
 }
 
@@ -425,11 +510,61 @@ fn midrPartIsN1() bool {
     return implementer == 0x41 and part == 0xd0c;
 }
 
+/// The Cascade Lake-SP discriminator: family 6, model 85 (0x55), and AVX512-VNNI present. VNNI is the
+/// clean separator from plain Skylake-SP, which shares family 6 / model 85 but lacks VNNI. Split out
+/// from the CPUID read so it is unit-testable without a real CPU.
+fn cascadelakeDiscriminator(family: u32, disp_model: u32, vnni: bool) bool {
+    return family == 6 and disp_model == 85 and vnni;
+}
+
+/// Read CPUID leaf 1 (family/model, with the extended-model combine) and leaf 7 subleaf 0 (ECX bit 11
+/// = AVX512-VNNI). x86_64-only, a pure query with no I/O, mirroring midrPartIsN1's shape. The x86
+/// named-register asm below is only ever semantically analyzed under `comptime builtin.cpu.arch ==
+/// .x86_64`, so this function still compiles cleanly on a non-x86_64 host (e.g. aarch64), where it
+/// just returns false without the compiler ever looking at the `"={eax}"`-style constraints.
+fn hostIsCascadeLake() bool {
+    if (comptime builtin.cpu.arch == .x86_64) {
+        // leaf 1 -> eax = version info
+        var eax: u32 = undefined;
+        var ebx: u32 = undefined;
+        var ecx: u32 = undefined;
+        var edx: u32 = undefined;
+        asm volatile ("cpuid"
+            : [a] "={eax}" (eax),
+              [b] "={ebx}" (ebx),
+              [c] "={ecx}" (ecx),
+              [d] "={edx}" (edx),
+            : [leaf] "{eax}" (@as(u32, 1)),
+              [sub] "{ecx}" (@as(u32, 0)),
+        );
+        const base_family = (eax >> 8) & 0xF;
+        const base_model = (eax >> 4) & 0xF;
+        const ext_model = (eax >> 16) & 0xF;
+        // Intel display-model combine: when base family == 6 or 15, model = (ext_model << 4) | base_model.
+        const disp_model = if (base_family == 6 or base_family == 0xF) (ext_model << 4) | base_model else base_model;
+        const disp_family = base_family; // ext_family adds only for base_family == 15, irrelevant to family 6
+        // leaf 7 subleaf 0 -> ecx bit 11 = AVX512-VNNI
+        asm volatile ("cpuid"
+            : [a] "={eax}" (eax),
+              [b] "={ebx}" (ebx),
+              [c] "={ecx}" (ecx),
+              [d] "={edx}" (edx),
+            : [leaf] "{eax}" (@as(u32, 7)),
+              [sub] "{ecx}" (@as(u32, 0)),
+        );
+        const vnni = (ecx & (1 << 11)) != 0;
+        return cascadelakeDiscriminator(disp_family, disp_model, vnni);
+    } else {
+        return false;
+    }
+}
+
 /// Identify the host part, or null when Vulcan does not recognize it. On riscv there is no
 /// architectural part register, so this returns null and the caller selects by name.
 pub fn detectHost() ?Microarch {
     switch (builtin.cpu.arch) {
         .aarch64 => if (midrPartIsN1()) return .@"ampere-altra",
+        .x86_64 => if (hostIsCascadeLake()) return .@"cascadelake-sp",
         else => {},
     }
     return null;
@@ -440,6 +575,21 @@ test "modelFor returns a self-consistent model for every Microarch" {
         const m = modelFor(t);
         try std.testing.expectEqual(t, m.tag);
     }
+}
+
+test "cascadelake-sp model carries the measured x86_64 shape and declares cmp/arith fusion" {
+    const c = modelFor(.@"cascadelake-sp");
+    try std.testing.expectEqual(model.Arch.x86_64, c.arch);
+    try std.testing.expectEqual(model.ExecMode.out_of_order, c.exec);
+    try std.testing.expectEqual(@as(u8, 4), c.issue_width);
+    try std.testing.expectEqual(@as(u16, 512), c.vector_bits);
+    try std.testing.expectEqual(@as(u8, 4), c.units.alu);
+    // integer imul latency 3 (per-BinOp, integer path)
+    try std.testing.expectEqual(@as(u32, 3), c.latency(.{ .arith = .{ .op = .mul, .lhs = undefined, .rhs = undefined } }));
+    try std.testing.expect(c.fuses(.cmp_branch));
+    try std.testing.expect(c.fuses(.arith_branch));
+    try std.testing.expect(!c.fuses(.shift_add));
+    try std.testing.expect(c.features.x86_64.avx512vnni);
 }
 
 test "Model.prefetches: ampere and the RV64GC application tiers (river-rc1.f/.ma) are true, the embedded tiers and et-soc are false" {
@@ -469,6 +619,13 @@ test "the Ampere and ET-SOC models carry the measured and documented shape" {
     // et-soc's vpu capability is what lets it reach the CORE-ET packed-single unit:
     // vectorize.runModel and the riscv64 backend both gate on this.
     try std.testing.expect(e.vpu());
+}
+
+test "cascadelakeDiscriminator matches model 85 with VNNI, rejects Skylake-SP (no VNNI) and other models" {
+    try std.testing.expect(cascadelakeDiscriminator(6, 85, true)); // Cascade Lake-SP
+    try std.testing.expect(!cascadelakeDiscriminator(6, 85, false)); // Skylake-SP: model 85 but no VNNI
+    try std.testing.expect(!cascadelakeDiscriminator(6, 94, true)); // different model
+    try std.testing.expect(!cascadelakeDiscriminator(15, 85, true)); // different family
 }
 
 test "detectHost identifies this box when it is a Neoverse N1, else null or a matching-arch tag" {

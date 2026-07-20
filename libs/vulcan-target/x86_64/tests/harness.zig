@@ -35,7 +35,10 @@ fn buildStub(allocator: std.mem.Allocator, args: []const i64) std.mem.Allocator.
     const arg_regs = [_]Reg{ .rdi, .rsi, .rdx, .rcx, .r8, .r9 };
     var s: std.ArrayList(u8) = .empty;
     errdefer s.deinit(allocator);
-    for (args, 0..) |a, i| try s.appendSlice(allocator, encode.movImm(arg_regs[i], @intCast(a), true).slice());
+    // A full 64-bit immediate load (not the i32-immediate `movImm`): an i64-typed test argument
+    // may carry a high-bit value (e.g. 0x1_0000_0000, used to prove a 64-bit-width compare), which
+    // does not fit `movImm`'s i32 field.
+    for (args, 0..) |a, i| try s.appendSlice(allocator, encode.movImm64(arg_regs[i], @bitCast(a)).slice());
 
     var exitseq: std.ArrayList(u8) = .empty;
     defer exitseq.deinit(allocator);

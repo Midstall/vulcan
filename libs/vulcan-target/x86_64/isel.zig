@@ -16,6 +16,7 @@ const encode = @import("encode.zig");
 const regalloc = @import("../regalloc.zig");
 const wimmer = @import("../wimmer.zig");
 const addrfold = @import("../addrfold.zig");
+const mm = @import("vulcan-opt").microarch;
 
 const Function = ir.function.Function;
 const Value = ir.function.Value;
@@ -218,6 +219,20 @@ const Ctx = struct {
     // to the empty analysis (nothing folds), so the Wimmer path and the allocator test hooks stay
     // byte-identical. `compile` overrides it with a real analysis of `func`.
     fold: *const addrfold.Analysis = &empty_fold,
+    // Model-tuned capability flags (see `ModelCaps`). Every field defaults inert (false), so any
+    // caller that does not thread a model (`compile`, the Wimmer differential compile, the
+    // allocator test hooks) stays byte-identical to before `ModelCaps` existed. Only
+    // `compileWithCaps` (via `selectFunctionForModel`) ever sets a field true.
+    caps: ModelCaps = .{},
+    // The current block's instruction slice and the index of the instruction being emitted,
+    // refreshed each iteration of `emitFromAllocation`'s inner loop (before `lowerInst`/`emitIf`
+    // dispatch). Backs `fusesIntoNextIf`: the icmp arm consults `cur_insts[cur_idx]` (itself) to
+    // decide whether to skip its materialization, and `emitIf` consults `cur_insts[cur_idx - 1]`
+    // (the immediately-preceding instruction) to decide whether to fuse. Defaults to an empty
+    // slice/0, which is never read: no caller reaches either predicate without the loop setting
+    // real values first.
+    cur_insts: []const ir.function.Inst = &.{},
+    cur_idx: usize = 0,
 
     fn loc(self: *const Ctx, v: Value) Loc {
         if (self.segments.get(v)) |segs| {
@@ -306,6 +321,27 @@ fn slotDisp(slot: u32) i32 {
     return @intCast(slot * 8);
 }
 
+/// Capabilities a model-aware call site threads into `compileWithCaps`. Grouped into one struct
+/// (rather than growing `compileWithCaps`'s parameter list one flag per model feature) so adding
+/// the next capability never touches every existing call site. `.{}` (every field false) is
+/// exactly today's behavior for every non-model caller (`compile`/`selectFunction`, the Wimmer
+/// differential compile, and the allocator test hooks): both flags are inert (false), so nothing
+/// they gate (`fusesIntoNextIf`'s and `fusesArithIntoBranch`'s call sites in `emitIf`/`lowerInst`)
+/// ever fires for them.
+pub const ModelCaps = struct {
+    /// Fuse a compare into its consumer branch (CMP+Jcc -> a single flags-setting compare
+    /// directly followed by the conditional jump, skipping the separate `setcc`/`test`
+    /// materialization). Not base-ISA on x86-64 (every model still executes a `cmp`, and this flag
+    /// is about whether the FRONT END recognizes the macro-op pair), so false by default. Gates
+    /// `fusesIntoNextIf` (Task B2), which `fusesArithIntoBranch` (Task B3) also requires.
+    fuse_cmp_branch: bool = false,
+    /// Fuse an arithmetic op's flag-setting form into its consumer branch (e.g. an `add` whose
+    /// flags are consumed directly by the next `jcc`, without a separate `cmp`/`test`). False by
+    /// default. Gates `fusesArithIntoBranch` (Task B3), together with `fuse_cmp_branch` (the fold
+    /// lives inside the compare-and-branch path, so both must be on).
+    fuse_arith_branch: bool = false,
+};
+
 /// Select x86-64 machine code for `func` (code only, call relocations dropped). Caller
 /// owns the slice.
 pub fn selectFunction(allocator: std.mem.Allocator, func: *const Function) Error![]u8 {
@@ -313,6 +349,35 @@ pub fn selectFunction(allocator: std.mem.Allocator, func: *const Function) Error
     allocator.free(compiled.relocs);
     allocator.free(compiled.lines);
     return compiled.code;
+}
+
+/// Compile `func` tuned to `model`: the machine-level hooks read the model's fusion table
+/// (see `capsForModel`). An inert model (an empty `.fusion`, no `cmp_branch`/`arith_branch`
+/// rule) makes this byte-identical to `selectFunction`.
+pub fn selectFunctionForModel(allocator: std.mem.Allocator, func: *const Function, model: *const mm.Model) Error![]u8 {
+    // Passing a foreign-arch model here is a caller bug, not a runtime fault.
+    std.debug.assert(model.arch == .x86_64);
+    const compiled = try compileWithCaps(allocator, func, capsForModel(model));
+    allocator.free(compiled.relocs);
+    allocator.free(compiled.lines);
+    return compiled.code;
+}
+
+/// The `ModelCaps` `selectFunctionForModel` builds for `model`. Split out so the model-to-caps
+/// mapping is unit-testable without compiling a whole function. Asserts `model.arch == .x86_64`,
+/// same as the caller above.
+pub fn capsForModel(model: *const mm.Model) ModelCaps {
+    std.debug.assert(model.arch == .x86_64);
+    return .{
+        .fuse_cmp_branch = model.fuses(.cmp_branch),
+        .fuse_arith_branch = model.fuses(.arith_branch),
+    };
+}
+
+test "x86_64 capsForModel reads cascadelake-sp fusion: cmp and arith on" {
+    const caps = capsForModel(mm.modelFor(.@"cascadelake-sp"));
+    try std.testing.expect(caps.fuse_cmp_branch);
+    try std.testing.expect(caps.fuse_arith_branch);
 }
 
 /// Test hook: run GPR allocation for `func` and report how many values were tail-split (their
@@ -371,8 +436,16 @@ pub fn reHomeCountForTest(allocator: std.mem.Allocator, func: *const Function) E
     return count;
 }
 
-/// Compile `func` to machine code plus its call relocations. Caller owns it.
+/// Compile `func` to machine code plus its call relocations. Caller owns it. Delegates to
+/// `compileWithCaps` with the inert (all-false) `ModelCaps`, so this stays byte-identical
+/// regardless of what `compileWithCaps` grows to support.
 pub fn compile(allocator: std.mem.Allocator, func: *const Function) Error!Compiled {
+    return compileWithCaps(allocator, func, .{});
+}
+
+/// Like `compile`, but tuned by `caps` (see `ModelCaps`). `compile` is exactly this with `.{}`
+/// (every flag inert), so a caller passing the default caps gets byte-identical output.
+pub fn compileWithCaps(allocator: std.mem.Allocator, func: *const Function, caps: ModelCaps) Error!Compiled {
     // f16 is now lowered here via F16C (held as its f32 widening in an xmm register, all
     // arithmetic in scalar-single SSE, hardware vcvtph2ps/vcvtps2ph conversion at the
     // boundaries). The other backends still reject f16 via `functionUsesF16`; x86_64 no longer
@@ -388,7 +461,7 @@ pub fn compile(allocator: std.mem.Allocator, func: *const Function) Error!Compil
     var fold = try addrfold.analyze(allocator, func, {}, x86_64FoldOffset);
     defer fold.deinit(allocator);
 
-    var ctx = Ctx{ .func = func, .fold = &fold };
+    var ctx = Ctx{ .func = func, .fold = &fold, .caps = caps };
     defer ctx.loc_of.deinit(allocator);
     defer ctx.code.deinit(allocator);
     defer ctx.fixups.deinit(allocator);
@@ -569,6 +642,11 @@ fn emitFromAllocation(allocator: std.mem.Allocator, ctx: *Ctx, func: *const Func
                 try emitSplitActionX86(allocator, ctx, act);
                 action_cursor += 1;
             }
+            // Thread the current block's instructions and this instruction's index onto `ctx` so
+            // both the `.icmp` arm (in `lowerInst`) and `emitIf` can consult `fusesIntoNextIf`
+            // without growing every call site's parameter list.
+            ctx.cur_insts = insts;
+            ctx.cur_idx = inst_idx;
             if (func.opcode(inst) == .@"if") {
                 // NEXT is the block emitted immediately after this one (x86_64 emits ALL blocks in
                 // order, so bi+1 is always the emitted-next), or null at the last block. Whichever
@@ -1075,6 +1153,13 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
                 try ctx.store(allocator, result, rd);
                 return;
             }
+            // Compare-into-branch fold (cmp_branch): when the model enables it and this icmp
+            // fuses into the immediately-following `if` (`fusesIntoNextIf`, the SAME predicate
+            // `emitIf` checks below), skip the materialize-then-test path entirely. The if's
+            // fused SETUP re-derives `cmp.lhs`/`cmp.rhs` and emits the `cmp`/`jcc` itself, so this
+            // icmp's result is never read (its sole use, the if's cond, is folded away) and its
+            // destination register can stay unwritten.
+            if (ctx.caps.fuse_cmp_branch and fusesIntoNextIf(func, ctx.cur_insts, ctx.cur_idx)) return;
             const rl = try ctx.use(allocator, cmp.lhs, scratch1);
             const rr = try ctx.use(allocator, cmp.rhs, scratch2);
             const rd = ctx.dst(result, scratch1);
@@ -1393,9 +1478,48 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
 
 fn emitIf(allocator: std.mem.Allocator, ctx: *Ctx, cf: ir.function.If, pred: Block, next_block: ?Block) Error!void {
     const func = ctx.func;
-    const cond = try ctx.use(allocator, cf.cond, scratch1);
-    // Test at the condition's width so a dirty upper half of a raw i32 cond is ignored.
-    try ctx.put(allocator, encode.testReg(cond, cond, intBits(func, cf.cond) > 32));
+    // SETUP: emit the test that decides the branch and yield its condition code `cc`. Fused
+    // compare-and-branch (the cmp_branch fold): when `caps.fuse_cmp_branch` is on and the
+    // immediately-preceding instruction is a single-use integer icmp that is exactly this if's
+    // condition (`fusesIntoNextIf`, the SAME predicate the icmp arm used to skip its own
+    // materialization), load the icmp's operands FRESH (mov/lea only, so EFLAGS is untouched
+    // between the load and the compare), set the flags with `cmp`, and branch on the icmp's own
+    // condition. Otherwise materialize the boolean and `test` it, branching on `.ne` (nonzero) as
+    // before. The three layouts below then all branch on `cc` (and invert it via
+    // `encode.invertCond`) instead of hardcoding `.ne`, so this is the ONLY place either path
+    // diverges.
+    //
+    // Nested inside the cmp_branch arm: the arith_branch fold (B3). When `fusesArithIntoBranch`
+    // also holds, the arith at cur_idx-2 (immediately before the icmp, which is immediately before
+    // this if) already left ZF = (its result == 0) as a side effect of computing that result (see
+    // `fusesArithIntoBranch`'s doc comment: x86's add/sub/and, unlike aarch64's, sets flags in
+    // their PLAIN form). So emit NOTHING here at all, neither loading the icmp's operands nor a
+    // `cmp`, and branch on eq/ne directly off those flags. The arith itself was lowered normally
+    // by `lowerInst`'s `.arith`/`.arith_imm` arm just before this if (this function never skips
+    // it), and the icmp between them was already skipped by the cmp_branch fold above (its sole
+    // use, this if's cond, is folded away), so no instruction sits between the arith and the `jcc`
+    // this SETUP yields to except the arith's own possible flag-neutral spill-store `mov` (see
+    // `Ctx.store`), leaving ZF intact at the branch.
+    var cc: encode.Cond = .ne;
+    if (ctx.cur_idx >= 1 and ctx.caps.fuse_cmp_branch and fusesIntoNextIf(func, ctx.cur_insts, ctx.cur_idx - 1)) {
+        const cmp = func.opcode(ctx.cur_insts[ctx.cur_idx - 1]).icmp;
+        if (fusesArithIntoBranch(func, ctx.cur_insts, ctx.cur_idx, ctx.caps.fuse_arith_branch and ctx.caps.fuse_cmp_branch)) {
+            // Emit nothing: the arith at cur_idx-2 already left ZF = (result == 0) set. `cc`
+            // below is set from `cmp.op` (eq/ne only, per `fusesArithIntoBranch`), so the `jcc`
+            // this SETUP yields to branches directly on those flags.
+        } else {
+            const rl = try ctx.use(allocator, cmp.lhs, scratch1);
+            const rr = try ctx.use(allocator, cmp.rhs, scratch2);
+            // Compare at the operand width, exactly like the unfused icmp lowering: an i32 compare
+            // sets flags from the low 32 bits, so a dirty upper half does not skew the result.
+            try ctx.put(allocator, encode.cmp(rl, rr, intBits(func, cmp.lhs) > 32));
+        }
+        cc = condOf(cmp.op, isSigned(func, cmp.lhs));
+    } else {
+        const cond = try ctx.use(allocator, cf.cond, scratch1);
+        // Test at the condition's width so a dirty upper half of a raw i32 cond is ignored.
+        try ctx.put(allocator, encode.testReg(cond, cond, intBits(func, cf.cond) > 32));
+    }
 
     // Layout selection. THEN and ELSE are the two successor blocks; NEXT is the block emitted right
     // after this one (or null at the last block). Whichever edge targets NEXT can fall through, so
@@ -1405,41 +1529,41 @@ fn emitIf(allocator: std.mem.Allocator, ctx: *Ctx, cf: ir.function.If, pred: Blo
     const else_next = next_block != null and cf.@"else".target == next_block.?;
 
     if (then_next) {
-        // THEN falls through. Keep `jnz -> then_start`, emit the ELSE-moves + `jmp ELSE` inline,
-        // then the THEN-moves last and FALL THROUGH to THEN (elide the trailing `jmp THEN`). The jnz
+        // THEN falls through. Keep `jcc -> then_start`, emit the ELSE-moves + `jmp ELSE` inline,
+        // then the THEN-moves last and FALL THROUGH to THEN (elide the trailing `jmp THEN`). The jcc
         // still jumps forward over the else section to then_start, so its displacement is unchanged.
-        const jnz = try emitBranch(allocator, ctx, encode.jcc(.ne, 0));
+        const jcc_at = try emitBranch(allocator, ctx, encode.jcc(cc, 0));
         try emitMoves(allocator, ctx, cf.@"else", pred); // ELSE-moves on the else path
         try emitBranchTo(allocator, ctx, encode.jmp(0), @intFromEnum(cf.@"else".target));
         const then_start = ctx.code.items.len;
-        const rel: i32 = @intCast(@as(i64, @intCast(then_start)) - @as(i64, @intCast(jnz + 4)));
-        std.mem.writeInt(u32, ctx.code.items[jnz..][0..4], @bitCast(rel), .little);
+        const rel: i32 = @intCast(@as(i64, @intCast(then_start)) - @as(i64, @intCast(jcc_at + 4)));
+        std.mem.writeInt(u32, ctx.code.items[jcc_at..][0..4], @bitCast(rel), .little);
         try emitMoves(allocator, ctx, cf.then, pred); // THEN-moves, then fall through to THEN
         return;
     }
 
     if (else_next) {
-        // ELSE falls through. INVERT the branch (jnz -> jz) so it jumps to else_start when the cond
-        // is FALSE (the else edge), and falls through to the THEN-moves when the cond is TRUE. Emit
-        // the THEN-moves + `jmp THEN` inline, then the ELSE-moves last and FALL THROUGH to ELSE. The
-        // jz's forward displacement targets else_start.
-        const jz = try emitBranch(allocator, ctx, encode.jcc(encode.invertCond(.ne), 0));
+        // ELSE falls through. INVERT the branch so it jumps to else_start when the cond is FALSE
+        // (the else edge), and falls through to the THEN-moves when the cond is TRUE. Emit the
+        // THEN-moves + `jmp THEN` inline, then the ELSE-moves last and FALL THROUGH to ELSE. The
+        // inverted jcc's forward displacement targets else_start.
+        const jcc_at = try emitBranch(allocator, ctx, encode.jcc(encode.invertCond(cc), 0));
         try emitMoves(allocator, ctx, cf.then, pred); // THEN-moves on the then (not-taken) path
         try emitBranchTo(allocator, ctx, encode.jmp(0), @intFromEnum(cf.then.target));
         const else_start = ctx.code.items.len;
-        const rel: i32 = @intCast(@as(i64, @intCast(else_start)) - @as(i64, @intCast(jz + 4)));
-        std.mem.writeInt(u32, ctx.code.items[jz..][0..4], @bitCast(rel), .little);
+        const rel: i32 = @intCast(@as(i64, @intCast(else_start)) - @as(i64, @intCast(jcc_at + 4)));
+        std.mem.writeInt(u32, ctx.code.items[jcc_at..][0..4], @bitCast(rel), .little);
         try emitMoves(allocator, ctx, cf.@"else", pred); // ELSE-moves, then fall through to ELSE
         return;
     }
 
     // Neither edge is NEXT (or this is the last block): emit both branches as before.
-    const jnz = try emitBranch(allocator, ctx, encode.jcc(.ne, 0));
+    const jcc_at = try emitBranch(allocator, ctx, encode.jcc(cc, 0));
     try emitMoves(allocator, ctx, cf.@"else", pred);
     try emitBranchTo(allocator, ctx, encode.jmp(0), @intFromEnum(cf.@"else".target));
     const then_start = ctx.code.items.len;
-    const rel: i32 = @intCast(@as(i64, @intCast(then_start)) - @as(i64, @intCast(jnz + 4)));
-    std.mem.writeInt(u32, ctx.code.items[jnz..][0..4], @bitCast(rel), .little);
+    const rel: i32 = @intCast(@as(i64, @intCast(then_start)) - @as(i64, @intCast(jcc_at + 4)));
+    std.mem.writeInt(u32, ctx.code.items[jcc_at..][0..4], @bitCast(rel), .little);
     try emitMoves(allocator, ctx, cf.then, pred);
     try emitBranchTo(allocator, ctx, encode.jmp(0), @intFromEnum(cf.then.target));
 }
@@ -2342,6 +2466,127 @@ fn forEachTermOperand(func: *const Function, term: ir.function.Terminator, ctx: 
         .ret => |v| if (v) |vv| f(ctx, vv, false),
         .jump => |j| for (func.blockArgs(j)) |a| f(ctx, a, true),
     }
+}
+
+const CountCtx = struct { target: Value, count: *usize };
+fn countOperand(ctx: CountCtx, operand: Value, is_edge_arg: bool) void {
+    _ = is_edge_arg;
+    if (operand == ctx.target) ctx.count.* += 1;
+}
+
+/// Total operand uses of `v` across the whole function (instruction operands, if/jump edge args,
+/// and terminators). Backs `fusesIntoNextIf`'s single-use check. Built on the shared
+/// `forEachOperand`/`forEachTermOperand` walkers (the SAME operand enumeration the local liveness
+/// computation uses), so it never drifts from what the allocator considers a use. `empty_fold` is
+/// deliberately used here rather than a real fold analysis: `fusesIntoNextIf` only ever counts uses
+/// of an icmp's boolean RESULT, never a pointer, so address-fold operand rerouting (which only
+/// touches load/store pointer operands) is irrelevant to this count either way.
+fn countUses(func: *const Function, v: Value) usize {
+    var count: usize = 0;
+    for (0..func.blockCount()) |bi| {
+        const block: Block = @enumFromInt(bi);
+        for (func.blockInsts(block)) |inst| forEachOperand(func, inst, &empty_fold, CountCtx{ .target = v, .count = &count }, countOperand);
+        if (func.terminator(block)) |term| forEachTermOperand(func, term, CountCtx{ .target = v, .count = &count }, countOperand);
+    }
+    return count;
+}
+
+/// Whether the integer `icmp` at `insts[idx]` fuses into an immediately-following `@"if"` whose
+/// condition it is and whose only use it is. When it fuses, the icmp materialization (`cmp; setcc;
+/// movzx`) is skipped and the if emits a fused `cmp; jcc` on the icmp's operands directly (see
+/// `emitIf`). This is the ONE eligibility predicate shared by the icmp-skip (in `lowerInst`'s
+/// `.icmp` arm) and the fused `emitIf`, so the two never disagree (no dangling or doubled compare).
+///
+/// Gated to integer/gpr operands (the plain icmp path): a vector icmp (`cmpps` mask) or a float
+/// icmp (`ucomiss`/`ucomisd` + `setcc`) lowers through a different arm entirely and must keep its
+/// current materialize-then-test path untouched.
+///
+/// This predicate itself carries no model gate. Both call sites additionally require
+/// `ctx.caps.fuse_cmp_branch` before honoring it, so a model without the fusion falls back to the
+/// materialize-then-test path unchanged (byte-identical to before this fold existed).
+fn fusesIntoNextIf(func: *const Function, insts: []const ir.function.Inst, idx: usize) bool {
+    const cmp = switch (func.opcode(insts[idx])) {
+        .icmp => |c| c,
+        else => return false,
+    };
+    // Integer/gpr operands only: isVector and isFloat both route to a different lowering
+    // (cmpps mask, or ucomiss/sd + setcc) that this fold must not touch.
+    if (isVector(func, cmp.lhs) or isFloat(func, cmp.lhs)) return false;
+    if (idx + 1 >= insts.len) return false; // must be immediately followed by the if
+    const cf = switch (func.opcode(insts[idx + 1])) {
+        .@"if" => |c| c,
+        else => return false,
+    };
+    const result = func.instResult(insts[idx]) orelse return false;
+    if (cf.cond != result) return false; // the if must test exactly this icmp's result
+    // Single-use: the boolean is read only by this if's condition. Since the icmp immediately
+    // precedes the if and equals cf.cond, a total use-count of exactly 1 means the if's cond is
+    // the sole use, so skipping the boolean harms nothing.
+    return countUses(func, result) == 1;
+}
+
+/// Whether the `if` at `insts[if_idx]` folds a flag-setting arithmetic op into its branch: the
+/// arith at `if_idx-2` is a single-use `add`/`sub`/`bit_and` (register form) or `add`/`sub`
+/// (immediate `arith_imm` form) whose result is compared eq/ne against a literal `0` by the icmp
+/// at `if_idx-1`, which is itself the single-use condition of this if (i.e. the compare-and-branch
+/// fold already applies, `fusesIntoNextIf`).
+///
+/// UNLIKE aarch64: a plain x86 `add`/`sub`/`and` ALREADY sets ZF (and the rest of the flags) as a
+/// side effect of computing its result, lowering through `binary`'s flag-setting
+/// `encode.add`/`sub`/`andr` (never a flag-silent `lea`). So this predicate does NOT gate a skip-
+/// and-reemit at the arith's own site the way aarch64's does: the arith runs through its normal
+/// `.arith`/`.arith_imm` lowering completely unchanged (neither arm reads this predicate), still
+/// materializing its result AND leaving ZF set. It is `emitIf`'s fused SETUP alone that reads this
+/// predicate, to emit NO compare at all (neither `cmp` nor `test`) and branch directly on the
+/// flags the arith already left behind. This is the ONE eligibility predicate the fold uses
+/// (mirrors `fusesIntoNextIf`, and aarch64's `fusesArithIntoBranch`).
+///
+/// `enabled` carries `caps.fuse_arith_branch and caps.fuse_cmp_branch` (the fold lives inside the
+/// compare-and-branch path: a model without either falls back to the plain arith followed by the
+/// cmp/test + branch of the unfused `emitIf` path, byte-identical to before this fold existed).
+///
+/// Scope (bounded for correctness): eq/ne ONLY (ZF is exactly (result == 0) for the eq/ne
+/// relation only. lt/le/gt/ge need SF/OF/CF reasoning tied to the actual COMPARE, which an arith's
+/// flags do not reproduce, so they stay on the plain cmp path). The icmp RHS must be a literal
+/// `iconst 0`. Register `add`/`sub`/`bit_and`, or `add`/`sub` in the immediate (`arith_imm`) form
+/// (a `bit_and` immediate is excluded, mirroring aarch64's bitmask-immediate exclusion, and simply
+/// unneeded: the plain path already handles it). Integer/gpr only (float/vector arith route
+/// through entirely different lowering and never set integer ZF this way), and the arith result
+/// must be single-use (only the icmp reads it, so nothing else depends on its materialization
+/// happening at any particular point relative to the icmp).
+fn fusesArithIntoBranch(func: *const Function, insts: []const ir.function.Inst, if_idx: usize, enabled: bool) bool {
+    if (!enabled) return false;
+    if (if_idx < 2) return false; // need the arith at if_idx-2 and the icmp at if_idx-1
+    // The compare-and-branch fold must already apply: the icmp at if_idx-1 is a single-use,
+    // integer/gpr icmp that is exactly this if's condition (see `fusesIntoNextIf`).
+    if (!fusesIntoNextIf(func, insts, if_idx - 1)) return false;
+    const cmp = func.opcode(insts[if_idx - 1]).icmp; // an icmp, per fusesIntoNextIf
+    // eq/ne only: ZF equals (result == 0), exactly these two relations.
+    if (cmp.op != .eq and cmp.op != .ne) return false;
+    // The icmp RHS must be a literal 0 (its defining instruction is `iconst 0`).
+    const rhs_def = func.definingInst(cmp.rhs) orelse return false;
+    switch (func.opcode(rhs_def)) {
+        .iconst => |c| if (c != 0) return false,
+        else => return false,
+    }
+    // The icmp LHS must be the result of the arith at if_idx-2.
+    const arith_inst = insts[if_idx - 2];
+    const arith_result = func.instResult(arith_inst) orelse return false;
+    if (cmp.lhs != arith_result) return false;
+    // Integer / GPR only (a float/vector arith routes through a different lowering entirely and
+    // never leaves ZF meaningfully set for this fold).
+    if (isVector(func, arith_result) or isFloat(func, arith_result)) return false;
+    // Single-use: the arith result is read only by the icmp. Since the arith immediately precedes
+    // the icmp and is its LHS, a total use-count of exactly 1 means the icmp is the sole reader.
+    if (countUses(func, arith_result) != 1) return false;
+    return switch (func.opcode(arith_inst)) {
+        .arith => |a| a.op == .add or a.op == .sub or a.op == .bit_and,
+        // Only add/sub in the immediate form: a bit_and immediate stays on the plain path
+        // (mirrors aarch64's bitmask-immediate exclusion; x86's `aluImm` could encode it, but
+        // narrowing the fold's surface keeps this port a direct match to the reference).
+        .arith_imm => |a| a.op == .add or a.op == .sub,
+        else => false,
+    };
 }
 
 /// Per-value split-liveness data for the eviction heuristic, built locally so `regalloc.zig` stays
