@@ -124,10 +124,12 @@ test "codegen+disasm round-trip: control flow (max via if/else)" {
 
 test "codegen+disasm round-trip: fused compare-and-branch for if(icmp)" {
     // An UNSIGNED `x < y` that is the single-use condition of the immediately-following
-    // if fuses into a native `bltu` on the two operands: no `sltu` materialization and no
-    // `bnez` re-test. This proves the fused branch is emitted (and exercises the bltu
-    // encoder path). Structural only; the qemu-user execution corpus (cases.zig) is the
-    // correctness oracle for the taken edge.
+    // if fuses into a native compare-and-branch on the two operands: no `sltu`
+    // materialization and no `bnez` re-test. The THEN edge (tb) is the block emitted right
+    // after the entry, so fall-through elision INVERTS the fused `bltu` to a `bgeu` that
+    // targets the ELSE block and drops the trailing `jal`, falling through to THEN. This
+    // proves the fused (inverted) branch is emitted. Structural only; the qemu-user
+    // execution corpus (cases.zig) is the correctness oracle for the taken edge.
     const a = std.testing.allocator;
     var func = Function.init(a);
     defer func.deinit();
@@ -149,9 +151,10 @@ test "codegen+disasm round-trip: fused compare-and-branch for if(icmp)" {
     defer words.deinit(a);
     const text = try disasm.format(a, words.items);
     defer a.free(text);
-    // Fusion fired: a native unsigned compare-branch on the operands (a0=x, a1=y),
-    // with no boolean materialization or re-test.
-    try std.testing.expect(std.mem.indexOf(u8, text, "bltu x10, x11") != null);
+    // Fusion fired: a native unsigned compare-branch on the operands (a0=x, a1=y), inverted
+    // to `bgeu` by fall-through elision (THEN is the next block), with no boolean
+    // materialization or re-test.
+    try std.testing.expect(std.mem.indexOf(u8, text, "bgeu x10, x11") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "sltu") == null);
     try std.testing.expect(std.mem.indexOf(u8, text, "bnez") == null);
 }
@@ -189,10 +192,11 @@ test "caps.fuse_cmp_branch = false falls back to sltu;bnez, not the fused bltu (
     const text = try disasm.format(a, words.items);
     defer a.free(text);
     // The gate declined the fusion: the icmp materializes its boolean (`sltu`) and the if
-    // re-tests it (`bnez`), NOT the fused `bltu` this same shape produces when the flag is on
-    // (see the byte-identical-default test right below).
+    // re-tests it, NOT the fused `bltu` this same shape produces when the flag is on (see the
+    // byte-identical-default test right below). The THEN block is emitted next, so fall-through
+    // elision INVERTS the boolean re-test `bnez` to `beqz` (targeting ELSE) and drops the `jal`.
     try std.testing.expect(std.mem.indexOf(u8, text, "sltu") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "bnez") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "beqz") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "bltu") == null);
 
     try std.testing.expectEqual(@as(i64, 3), try harness.runCode(io, a, words.items, &.{ 7, 3 }, harness.qemu_user));
@@ -210,7 +214,10 @@ test "caps.fuse_cmp_branch = true (the default) emits the fused bltu with no slt
     defer words.deinit(a);
     const text = try disasm.format(a, words.items);
     defer a.free(text);
-    try std.testing.expect(std.mem.indexOf(u8, text, "bltu") != null);
+    // Fusion fired and fall-through elision inverted the fused `bltu` to `bgeu` (THEN is the
+    // next block), targeting ELSE with the `jal` dropped: still a native compare-branch on the
+    // operands, no boolean materialization or re-test.
+    try std.testing.expect(std.mem.indexOf(u8, text, "bgeu") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "sltu") == null);
     try std.testing.expect(std.mem.indexOf(u8, text, "bnez") == null);
 
@@ -422,6 +429,213 @@ test "qemu-user-riscv: a loop's backward conditional branch past -4KiB relaxes a
     // it exactly once, exiting on the very first test without ever taking the back edge.
     try std.testing.expectEqual(@as(i64, 19515), try harness.runCode(io, a, words.items, &.{5}, harness.qemu_user)); // 1301 * 15
     try std.testing.expectEqual(@as(i64, 1301), try harness.runCode(io, a, words.items, &.{1}, harness.qemu_user)); // 1301 * 1
+}
+
+test "riscv64 fallthrough: an unconditional jump to the next block elides the jal" {
+    // entry computes x + y and jumps to `tail`, which is emitted immediately after it. The jump
+    // falls through: the sum move into `tail`'s parameter still runs, but the `jal` is elided.
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var func = Function.init(a);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+
+    const entry = try func.appendBlock();
+    const tail = try func.appendBlock();
+    const x = try func.appendBlockParam(entry, i32_t);
+    const y = try func.appendBlockParam(entry, i32_t);
+    const s = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = y } });
+    try func.setJump(entry, tail, &.{s});
+    const p = try func.appendBlockParam(tail, i32_t);
+    func.setTerminator(tail, .{ .ret = p });
+
+    var words = try harness.compileFunc(a, &func);
+    defer words.deinit(a);
+    const text = try disasm.format(a, words.items);
+    defer a.free(text);
+    // The only control transfer left is the final `ret`: no unconditional `j` bridges the two blocks.
+    try std.testing.expect(std.mem.indexOf(u8, text, "j .") == null);
+
+    try std.testing.expectEqual(@as(i64, 7), try harness.runCode(io, a, words.items, &.{ 3, 4 }, harness.qemu_user));
+    try std.testing.expectEqual(@as(i64, -1), try harness.runCode(io, a, words.items, &.{ 4, -5 }, harness.qemu_user));
+}
+
+test "riscv64 fallthrough: an if whose else-edge targets the next block elides the jal" {
+    // Append order sets layout: entry(0), else_b(1), then_b(2). The ELSE edge targets the block
+    // emitted next, so elision keeps the branch to THEN and drops the `jal`, falling through to ELSE.
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var func = Function.init(a);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+
+    const entry = try func.appendBlock();
+    const else_b = try func.appendBlock();
+    const then_b = try func.appendBlock();
+    const x = try func.appendBlockParam(entry, i32_t);
+    const seven = try func.appendInst(entry, i32_t, .{ .iconst = 7 });
+    const c = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .eq, .lhs = x, .rhs = seven } });
+    try func.appendIf(entry, c, .{ .target = then_b, .args = &.{} }, .{ .target = else_b, .args = &.{} });
+    const r_then = try func.appendInst(then_b, i32_t, .{ .iconst = 111 });
+    func.setTerminator(then_b, .{ .ret = r_then });
+    const r_else = try func.appendInst(else_b, i32_t, .{ .iconst = 222 });
+    func.setTerminator(else_b, .{ .ret = r_else });
+
+    var words = try harness.compileFunc(a, &func);
+    defer words.deinit(a);
+    const text = try disasm.format(a, words.items);
+    defer a.free(text);
+    // The un-inverted fused branch to THEN stays (rs1 = x = a0); its `jal` to ELSE is elided.
+    try std.testing.expect(std.mem.indexOf(u8, text, "beq x10,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "j .") == null);
+
+    // Sweep: x == 7 branches to THEN (111); anything else falls through to ELSE (222).
+    try std.testing.expectEqual(@as(i64, 111), try harness.runCode(io, a, words.items, &.{7}, harness.qemu_user));
+    try std.testing.expectEqual(@as(i64, 222), try harness.runCode(io, a, words.items, &.{5}, harness.qemu_user));
+    try std.testing.expectEqual(@as(i64, 222), try harness.runCode(io, a, words.items, &.{0}, harness.qemu_user));
+}
+
+test "riscv64 fallthrough: an if whose then-edge targets the next block inverts the branch" {
+    // Append order sets layout: entry(0), then_b(1), else_b(2). The THEN edge targets the block
+    // emitted next, so elision INVERTS the fused `beq` to `bne` (targeting ELSE), drops the `jal`,
+    // and falls through to THEN.
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var func = Function.init(a);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+
+    const entry = try func.appendBlock();
+    const then_b = try func.appendBlock();
+    const else_b = try func.appendBlock();
+    const x = try func.appendBlockParam(entry, i32_t);
+    const seven = try func.appendInst(entry, i32_t, .{ .iconst = 7 });
+    const c = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .eq, .lhs = x, .rhs = seven } });
+    try func.appendIf(entry, c, .{ .target = then_b, .args = &.{} }, .{ .target = else_b, .args = &.{} });
+    const r_then = try func.appendInst(then_b, i32_t, .{ .iconst = 111 });
+    func.setTerminator(then_b, .{ .ret = r_then });
+    const r_else = try func.appendInst(else_b, i32_t, .{ .iconst = 222 });
+    func.setTerminator(else_b, .{ .ret = r_else });
+
+    var words = try harness.compileFunc(a, &func);
+    defer words.deinit(a);
+    const text = try disasm.format(a, words.items);
+    defer a.free(text);
+    // The fused `beq` was inverted to `bne` (rs1 = x = a0), so no plain `beq` and no `jal` remain.
+    try std.testing.expect(std.mem.indexOf(u8, text, "bne x10,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "beq") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "j .") == null);
+
+    // Sweep: x == 7 falls through to THEN (111); anything else takes the inverted branch to ELSE (222).
+    try std.testing.expectEqual(@as(i64, 111), try harness.runCode(io, a, words.items, &.{7}, harness.qemu_user));
+    try std.testing.expectEqual(@as(i64, 222), try harness.runCode(io, a, words.items, &.{5}, harness.qemu_user));
+    try std.testing.expectEqual(@as(i64, 222), try harness.runCode(io, a, words.items, &.{0}, harness.qemu_user));
+}
+
+test "riscv64 fallthrough: block-param moves on a jump fall-through edge stay correct" {
+    // entry passes its two params SWAPPED into `tail`'s params over a fall-through edge (tail is next).
+    // The `jal` is elided, but the cycle-breaking swap moves must still run, so `tail` sees (b, a) and
+    // returns b - a. `@"if"` edges carry no args on riscv64, so a JUMP terminator exercises this.
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var func = Function.init(a);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+
+    const entry = try func.appendBlock();
+    const tail = try func.appendBlock();
+    const av = try func.appendBlockParam(entry, i32_t);
+    const bv = try func.appendBlockParam(entry, i32_t);
+    try func.setJump(entry, tail, &.{ bv, av }); // swap: p <- b, q <- a
+    const p = try func.appendBlockParam(tail, i32_t);
+    const q = try func.appendBlockParam(tail, i32_t);
+    const d = try func.appendInst(tail, i32_t, .{ .arith = .{ .op = .sub, .lhs = p, .rhs = q } });
+    func.setTerminator(tail, .{ .ret = d });
+
+    var words = try harness.compileFunc(a, &func);
+    defer words.deinit(a);
+    const text = try disasm.format(a, words.items);
+    defer a.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "j .") == null); // fall-through, no jump word
+
+    try std.testing.expectEqual(@as(i64, -7), try harness.runCode(io, a, words.items, &.{ 10, 3 }, harness.qemu_user)); // 3 - 10
+    try std.testing.expectEqual(@as(i64, 5), try harness.runCode(io, a, words.items, &.{ 4, 9 }, harness.qemu_user)); // 9 - 4
+    try std.testing.expectEqual(@as(i64, 0), try harness.runCode(io, a, words.items, &.{ 7, 7 }, harness.qemu_user));
+}
+
+test "riscv64 fallthrough: a diamond and a loop compute correctly under elision" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+
+    // DIAMOND: signed max(x, y) via an if/else that merges. Critical-edge splitting inserts the
+    // trampoline blocks and every fall-through edge among them is elided where it targets the next
+    // block. Execution must still select the larger value.
+    {
+        var func = Function.init(a);
+        defer func.deinit();
+        const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+        const bool_t = try func.types.intern(.bool);
+        const entry = try func.appendBlock();
+        const merge = try func.appendBlock();
+        const x = try func.appendBlockParam(entry, i32_t);
+        const y = try func.appendBlockParam(entry, i32_t);
+        const r = try func.appendBlockParam(merge, i32_t);
+        const c = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .gt, .lhs = x, .rhs = y } });
+        try func.appendIf(entry, c, .{ .target = merge, .args = &.{x} }, .{ .target = merge, .args = &.{y} });
+        func.setTerminator(merge, .{ .ret = r });
+
+        var words = try harness.compileFunc(a, &func);
+        defer words.deinit(a);
+        try std.testing.expectEqual(@as(i64, 9), try harness.runCode(io, a, words.items, &.{ 9, 4 }, harness.qemu_user));
+        try std.testing.expectEqual(@as(i64, 8), try harness.runCode(io, a, words.items, &.{ 3, 8 }, harness.qemu_user));
+        try std.testing.expectEqual(@as(i64, 5), try harness.runCode(io, a, words.items, &.{ 5, 5 }, harness.qemu_user));
+    }
+
+    // LOOP: sum of 1..n via a do-while over two alloca slots (edges carry no args, so the back edge
+    // stays wired straight to the header). The header's if falls through to the body by inverting its
+    // branch (THEN is next); the total must be n*(n+1)/2.
+    {
+        var func = Function.init(a);
+        defer func.deinit();
+        const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+        const bool_t = try func.types.intern(.bool);
+        const ptr_t = try func.types.intern(.ptr);
+        const entry = try func.appendBlock();
+        const loop = try func.appendBlock();
+        const body = try func.appendBlock();
+        const done = try func.appendBlock();
+        const n = try func.appendBlockParam(entry, i32_t);
+        const pi = try func.appendInst(entry, ptr_t, .{ .alloca = .{ .elem = i32_t } });
+        const psum = try func.appendInst(entry, ptr_t, .{ .alloca = .{ .elem = i32_t } });
+        try func.appendStore(entry, n, pi);
+        const zero0 = try func.appendInst(entry, i32_t, .{ .iconst = 0 });
+        try func.appendStore(entry, zero0, psum);
+        try func.setJump(entry, loop, &.{});
+
+        const i_val = try func.appendInst(loop, i32_t, .{ .load = .{ .ptr = pi } });
+        const zero1 = try func.appendInst(loop, i32_t, .{ .iconst = 0 });
+        const c = try func.appendInst(loop, bool_t, .{ .icmp = .{ .op = .gt, .lhs = i_val, .rhs = zero1 } });
+        try func.appendIf(loop, c, .{ .target = body, .args = &.{} }, .{ .target = done, .args = &.{} });
+
+        const sum_val = try func.appendInst(body, i32_t, .{ .load = .{ .ptr = psum } });
+        const i_body = try func.appendInst(body, i32_t, .{ .load = .{ .ptr = pi } });
+        const nsum = try func.appendInst(body, i32_t, .{ .arith = .{ .op = .add, .lhs = sum_val, .rhs = i_body } });
+        const ni = try func.appendArithImm(body, i32_t, .sub, i_body, 1);
+        try func.appendStore(body, nsum, psum);
+        try func.appendStore(body, ni, pi);
+        try func.setJump(body, loop, &.{});
+
+        const rsum = try func.appendInst(done, i32_t, .{ .load = .{ .ptr = psum } });
+        func.setTerminator(done, .{ .ret = rsum });
+
+        var words = try harness.compileFunc(a, &func);
+        defer words.deinit(a);
+        try std.testing.expectEqual(@as(i64, 15), try harness.runCode(io, a, words.items, &.{5}, harness.qemu_user)); // 1+2+3+4+5
+        try std.testing.expectEqual(@as(i64, 55), try harness.runCode(io, a, words.items, &.{10}, harness.qemu_user));
+        try std.testing.expectEqual(@as(i64, 0), try harness.runCode(io, a, words.items, &.{0}, harness.qemu_user));
+    }
 }
 
 test "native-riscv: arithmetic runs in-process when the host is RISC-V" {

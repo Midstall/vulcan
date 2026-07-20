@@ -81,17 +81,18 @@ test "codegen+disasm round-trip: control flow (max via if/else)" {
     // The icmp is the single-use condition of the immediately-following if, so isel fuses
     // it into a compare-and-branch: no `cset` boolean, and the `cbnz` re-test becomes a
     // `b.gt` on the flags `cmp` set (branching to the then-edge on the icmp's condition).
-    // Exercises the disassembler on real branch offsets (b.cc/b .+N) and block-edge moves.
-    // The native max tests below prove this fused form returns the same results.
+    // The then-edge target `m` is the block emitted next, so the trailing `b then` is elided
+    // and the then-moves fall through into `m` (fall-through branch elision). The `b else`
+    // now jumps just over the then-moves. Exercises the disassembler on real branch offsets
+    // and block-edge moves. The native max tests below prove this returns the same results.
     try expectAsm(&func,
         \\0000: 6b01001f  cmp w0, w1
         \\0004: 5400006c  b.gt .+12
         \\0008: aa0103e7  mov x7, x1
-        \\000c: 14000003  b .+12
+        \\000c: 14000002  b .+8
         \\0010: aa0003e7  mov x7, x0
-        \\0014: 14000001  b .+4
-        \\0018: aa0703e0  mov x0, x7
-        \\001c: d65f03c0  ret
+        \\0014: aa0703e0  mov x0, x7
+        \\0018: d65f03c0  ret
         \\
     );
 }
@@ -5001,5 +5002,275 @@ test "aarch64 arith_branch: 64-bit decrement is NOT folded (encode.cmp is 32-bit
         try std.testing.expectEqual(@as(i64, 100), f(5)); // 5-1 != 0 -> then
         try std.testing.expectEqual(@as(i64, 100), f(0)); // 0-1 == -1 != 0 -> then
         try std.testing.expectEqual(@as(i64, 100), f(-3));
+    }
+}
+
+/// Count non-overlapping occurrences of `needle` in `haystack`. Used to assert how many branches of
+/// a given shape a disassembled listing contains (an elided branch drops the count).
+fn countSubstr(haystack: []const u8, needle: []const u8) usize {
+    var count: usize = 0;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, haystack, i, needle)) |at| {
+        count += 1;
+        i = at + needle.len;
+    }
+    return count;
+}
+
+test "aarch64 fallthrough: unconditional jump to the next block elides the branch" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const entry = try func.appendBlock();
+    const a = try func.appendBlockParam(entry, t);
+    const s = try func.appendInst(entry, t, .{ .arith = .{ .op = .add, .lhs = a, .rhs = a } });
+    const tail = try func.appendBlock();
+    const r = try func.appendBlockParam(tail, t);
+    func.setTerminator(entry, .{ .jump = .{ .target = tail, .args = try func.internValueList(&.{s}) } });
+    func.setTerminator(tail, .{ .ret = r });
+
+    // `tail` is the block emitted right after `entry`, so the jump falls through: no `b`.
+    const code = try isel.selectFunction(allocator, &func);
+    defer allocator.free(code);
+    const text = try disasm.format(allocator, code);
+    defer allocator.free(text);
+    try std.testing.expectEqual(@as(usize, 0), countSubstr(text, "  b ."));
+
+    // 2*a arrives through the block-param move that stays on the fall-through edge.
+    for ([_]i32{ 0, 1, -1, 7, -13, 1000 }) |v| {
+        try expectRun(allocator, &func, &.{v}, v *% 2);
+    }
+}
+
+test "aarch64 fallthrough: conditional then-edge next elides b-then" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const a = try func.appendBlockParam(entry, t);
+    const b = try func.appendBlockParam(entry, t);
+    const c = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .gt, .lhs = a, .rhs = b } });
+    const then_b = try func.appendBlock(); // emitted next, so the then-edge falls through
+    const else_b = try func.appendBlock();
+    try func.appendIf(entry, c, .{ .target = then_b, .args = &.{} }, .{ .target = else_b, .args = &.{} });
+    const one = try func.appendInst(then_b, t, .{ .iconst = 1 });
+    func.setTerminator(then_b, .{ .ret = one });
+    const zero = try func.appendInst(else_b, t, .{ .iconst = 0 });
+    func.setTerminator(else_b, .{ .ret = zero });
+
+    const code = try isel.selectFunction(allocator, &func);
+    defer allocator.free(code);
+    const text = try disasm.format(allocator, code);
+    defer allocator.free(text);
+    // The fused `b.gt` (branch to the then-label) stays and the `b else` stays, but the trailing
+    // `b then` is elided: exactly one unconditional branch remains.
+    try std.testing.expect(std.mem.indexOf(u8, text, "b.gt ") != null);
+    try std.testing.expectEqual(@as(usize, 1), countSubstr(text, "  b ."));
+
+    const cases = [_][2]i32{ .{ 3, 1 }, .{ 1, 3 }, .{ 5, 5 }, .{ -2, -7 }, .{ -7, -2 } };
+    for (cases) |cc| {
+        try expectRun(allocator, &func, &.{ cc[0], cc[1] }, if (cc[0] > cc[1]) 1 else 0);
+    }
+}
+
+test "aarch64 fallthrough: conditional else-edge next inverts and falls through" {
+    const allocator = std.testing.allocator;
+
+    // Fused path: the else-edge is next, so the fused `b.gt then` inverts to `b.le else` and the
+    // else-moves fall through. Exactly one unconditional branch (`b then`) remains.
+    {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+        const bool_t = try func.types.intern(.bool);
+        const entry = try func.appendBlock();
+        const a = try func.appendBlockParam(entry, t);
+        const b = try func.appendBlockParam(entry, t);
+        const c = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .gt, .lhs = a, .rhs = b } });
+        const else_b = try func.appendBlock(); // emitted next, so the else-edge falls through
+        const then_b = try func.appendBlock();
+        try func.appendIf(entry, c, .{ .target = then_b, .args = &.{} }, .{ .target = else_b, .args = &.{} });
+        const one = try func.appendInst(then_b, t, .{ .iconst = 1 });
+        func.setTerminator(then_b, .{ .ret = one });
+        const zero = try func.appendInst(else_b, t, .{ .iconst = 0 });
+        func.setTerminator(else_b, .{ .ret = zero });
+
+        const code = try isel.selectFunction(allocator, &func);
+        defer allocator.free(code);
+        const text = try disasm.format(allocator, code);
+        defer allocator.free(text);
+        try std.testing.expect(std.mem.indexOf(u8, text, "b.le ") != null); // inverted condition
+        try std.testing.expect(std.mem.indexOf(u8, text, "b.gt ") == null);
+        try std.testing.expectEqual(@as(usize, 1), countSubstr(text, "  b ."));
+
+        const cases = [_][2]i32{ .{ 3, 1 }, .{ 1, 3 }, .{ 5, 5 }, .{ -2, -7 }, .{ -7, -2 } };
+        for (cases) |cc| {
+            try expectRun(allocator, &func, &.{ cc[0], cc[1] }, if (cc[0] > cc[1]) 1 else 0);
+        }
+    }
+
+    // Boolean (non-fused) path: a bare bool condition normally branches with `cbnz then`; inverting
+    // for the else-fall-through emits `cbz else`. Verifies the cbz encoder on the inverted boolean path.
+    {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+        const bool_t = try func.types.intern(.bool);
+        const entry = try func.appendBlock();
+        const flag = try func.appendBlockParam(entry, bool_t);
+        const else_b = try func.appendBlock(); // emitted next, so the else-edge falls through
+        const then_b = try func.appendBlock();
+        try func.appendIf(entry, flag, .{ .target = then_b, .args = &.{} }, .{ .target = else_b, .args = &.{} });
+        const one = try func.appendInst(then_b, t, .{ .iconst = 1 });
+        func.setTerminator(then_b, .{ .ret = one });
+        const zero = try func.appendInst(else_b, t, .{ .iconst = 0 });
+        func.setTerminator(else_b, .{ .ret = zero });
+
+        const code = try isel.selectFunction(allocator, &func);
+        defer allocator.free(code);
+        const text = try disasm.format(allocator, code);
+        defer allocator.free(text);
+        try std.testing.expect(std.mem.indexOf(u8, text, "cbz ") != null); // inverted boolean branch
+        try std.testing.expect(std.mem.indexOf(u8, text, "cbnz ") == null);
+
+        for ([_]i32{ 0, 1 }) |flag_val| {
+            try expectRun(allocator, &func, &.{flag_val}, if (flag_val != 0) 1 else 0);
+        }
+    }
+}
+
+test "aarch64 fallthrough: block-param moves on the fall-through edge stay correct" {
+    const allocator = std.testing.allocator;
+
+    // Unconditional fall-through carrying TWO block-param args (p = a+1, q = 2a). Result p+q = 3a+1.
+    {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+        const entry = try func.appendBlock();
+        const a = try func.appendBlockParam(entry, t);
+        const p = try func.appendInst(entry, t, .{ .arith_imm = .{ .op = .add, .lhs = a, .imm = 1 } });
+        const q = try func.appendInst(entry, t, .{ .arith = .{ .op = .add, .lhs = a, .rhs = a } });
+        const tail = try func.appendBlock();
+        const pp = try func.appendBlockParam(tail, t);
+        const qq = try func.appendBlockParam(tail, t);
+        func.setTerminator(entry, .{ .jump = .{ .target = tail, .args = try func.internValueList(&.{ p, q }) } });
+        const sum = try func.appendInst(tail, t, .{ .arith = .{ .op = .add, .lhs = pp, .rhs = qq } });
+        func.setTerminator(tail, .{ .ret = sum });
+        for ([_]i32{ 0, 1, -1, 4, -9, 250 }) |v| {
+            try expectRun(allocator, &func, &.{v}, (3 *% v) +% 1);
+        }
+    }
+
+    // Conditional THEN-edge fall-through carrying an arg: max via `if a>b then then_b(a) else else_b(b)`,
+    // then_b emitted next. The then-edge's arg `a` moves into the then-param on the fall-through path.
+    {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+        const bool_t = try func.types.intern(.bool);
+        const entry = try func.appendBlock();
+        const a = try func.appendBlockParam(entry, t);
+        const b = try func.appendBlockParam(entry, t);
+        const c = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .gt, .lhs = a, .rhs = b } });
+        const then_b = try func.appendBlock(); // next -> then-edge falls through
+        const tv = try func.appendBlockParam(then_b, t);
+        const else_b = try func.appendBlock();
+        const ev = try func.appendBlockParam(else_b, t);
+        try func.appendIf(entry, c, .{ .target = then_b, .args = &.{a} }, .{ .target = else_b, .args = &.{b} });
+        func.setTerminator(then_b, .{ .ret = tv });
+        func.setTerminator(else_b, .{ .ret = ev });
+        const cases = [_][2]i32{ .{ 3, 1 }, .{ 1, 3 }, .{ 5, 5 }, .{ -2, -7 }, .{ -7, -2 }, .{ 100, -100 } };
+        for (cases) |cc| {
+            try expectRun(allocator, &func, &.{ cc[0], cc[1] }, if (cc[0] > cc[1]) cc[0] else cc[1]);
+        }
+    }
+
+    // Conditional ELSE-edge fall-through carrying an arg (the inverted layout): same max, but else_b
+    // is emitted next. The else-edge's arg `b` moves into the else-param on the fall-through path.
+    {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+        const bool_t = try func.types.intern(.bool);
+        const entry = try func.appendBlock();
+        const a = try func.appendBlockParam(entry, t);
+        const b = try func.appendBlockParam(entry, t);
+        const c = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .gt, .lhs = a, .rhs = b } });
+        const else_b = try func.appendBlock(); // next -> else-edge falls through (inverted branch)
+        const ev = try func.appendBlockParam(else_b, t);
+        const then_b = try func.appendBlock();
+        const tv = try func.appendBlockParam(then_b, t);
+        try func.appendIf(entry, c, .{ .target = then_b, .args = &.{a} }, .{ .target = else_b, .args = &.{b} });
+        func.setTerminator(then_b, .{ .ret = tv });
+        func.setTerminator(else_b, .{ .ret = ev });
+        const cases = [_][2]i32{ .{ 3, 1 }, .{ 1, 3 }, .{ 5, 5 }, .{ -2, -7 }, .{ -7, -2 }, .{ 100, -100 } };
+        for (cases) |cc| {
+            try expectRun(allocator, &func, &.{ cc[0], cc[1] }, if (cc[0] > cc[1]) cc[0] else cc[1]);
+        }
+    }
+}
+
+test "aarch64 fallthrough: a diamond and a loop compute correctly" {
+    const allocator = std.testing.allocator;
+
+    // Diamond: entry -> (then_b | else_b) -> merge(param) -> ret. else_b's jump to merge also falls
+    // through (merge is emitted right after else_b), so both the then-edge elision and an
+    // unconditional fall-through with a block-param arg are exercised in one function. Result = max.
+    {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+        const bool_t = try func.types.intern(.bool);
+        const entry = try func.appendBlock();
+        const a = try func.appendBlockParam(entry, t);
+        const b = try func.appendBlockParam(entry, t);
+        const c = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .gt, .lhs = a, .rhs = b } });
+        const then_b = try func.appendBlock();
+        const else_b = try func.appendBlock();
+        const merge = try func.appendBlock();
+        const m = try func.appendBlockParam(merge, t);
+        try func.appendIf(entry, c, .{ .target = then_b, .args = &.{} }, .{ .target = else_b, .args = &.{} });
+        func.setTerminator(then_b, .{ .jump = .{ .target = merge, .args = try func.internValueList(&.{a}) } });
+        func.setTerminator(else_b, .{ .jump = .{ .target = merge, .args = try func.internValueList(&.{b}) } });
+        func.setTerminator(merge, .{ .ret = m });
+        const cases = [_][2]i32{ .{ 3, 1 }, .{ 1, 3 }, .{ 5, 5 }, .{ -8, -2 }, .{ 42, 41 } };
+        for (cases) |cc| {
+            try expectRun(allocator, &func, &.{ cc[0], cc[1] }, if (cc[0] > cc[1]) cc[0] else cc[1]);
+        }
+    }
+
+    // Counting loop: sum_{i=0}^{n-1} i. entry falls through to the header, the header's then-edge
+    // (body) falls through, and body's back-edge to the header is a real backward `b`.
+    {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+        const bool_t = try func.types.intern(.bool);
+        const entry = try func.appendBlock();
+        const n = try func.appendBlockParam(entry, t);
+        const header = try func.appendBlock();
+        const i = try func.appendBlockParam(header, t);
+        const acc = try func.appendBlockParam(header, t);
+        const body = try func.appendBlock();
+        const exit = try func.appendBlock();
+        const zero_i = try func.appendInst(entry, t, .{ .iconst = 0 });
+        const zero_acc = try func.appendInst(entry, t, .{ .iconst = 0 });
+        func.setTerminator(entry, .{ .jump = .{ .target = header, .args = try func.internValueList(&.{ zero_i, zero_acc }) } });
+        const c = try func.appendInst(header, bool_t, .{ .icmp = .{ .op = .lt, .lhs = i, .rhs = n } });
+        try func.appendIf(header, c, .{ .target = body, .args = &.{} }, .{ .target = exit, .args = &.{} });
+        const next_i = try func.appendInst(body, t, .{ .arith_imm = .{ .op = .add, .lhs = i, .imm = 1 } });
+        const acc2 = try func.appendInst(body, t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = i } });
+        func.setTerminator(body, .{ .jump = .{ .target = header, .args = try func.internValueList(&.{ next_i, acc2 }) } });
+        func.setTerminator(exit, .{ .ret = acc });
+        for ([_]i32{ 0, 1, 2, 5, 10, 100 }) |nv| {
+            var expected: i32 = 0;
+            var k: i32 = 0;
+            while (k < nv) : (k += 1) expected +%= k;
+            try expectRun(allocator, &func, &.{nv}, expected);
+        }
     }
 }

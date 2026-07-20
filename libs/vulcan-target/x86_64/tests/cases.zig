@@ -16,6 +16,7 @@ pub fn runAll(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !voi
     try arithmetic(io, allocator, backend);
     try immediates(io, allocator, backend);
     try controlFlow(io, allocator, backend);
+    try fallthrough(io, allocator, backend);
     try spilling(io, allocator, backend);
     try calls(io, allocator, backend);
     try floats(io, allocator, backend);
@@ -719,6 +720,112 @@ fn controlFlow(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !vo
         const ob = try f.appendInst(body, t, .{ .iconst = 1 });
         const inext = try f.appendInst(body, t, .{ .arith = .{ .op = .add, .lhs = i, .rhs = ob } });
         try f.setJump(body, header, &.{ sum2, inext });
+        f.setTerminator(exit, .{ .ret = r });
+        try expectRun(io, allocator, &f, &.{5}, 15, backend);
+        try expectRun(io, allocator, &f, &.{10}, 55, backend);
+    }
+}
+
+fn fallthrough(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {
+    // Fall-through branch elision. x86_64 emits blocks in append order, so a successor whose block
+    // is appended immediately after its predecessor is the emitted-NEXT block and its branch is
+    // elided (the code just falls into it). These cases execute the elided layouts end to end.
+
+    { // x86_64 fallthrough: unconditional jump to the next block elides the jmp, block param on
+        // the fall-through edge still arrives. entry -> next(x + 100), next(p) -> ret p.
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const t = try h.i32type(&f);
+        const entry = try f.appendBlock();
+        const x = try f.appendBlockParam(entry, t);
+        const next = try f.appendBlock(); // appended right after entry: the emitted-NEXT block
+        const p = try f.appendBlockParam(next, t);
+        const k = try f.appendArithImm(entry, t, .add, x, 100); // carried across the fall-through edge
+        try f.setJump(entry, next, &.{k});
+        f.setTerminator(next, .{ .ret = p });
+        for ([_]i32{ 0, 1, -1, 7, 55 }) |xv| {
+            try expectRun(io, allocator, &f, &.{xv}, xv +% 100, backend);
+        }
+    }
+
+    { // x86_64 fallthrough: conditional then-edge next elides jmp-then (then_next layout), block
+        // param on the then fall-through edge arrives. entry: if a>b -> then_b(a) else else_b(b),
+        // with then_b appended NEXT. Sweep the condition so both edges are taken. Result = max(a,b).
+        const Case = struct { a: i32, b: i32 };
+        for ([_]Case{ .{ .a = 3, .b = 4 }, .{ .a = 7, .b = 2 }, .{ .a = -5, .b = -9 }, .{ .a = 6, .b = 6 } }) |c| {
+            var f = Function.init(allocator);
+            defer f.deinit();
+            const t = try h.i32type(&f);
+            const bool_t = try f.types.intern(.bool);
+            const entry = try f.appendBlock();
+            const a = try f.appendBlockParam(entry, t);
+            const b = try f.appendBlockParam(entry, t);
+            const then_b = try f.appendBlock(); // NEXT: the then edge falls through
+            const pt = try f.appendBlockParam(then_b, t);
+            const else_b = try f.appendBlock();
+            const pe = try f.appendBlockParam(else_b, t);
+            const merge = try f.appendBlock();
+            const r = try f.appendBlockParam(merge, t);
+            const cnd = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .gt, .lhs = a, .rhs = b } });
+            try f.appendIf(entry, cnd, .{ .target = then_b, .args = &.{a} }, .{ .target = else_b, .args = &.{b} });
+            try f.setJump(then_b, merge, &.{pt});
+            try f.setJump(else_b, merge, &.{pe});
+            f.setTerminator(merge, .{ .ret = r });
+            try expectRun(io, allocator, &f, &.{ c.a, c.b }, @max(c.a, c.b), backend);
+        }
+    }
+
+    { // x86_64 fallthrough: conditional else-edge next inverts (jnz->jz) and falls through
+        // (else_next layout), block param on the else fall-through edge arrives. Same diamond but
+        // else_b is appended NEXT, forcing the inverted branch. Sweep the condition. Result = max(a,b).
+        const Case = struct { a: i32, b: i32 };
+        for ([_]Case{ .{ .a = 3, .b = 4 }, .{ .a = 7, .b = 2 }, .{ .a = -5, .b = -9 }, .{ .a = 6, .b = 6 } }) |c| {
+            var f = Function.init(allocator);
+            defer f.deinit();
+            const t = try h.i32type(&f);
+            const bool_t = try f.types.intern(.bool);
+            const entry = try f.appendBlock();
+            const a = try f.appendBlockParam(entry, t);
+            const b = try f.appendBlockParam(entry, t);
+            const else_b = try f.appendBlock(); // NEXT: the else edge falls through (branch inverted)
+            const pe = try f.appendBlockParam(else_b, t);
+            const then_b = try f.appendBlock();
+            const pt = try f.appendBlockParam(then_b, t);
+            const merge = try f.appendBlock();
+            const r = try f.appendBlockParam(merge, t);
+            const cnd = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .gt, .lhs = a, .rhs = b } });
+            try f.appendIf(entry, cnd, .{ .target = then_b, .args = &.{a} }, .{ .target = else_b, .args = &.{b} });
+            try f.setJump(then_b, merge, &.{pt});
+            try f.setJump(else_b, merge, &.{pe});
+            f.setTerminator(merge, .{ .ret = r });
+            try expectRun(io, allocator, &f, &.{ c.a, c.b }, @max(c.a, c.b), backend);
+        }
+    }
+
+    { // x86_64 fallthrough: a diamond and a loop compute correctly. The loop chains every elided
+        // layout: entry -> header falls through with block params, header's then-edge (body) falls
+        // through, body jumps BACKWARD to header (a real jmp, not elided). Counting sum 1..n.
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const t = try h.i32type(&f);
+        const bool_t = try f.types.intern(.bool);
+        const entry = try f.appendBlock();
+        const n = try f.appendBlockParam(entry, t);
+        const header = try f.appendBlock();
+        const sum = try f.appendBlockParam(header, t);
+        const i = try f.appendBlockParam(header, t);
+        const body = try f.appendBlock();
+        const exit = try f.appendBlock();
+        const r = try f.appendBlockParam(exit, t);
+        const zero = try f.appendInst(entry, t, .{ .iconst = 0 });
+        const one = try f.appendInst(entry, t, .{ .iconst = 1 });
+        try f.setJump(entry, header, &.{ zero, one }); // fall-through with two block params
+        const cont = try f.appendInst(header, bool_t, .{ .icmp = .{ .op = .le, .lhs = i, .rhs = n } });
+        try f.appendIf(header, cont, .{ .target = body, .args = &.{} }, .{ .target = exit, .args = &.{sum} });
+        const sum2 = try f.appendInst(body, t, .{ .arith = .{ .op = .add, .lhs = sum, .rhs = i } });
+        const ob = try f.appendInst(body, t, .{ .iconst = 1 });
+        const inext = try f.appendInst(body, t, .{ .arith = .{ .op = .add, .lhs = i, .rhs = ob } });
+        try f.setJump(body, header, &.{ sum2, inext }); // backward jump: a real jmp, not elided
         f.setTerminator(exit, .{ .ret = r });
         try expectRun(io, allocator, &f, &.{5}, 15, backend);
         try expectRun(io, allocator, &f, &.{10}, 55, backend);

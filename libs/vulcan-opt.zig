@@ -25,6 +25,7 @@ pub const lto = @import("vulcan-opt/lto.zig");
 pub const pgo = @import("vulcan-opt/pgo.zig");
 pub const lowerdiv = @import("vulcan-opt/lowerdiv.zig");
 pub const vectorize = @import("vulcan-opt/vectorize.zig");
+pub const blocklayout = @import("vulcan-opt/blocklayout.zig");
 pub const microarch = @import("vulcan-opt/microarch.zig");
 
 /// Default pipeline: constant folding, algebraic simplification, strength reduction, GVN/CSE, LICM,
@@ -46,7 +47,13 @@ pub const default_pipeline = [_]pass.Pass{
 /// Optimize `func` in place with the default pipeline. Returns whether anything
 /// changed.
 pub fn optimize(allocator: std.mem.Allocator, func: *ir.function.Function) pass.Error!bool {
-    return pass.runToFixpoint(allocator, func, &default_pipeline, 16);
+    const optimized = try pass.runToFixpoint(allocator, func, &default_pipeline, 16);
+    // Block layout is a ONE-SHOT run after the pipeline fixpoint, not an iterated pass: it computes a
+    // single fall-through-friendly linearization and permutes the blocks into it once. It is
+    // dominance-respecting by construction and falls back to the original order if unsure, so it is
+    // always safe on the machine-backend path.
+    const laid_out = try blocklayout.layout(allocator, func, null);
+    return optimized or laid_out;
 }
 
 test {

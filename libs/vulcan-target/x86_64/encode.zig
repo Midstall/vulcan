@@ -653,6 +653,28 @@ pub const Cond = enum(u8) {
     np = 0xB, // not parity (an ordered float compare)
 };
 
+/// The logical inverse of a condition. In the x86 condition-code encoding bit 0 toggles the
+/// sense, so the inverse is the paired code: e<->ne, l<->ge, le<->g, b<->ae, be<->a, p<->np.
+/// Used to fall through the ELSE edge of an `if` by branching to the else label on the inverted
+/// predicate (jnz becomes jz). Exhaustive over `Cond` so a newly added condition forces a
+/// matching inverse here.
+pub fn invertCond(cond: Cond) Cond {
+    return switch (cond) {
+        .e => .ne,
+        .ne => .e,
+        .l => .ge,
+        .ge => .l,
+        .le => .g,
+        .g => .le,
+        .b => .ae,
+        .ae => .b,
+        .be => .a,
+        .a => .be,
+        .p => .np,
+        .np => .p,
+    };
+}
+
 /// `cmovcc dst, src` (0F 40+cc /r): move `src` into `dst` if the condition holds.
 pub fn cmovcc(dst: Reg, src: Reg, cond: Cond) Inst {
     return Inst.of(&.{ rexW(dst, src), 0x0F, 0x40 | @intFromEnum(cond), modrm(dst, src) });
@@ -1188,6 +1210,26 @@ test "control-flow encodings" {
     try std.testing.expectEqualSlices(u8, &.{ 0x0F, 0x85, 0x00, 0x00, 0x00, 0x00 }, jcc(.ne, 0).slice()); // jne
     try std.testing.expectEqualSlices(u8, &.{ 0xE9, 0x05, 0x00, 0x00, 0x00 }, jmp(5).slice()); // jmp +5
     try std.testing.expectEqualSlices(u8, &.{ 0x48, 0x0F, 0x45, 0xC3 }, cmovcc(.rax, .rbx, .ne).slice()); // cmovne rax, rbx
+}
+
+test "invertCond pairs every condition with its logical inverse" {
+    try std.testing.expectEqual(Cond.e, invertCond(.ne));
+    try std.testing.expectEqual(Cond.ne, invertCond(.e));
+    try std.testing.expectEqual(Cond.ge, invertCond(.l));
+    try std.testing.expectEqual(Cond.l, invertCond(.ge));
+    try std.testing.expectEqual(Cond.g, invertCond(.le));
+    try std.testing.expectEqual(Cond.le, invertCond(.g));
+    try std.testing.expectEqual(Cond.ae, invertCond(.b));
+    try std.testing.expectEqual(Cond.b, invertCond(.ae));
+    try std.testing.expectEqual(Cond.a, invertCond(.be));
+    try std.testing.expectEqual(Cond.be, invertCond(.a));
+    try std.testing.expectEqual(Cond.np, invertCond(.p));
+    try std.testing.expectEqual(Cond.p, invertCond(.np));
+    // The inverse is an involution and the low bit toggles the sense.
+    inline for (std.meta.tags(Cond)) |c| {
+        try std.testing.expectEqual(c, invertCond(invertCond(c)));
+        try std.testing.expectEqual(@intFromEnum(c) ^ 1, @intFromEnum(invertCond(c)));
+    }
 }
 
 test "division and shift encodings" {

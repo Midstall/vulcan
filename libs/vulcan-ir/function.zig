@@ -858,6 +858,78 @@ pub const Function = struct {
         try data.insts.appendSlice(self.allocator, insts);
     }
 
+    /// Permute the function's blocks into `order` (`order[i]` is the OLD block that becomes new
+    /// index `i`) and remap every block reference to the new ids. `order` must be a permutation of
+    /// `0..blockCount()` with `order[0]` the entry (Block 0), which stays first. Block params/
+    /// insts/terminator travel with each block: the `BlockData` structs are moved (their
+    /// `ArrayList` handles relocated), never copied field-by-field, so no inner list is
+    /// reallocated or double-freed. Values are function-global, so reordering blocks needs no
+    /// value remap. The CFG (edges) is unchanged, only the linear order differs. Foundation for
+    /// the block-layout pass.
+    ///
+    /// CAVEAT: this remaps block references in terminators and `@"if"` edges only. It does NOT remap
+    /// block ids encoded in ATTRIBUTES (`AttrTarget.block` keys, or the glsl/wasm/spirv structured
+    /// control-flow "cf" custom attributes that store merge/continue block ids as int payloads). A
+    /// caller must not reorder a function that carries block-keyed attributes, or it would leave those
+    /// references stale. The block-layout pass (item 5) runs only on the machine-backend path and
+    /// must skip any function with such attributes.
+    pub fn reorderBlocks(self: *Function, allocator: std.mem.Allocator, order: []const Block) std.mem.Allocator.Error!void {
+        const n = self.blockCount();
+        std.debug.assert(order.len == n);
+        std.debug.assert(order[0] == @as(Block, @enumFromInt(0))); // entry stays first
+
+        // order must be a permutation of 0..n: every old id appears exactly once.
+        const seen = try allocator.alloc(bool, n);
+        defer allocator.free(seen);
+        @memset(seen, false);
+        for (order) |old| {
+            const old_index = @intFromEnum(old);
+            std.debug.assert(old_index < n);
+            std.debug.assert(!seen[old_index]); // no id repeated
+            seen[old_index] = true;
+        }
+
+        // new_id[old block index] = new block index.
+        const new_id = try allocator.alloc(u32, n);
+        defer allocator.free(new_id);
+        for (order, 0..) |old, new_index| new_id[@intFromEnum(old)] = @intCast(new_index);
+
+        // Permute the BlockData structs themselves: tmp[i] takes ownership of the storage that
+        // used to live at the old index, then the memcpy-back writes those (moved, not copied)
+        // structs into their new slots. No inner ArrayList is touched, so nothing is freed twice.
+        const tmp = try allocator.alloc(BlockData, n);
+        defer allocator.free(tmp);
+        for (order, 0..) |old, new_index| tmp[new_index] = self.blocks.items[@intFromEnum(old)];
+        @memcpy(self.blocks.items, tmp);
+
+        // Remap every block reference (terminator jump targets, `if` then/else targets) through
+        // new_id. Values are function-global, so nothing else needs remapping.
+        var bi: usize = 0;
+        while (bi < n) : (bi += 1) {
+            const block: Block = @enumFromInt(bi);
+            const tp = self.terminatorPtr(block);
+            if (tp.*) |*t| switch (t.*) {
+                .ret => {},
+                .jump => |*j| {
+                    const mapped = new_id[@intFromEnum(j.target)];
+                    std.debug.assert(mapped < n);
+                    j.target = @enumFromInt(mapped);
+                },
+            };
+            for (self.blockInsts(block)) |inst| {
+                const op = self.opcodeMut(inst);
+                if (op.* == .@"if") {
+                    const then_mapped = new_id[@intFromEnum(op.@"if".then.target)];
+                    const else_mapped = new_id[@intFromEnum(op.@"if".@"else".target)];
+                    std.debug.assert(then_mapped < n);
+                    std.debug.assert(else_mapped < n);
+                    op.@"if".then.target = @enumFromInt(then_mapped);
+                    op.@"if".@"else".target = @enumFromInt(else_mapped);
+                }
+            }
+        }
+    }
+
     /// Intern a run of values into the value-list pool (for variadic operands).
     pub fn internValueList(self: *Function, vals: []const Value) std.mem.Allocator.Error!ValueList {
         return self.internValues(vals);
@@ -1735,4 +1807,117 @@ test "functionUsesF16 sees f16 nested inside a struct field" {
     _ = try func.appendBlockParam(block, struct_t);
 
     try std.testing.expect(functionUsesF16(&func));
+}
+
+const verify = @import("verify.zig");
+
+test "reorderBlocks permutes a 3-block chain and remaps jump targets" {
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+
+    // entry(block0) -> block1 -> block2, a straight-line chain. block1 carries a
+    // distinguishing const (99) so we can tell it apart after the move.
+    const entry = try func.appendBlock();
+    const mid = try func.appendBlock();
+    const tail = try func.appendBlock();
+
+    const marker = try func.appendInst(mid, i32_t, .{ .iconst = 99 });
+    try func.setJump(entry, mid, &.{});
+    try func.setJump(mid, tail, &.{});
+    func.setTerminator(tail, .{ .ret = null });
+    _ = marker;
+
+    // New order: entry stays first, old tail moves to index 1, old mid to index 2.
+    try func.reorderBlocks(std.testing.allocator, &.{ entry, tail, mid });
+
+    // New index 1 now holds the old tail block (empty, ret void terminator).
+    const new_tail: Block = @enumFromInt(1);
+    try std.testing.expectEqual(@as(usize, 0), func.blockInsts(new_tail).len);
+    try std.testing.expectEqual(Terminator{ .ret = null }, func.terminator(new_tail).?);
+
+    // New index 2 now holds the old mid block, carrying the marker const and its jump.
+    const new_mid: Block = @enumFromInt(2);
+    const new_mid_insts = func.blockInsts(new_mid);
+    try std.testing.expectEqual(@as(usize, 1), new_mid_insts.len);
+    try std.testing.expectEqual(@as(i64, 99), func.opcode(new_mid_insts[0]).iconst);
+
+    // The CFG edges are preserved under the new ids: entry -> new_mid (old mid is now index 2),
+    // new_mid -> new_tail (old tail is now index 1).
+    try std.testing.expectEqual(new_mid, func.terminator(entry).?.jump.target);
+    try std.testing.expectEqual(new_tail, func.terminator(new_mid).?.jump.target);
+
+    var d = try verify.verify(std.testing.allocator, &func, .high);
+    defer d.deinit();
+    try std.testing.expect(d.ok());
+}
+
+test "reorderBlocks remaps if then/else edges" {
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+
+    const bool_t = try func.types.intern(.bool);
+
+    // An if-diamond: block0 -[if]-> then=block1, else=block2, both jump to merge=block3.
+    const entry = try func.appendBlock();
+    const then_b = try func.appendBlock();
+    const else_b = try func.appendBlock();
+    const merge = try func.appendBlock();
+
+    const cond = try func.appendInst(entry, bool_t, .{ .iconst = 1 });
+    try func.appendIf(entry, cond, .{ .target = then_b }, .{ .target = else_b });
+    try func.setJump(then_b, merge, &.{});
+    try func.setJump(else_b, merge, &.{});
+    func.setTerminator(merge, .{ .ret = null });
+
+    // Swap then_b and else_b's positions (and move merge before else_b).
+    try func.reorderBlocks(std.testing.allocator, &.{ entry, else_b, then_b, merge });
+
+    const new_then: Block = @enumFromInt(2); // old then_b
+    const new_else: Block = @enumFromInt(1); // old else_b
+    const new_merge: Block = @enumFromInt(3); // old merge, unchanged position
+
+    const if_inst = func.blockInsts(entry)[func.blockInsts(entry).len - 1];
+    const cf = func.opcode(if_inst).@"if";
+    try std.testing.expectEqual(new_then, cf.then.target);
+    try std.testing.expectEqual(new_else, cf.@"else".target);
+
+    // Both original branches still land on merge, under its new id.
+    try std.testing.expectEqual(new_merge, func.terminator(new_then).?.jump.target);
+    try std.testing.expectEqual(new_merge, func.terminator(new_else).?.jump.target);
+
+    var d = try verify.verify(std.testing.allocator, &func, .high);
+    defer d.deinit();
+    try std.testing.expect(d.ok());
+}
+
+test "reorderBlocks identity permutation leaves the function unchanged" {
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+
+    const bool_t = try func.types.intern(.bool);
+
+    const entry = try func.appendBlock();
+    const then_b = try func.appendBlock();
+    const else_b = try func.appendBlock();
+
+    const cond = try func.appendInst(entry, bool_t, .{ .iconst = 1 });
+    try func.appendIf(entry, cond, .{ .target = then_b }, .{ .target = else_b });
+    func.setTerminator(then_b, .{ .ret = null });
+    func.setTerminator(else_b, .{ .ret = null });
+
+    const before = try std.fmt.allocPrint(std.testing.allocator, "{f}", .{func});
+    defer std.testing.allocator.free(before);
+
+    try func.reorderBlocks(std.testing.allocator, &.{ entry, then_b, else_b });
+
+    const after = try std.fmt.allocPrint(std.testing.allocator, "{f}", .{func});
+    defer std.testing.allocator.free(after);
+
+    try std.testing.expectEqualStrings(before, after);
+
+    var d = try verify.verify(std.testing.allocator, &func, .high);
+    defer d.deinit();
+    try std.testing.expect(d.ok());
 }

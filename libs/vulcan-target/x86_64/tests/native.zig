@@ -112,11 +112,10 @@ test "codegen+disasm round-trip: control flow (max via if/else)" {
         \\0011: test rdi, rdi
         \\0014: jne .+8
         \\001a: mov rdi, r8
-        \\001d: jmp .+8
+        \\001d: jmp .+3
         \\0022: mov rdi, r9
-        \\0025: jmp .+0
-        \\002a: mov rax, rdi
-        \\002d: ret
+        \\0025: mov rax, rdi
+        \\0028: ret
         \\
     , text);
 }
