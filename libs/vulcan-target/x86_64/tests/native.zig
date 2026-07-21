@@ -73,13 +73,12 @@ test "codegen+disasm round-trip: integer add" {
     defer a.free(code);
     const text = try disasm.format(a, code);
     defer a.free(text);
+    // The shared Wimmer allocator (SP2 production flip) keeps the two params in their ABI registers
+    // and the result in rax, so the add is `x += y` in place with no shuffle moves.
     try std.testing.expectEqualStrings(
-        \\0000: mov r9, rdi
-        \\0003: mov r8, rsi
-        \\0006: mov rdi, r9
-        \\0009: add edi, r8d
-        \\000c: mov rax, rdi
-        \\000f: ret
+        \\0000: mov rax, rdi
+        \\0003: add eax, esi
+        \\0005: ret
         \\
     , text);
 }
@@ -104,19 +103,22 @@ test "codegen+disasm round-trip: control flow (max via if/else)" {
     defer a.free(code);
     const text = try disasm.format(a, code);
     defer a.free(text);
+    // The shared Wimmer allocator (SP2 production flip) SPLITS the two critical edges e->m, so each
+    // arm reaches the join `m` through its own forwarding block (the extra `jmp`s), where the phi
+    // move places the taken value in rax before falling into the return.
     try std.testing.expectEqualStrings(
-        \\0000: mov r9, rdi
-        \\0003: mov r8, rsi
-        \\0006: cmp r9d, r8d
-        \\0009: setg dil
-        \\000d: movzx rdi, dil
-        \\0011: test rdi, rdi
-        \\0014: jne .+8
-        \\001a: mov rdi, r8
-        \\001d: jmp .+3
-        \\0022: mov rdi, r9
-        \\0025: mov rax, rdi
-        \\0028: ret
+        \\0000: cmp edi, esi
+        \\0002: setg al
+        \\0006: movzx rax, al
+        \\000a: test rax, rax
+        \\000d: jne .+5
+        \\0013: jmp .+14
+        \\0018: jmp .+1
+        \\001d: ret
+        \\001e: mov rax, rdi
+        \\0021: jmp .-9
+        \\0026: mov rax, rsi
+        \\0029: jmp .-17
         \\
     , text);
 }

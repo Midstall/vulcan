@@ -897,14 +897,12 @@ fn secondChanceReHome(io: std.Io, allocator: std.mem.Allocator, backend: h.Backe
 }
 
 fn secondChanceDecline(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {
-    // A sustained-pressure kernel where second-chance CANNOT save every split value. Six early
-    // `sp[i] = a*(i+1)` products are defined first and used only late, so under pressure they
+    // A sustained-pressure kernel where many values must spill and reload under a full register pool.
+    // Six early `sp[i] = a*(i+1)` products are defined first and used only late, so under pressure they
     // TAIL-SPLIT (their far next use makes them the Belady victims). Twelve `res[i] = b + const`
     // values are then defined and used TWICE (once before and once after the sp uses), so they stay
-    // register-resident and occupy every register ACROSS the sp uses. With the pool full at those
-    // uses, second-chance has no free register to re-home some split sp values, so they fall back to
-    // per-use slot reloads. This exercises the DECLINE path (`free` empty) alongside the re-homes,
-    // and the result is correct only if every reload (re-homed or per-use) is right.
+    // register-resident and occupy every register ACROSS the sp uses. The result is correct only if
+    // every spill store and reload round-trips the right bits under this sustained pressure.
     const nspill = 6;
     const nres = 12;
     var f = Function.init(allocator);
@@ -929,12 +927,14 @@ fn secondChanceDecline(io: std.Io, allocator: std.mem.Allocator, backend: h.Back
     for (0..nres) |i| acc = try f.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = res[i] } });
     f.setTerminator(b, .{ .ret = acc });
 
-    // Meaningful gate: more values TAIL-SPLIT than were RE-HOMED, i.e. at least one split value found
-    // no free register at its tail use and DECLINED (stayed in its slot, reloading per use). Both the
-    // re-home path and the decline path are thus exercised in one kernel.
+    // Meaningful gate: under the shared Wimmer allocator this kernel both SPLITS values (spilled
+    // under pressure) and RE-HOMES some (a spill slot reloaded back into a register for a later use,
+    // since every x86 use needs a register), so the spill store AND the reload-into-register paths are
+    // both exercised. (Unlike the retired native allocator, Wimmer has no per-use "decline" path: a
+    // reused spilled value is always reloaded into a register segment, so `segs == rehomes` here.)
     const segs = try isel.splitCountForTest(allocator, &f);
     const rehomes = try isel.reHomeCountForTest(allocator, &f);
-    try std.testing.expect(segs > rehomes);
+    try std.testing.expect(segs > 0 and rehomes > 0);
 
     // result = 2*sum_i(b + 100 + i) + sum_i(a*(i+1)), i32 wrapping arithmetic, read mod 256.
     const inputs = [_][2]i32{ .{ 0, 0 }, .{ 1, 0 }, .{ 0, 1 }, .{ -1, -1 }, .{ 3, 5 }, .{ -2, 1 }, .{ 7, -9 }, .{ 100, 25 }, .{ -37, 41 } };
@@ -998,13 +998,16 @@ fn terminatorReHome(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend
 
 fn tailSplit(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {
     // Force an intra-block tail split: `v = a + 100` is defined early and used ONLY at the very
-    // end, so its next use is the furthest of any live value. Ten temporaries `t_k = a + k` all
-    // live until summed drive pressure past the seven-register GPR pool, so eviction picks `v`
-    // (furthest next use) and TAIL-SPLITS it: its register serves the hot prefix, a stack slot the
-    // cold tail, with a store at the split point. The final `res = (sum t_k) + v` reloads `v` from
-    // that slot, so a mis-drained store (saving after the taker overwrote the register) would give
-    // the wrong result. Swept over inputs and checked bit-identical against a Zig reference:
-    //   res = (11 * a) + 155  for ten temporaries (sum_{k=1..10}(a+k) = 10a + 55, plus a + 100).
+    // end, so its next use is the furthest of any live value. Twenty temporaries `t_k = a + k` all
+    // live until summed drive pressure well past the twelve-register GPR pool (the shared Wimmer
+    // allocator's pool, which unlike the retired native pool includes the callee-saved registers),
+    // so eviction picks `v` (furthest next use) and TAIL-SPLITS it: its register serves the hot
+    // prefix, a stack slot the cold tail, with a store at the split point. The final
+    // `res = (sum t_k) + v` reloads `v` from that slot, so a mis-drained store (saving after the
+    // taker overwrote the register) would give the wrong result. Swept over inputs and checked
+    // bit-identical against a Zig reference:
+    //   res = (21 * a) + 310  (sum_{k=1..20}(a+k) = 20a + 210, plus a + 100).
+    const nterm = 20;
     for ([_]i64{ 3, 5, 7 }) |av| {
         var f = Function.init(allocator);
         defer f.deinit();
@@ -1012,10 +1015,10 @@ fn tailSplit(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void
         const b = try f.appendBlock();
         const a = try f.appendBlockParam(b, t);
         const v = try f.appendArithImm(b, t, .add, a, 100); // long-lived, used only at the end
-        var terms: [10]ir.function.Value = undefined;
-        for (0..10) |k| terms[k] = try f.appendArithImm(b, t, .add, a, @intCast(k + 1));
+        var terms: [nterm]ir.function.Value = undefined;
+        for (0..nterm) |k| terms[k] = try f.appendArithImm(b, t, .add, a, @intCast(k + 1));
         var acc = terms[0];
-        for (1..10) |k| acc = try f.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = terms[k] } });
+        for (1..nterm) |k| acc = try f.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = terms[k] } });
         const res = try f.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = v } }); // v's sole use
         f.setTerminator(b, .{ .ret = res });
 
@@ -1023,7 +1026,7 @@ fn tailSplit(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void
         try std.testing.expect(try isel.splitCountForTest(allocator, &f) > 0);
 
         var expected: i64 = av + 100; // v
-        for (1..11) |k| expected += av + @as(i64, @intCast(k)); // sum of the temporaries
+        for (1..nterm + 1) |k| expected += av + @as(i64, @intCast(k)); // sum of the temporaries
         try expectRun(io, allocator, &f, &.{av}, expected, backend);
     }
 }

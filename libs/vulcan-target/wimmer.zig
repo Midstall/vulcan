@@ -1257,7 +1257,18 @@ fn allocateBlockedReg(
     // clobber, so split it before the block and re-allocate the far side.
     if (block_pos[reg] < current.end()) {
         const bp = block_pos[reg];
-        std.debug.assert(bp > p);
+        // `bp <= p` means the clobber falls AT `current`'s very start, which is not a legal split
+        // point (`splitInterval` needs pos > start). This arises when `current` is a value used AT `p`
+        // and ALSO live past a clobber it cannot escape (e.g. an xmm value that is a call ARGUMENT and
+        // live across the call, in a class with no callee-saved register). It cannot bridge the clobber
+        // in `reg`, so it must live in a slot across it: spill `current` instead of splitting. The
+        // occupants evicted above are simply re-allocated (harmless). `spillCurrent` still bails
+        // `error.Unsupported` if `current` has a MUST_HAVE use at its start (a demand no slot can
+        // satisfy); a target whose uses may read from a slot (`should_have_register`) spills cleanly.
+        if (bp <= p) {
+            try spillCurrent(allocator, current, unhandled, children, slots, class_idx);
+            return;
+        }
         const tail = try splitInterval(allocator, current, bp, children);
         try insertSorted(allocator, unhandled, tail);
     }
