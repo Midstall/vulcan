@@ -419,7 +419,14 @@ test "qemu-user-riscv: a loop's backward conditional branch past -4KiB relaxes a
     // actually goes backward (to the loop header), not forward.
     const text = try disasm.format(a, words.items);
     defer a.free(text);
-    try std.testing.expect(std.mem.indexOf(u8, text, ".+8\n") != null);
+    // Relaxation inverts the too-far backward branch into a FORWARD short branch that skips the exit
+    // epilogue and lands on an unconditional `j` with a NEGATIVE (backward) displacement to the loop
+    // header. The skip distance is the length of the exit path it hops over: under the shared Wimmer
+    // allocator the loop draws more callee-saved registers than the retired native linear scan, so the
+    // epilogue that restores them is longer and the inverted branch skips `.+36` (nine words: the
+    // done-block reload/return sequence) rather than the old `.+8`. The backward `j` and the qemu
+    // execution of BOTH edges below are what keep this proving real relaxation, not the exact skip.
+    try std.testing.expect(std.mem.indexOf(u8, text, ".+36\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "j .-") != null);
 
     // Execute under qemu (skips cleanly if qemu is absent). Each iteration accumulates

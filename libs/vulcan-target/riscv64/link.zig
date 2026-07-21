@@ -157,17 +157,20 @@ test "links an intra-module call to a real jal offset" {
     var linked = try compileModule(allocator, &module);
     defer linked.deinit(allocator);
 
-    // callee is a leaf (one `jalr`). Caller is non-leaf, so it opens a frame and
-    // saves/restores ra around the call. Its `jal` (at word 3) targets callee at
-    // word 0, a -12 byte offset. No external relocs remain.
+    // callee is a leaf (one `jalr`). Caller is non-leaf, so it opens a frame and saves/restores ra
+    // around the call. The shared Wimmer allocator parks the call result in callee-saved x9, so the
+    // caller also saves/restores x9, which pushes its `jal` (now at word 4) to a -16 byte backward
+    // offset to callee at word 0. No external relocs remain.
     try std.testing.expectEqualSlices(u32, &.{
         encode.jalr(.x0, .x1, 0), // callee: ret
         encode.addi(.x2, .x2, -16), // caller: open frame
-        encode.sd(.x1, .x2, 0), // caller: save ra
-        encode.jal(.x1, -12), // caller: call callee  (resolved)
-        encode.addi(.x5, .x10, 0), // r = a0
-        encode.addi(.x10, .x5, 0), // mv a0, r
-        encode.ld(.x1, .x2, 0), // caller: restore ra
+        encode.sd(.x1, .x2, 8), // caller: save ra
+        encode.sd(.x9, .x2, 0), // caller: save x9 (holds the result)
+        encode.jal(.x1, -16), // caller: call callee  (resolved)
+        encode.addi(.x9, .x10, 0), // r = a0  (into callee-saved x9)
+        encode.addi(.x10, .x9, 0), // mv a0, r
+        encode.ld(.x1, .x2, 8), // caller: restore ra
+        encode.ld(.x9, .x2, 0), // caller: restore x9
         encode.addi(.x2, .x2, 16), // caller: close frame
         encode.jalr(.x0, .x1, 0), // caller: ret
     }, linked.code);
@@ -195,5 +198,7 @@ test "an unresolved external call stays a relocation" {
 
     try std.testing.expectEqual(@as(usize, 1), linked.relocs.len);
     try std.testing.expectEqualStrings("external", linked.relocs[0].symbol);
-    try std.testing.expectEqual(@as(usize, 2), linked.relocs[0].offset); // caller@0 + jal@2 (after prologue)
+    // caller@0 then prologue (frame open + save ra + save the callee-saved x9 that the shared Wimmer
+    // allocator parks the result in), so the `jal` lands at word 3 and its relocation is unresolved.
+    try std.testing.expectEqual(@as(usize, 3), linked.relocs[0].offset);
 }
