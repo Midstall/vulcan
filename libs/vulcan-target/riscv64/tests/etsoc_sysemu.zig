@@ -3606,15 +3606,12 @@ test "wimmer-vpu: a vpu vector live across a call spills across the call (not an
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    // The NATIVE allocator STILL bails `error.Unsupported` on a vpu vector live across a call (every
-    // f16..f27 is caller-saved and it has no vpu vector split), so there is no native reference to
-    // diff against: that limitation is exactly what the shared Wimmer path removes here. Confirm the
-    // native path really cannot compile this shape (documents why the oracle is the host reference).
-    var native_probe = Function.init(allocator);
-    defer native_probe.deinit();
-    try buildVpuAcrossCallCaller(&native_probe);
+    // A vpu vector live across a call has NO native reference to diff against (the retired native
+    // allocator bailed `error.Unsupported` on it - every f16..f27 is caller-saved and it had no vpu
+    // vector split - and `selectFunctionForModel` is now itself the shared Wimmer path, so it no longer
+    // bails). That limitation is exactly what the shared Wimmer path removes here, so the oracle is the
+    // host reference computed below.
     const model = mm.modelFor(.@"et-soc");
-    try std.testing.expectError(error.Unsupported, isel.selectFunctionForModel(allocator, &native_probe, model));
 
     // Wimmer: caller through the SHARED allocator (this MUST succeed), callee through the native
     // path, linked and run. `va` spills across the call and reloads afterward.
@@ -3645,5 +3642,117 @@ test "wimmer-vpu: a vpu vector live across a call spills across the call (not an
     // `va` survived the call: out[i] = a[i], lane for lane.
     for (0..8) |i| {
         try std.testing.expectEqual(@as(u32, @bitCast(in_a[i])), @as(u32, @bitCast(got[i])));
+    }
+}
+
+/// Build the VPU cross-block edge kernel `f(a, b, out)`: a diamond whose merge block takes a
+/// `<8 x f32>` block param fed from BOTH arms, so the arm->merge jump edges each carry a vpu vector
+/// argument and the shared allocator must realize a CLASS-3 EDGE MOVE (reg->reg through the reserved
+/// `vpu_pack_base` scratch, or reg->slot `fsw.ps` under pressure) to land each arm's result in the
+/// merge param's location. `vb` is defined in `entry` and used in BOTH arms, so it is a cross-block
+/// VPU value live across the branch (held in a vpu register the whole diamond, no call clobbers it).
+///
+/// The branch reads an i32 reinterpreted from `b[0]`'s bits (`c = load i32 (ptr_b)`), so the arm taken
+/// is controlled by the sign of `in_b[0]` as a float (a positive f32 has a positive i32 bit pattern):
+///   cond = c > 0 TRUE  -> arm A -> out[i] = a[i] + b[i]
+///   cond = c > 0 FALSE -> arm B -> out[i] = 2 * b[i]
+/// so the two input sets below drive the two arms, each landing its result through an edge move.
+fn buildVpuEdgeKernel(func: *Function) !void {
+    const V = ir.function.Value;
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const v8 = try func.types.intern(.{ .vector = .{ .len = 8, .elem = f32_t } });
+    const ptr_t = try func.types.intern(.ptr);
+
+    const entry = try func.appendBlock();
+    const arm_a = try func.appendBlock();
+    const arm_b = try func.appendBlock();
+    const merge = try func.appendBlock();
+
+    const ptr_a = try func.appendBlockParam(entry, ptr_t);
+    const ptr_b = try func.appendBlockParam(entry, ptr_t);
+    const ptr_out = try func.appendBlockParam(entry, ptr_t);
+
+    var av: [8]V = undefined;
+    for (0..8) |i| {
+        const addr_a = try func.appendArithImm(entry, ptr_t, .add, ptr_a, @intCast(i * 4));
+        av[i] = try func.appendInst(entry, f32_t, .{ .load = .{ .ptr = addr_a } });
+    }
+    const va = try func.appendInst(entry, v8, .{ .struct_new = .{ .fields = try func.internValueList(&av) } });
+    var bv: [8]V = undefined;
+    for (0..8) |i| {
+        const addr_b = try func.appendArithImm(entry, ptr_t, .add, ptr_b, @intCast(i * 4));
+        bv[i] = try func.appendInst(entry, f32_t, .{ .load = .{ .ptr = addr_b } });
+    }
+    const vb = try func.appendInst(entry, v8, .{ .struct_new = .{ .fields = try func.internValueList(&bv) } });
+
+    // The branch condition: b[0]'s raw bits read as an i32, compared against zero. Kept a plain
+    // runtime value (not a constant) so isel emits both arms and the merge really has two live preds.
+    const c = try func.appendInst(entry, i32_t, .{ .load = .{ .ptr = ptr_b } });
+    const zero = try func.appendInst(entry, i32_t, .{ .iconst = 0 });
+    const cond = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .gt, .lhs = c, .rhs = zero } });
+    try func.appendIf(entry, cond, .{ .target = arm_a }, .{ .target = arm_b });
+
+    // Arm A: va + vb. Arm B: vb + vb (= 2*b). Both consume `vb` (the cross-block value), and each
+    // hands its OWN result to the merge param, so at least one arm needs a real edge move.
+    const v_a = try func.appendInst(arm_a, v8, .{ .arith = .{ .op = .add, .lhs = va, .rhs = vb } });
+    try func.setJump(arm_a, merge, &.{v_a});
+    const v_b = try func.appendInst(arm_b, v8, .{ .arith = .{ .op = .add, .lhs = vb, .rhs = vb } });
+    try func.setJump(arm_b, merge, &.{v_b});
+
+    const vp = try func.appendBlockParam(merge, v8);
+    for (0..8) |i| {
+        const cc = try func.appendInst(merge, f32_t, .{ .extract = .{ .aggregate = vp, .index = @intCast(i) } });
+        const addr_out = try func.appendArithImm(merge, ptr_t, .add, ptr_out, @intCast(i * 4));
+        try func.appendStore(merge, cc, addr_out);
+    }
+    func.setTerminator(merge, .{ .ret = null });
+}
+
+test "wimmer-vpu: a vpu vector carried across a cross-block edge matches (class-3 edge move)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const model = mm.modelFor(.@"et-soc");
+    try std.testing.expect(model.vpu());
+
+    // Two input sets: in_b[0] positive (bits > 0 as i32) takes arm A (a + b); in_b[0] negative (sign
+    // bit set, a negative i32) takes arm B (2 * b). Both drive a vpu vector through an edge move.
+    const Case = struct { b0: f32, arm_a: bool };
+    const cases = [_]Case{ .{ .b0 = 2.0, .arm_a = true }, .{ .b0 = -1.0, .arm_a = false } };
+    for (cases) |case| {
+        const in_a = [8]f32{ 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0 };
+        const in_b = [8]f32{ case.b0, 20.0, -3.0, 0.0, 100.0, -0.5, 42.0, 1000.0 };
+
+        // A vpu vector carried across a block edge has no native reference to diff against (the retired
+        // native path bailed `error.Unsupported` on it - there is no whole-vector VPU move instruction,
+        // so it refused to guess a move sequence - and `selectFunctionForModel` is now itself the shared
+        // Wimmer path, which resolves it with class-3 edge moves). The oracle is the host ground truth.
+
+        // Wimmer: the diamond through the SHARED allocator in vpu mode. The merge block param is a
+        // `<8 x f32>` fed from both arms, so class-3 edge moves resolve it. This MUST compile (a
+        // class-3 edge-move bail would be `error.Unsupported`) and runs unconditionally.
+        var wim_func = Function.init(allocator);
+        defer wim_func.deinit();
+        try buildVpuEdgeKernel(&wim_func);
+        var wim = try compileVpuWimmer(allocator, &wim_func);
+        defer wim.deinit(allocator);
+        try std.testing.expect(hasVpuMaskPreamble(wim.code));
+        // Proof a real class-3 EDGE MOVE engaged (not coalesced away): this kernel has NO spill (only
+        // ~3 live vpu vectors < 12 registers) and NO call, and its `struct_new` packs use scalar `fsw`,
+        // not `fsw.ps`. So the one `fsw.ps` here can only be the reg->reg edge move's `vpu_pack_base`
+        // round trip (`fsw.ps` then `flw.ps`) that lands an arm's result in the merge param's register.
+        try std.testing.expect(countFswPs(wim.code) > 0);
+
+        const got = runVpuKernel(io, allocator, wim.code, in_a, in_b) catch |e| switch (e) {
+            error.SkipZigTest => return error.SkipZigTest,
+            else => return e,
+        };
+        // Diff against the host f32 ground truth, lane for lane. `a[i] + b[i]` (arm A) and `2*b[i]`
+        // (arm B) are exact for these small-integer inputs, so single-rounding VPU adds match exactly.
+        for (0..8) |i| {
+            const expected: f32 = if (case.arm_a) in_a[i] + in_b[i] else in_b[i] + in_b[i];
+            try std.testing.expectEqual(@as(u32, @bitCast(expected)), @as(u32, @bitCast(got[i])));
+        }
     }
 }

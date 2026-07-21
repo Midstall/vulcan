@@ -195,7 +195,7 @@ test "riscv64 description: non-vpu int + float pools and entry param pinning" {
     _ = fsum;
     func.setTerminator(b, .{ .ret = isum });
 
-    var desc = try riscv64.riscv64RegDescription(allocator, &func, false);
+    var desc = try riscv64.riscv64RegDescription(allocator, &func, false, false);
     defer desc.deinit(allocator);
 
     // Four classes: 0 int, 1 float, 2 RVV-vector, 3 VPU-vector.
@@ -268,7 +268,7 @@ test "riscv64 description: a call clobbers caller-saved of every class incl all 
     const sum = try func.appendInst(b, i32t, .{ .arith = .{ .op = .add, .lhs = called, .rhs = x } });
     func.setTerminator(b, .{ .ret = sum });
 
-    var desc = try riscv64.riscv64RegDescription(allocator, &func, false);
+    var desc = try riscv64.riscv64RegDescription(allocator, &func, false, false);
     defer desc.deinit(allocator);
 
     try std.testing.expect(desc.call_sites.len >= 1);
@@ -297,6 +297,39 @@ test "riscv64 description: a call clobbers caller-saved of every class incl all 
     try std.testing.expectEqual(@as(usize, 0), vpu_clob.len);
 }
 
+test "riscv64 description: software-f16 shrinks class 0 to x5/x7 and drops x28..x31 from the clobber list" {
+    // SP3 Task 2, Gap B: `uses_f16 = true` mirrors the OLD `compileFunction`'s `reserve_f16_scratch`
+    // gate (x28..x31 are the software f16 convert scratch, unconditionally clobbered by
+    // `emitHalfToFloat`/`emitFloatToHalf` at every f16 boundary). Both the allocatable set and the
+    // per-call clobber list must exclude them, so the shared allocator never places a live value there.
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const b = try func.appendBlock();
+    const x = try func.appendBlockParam(b, i32t);
+    const called = try func.appendCall(b, i32t, "callee", &.{x});
+    const sum = try func.appendInst(b, i32t, .{ .arith = .{ .op = .add, .lhs = called, .rhs = x } });
+    func.setTerminator(b, .{ .ret = sum });
+
+    var desc = try riscv64.riscv64RegDescription(allocator, &func, false, true);
+    defer desc.deinit(allocator);
+
+    // Class 0 allocatable: x5/x7 (the shrunk temp slice) + the 11 callee-saved (x9/x18..x27) = 13.
+    try std.testing.expectEqual(@as(usize, 13), desc.classes[0].allocatable.len);
+    for ([_]u16{ 5, 7 }) |idx| try std.testing.expect(contains(desc.classes[0].allocatable, idx));
+    for ([_]u16{ 28, 29, 30, 31 }) |idx| try std.testing.expect(!contains(desc.classes[0].allocatable, idx));
+    for ([_]u16{ 9, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27 }) |idx| try std.testing.expect(contains(desc.classes[0].allocatable, idx));
+
+    // The per-call clobber list matches: x5/x7 clobbered, x28..x31 NOT (nothing is ever allocated
+    // there, so treating them as call-clobbered would be a stray, meaningless fixed interval).
+    try std.testing.expect(desc.call_sites.len >= 1);
+    const cs = desc.call_sites[0];
+    const int_clob = clobberOf(cs, 0).?;
+    for ([_]u16{ 5, 7 }) |idx| try std.testing.expect(contains(int_clob, idx));
+    for ([_]u16{ 28, 29, 30, 31 }) |idx| try std.testing.expect(!contains(int_clob, idx));
+}
+
 test "riscv64 description: vpu mode swaps the vector class and narrows the float pool" {
     const allocator = std.testing.allocator;
     var func = Function.init(allocator);
@@ -308,7 +341,7 @@ test "riscv64 description: vpu mode swaps the vector class and narrows the float
     const sum = try func.appendInst(b, i32t, .{ .arith = .{ .op = .add, .lhs = called, .rhs = x } });
     func.setTerminator(b, .{ .ret = sum });
 
-    var desc = try riscv64.riscv64RegDescription(allocator, &func, true);
+    var desc = try riscv64.riscv64RegDescription(allocator, &func, true, false);
     defer desc.deinit(allocator);
 
     // Class 2 (RVV vector) is empty in vpu mode: there is no RVV under the VPU.
