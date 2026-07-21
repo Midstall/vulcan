@@ -1054,6 +1054,40 @@ test "resolve: independent reg and slot moves pass through as single ops in a va
     try expectRealizesMoves(allocator, &raw, ordered, 0);
 }
 
+test "resolve: a store and a reload on the same register at one position order store-first (gap #6)" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(i32k);
+    const b = try func.appendBlock();
+    const x = try func.appendBlockParam(b, t);
+    func.setTerminator(b, .{ .ret = x });
+
+    var desc = try aarch64.aarch64RegDescription(allocator, &func);
+    defer desc.deinit(allocator);
+
+    // The exact same-position drain hazard the retired aarch64 `hasSamePosRegHazard` guarded against:
+    // one value is RELOADED into x9 while a DIFFERENT value is STORED out of x9, both at one position.
+    // A fixed drain order (reload before store) would reload x9 first, clobbering the value the store
+    // still has to save. The parallel-move ordering must therefore emit the STORE first (its source x9
+    // is read by the reload's destination, so the reload is blocked until x9 is free), then the reload.
+    // This is the primitive `wimmer.orderIntraActions` runs on every intra-block same-position cluster.
+    const raw = [_]Move{
+        .{ .src = .{ .slot = 0 }, .dst = .{ .reg = 9 }, .class = 0, .value = x }, // reload into x9
+        .{ .src = .{ .reg = 9 }, .dst = .{ .slot = 1 }, .class = 0, .value = x }, // store out of x9
+    };
+
+    const ordered = try wimmer.orderMoves(allocator, &raw, &desc);
+    defer allocator.free(ordered);
+
+    // No cycle (a slot is never both a source and a destination), so no scratch: exactly two ops, the
+    // store strictly before the reload.
+    try std.testing.expectEqual(@as(usize, 2), ordered.len);
+    try std.testing.expect(locEq(ordered[0].src, .{ .reg = 9 }) and locEq(ordered[0].dst, .{ .slot = 1 }));
+    try std.testing.expect(locEq(ordered[1].src, .{ .slot = 0 }) and locEq(ordered[1].dst, .{ .reg = 9 }));
+    try expectRealizesMoves(allocator, &raw, ordered, 0);
+}
+
 test "resolve: a block-param arg in a different register than the param becomes an edge move" {
     const allocator = std.testing.allocator;
     var func = Function.init(allocator);
