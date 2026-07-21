@@ -616,13 +616,21 @@ pub const Segment = struct { from: u32, loc: Location };
 /// vector moves at a fixed width, so they ignore this field.
 pub const Move = struct { src: Location, dst: Location, class: u16, value: Value };
 
-/// An intra-block spill/reload/move the resolver emits at position `at` (Task 5). Unused here.
+/// An intra-block spill/reload/move the resolver emits at position `at` (Task 5). A same-position
+/// CLUSTER of these is a parallel move (all sources read from the pre-instruction state, all
+/// destinations written), so `buildAllocation` orders each cluster through the SAME routine the
+/// control-flow edges use (`orderMoves`): every source is read before it is overwritten, register
+/// cycles are broken through the class scratch, and a slot->slot shuffle is expanded through the
+/// scratch too. `value` carries the IR value whose bits the action transfers, so a width-aware
+/// backend can pick the move/store/load form (and it survives the scratch routing, each step
+/// carrying the routed value). Draining the resulting list in order is hazard-free.
 pub const Action = struct {
     at: u32,
     kind: enum { store, reload, move },
     class: u16,
     src: Location,
     dst: Location,
+    value: Value,
 };
 
 /// The parallel move set on a control-flow edge (Task 7): resolution and block-param moves. Unused
@@ -664,9 +672,12 @@ pub const Allocation = struct {
     }
 };
 
-/// The only failure mode of `allocate`: out of memory. Task 4's splitter handles every register
-/// pressure case, so the earlier `error.Unsupported` bail is gone.
-pub const AllocateError = Error;
+/// `allocate`'s failure modes: out of memory, or `error.Unsupported` when a single position demands
+/// more simultaneous must-have registers than the class has (Task 6b: the bail is BACK, deliberately,
+/// matching the OLD allocator's "too many live params" rejection of the same shape). Task 4's splitter
+/// handles every OTHER register-pressure case by splitting and spilling. This is the residual case
+/// where nothing is left to split.
+pub const AllocateError = Error || error{Unsupported};
 
 /// A free-until position meaning "never conflicts". Program positions never reach it.
 const infinity: u32 = std.math.maxInt(u32);
@@ -1077,6 +1088,8 @@ fn splitInterval(allocator: std.mem.Allocator, parent: *Interval, pos: u32, chil
 /// `must_have_register` use forces the spilled part to end at that use so the use lands back in a
 /// register (the head, which holds no must_have use, is safe in memory and the register-needing tail
 /// is re-queued). Otherwise the whole interval goes to a slot. Shared by both spill-current paths.
+/// Returns `error.Unsupported` when a same-position must-have demand exceeds the register pool (the
+/// unsatisfiable case the old allocator also rejects as "too many live params").
 fn spillCurrent(
     allocator: std.mem.Allocator,
     current: *Interval,
@@ -1084,12 +1097,17 @@ fn spillCurrent(
     children: *std.ArrayList(*Interval),
     slots: []u32,
     class_idx: u16,
-) Error!void {
+) AllocateError!void {
     if (firstMustHaveUse(current)) |u| {
-        // A must_have use at `current.start()` would mean more values need a register at one position
-        // than the class has registers, an unsatisfiable target model (a programmer error, not a
-        // spill we can make). For every reachable case the first must_have use is strictly later.
-        std.debug.assert(u > current.start());
+        // A must_have use AT `current.start()` means `current` needs a register the instant it
+        // becomes live, but it is the interval being spilled BECAUSE nothing here can be freed for
+        // it (Task 6b, a Task 2 finding): a same-position group (e.g. a loop header with more live
+        // params than the class has registers) can reach this exact split child through repeated
+        // re-eviction, where the only remaining must-have use coincides with the child's own start.
+        // That is more simultaneous must-have demand than the class can ever satisfy, the SAME
+        // "too many live params" limit the old allocator (aarch64 isel.zig `allocate`) rejects for
+        // this shape, so this bails to match rather than asserting a programmer error.
+        if (u <= current.start()) return error.Unsupported;
         const tail = try splitInterval(allocator, current, u, children);
         current.location = .{ .slot = slots[class_idx] };
         slots[class_idx] += 1;
@@ -1107,7 +1125,8 @@ fn spillCurrent(
 /// spill `current` if its own first use is even further off, otherwise take the register and split
 /// the intervals it displaces. A fixed clobber of the chosen register before `current` ends also
 /// splits `current` before the clobber. Honors `must_have_register`: a spilled head is cut before the
-/// first must_have use so that use lands back in a register.
+/// first must_have use so that use lands back in a register. Propagates `error.Unsupported` from
+/// `spillCurrent` when a same-position must-have demand exceeds the register pool.
 fn allocateBlockedReg(
     allocator: std.mem.Allocator,
     current: *Interval,
@@ -1117,7 +1136,7 @@ fn allocateBlockedReg(
     children: *std.ArrayList(*Interval),
     slots: []u32,
     desc: *const RegDescription,
-) Error!void {
+) AllocateError!void {
     const class_idx = current.class;
     const class = desc.classes[class_idx];
     const p = current.start();
@@ -1283,6 +1302,54 @@ fn actionAtLessThan(_: void, a: Action, b: Action) bool {
     return a.at < b.at;
 }
 
+/// Order the intra-block actions so every same-position cluster drains hazard-free. Input is the
+/// actions already sorted ascending by `at`; for each maximal same-`at` run this treats the cluster
+/// as a parallel move (each action is one `(src -> dst)` transfer at that position) and runs it
+/// through `orderMoves` (the SAME routine, and scratch cycle-break, the control-flow edges use), then
+/// re-tags the ordered primitive moves as actions at that position. The result is still ascending by
+/// `at`, and within a cluster every source is read before it is overwritten. The caller owns the
+/// returned slice. Reusing the edge resolver is what lets the aarch64 bridge drop its ad-hoc
+/// same-position hazard detector: the ordering makes the fixed drain order always safe.
+///
+/// The parallel-move invariants `orderClassMoves` relies on hold for an intra-block cluster exactly
+/// as for an edge: every spill slot names a distinct interval, so within one position a slot is never
+/// both a source and a destination (a store writes a fresh slot no other action reads; a reload reads
+/// a slot no other action writes). Therefore every register cycle is reg->reg and every slot->slot is
+/// independent, so the scratch routing is never nested inside a held cycle.
+fn orderIntraActions(allocator: std.mem.Allocator, sorted: []const Action, desc: *const RegDescription) Error![]Action {
+    var out: std.ArrayList(Action) = .empty;
+    errdefer out.deinit(allocator);
+
+    var moves: std.ArrayList(Move) = .empty;
+    defer moves.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < sorted.len) {
+        const at = sorted[i].at;
+        var j = i;
+        while (j < sorted.len and sorted[j].at == at) : (j += 1) {}
+
+        moves.clearRetainingCapacity();
+        for (sorted[i..j]) |a| {
+            try moves.append(allocator, .{ .src = a.src, .dst = a.dst, .class = a.class, .value = a.value });
+        }
+        const ordered = try orderMoves(allocator, moves.items, desc);
+        defer allocator.free(ordered);
+        for (ordered) |m| {
+            try out.append(allocator, .{
+                .at = at,
+                .kind = actionKind(m.src, m.dst),
+                .class = m.class,
+                .src = m.src,
+                .dst = m.dst,
+                .value = m.value,
+            });
+        }
+        i = j;
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 /// Invoke `f(iv)` for every placed VALUE interval, both the originals and the split children (fixed
 /// intervals and unplaced intervals are skipped). Keeps the two storage lists in one walk.
 fn forEachPlacedValue(originals: []const Interval, children: []const *Interval, ctx: anytype, comptime f: fn (@TypeOf(ctx), *const Interval) Error!void) Error!void {
@@ -1372,7 +1439,7 @@ fn buildAllocation(allocator: std.mem.Allocator, func: *const Function, interval
                 result.needs_resolution = true;
                 continue;
             }
-            try actions.append(allocator, .{ .at = at, .kind = actionKind(a.loc, b.loc), .class = class, .src = a.loc, .dst = b.loc });
+            try actions.append(allocator, .{ .at = at, .kind = actionKind(a.loc, b.loc), .class = class, .src = a.loc, .dst = b.loc, .value = e.key_ptr.* });
         }
 
         const owned = try segs.toOwnedSlice(allocator);
@@ -1380,9 +1447,15 @@ fn buildAllocation(allocator: std.mem.Allocator, func: *const Function, interval
         try result.segments.put(allocator, e.key_ptr.*, owned);
     }
 
-    // Actions land in ascending-`at` order for the emitter's single-cursor drain.
+    // Actions land in ascending-`at` order for the emitter's single-cursor drain, and every
+    // same-position cluster is ordered into a hazard-free parallel-move sequence (Task 5): draining
+    // the result in order can never clobber a live value (a store's source read before a reload
+    // overwrites that register, a register cycle broken through the class scratch, a slot->slot
+    // shuffle expanded through it). Reuses `orderMoves` (the edge-move ordering), not a second resolver.
     std.mem.sort(Action, actions.items, {}, actionAtLessThan);
-    result.actions = try actions.toOwnedSlice(allocator);
+    const raw_actions = try actions.toOwnedSlice(allocator);
+    defer allocator.free(raw_actions);
+    result.actions = try orderIntraActions(allocator, raw_actions, desc);
 
     // Copy the accumulated per-class slot counts into an owned slice for the result.
     const slot_counts = try allocator.alloc(u32, desc.classes.len);

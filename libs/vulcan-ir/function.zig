@@ -405,6 +405,54 @@ pub const Function = struct {
         self.types.deinit();
     }
 
+    /// A deep, independently-owned copy of `self` under `allocator`. The clone shares NO backing
+    /// memory with the original: every array is duplicated, the type table is rebuilt by re-interning
+    /// each kind in order (so Type handles are preserved), attribute string payloads are re-owned, and
+    /// each block's parameter and instruction sub-lists are duplicated. All IR references are index or
+    /// enum handles (Value/Inst/Block, ValueList `{start,len}`, scale/bias pool indices), never heap
+    /// pointers, so the raw arrays copy verbatim and stay valid. Both the clone and the original can be
+    /// `deinit`'d independently. Codegen uses this to run a MUTATING pass (critical-edge splitting)
+    /// on a working copy without disturbing a caller's function, which may be shared across backends.
+    pub fn clone(self: *const Function, allocator: std.mem.Allocator) std.mem.Allocator.Error!Function {
+        var out = Function.init(allocator);
+        errdefer out.deinit();
+
+        // Types: re-intern each kind in the original's order. The original table is deduped (every
+        // kind unique), and interning is order-preserving, so the n-th kind receives handle n exactly,
+        // keeping every Type handle in the copied arrays valid. `intern` re-owns slice-bearing kinds
+        // (struct fields) into the clone's storage.
+        for (self.types.kinds.items) |kind| _ = try out.types.intern(kind);
+
+        // Interned callee names: re-intern in order (they are already unique, so indices match).
+        for (self.symbols.items) |s| _ = try out.internSymbol(s);
+
+        // Constant pools and the index-based reference arrays copy verbatim (plain data, no pointers).
+        try out.scale_pool.appendSlice(allocator, self.scale_pool.items);
+        try out.bias_pool.appendSlice(allocator, self.bias_pool.items);
+        try out.value_lists.appendSlice(allocator, self.value_lists.items);
+        try out.values.appendSlice(allocator, self.values.items);
+        try out.insts.appendSlice(allocator, self.insts.items);
+
+        // Blocks: duplicate each block's own parameter and instruction sub-lists (the terminator is
+        // plain data and copies by value).
+        try out.blocks.ensureTotalCapacity(allocator, self.blocks.items.len);
+        for (self.blocks.items) |blk| {
+            var nb: BlockData = .{ .params = .empty, .insts = .empty, .term = blk.term };
+            errdefer {
+                nb.params.deinit(allocator);
+                nb.insts.deinit(allocator);
+            }
+            try nb.params.appendSlice(allocator, blk.params.items);
+            try nb.insts.appendSlice(allocator, blk.insts.items);
+            try out.blocks.append(allocator, nb);
+        }
+
+        // Attributes: `addAttr` re-owns any string payloads into the clone's storage.
+        for (self.attributes.items) |entry| try out.addAttr(entry.target, entry.attr);
+
+        return out;
+    }
+
     /// Intern a callee name, returning its symbol index. Equal names share an
     /// index, the function owns the copied string.
     pub fn internSymbol(self: *Function, name: []const u8) std.mem.Allocator.Error!u32 {
@@ -2180,4 +2228,38 @@ test "cloneBlock produces a block verify accepts once wired into the CFG" {
     var d = try verify.verify(std.testing.allocator, &func, .high);
     defer d.deinit();
     try std.testing.expect(d.ok());
+}
+
+test "clone deep-copies a function and leaves the original untouched" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const x = try func.appendBlockParam(entry, i32_t);
+    _ = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .gt, .lhs = x, .rhs = x } });
+    const called = try func.appendCall(entry, i32_t, "callee", &.{x});
+    func.setTerminator(entry, .{ .ret = called });
+    try func.addAttr(.{ .inst = @enumFromInt(0) }, .{ .custom = .{ .namespace = "debug", .key = "line", .value = .{ .int = 12 } } });
+
+    var copy = try func.clone(allocator);
+    defer copy.deinit();
+
+    // Structure and interned tables match by construction (handles are index-preserved).
+    try std.testing.expectEqual(func.blockCount(), copy.blockCount());
+    try std.testing.expectEqual(func.valueCount(), copy.valueCount());
+    try std.testing.expectEqual(func.types.count(), copy.types.count());
+    try std.testing.expectEqual(func.symbolCount(), copy.symbolCount());
+    try std.testing.expectEqualStrings("callee", copy.symbolName(0));
+
+    // The copy's symbol string is INDEPENDENT storage (not aliased into the original).
+    try std.testing.expect(copy.symbolName(0).ptr != func.symbolName(0).ptr);
+
+    // Mutating the copy's CFG (edge splitting is the real use) must not touch the original.
+    const before = func.blockCount();
+    _ = try copy.appendBlock();
+    try std.testing.expectEqual(before, func.blockCount());
+    try std.testing.expectEqual(before + 1, copy.blockCount());
 }

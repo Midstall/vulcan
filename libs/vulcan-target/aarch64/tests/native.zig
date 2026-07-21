@@ -39,8 +39,8 @@ test "codegen+disasm round-trip: integer add" {
     func.setTerminator(e, .{ .ret = s });
 
     try expectAsm(&func,
-        \\0000: 0b010007  add w7, w0, w1
-        \\0004: aa0703e0  mov x0, x7
+        \\0000: 0b010002  add w2, w0, w1
+        \\0004: aa0203e0  mov x0, x2
         \\0008: d65f03c0  ret
         \\
     );
@@ -55,10 +55,11 @@ test "codegen+disasm round-trip: a returned constant" {
     const v = try func.appendInst(e, i32_t, .{ .iconst = 42 });
     func.setTerminator(e, .{ .ret = v });
 
+    // The Wimmer allocator colours the constant straight into the return register x0, so no
+    // extra `mov x0, xN` is needed (the retired native scan parked it in x7 then copied it out).
     try expectAsm(&func,
-        \\0000: 52800547  mov w7, #0x2a
-        \\0004: aa0703e0  mov x0, x7
-        \\0008: d65f03c0  ret
+        \\0000: 52800540  mov w0, #0x2a
+        \\0004: d65f03c0  ret
         \\
     );
 }
@@ -78,21 +79,24 @@ test "codegen+disasm round-trip: control flow (max via if/else)" {
     try func.appendIf(e, c, .{ .target = m, .args = &.{x} }, .{ .target = m, .args = &.{y} });
     func.setTerminator(m, .{ .ret = r });
 
-    // The icmp is the single-use condition of the immediately-following if, so isel fuses
-    // it into a compare-and-branch: no `cset` boolean, and the `cbnz` re-test becomes a
-    // `b.gt` on the flags `cmp` set (branching to the then-edge on the icmp's condition).
-    // The then-edge target `m` is the block emitted next, so the trailing `b then` is elided
-    // and the then-moves fall through into `m` (fall-through branch elision). The `b else`
-    // now jumps just over the then-moves. Exercises the disassembler on real branch offsets
-    // and block-edge moves. The native max tests below prove this returns the same results.
+    // The icmp is the single-use condition of the immediately-following if, so isel fuses it into a
+    // compare-and-branch: no `cset` boolean, the re-test becomes a `b.gt` on the flags `cmp` set. Both
+    // `if` edges target `m` (which has two predecessors), so BOTH are critical and the Wimmer path
+    // splits each onto its own forwarding block: `b.gt` selects the then-forwarding block (`mov x2, x0`
+    // = r:=x), the fall-through `b` selects the else-forwarding block (`mov x2, x1` = r:=y), and each
+    // forwarding block jumps to `m` (`mov x0, x2; ret`). Exercises the disassembler on real branch
+    // offsets and edge moves across split edges. The native max tests below prove the same results.
     try expectAsm(&func,
         \\0000: 6b01001f  cmp w0, w1
-        \\0004: 5400006c  b.gt .+12
-        \\0008: aa0103e7  mov x7, x1
-        \\000c: 14000002  b .+8
-        \\0010: aa0003e7  mov x7, x0
-        \\0014: aa0703e0  mov x0, x7
-        \\0018: d65f03c0  ret
+        \\0004: 5400004c  b.gt .+8
+        \\0008: 14000006  b .+24
+        \\000c: 14000003  b .+12
+        \\0010: aa0203e0  mov x0, x2
+        \\0014: d65f03c0  ret
+        \\0018: aa0003e2  mov x2, x0
+        \\001c: 17fffffd  b .-12
+        \\0020: aa0103e2  mov x2, x1
+        \\0024: 17fffffb  b .-20
         \\
     );
 }
@@ -109,8 +113,8 @@ test "codegen+disasm round-trip: scalar float add" {
     func.setTerminator(e, .{ .ret = s });
 
     try expectAsm(&func,
-        \\0000: 1e212807  fadd s7, s0, s1
-        \\0004: 1e6040e0  fmov d0, d7
+        \\0000: 1e212802  fadd s2, s0, s1
+        \\0004: 1e604040  fmov d0, d2
         \\0008: d65f03c0  ret
         \\
     );
@@ -175,218 +179,6 @@ test "native: a register-pressure kernel spills and reloads to the correct resul
     try expectRun(allocator, &func, &.{ 3, 5 }, 730);
     // a=-2, b=1: sum_{k=1..20}(-2k+1) = -2*210 + 20 = -400.
     try expectRun(allocator, &func, &.{ -2, 1 }, -400);
-}
-
-test "intra-block tail split reloads the correct value" {
-    // f(a, b) = a*b (defined FIRST, then held live over heavy register pressure) plus
-    // sum_{k=1..20}(a*k + b). The early product `t0` is an intra value whose only remaining use is
-    // the very last add, so Belady/MIN spills it under pressure. With live-range splitting it
-    // TAIL-SPLITS: register for the hot prefix, stack slot for the cold tail, with a store at the
-    // split point. The late add reloads it from the slot, so the result is only correct if the
-    // split store/reload round-trips the right bits.
-    const allocator = std.testing.allocator;
-    var func = Function.init(allocator);
-    defer func.deinit();
-    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
-    const b = try func.appendBlock();
-    const a = try func.appendBlockParam(b, t);
-    const bp = try func.appendBlockParam(b, t);
-    // t0 is defined early and used only at the end: a long intra live range across the pressure.
-    const t0 = try func.appendInst(b, t, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = bp } });
-    var terms: [20]ir.function.Value = undefined;
-    var k: i64 = 1;
-    while (k <= 20) : (k += 1) {
-        const kc = try func.appendInst(b, t, .{ .iconst = k });
-        const ak = try func.appendInst(b, t, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = kc } });
-        terms[@intCast(k - 1)] = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = ak, .rhs = bp } });
-    }
-    var acc = terms[0];
-    var j: usize = 1;
-    while (j < terms.len) : (j += 1) {
-        acc = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = terms[j] } });
-    }
-    // The late use of t0: without a correct tail split this reloads garbage.
-    const result = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = t0 } });
-    func.setTerminator(b, .{ .ret = result });
-
-    // Meaningful-differential gate: at least one value must actually tail-split, otherwise a plain
-    // whole-spill would also return the right value and the test would not exercise the new path.
-    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
-    try std.testing.expect(try isel.debugSegmentCount(allocator, &func) > 0);
-
-    // Sweep inputs (0, 1, -1, and larger magnitudes). Expected in i32 wrapping arithmetic to match
-    // the target's 32-bit adds/muls exactly. result = a*b + sum_{k=1..20}(a*k + b).
-    const inputs = [_][2]i32{ .{ 0, 0 }, .{ 1, 0 }, .{ 0, 1 }, .{ -1, -1 }, .{ 3, 5 }, .{ -2, 1 }, .{ 7, -9 }, .{ 100, 25 }, .{ -37, 41 } };
-    for (inputs) |in| {
-        const av = in[0];
-        const bv = in[1];
-        var expected: i32 = av *% bv;
-        var kk: i32 = 1;
-        while (kk <= 20) : (kk += 1) expected +%= (av *% kk) +% bv;
-        const got = try run(allocator, &func, &.{ av, bv });
-        try std.testing.expectEqual(expected, got);
-    }
-}
-
-test "second-chance reload re-homes a spilled value" {
-    // f(a, b): t0 = a*b is defined FIRST and used again only at the very end. Under the 20-term
-    // pressure block it TAIL-SPLITS (register prefix + slot tail). As the reduction consumes the
-    // terms the register pressure DROPS, so by t0's late use a register is free again and
-    // second-chance RE-HOMES t0 into it: its final use reads that register instead of reloading from
-    // the slot. The result is correct only if the re-home reload round-trips the right bits.
-    const allocator = std.testing.allocator;
-    var func = Function.init(allocator);
-    defer func.deinit();
-    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
-    const b = try func.appendBlock();
-    const a = try func.appendBlockParam(b, t);
-    const bp = try func.appendBlockParam(b, t);
-    // t0 is defined early and used only at the end: a long intra live range across the pressure.
-    const t0 = try func.appendInst(b, t, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = bp } });
-    var terms: [20]ir.function.Value = undefined;
-    var k: i64 = 1;
-    while (k <= 20) : (k += 1) {
-        const kc = try func.appendInst(b, t, .{ .iconst = k });
-        const ak = try func.appendInst(b, t, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = kc } });
-        terms[@intCast(k - 1)] = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = ak, .rhs = bp } });
-    }
-    var acc = terms[0];
-    var j: usize = 1;
-    while (j < terms.len) : (j += 1) {
-        acc = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = terms[j] } });
-    }
-    // The late use of t0: with second-chance it reads a re-homed register, not a per-use slot reload.
-    const result = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = t0 } });
-    func.setTerminator(b, .{ .ret = result });
-
-    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
-    // Meaningful-differential gate: a second-chance re-home MUST have fired (a `.reg` segment after a
-    // `.slot` segment). Without it this would only exercise Task 4 tail-split + per-use reload.
-    try std.testing.expect(try isel.debugReHomeCount(allocator, &func) > 0);
-
-    // Sweep inputs (0, 1, -1, and larger magnitudes), i32 wrapping arithmetic to match the target's
-    // 32-bit adds/muls exactly. result = a*b + sum_{k=1..20}(a*k + b).
-    const inputs = [_][2]i32{ .{ 0, 0 }, .{ 1, 0 }, .{ 0, 1 }, .{ -1, -1 }, .{ 3, 5 }, .{ -2, 1 }, .{ 7, -9 }, .{ 100, 25 }, .{ -37, 41 } };
-    for (inputs) |in| {
-        const av = in[0];
-        const bv = in[1];
-        var expected: i32 = av *% bv;
-        var kk: i32 = 1;
-        while (kk <= 20) : (kk += 1) expected +%= (av *% kk) +% bv;
-        const got = try run(allocator, &func, &.{ av, bv });
-        try std.testing.expectEqual(expected, got);
-    }
-}
-
-test "second-chance declines when no register is free at the tail use (per-use reload)" {
-    // A sustained-pressure kernel where second-chance CANNOT save every split value. Six early
-    // `sp[i] = a*(i+1)` products are defined first and used only late, so under pressure they
-    // TAIL-SPLIT (their far next use makes them the Belady victims). Twelve `res[i] = b+const`
-    // values are then defined and used TWICE (once before and once after the sp uses), so they stay
-    // register-resident and occupy every register ACROSS the sp uses. With the pool full at those
-    // uses, second-chance has no free register to re-home some of the split sp values, so they fall
-    // back to per-use slot reloads. This exercises the decline path (`frees` empty) alongside the
-    // re-homes, and the result is correct only if every reload (re-homed or per-use) is right.
-    const allocator = std.testing.allocator;
-    var func = Function.init(allocator);
-    defer func.deinit();
-    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
-    const b = try func.appendBlock();
-    const a = try func.appendBlockParam(b, t);
-    const bp = try func.appendBlockParam(b, t);
-    const nspill = 6;
-    const nres = 12;
-    var sp: [nspill]ir.function.Value = undefined;
-    for (0..nspill) |i| {
-        const c = try func.appendInst(b, t, .{ .iconst = @intCast(i + 1) });
-        sp[i] = try func.appendInst(b, t, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = c } });
-    }
-    var res: [nres]ir.function.Value = undefined;
-    for (0..nres) |i| {
-        const c = try func.appendInst(b, t, .{ .iconst = @intCast(100 + i) });
-        res[i] = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = bp, .rhs = c } });
-    }
-    var acc = res[0];
-    for (1..nres) |i| acc = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = res[i] } });
-    for (0..nspill) |i| acc = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = sp[i] } });
-    for (0..nres) |i| acc = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = res[i] } });
-    func.setTerminator(b, .{ .ret = acc });
-
-    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
-    // Meaningful gate: more values TAIL-SPLIT than were RE-HOMED, i.e. at least one split value found
-    // no free register at its tail use and DECLINED (stayed in its slot, reloading per use). Both the
-    // re-home path and the decline path are thus exercised in one kernel.
-    const segs = try isel.debugSegmentCount(allocator, &func);
-    const rehomes = try isel.debugReHomeCount(allocator, &func);
-    try std.testing.expect(segs > rehomes);
-
-    // result = 2*sum_i(b + 100 + i) + sum_i(a*(i+1)), evaluated in i32 wrapping arithmetic to match
-    // the target's 32-bit adds/muls exactly. Sweep inputs including zero, unit, and larger magnitudes.
-    const inputs = [_][2]i32{ .{ 0, 0 }, .{ 1, 0 }, .{ 0, 1 }, .{ -1, -1 }, .{ 3, 5 }, .{ -2, 1 }, .{ 7, -9 }, .{ 100, 25 }, .{ -37, 41 } };
-    for (inputs) |in| {
-        const av = in[0];
-        const bv = in[1];
-        var expected: i32 = bv +% 100; // res[0]
-        var i: i32 = 1;
-        while (i < nres) : (i += 1) expected +%= bv +% (100 + i);
-        i = 0;
-        while (i < nspill) : (i += 1) expected +%= av *% (i + 1);
-        i = 0;
-        while (i < nres) : (i += 1) expected +%= bv +% (100 + i);
-        const got = try run(allocator, &func, &.{ av, bv });
-        try std.testing.expectEqual(expected, got);
-    }
-}
-
-test "second-chance re-homes a ret-only value AT the terminator (terminator drain)" {
-    // Regression for the terminator-position reload drain. t0 = a*b is defined FIRST and is used ONLY
-    // by the `ret`, whose operand is a NON-edge-arg, so t0 is intra-splittable. Under the 20-term
-    // pressure block t0 TAIL-SPLITS (register prefix + slot tail). As the reduction drains the terms a
-    // register frees, and because t0's SOLE remaining use is the terminator, second-chance re-homes t0
-    // with a `.reload` recorded AT the terminator position (block_end). The per-instruction drain never
-    // reaches that position, so before the fix the reload is dropped and `ret` returns the stale
-    // register (wrong value). The result is correct only if the new terminator drain emits the reload.
-    const allocator = std.testing.allocator;
-    var func = Function.init(allocator);
-    defer func.deinit();
-    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
-    const b = try func.appendBlock();
-    const a = try func.appendBlockParam(b, t);
-    const bp = try func.appendBlockParam(b, t);
-    // t0 is defined early and used only by the ret: a long intra live range across the pressure whose
-    // sole use lands on the terminator position.
-    const t0 = try func.appendInst(b, t, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = bp } });
-    var terms: [20]ir.function.Value = undefined;
-    var k: i64 = 1;
-    while (k <= 20) : (k += 1) {
-        const kc = try func.appendInst(b, t, .{ .iconst = k });
-        const ak = try func.appendInst(b, t, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = kc } });
-        terms[@intCast(k - 1)] = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = ak, .rhs = bp } });
-    }
-    var acc = terms[0];
-    var j: usize = 1;
-    while (j < terms.len) : (j += 1) {
-        acc = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = terms[j] } });
-    }
-    // The reduction only exists to create and then relieve register pressure (its final `acc` is
-    // deliberately unreturned). The RETURN value is t0 itself, so t0's last use is the terminator and
-    // any second-chance re-home of it lands there.
-    func.setTerminator(b, .{ .ret = t0 });
-
-    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
-    // Meaningful-differential gate: t0 must actually tail-split, otherwise a whole-life register would
-    // also return the right value and the terminator drain would not be exercised.
-    try std.testing.expect(try isel.debugReHomeCount(allocator, &func) > 0);
-
-    // Sweep inputs (zero, unit, negatives, larger magnitudes). result = a*b in i32 wrapping arithmetic.
-    const inputs = [_][2]i32{ .{ 0, 0 }, .{ 1, 0 }, .{ 0, 1 }, .{ -1, -1 }, .{ 3, 5 }, .{ -2, 1 }, .{ 7, -9 }, .{ 100, 25 }, .{ -37, 41 } };
-    for (inputs) |in| {
-        const av = in[0];
-        const bv = in[1];
-        const expected: i32 = av *% bv;
-        const got = try run(allocator, &func, &.{ av, bv });
-        try std.testing.expectEqual(expected, got);
-    }
 }
 
 test "codegen+disasm round-trip: a call emits the ABI frame and bl" {
@@ -513,12 +305,13 @@ test "module disasm: linked functions get labels and a resolved, named call" {
     const text = try disasm.formatModule(a, linked.code, syms);
     defer a.free(text);
 
-    // The `bl` in main resolves back to helper and is annotated with its name. The displacement
-    // is -40 (not -48): main's prologue fuses its link-register + callee-saved stores into stp
-    // pairs (the ldp/stp peephole), shrinking main so the backward branch to helper is shorter.
+    // The `bl` in main resolves back to helper and is annotated with its name. The displacement is
+    // -36 under the Wimmer allocator: main's prologue fuses its link-register + callee-saved stores
+    // into stp pairs (the ldp/stp peephole), and the shared allocator's frame lands the backward
+    // branch to helper nine words back.
     try std.testing.expect(std.mem.indexOf(u8, text, "helper:\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "main:\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "bl .-40  <helper>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "bl .-36  <helper>") != null);
 }
 
 /// A named function for `runModule`. The entry must be first.
@@ -4293,11 +4086,12 @@ fn countAdds(allocator: std.mem.Allocator, func: *const Function) !usize {
     return count;
 }
 
-test "addrfold: constant-index i64 copy folds and adjacent pairs emit ldp/stp" {
-    // out[j] = in[j] for j in 0..4, each addressed through `in + 8*j` / `out + 8*j`. Every address-add
-    // folds into the ldr/str displacement and dies, leaving four adjacent `ldr x,[in,#8j]` and four
-    // adjacent `str x,[out,#8j]`, which pairMemory fuses into ldp/stp. Proves the fold (no add words,
-    // pairs present) AND the data (the copy is correct across a sweep).
+test "addrfold: constant-index i64 copy folds every address-add away and computes correctly" {
+    // out[j] = in[j] for j in 0..4, each addressed through `in + 8*j` / `out + 8*j`. Address-mode
+    // folding is a PRE-ALLOCATION IR rewrite on the production Wimmer path (Task 7b): each folded mem
+    // op's `ptr` is repointed to its base so the fold-agnostic allocator keeps the base live to the
+    // load/store, then the now-dead address-adds are dropped. So every one of the six address-adds
+    // disappears and the offset loads/stores land adjacent, which `pairMemory` fuses into ldp/stp.
     if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const n = 4;
@@ -4320,13 +4114,15 @@ test "addrfold: constant-index i64 copy folds and adjacent pairs emit ldp/stp" {
     }
     func.setTerminator(b, .{ .ret = null });
 
-    // The fold eliminated every address-add, so none survive in the machine code (this is a pure
-    // copy with no other arithmetic, so a nonzero count would mean an address-add failed to fold).
+    // Fold is on and every address-add is dead once its mem op reads `[base, #off]`, so all six are
+    // dropped and no register-form `add` word survives. A nonzero count here would mean the rewrite
+    // failed to fire (or an add was left materialized), reintroducing the addressing cost the flip
+    // was meant to recover.
     try std.testing.expectEqual(@as(usize, 0), try countAdds(allocator, &func));
-    // The folded, now-adjacent loads/stores fuse into at least one ldp and one stp.
-    const counts = try countMemPairs(allocator, &func);
-    try std.testing.expect(counts[0] >= 1); // ldp
-    try std.testing.expect(counts[1] >= 1); // stp
+    // The folded, now-adjacent same-base loads and stores fuse: at least one ldp and one stp.
+    const pairs = try countMemPairs(allocator, &func);
+    try std.testing.expect(pairs[0] >= 1); // ldp (the folded loads)
+    try std.testing.expect(pairs[1] >= 1); // stp (the folded stores)
 
     const code = try isel.selectFunction(allocator, &func);
     defer allocator.free(code);
@@ -5522,4 +5318,91 @@ test "aarch64 fallthrough: a diamond and a loop compute correctly" {
             try expectRun(allocator, &func, &.{nv}, expected);
         }
     }
+}
+
+// --- Address-mode folding is SOUND under the shared Wimmer allocator (Task 7b) ---
+// `compileFunction` rewrites a foldable `p = arith_imm.add(base, imm); mem(p)` into `mem(base)` with
+// the displacement side-tabled, then drops the dead add, BEFORE the fold-agnostic allocator runs. So
+// the allocator sees `base` used AT the mem op and keeps its register live there. These tests place
+// the folded mem op AFTER a wall of simultaneously-live temporaries: if the allocator wrongly thought
+// `base` died at the (now folded, removed) address-add it would reuse base's register across the
+// pressure and the folded `[base, #off]` access would read garbage. The host CPU is the oracle.
+
+test "addrfold+wimmer: a folded load whose base is live across register pressure reads the right base" {
+    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+
+    const ptr_t = try func.types.intern(.ptr);
+    const i64_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
+    const blk = try func.appendBlock();
+    const base = try func.appendBlockParam(blk, ptr_t);
+    const k = try func.appendBlockParam(blk, i64_t);
+
+    // Eight independent temporaries `k+1 .. k+8`, all live at the return, so registers are scarce
+    // between base's def (the entry) and its single use (the folded load placed after them).
+    var temps: [8]ir.function.Value = undefined;
+    for (&temps, 0..) |*t, j| t.* = try func.appendArithImm(blk, i64_t, .add, k, @intCast(j + 1));
+
+    // base + 24 folds to `[base, #24]` (i64 granule 8, index 3). The add is removed; the load's
+    // ptr operand becomes `base`, keeping base's live range through the pressure to here.
+    const p = try func.appendArithImm(blk, ptr_t, .add, base, 24);
+    const x = try func.appendInst(blk, i64_t, .{ .load = .{ .ptr = p } });
+
+    // sum = base[3] + (k+1) + ... + (k+8) = base[3] + 8k + 36, so every temporary stays live.
+    var sum = x;
+    for (temps) |t| sum = try func.appendInst(blk, i64_t, .{ .arith = .{ .op = .add, .lhs = sum, .rhs = t } });
+    func.setTerminator(blk, .{ .ret = sum });
+
+    const code = try isel.selectFunction(allocator, &func);
+    defer allocator.free(code);
+    var buf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(code));
+    defer buf.deinit();
+
+    const Fn = *const fn (*const [4]i64, i64) callconv(.c) i64;
+    const f: Fn = @ptrCast(buf.memory.ptr);
+    const arr = [4]i64{ 100, 200, 300, 400 };
+    const kv: i64 = 10;
+    const got = f(&arr, kv);
+    try std.testing.expectEqual(@as(i64, 400 + 8 * 10 + 36), got); // base[3] + 8k + 36
+}
+
+test "addrfold+wimmer: a folded store whose base is live across register pressure writes the right base" {
+    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+
+    const ptr_t = try func.types.intern(.ptr);
+    const i64_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
+    const blk = try func.appendBlock();
+    const base = try func.appendBlockParam(blk, ptr_t);
+    const k = try func.appendBlockParam(blk, i64_t);
+
+    var temps: [8]ir.function.Value = undefined;
+    for (&temps, 0..) |*t, j| t.* = try func.appendArithImm(blk, i64_t, .add, k, @intCast(j + 1));
+
+    // The value to store: (k+1) + ... + (k+8) = 8k + 36, keeping every temporary live.
+    var sum = temps[0];
+    var idx: usize = 1;
+    while (idx < temps.len) : (idx += 1) sum = try func.appendInst(blk, i64_t, .{ .arith = .{ .op = .add, .lhs = sum, .rhs = temps[idx] } });
+
+    // base + 16 folds to `[base, #16]` (i64 granule 8, index 2). The store's ptr becomes `base`.
+    const p = try func.appendArithImm(blk, ptr_t, .add, base, 16);
+    try func.appendStore(blk, sum, p);
+    func.setTerminator(blk, .{ .ret = null });
+
+    const code = try isel.selectFunction(allocator, &func);
+    defer allocator.free(code);
+    var buf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(code));
+    defer buf.deinit();
+
+    const Fn = *const fn (*[4]i64, i64) callconv(.c) void;
+    const f: Fn = @ptrCast(buf.memory.ptr);
+    var arr = [4]i64{ 1, 2, 3, 4 };
+    const kv: i64 = 7;
+    f(&arr, kv);
+    try std.testing.expectEqual(@as(i64, 8 * 7 + 36), arr[2]); // base[2] = 8k + 36
+    try std.testing.expectEqual(@as(i64, 1), arr[0]); // neighbors untouched
 }
