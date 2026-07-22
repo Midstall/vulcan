@@ -3112,40 +3112,24 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
     try ir.critical_edge.splitCriticalEdges(allocator, &work);
     try splitCriticalEdges(allocator, &work);
 
-    // Reachability from the entry (block 0). An orphaned unreachable nest (e.g. a matmul-recognized
-    // loop the IR cannot delete) contributes no emitted code: `emitFromAllocation` skips its blocks
-    // while still ACCOUNTING for their positions so the all-block Wimmer numbering stays in lockstep
-    // (see the dead-block arm there). Unlike the differential entries this does NOT require
-    // all-reachable, so the reachability-aware isel path (the matmul enabler) keeps working.
-    var doms = try dominators.compute(allocator, &work);
-    defer doms.deinit(allocator);
-    const reachable = doms.reachable;
-
-    // NEUTRALIZE every unreachable block so the shared Wimmer allocator sees exactly the reachable CFG
-    // the emitter already restricts itself to. The matmul-recognition pass raises a loop nest into a
-    // single `matmul` op by overwriting the preheader terminator, and the IR has no block-delete, so the
-    // orphaned original nest stays physically present and still holds instructions that USE reachable
-    // values (a preheader-defined loop invariant). `buildIntervals` (wimmer.zig) walks ALL blocks, so
-    // such a value gets a first live range built entirely from the dead nest, one that does not contain
-    // its def in the reachable entry, tripping its SSA "def lies in the earliest range" assert.
+    // Reachability from the entry (block 0), and neutralization of every unreachable block, both now live
+    // in the shared `ir.reachable.neutralizeUnreachable`. An orphaned unreachable nest (e.g. a
+    // matmul-recognized loop the IR cannot delete) still holds instructions that USE values defined in
+    // reachable blocks, and `buildIntervals` (wimmer.zig) walks ALL blocks, so such a value would get a
+    // first live range built entirely from the dead nest, one that does not contain its def in the
+    // reachable entry, tripping the allocator's SSA "def lies in the earliest range" assert. Emptying
+    // every unreachable block's params, instructions, and terminator removes the spurious uses, turning
+    // that value into a harmless dead def ([def, def+1)) instead of a cross-region range. Each dead block
+    // is kept PHYSICALLY PRESENT (its index and enum handle stay stable) so branch and reloc targets,
+    // which reference blocks by handle, are undisturbed. The matmul op itself lives in a REACHABLE block,
+    // so it is never neutralized.
     //
-    // Clearing each dead block's params, instructions, and terminator removes every use it contributed,
-    // so that value becomes a harmless dead def ([def, def+1)) instead of a cross-region range. We keep
-    // the block PHYSICALLY PRESENT (its index and enum handle are stable) so branch and reloc targets,
-    // which reference blocks by handle, are undisturbed. Numbering stays consistent because all three
-    // consumers derive positions from the SAME post-neutralize `work`: `buildIntervals` and
-    // `translateAllocation` both count `blockParams` (one row) + each `blockInsts` + one terminator slot,
-    // and `emitFromAllocation`'s dead-block arm advances `pos` by `blockInsts(bi).len + 2`, all of which
-    // read the now-empty dead blocks identically. Reachable blocks are untouched, so their emitted code
-    // and allocation are unchanged (the dead nest only ever ADDED spurious liveness). The matmul op
-    // itself lives in a REACHABLE block, so it is never neutralized.
-    for (0..work.blockCount()) |bi| {
-        if (reachable[bi]) continue;
-        const dead: Block = @enumFromInt(bi);
-        try work.setBlockParams(dead, &.{});
-        work.blockInstsMut(dead).clearRetainingCapacity();
-        work.terminatorPtr(dead).* = null;
-    }
+    // `emitFromAllocation` still SKIPS these now-empty blocks in emission while ACCOUNTING for their
+    // positions, so the all-block Wimmer numbering stays in lockstep with the post-neutralize `work` (see
+    // the dead-block arm there). This does NOT require all-reachable, unlike the differential entries, so
+    // the reachability-aware isel path (the matmul enabler) keeps working.
+    const reachable = try ir.reachable.neutralizeUnreachable(allocator, &work);
+    defer allocator.free(reachable);
 
     // Address-mode folding is a PRE-ALLOCATION IR REWRITE so it is SOUND under the fold-agnostic shared
     // Wimmer allocator (which reads only the actual IR operands). `analyze` recognizes each foldable

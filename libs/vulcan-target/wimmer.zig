@@ -460,8 +460,19 @@ pub fn buildIntervals(allocator: std.mem.Allocator, func: *const Function, desc:
         if (is_def[v]) {
             // In SSA a value is not live before its single def, which lies in its earliest range.
             const first = &range_lists[v].items[0];
-            std.debug.assert(first.from <= def_pos[v] and def_pos[v] < first.to);
-            first.from = def_pos[v];
+            if (first.from <= def_pos[v] and def_pos[v] < first.to) {
+                first.from = def_pos[v];
+            } else {
+                // Defensive path: the def is reachable but every use of the value lies in an
+                // unreachable block, so its ranges were built entirely from the dead region and the
+                // earliest one does not contain the def. This is only reachable when a caller skipped
+                // `ir.reachable.neutralizeUnreachable` (which empties dead blocks so no such range is
+                // ever built). Degrade the value to a single dead-def range instead of crashing: drop
+                // the dead-region ranges and keep only [def, def+1). For an all-reachable function the
+                // invariant always holds, so this branch is never taken and the output is unchanged.
+                range_lists[v].clearRetainingCapacity();
+                try range_lists[v].append(allocator, .{ .from = def_pos[v], .to = def_pos[v] + 1 });
+            }
         }
     }
 
