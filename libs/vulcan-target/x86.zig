@@ -22,6 +22,7 @@ const tests = struct {
     pub const qemu = @import("x86/tests/qemu.zig");
     pub const native = @import("x86/tests/native.zig");
     pub const addrfold = @import("x86/tests/addrfold.zig");
+    pub const wimmer_diff = @import("x86/tests/wimmer_diff.zig");
 };
 
 test {

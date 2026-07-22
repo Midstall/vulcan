@@ -33,9 +33,6 @@ pub const dwarf = @import("vulcan-target/dwarf.zig");
 /// Minimal ELF reader: locate `.text` + machine so a disassembler can be picked.
 pub const elf_read = @import("vulcan-target/elf_read.zig");
 
-/// Shared register-allocation support (target-independent live intervals).
-pub const regalloc = @import("vulcan-target/regalloc.zig");
-
 /// Shared, target-independent Wimmer-Franz register allocator (target abstraction + algorithm).
 pub const wimmer = @import("vulcan-target/wimmer.zig");
 

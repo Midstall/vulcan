@@ -99,6 +99,13 @@ fn runCode(io: std.Io, allocator: std.mem.Allocator, code: []const u8, args: []c
     };
 }
 
+/// Run raw compiled `code` (entered at offset 0) with integer `args`, returning the low byte of its
+/// result. Used by the shared-Wimmer differential tests, which compile through
+/// `isel.compileFunctionWimmerX86`/`...Fold` (bytes, not a `Function`) and diff against `runFunc`.
+pub fn runCodeInt(io: std.Io, allocator: std.mem.Allocator, code: []const u8, args: []const i64, backend: Backend) !u8 {
+    return runCode(io, allocator, code, args, backend);
+}
+
 pub fn expectRun(io: std.Io, allocator: std.mem.Allocator, func: *const Function, args: []const i64, expected: i64, backend: Backend) !void {
     const want: u8 = @truncate(@as(u64, @bitCast(expected)));
     try std.testing.expectEqual(want, try runFunc(io, allocator, func, args, backend));
