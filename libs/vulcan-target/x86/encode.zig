@@ -198,6 +198,11 @@ pub fn pushReg(r: Reg) Inst {
     return Inst.of(&.{0x50 | n(r)});
 }
 
+/// `pop reg` (58+r). Restores a callee-saved register in the epilogue.
+pub fn popReg(r: Reg) Inst {
+    return Inst.of(&.{0x58 | n(r)});
+}
+
 /// `cmp a, b` (39 /r): compute `a - b`, set flags.
 pub fn cmp(a: Reg, b: Reg) Inst {
     return aluRR(0x39, b, a);
@@ -226,11 +231,18 @@ pub const Cond = enum(u8) {
 /// EAX/ECX/EDX/EBX (registers 0..3, whose low byte is al/cl/dl/bl). The allocator
 /// constrains boolean values to those registers.
 pub fn setcc(dst: Reg, cond: Cond) Inst {
+    // Byte-addressability invariant: without a REX prefix, only eax/ecx/edx/ebx
+    // (enum indices 0..3) have a low-byte alias (al/cl/dl/bl). esi/edi (4/5 are
+    // esp/ebp, 6/7 are esi/edi) would silently misencode to a different register.
+    std.debug.assert(@intFromEnum(dst) < 4);
     return Inst.of(&.{ 0x0F, 0x90 | @intFromEnum(cond), 0xC0 | n(dst) });
 }
 
 /// `movzx dst, src8` (0F B6 /r): zero-extend `src`'s low byte. `src` must be 0..3.
 pub fn movzxByte(dst: Reg, src: Reg) Inst {
+    // Byte-addressability invariant: `src`'s low byte is read directly (al/cl/dl/bl),
+    // so without a REX prefix `src` MUST be eax/ecx/edx/ebx (enum indices 0..3).
+    std.debug.assert(@intFromEnum(src) < 4);
     return Inst.of(&.{ 0x0F, 0xB6, modrm(dst, src) });
 }
 

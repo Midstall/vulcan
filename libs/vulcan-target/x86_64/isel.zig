@@ -4,8 +4,8 @@
 //! arithmetic, and register spilling.
 //!
 //! x86 arithmetic is two-operand, so `c = a op b` becomes `mov c, a` then `op c, b`.
-//! Registers are linear-scanned with reuse and spilling over the shared regalloc
-//! intervals. A spilled value lives in a stack slot, reloaded into a scratch register
+//! Registers are allocated by the shared Wimmer-Franz linear-scan-on-SSA allocator
+//! (`wimmer.zig`). A spilled value lives in a stack slot, reloaded into a scratch register
 //! (R10/R11) at each use, computed in a scratch, and stored back. R11 doubles as the
 //! parallel-move scratch (non-overlapping in time). RAX/RDX are reserved when dividing,
 //! RCX when shifting.
@@ -13,7 +13,6 @@
 const std = @import("std");
 const ir = @import("vulcan-ir");
 const encode = @import("encode.zig");
-const regalloc = @import("../regalloc.zig");
 const wimmer = @import("../wimmer.zig");
 const addrfold = @import("../addrfold.zig");
 const mm = @import("vulcan-opt").microarch;
@@ -2485,8 +2484,8 @@ pub fn compileFunctionWimmerX86Fold(allocator: std.mem.Allocator, func: *Functio
 
 /// Visit every operand VALUE read by `inst`, calling `f(ctx, value, is_edge_arg)`. The block
 /// arguments of an `if` are edge args (they move along a control edge), every other operand is an
-/// ordinary use. Mirrors the shared `regalloc.forEachUse` operand set, adding the edge-arg flag the
-/// split-liveness `is_intra` predicate needs. Kept local so `regalloc.zig` stays untouched.
+/// ordinary use. This local walk defines the exact operand set the split-liveness `is_intra`
+/// predicate scores, carrying the edge-arg flag that predicate needs.
 fn forEachOperand(func: *const Function, inst: ir.function.Inst, fold: *const addrfold.Analysis, ctx: anytype, comptime f: fn (@TypeOf(ctx), Value, bool) void) void {
     switch (func.opcode(inst)) {
         .iconst, .fconst, .alloca, .global_addr => {},
@@ -2510,8 +2509,8 @@ fn forEachOperand(func: *const Function, inst: ir.function.Inst, fold: *const ad
         // A folded load/store attributes its POINTER use to the fold base (the add's lhs), not the
         // add's own result, so the base stays live to the mem op and the dead add's result gets no
         // use. `baseOf` returns the raw ptr when unfolded (the empty analysis), so the non-folding
-        // case is byte-identical. This mirrors `regalloc.forEachUse` exactly, keeping this local
-        // liveness in position/value parity with the shared interval computation.
+        // case is byte-identical. Keeping this local walk in lockstep with the emission's operand
+        // reads is what keeps the fold's liveness sound.
         .load => f(ctx, fold.baseOf(func, inst), false),
         .store => |st| {
             f(ctx, st.value, false);
