@@ -572,6 +572,38 @@ test "intervals: a value dead between two uses has a hole" {
     try std.testing.expect(iv.ranges[0].to < iv.ranges[1].from);
 }
 
+test "intervals: a reachable def used only in an unreachable block degrades to a dead def" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(i32k);
+
+    // b0 (entry) defines V and immediately returns, so V is never used on any reachable path. b1 is
+    // UNREACHABLE (no block branches to it) and is the only user of V. buildIntervals walks all
+    // blocks, so V's ranges are built entirely from b1's dead region, whose earliest range does not
+    // contain V's def in b0. This is the exact shape that tripped the SSA def-in-range assert. We
+    // drive buildIntervals DIRECTLY here (bypassing neutralizeUnreachable) to prove the Pass C relax
+    // degrades V to a single dead-def range instead of crashing.
+    const b0 = try func.appendBlock();
+    const b1 = try func.appendBlock();
+    const v = try func.appendInst(b0, t, .{ .iconst = 5 });
+    func.setTerminator(b0, .{ .ret = null });
+
+    const w = try func.appendInst(b1, t, .{ .arith = .{ .op = .add, .lhs = v, .rhs = v } });
+    func.setTerminator(b1, .{ .ret = w });
+
+    var desc = try aarch64.aarch64RegDescription(allocator, &func);
+    defer desc.deinit(allocator);
+
+    const intervals = try wimmer.buildIntervals(allocator, &func, &desc);
+    defer wimmer.freeIntervals(allocator, intervals);
+
+    const iv = findValueInterval(intervals, v) orelse return error.MissingInterval;
+    // The relax collapses V to a single minimal [def, def+1) range, discarding the dead-region ranges.
+    try std.testing.expectEqual(@as(usize, 1), iv.ranges.len);
+    try std.testing.expectEqual(iv.ranges[0].from + 1, iv.ranges[0].to);
+}
+
 test "intervals: a loop-carried value stays live across the whole loop body" {
     const allocator = std.testing.allocator;
     var func = Function.init(allocator);

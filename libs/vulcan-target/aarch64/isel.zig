@@ -526,6 +526,19 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
     defer work.deinit();
     try ir.critical_edge.splitCriticalEdges(allocator, &work);
 
+    // Neutralize every block unreachable from the entry BEFORE any numbering is built. A pass that
+    // raised a loop nest into one op could orphan its blocks (the IR has no block-delete), leaving
+    // instructions that USE values defined in reachable blocks, and the shared `buildIntervals` walks
+    // ALL blocks, so such a value would get a live range built entirely from the dead region and trip
+    // the allocator's SSA def-in-range assert. Emptying every unreachable block's params, instructions,
+    // and terminator removes those spurious uses. This backend emits EVERY block, so it does NOT consume
+    // the returned reachable set: `emitFromAllocation` detects a neutralized block by its emptied shape
+    // (no instructions AND a null terminator) and emits nothing for it. A NO-OP for a function whose
+    // blocks are all reachable (nothing is emptied), so output stays byte-identical for every existing
+    // caller.
+    const reachable = try ir.reachable.neutralizeUnreachable(allocator, &work);
+    allocator.free(reachable);
+
     // Address-mode folding is a PRE-ALLOCATION IR REWRITE so it is SOUND under the fold-agnostic
     // shared Wimmer allocator (which sees only the actual IR operands and keeps a frozen `wimmer.zig`).
     // `analyze` recognizes each foldable `p = arith_imm.add(base, imm); load/store(p)` and which adds
@@ -873,6 +886,24 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
     for (0..nblocks) |bi| {
         const block: Block = @enumFromInt(bi);
         ctx.block = block; // the predecessor for any edge this block terminates in (edge-move keying)
+        // A neutralized (unreachable) block: `neutralizeUnreachable` emptied its params, instructions,
+        // and terminator so downstream passes see only the reachable CFG. It carries no code and no
+        // reachable branch targets it (valid SSA), so emit NOTHING. The shared Wimmer allocator still
+        // NUMBERS it (param row + 0 insts + terminator slot = 2 positions), so advance `pos` over that
+        // span and discard any split actions the allocator recorded inside a block that is never entered
+        // (those moves have no runtime effect). When every block is reachable this branch is never taken,
+        // so output is byte-identical for every normal function. The detector (no instructions AND a
+        // null terminator) is unambiguous: a block ending in a structured `if` has instructions, and a
+        // forwarding block has a non-null jump terminator, so only a neutralized block matches both.
+        if (func.blockInsts(block).len == 0 and func.terminator(block) == null) {
+            block_start[bi] = code.items.len;
+            const dead_end = pos + 1; // last position this empty block owns (param row, terminator slot)
+            while (action_cursor < alloc.actions.items.len and alloc.actions.items[action_cursor].at <= dead_end) {
+                action_cursor += 1;
+            }
+            pos += 2;
+            continue;
+        }
         if (fetch_align > 4 and is_loop_header[bi]) {
             var pad = alignPadWords(code.items.len, fetch_align);
             while (pad > 0) : (pad -= 1) try code.append(allocator, encode.nop());
