@@ -11,6 +11,7 @@ const ir = @import("vulcan-ir");
 const isel = @import("isel.zig");
 const encode = @import("encode.zig");
 const jit_platform = @import("../jit_platform.zig");
+const mm = @import("vulcan-opt").microarch;
 
 const Function = ir.function.Function;
 
@@ -36,6 +37,9 @@ pub const Data = struct { name: []const u8, bytes: []const u8, kind: DataKind, s
 pub const Module = struct {
     functions: std.ArrayListUnmanaged(Entry) = .empty,
     data: std.ArrayListUnmanaged(Data) = .empty,
+    /// When set, `object.writeModule` selects code for this microarch model
+    /// instead of the generic default. Null keeps the generic path.
+    model: ?*const mm.Model = null,
 
     pub const Entry = struct { name: []const u8, func: *const Function };
 

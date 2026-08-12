@@ -480,9 +480,10 @@ pub fn writeModule(allocator: std.mem.Allocator, module: *const link.Module) Err
     defer pending.deinit(allocator);
 
     // Functions, laid out back to back in `.text`.
+    const caps: isel.ModelCaps = if (module.model) |m| isel.capsForModel(m) else .{};
     for (module.entries.items) |entry| {
         const start: u64 = text.items.len;
-        var compiled = try isel.compileFunction(allocator, entry.func, .{});
+        var compiled = try isel.compileFunction(allocator, entry.func, caps);
         defer compiled.deinit(allocator);
         for (compiled.code) |word| {
             var w: [4]u8 = undefined;
@@ -587,9 +588,10 @@ pub fn writeModuleWithDebug(allocator: std.mem.Allocator, module: *const link.Mo
     var fndies: std.ArrayList(FnDie) = .empty;
     defer fndies.deinit(allocator);
 
+    const caps: isel.ModelCaps = if (module.model) |m| isel.capsForModel(m) else .{};
     for (module.entries.items) |entry| {
         const start: u64 = text.items.len;
-        var compiled = try isel.compileFunction(allocator, entry.func, .{});
+        var compiled = try isel.compileFunction(allocator, entry.func, caps);
         defer compiled.deinit(allocator);
         for (compiled.code) |word| {
             var w: [4]u8 = undefined;

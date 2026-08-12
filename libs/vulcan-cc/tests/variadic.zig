@@ -2439,4 +2439,3 @@ test "real glibc ldiv(17,5) struct-return (ldiv_t, two integer eightbytes rax:rd
 test "i386 real-glibc div_t is a documented skip (pre-existing struct-local gap)" {
     return error.SkipZigTest;
 }
-

@@ -126,8 +126,9 @@ pub fn writeModule(allocator: std.mem.Allocator, module: *const link.Module) Err
         for (compiled[0..compiled_n]) |*c| c.deinit(allocator);
         allocator.free(compiled);
     }
+    const caps: isel.ModelCaps = if (module.model) |m| isel.capsForModel(m) else .{};
     for (funcs, 0..) |e, i| {
-        compiled[i] = try isel.compile(allocator, e.func);
+        compiled[i] = try isel.compileWithCaps(allocator, e.func, caps);
         compiled_n = i + 1;
     }
 
@@ -265,8 +266,9 @@ pub fn writeModuleWithDebug(allocator: std.mem.Allocator, module: *const link.Mo
         for (compiled[0..compiled_n]) |*c| c.deinit(allocator);
         allocator.free(compiled);
     }
+    const caps: isel.ModelCaps = if (module.model) |m| isel.capsForModel(m) else .{};
     for (funcs, 0..) |e, i| {
-        compiled[i] = try isel.compile(allocator, e.func);
+        compiled[i] = try isel.compileWithCaps(allocator, e.func, caps);
         compiled_n = i + 1;
     }
 

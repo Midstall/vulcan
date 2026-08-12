@@ -3051,4 +3051,3 @@ test "struct-by-value integration: small int + large by-ref/sret + float HFA + m
         &.{},
     ); // 3 + 31 + 4 + 4 = 42
 }
-
