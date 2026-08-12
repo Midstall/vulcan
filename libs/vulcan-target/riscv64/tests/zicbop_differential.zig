@@ -89,7 +89,7 @@ fn build(func: *Function) anyerror!void {
     const ni = try func.appendArithImm(body, i32_t, .add, bi, 1);
     try func.setJump(body, loop, &.{ ni, np, ns });
 
-    func.setTerminator(done, .{ .ret = ds });
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(ds) });
 }
 
 /// Compile `func` through the same legalize/split/schedule pipeline `harness.compileFunc` uses,

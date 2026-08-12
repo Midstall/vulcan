@@ -1,19 +1,20 @@
-//! Emit JavaScript from a Vulcan IR function: a second source-level backend alongside
-//! `c.zig`. JavaScript has one number type and no `goto`, so the mapping differs from C:
+//! Emit JavaScript from a Vulcan IR function. This is a second source-level backend,
+//! alongside `c.zig`. JavaScript has one number type and no `goto`, so the mapping
+//! differs from C:
 //!
-//!   - Integers are BigInt, canonicalized to their type after each op with
-//!     `BigInt.asIntN(bits, x)` / `asUintN`, so wrapping matches any bit width including 64.
-//!   - Floats are Number; an f32 result is `Math.fround`-normalized so single precision is
-//!     exact, and an f16 result is `Math.f16round`-normalized the same way (scalar f16 only;
-//!     f16 nested in a composite is rejected, see `functionUsesCompositeF16`).
-//!   - Booleans are JS booleans; pointers are BigInt byte offsets into a shared memory.
+//!   - Integers are BigInt. Each op canonicalizes the result to its type with
+//!     `BigInt.asIntN(bits, x)` / `asUintN`, so wrapping matches any bit width, up to 64.
+//!   - Floats are Number. An f32 result is `Math.fround`-normalized, so single precision
+//!     stays exact. An f16 result is `Math.f16round`-normalized the same way. This covers
+//!     scalar f16 only, f16 nested in a composite is rejected, see `functionUsesCompositeF16`.
+//!   - Booleans are JS booleans. Pointers are BigInt byte offsets into a shared memory.
 //!   - Aggregates (struct/vector/array/slice) are JS arrays `[f0, f1, ...]`.
-//!   - Control flow is a `while (true) switch (__blk)` state machine (blocks are cases,
-//!     jumps assign `__blk` and `break`), since JS lacks `goto`.
-//!   - Memory (alloca/load/store) uses a DataView over one ArrayBuffer, set up by the
-//!     runtime preamble (`runtime_preamble`), which also holds the reinterpret and
-//!     round-to-even helpers. A single function depends on that preamble being present, the
-//!     way a C function depends on its headers.
+//!   - Control flow is a `while (true) switch (__blk)` state machine. Blocks are cases,
+//!     and jumps assign `__blk` then `break`, since JS lacks `goto`.
+//!   - Memory (alloca/load/store) uses a DataView over one ArrayBuffer. The runtime
+//!     preamble (`runtime_preamble`) sets this up, and also holds the reinterpret and
+//!     round-to-even helpers. A single function depends on that preamble being present,
+//!     the way a C function depends on its headers.
 
 const std = @import("std");
 const ir = @import("vulcan-ir");
@@ -26,9 +27,9 @@ const Type = ir.types.Type;
 
 pub const Error = error{Unsupported} || std.mem.Allocator.Error;
 
-/// The shared runtime every emitted function assumes: a linear memory + DataView, a bump
-/// allocator for `alloca`, typed load/store helpers, bit-reinterpret helpers, and a
-/// round-half-to-even `__rint`. `emitModule` includes it once; a lone `emitFunction` output
+/// The shared runtime every emitted function assumes: a linear memory plus a DataView, a
+/// bump allocator for `alloca`, typed load/store helpers, bit-reinterpret helpers, and a
+/// round-half-to-even `__rint`. `emitModule` includes it once. A lone `emitFunction` output
 /// needs it prepended by the caller.
 pub const runtime_preamble =
     \\const __mem = new ArrayBuffer(1 << 20);
@@ -69,11 +70,11 @@ pub const runtime_preamble =
 /// Emit `func` as a single JS function named `name`. Caller owns the returned source. The
 /// output assumes `runtime_preamble` is in scope.
 pub fn emitFunction(allocator: std.mem.Allocator, func: *const Function, name: []const u8) Error![]u8 {
-    // JS has `Math.f16round` (mirrors `Math.fround` for f32), so scalar f16 lowers the same
-    // way f32 does: every fround site below gets an f16round twin. f16 nested in a
-    // vector/aggregate has no tested emission path here (the other scalar-f16 backends draw
-    // the same line), so that composite case still rejects cleanly. Covers both this direct
-    // entry and emitModule, which delegates here per function.
+    // JS has `Math.f16round` (it mirrors `Math.fround` for f32). So scalar f16 lowers the
+    // same way f32 does: every fround site below gets an f16round twin. f16 nested in a
+    // vector or an aggregate has no tested emission path here. The other scalar-f16
+    // backends draw the same line, so this composite case still rejects cleanly. This
+    // covers both this direct entry and emitModule, which delegates here per function.
     if (ir.function.functionUsesCompositeF16(func)) return error.Unsupported;
 
     var e = Emitter{ .allocator = allocator, .func = func };
@@ -272,10 +273,14 @@ const Emitter = struct {
             .load => |ld| try self.emitLoad(res.?, ld.ptr, indent),
             .store => |st| try self.emitStore(st.value, st.ptr, indent),
             .prefetch => {}, // a hint, JS has no prefetch, dropped
-            // dot is aarch64+dotprod-only in practice; the JS backend has no lowering for it.
+            // dot is aarch64+dotprod-only in practice. The JS backend has no lowering for it.
             .dot => return error.Unsupported,
-            // matmul is et-soc-only (a later task); the JS backend has no lowering for it.
+            // matmul is et-soc-only (a later task). The JS backend has no lowering for it.
             .matmul => return error.Unsupported,
+            // The IR ops exist already (frontend and IR construction only). This backend
+            // has no lowering for them yet. That is a later task, like `dot` and `matmul`
+            // above.
+            .va_start, .va_arg, .va_end => return error.Unsupported,
             .struct_new => |sn| {
                 try self.print("{s}v{d} = [", .{ indent, self.name(res.?) });
                 for (func.valueList(sn.fields), 0..) |field, i| {
@@ -301,7 +306,13 @@ const Emitter = struct {
             },
             // A global resolves to a same-named binding in scope (a function for
             // call_indirect, or a byte offset for a data global).
-            .global_addr => |ga| try self.print("{s}v{d} = {s};\n", .{ indent, self.name(res.?), func.symbolName(ga.symbol) }),
+            .global_addr => |ga| {
+                // GOT-indirect data addressing has no JS-source rendering yet. Only
+                // aarch64's native instruction selection supports `via_got` today. Fail
+                // loudly, instead of silently emitting a direct-address expression for it.
+                if (ga.via_got) return error.Unsupported;
+                try self.print("{s}v{d} = {s};\n", .{ indent, self.name(res.?), func.symbolName(ga.symbol) });
+            },
         }
     }
 
@@ -463,10 +474,10 @@ const Emitter = struct {
             return;
         };
         switch (term) {
-            .ret => |v| if (v) |vv| {
-                try self.print("{s}{s}return v{d};\n", .{ indent, restore, self.name(vv) });
-            } else {
-                try self.print("{s}{s}return;\n", .{ indent, restore });
+            .ret => |r| switch (r.count) {
+                0 => try self.print("{s}{s}return;\n", .{ indent, restore }),
+                1 => try self.print("{s}{s}return v{d};\n", .{ indent, restore, self.name(r.values[0]) }),
+                else => return error.Unsupported, // multi-value struct return not yet lowered
             },
             .jump => |j| try self.emitEdge(j.target, self.func.blockArgs(j), indent),
         }
@@ -492,10 +503,11 @@ const Emitter = struct {
         try self.print("{s}  }}\n", .{indent});
     }
 
-    /// Write the prefix that canonicalizes an expression of type `ty`: `BigInt.asIntN(...)`
-    /// for integers/pointers, `Math.fround(` for f32, `Math.f16round(` for f16 (so a plain JS
-    /// Number `+`/`*`/etc, computed at double precision, gets re-rounded to the op's actual
-    /// width once the expression closes), nothing for f64.
+    /// Write the prefix that canonicalizes an expression of type `ty`. It writes
+    /// `BigInt.asIntN(...)` for integers and pointers, `Math.fround(` for f32, and
+    /// `Math.f16round(` for f16. A plain JS Number op (`+`, `*`, and so on) computes at
+    /// double precision. This prefix re-rounds the result to the op's actual width once
+    /// the expression closes. It writes nothing for f64.
     fn wrapPre(self: *Emitter, ty: Type) Error!void {
         switch (self.kind(ty)) {
             .int => |i| try self.print("BigInt.as{s}N({d}, ", .{ if (i.signedness == .unsigned) "Uint" else "Int", i.bits }),
@@ -579,7 +591,7 @@ test "emits a straight-line function returning a constant" {
     const a = try func.appendBlockParam(entry, i32_t);
     const b = try func.appendBlockParam(entry, i32_t);
     const sum = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .add, .lhs = a, .rhs = b } });
-    func.setTerminator(entry, .{ .ret = sum });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(sum) });
 
     const src = try emitFunction(std.testing.allocator, &func, "add");
     defer std.testing.allocator.free(src);
@@ -603,7 +615,7 @@ test "an f16 add emits Math.f16round, mirroring the f32 Math.fround path" {
     const a = try func.appendBlockParam(entry, f16_t);
     const b = try func.appendBlockParam(entry, f16_t);
     const sum = try func.appendInst(entry, f16_t, .{ .arith = .{ .op = .add, .lhs = a, .rhs = b } });
-    func.setTerminator(entry, .{ .ret = sum });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(sum) });
 
     const src = try emitFunction(std.testing.allocator, &func, "add");
     defer std.testing.allocator.free(src);
@@ -620,7 +632,8 @@ test "an f16 add emits Math.f16round, mirroring the f32 Math.fround path" {
         \\
     , src);
 
-    // A module also accepts a scalar-f16 function now; only a composite f16 rejects (below).
+    // A module also accepts a scalar-f16 function now. Only a composite f16 rejects it
+    // (below).
     const named = [_]NamedFunc{.{ .name = "add", .func = &func }};
     const mod_src = try emitModule(std.testing.allocator, &named);
     defer std.testing.allocator.free(mod_src);
@@ -635,12 +648,23 @@ test "composite f16 (a vector of half) is still rejected cleanly" {
     const v2 = try func.types.intern(.{ .vector = .{ .len = 2, .elem = f16_t } });
     const entry = try func.appendBlock();
     const a = try func.appendBlockParam(entry, v2);
-    func.setTerminator(entry, .{ .ret = a });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(a) });
 
     try std.testing.expectError(error.Unsupported, emitFunction(std.testing.allocator, &func, "vh"));
 
     const named = [_]NamedFunc{.{ .name = "vh", .func = &func }};
     try std.testing.expectError(error.Unsupported, emitModule(std.testing.allocator, &named));
+}
+
+test "a via_got global_addr is rejected (no JS-source rendering for GOT-indirect addressing)" {
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+    const ptr_t = try func.types.intern(.ptr);
+    const entry = try func.appendBlock();
+    const g = try func.appendGlobalAddrGot(entry, ptr_t, "G");
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(g) });
+
+    try std.testing.expectError(error.Unsupported, emitFunction(std.testing.allocator, &func, "getg"));
 }
 
 test "emits a state machine for an if/else diamond" {
@@ -656,7 +680,7 @@ test "emits a state machine for an if/else diamond" {
     const r = try func.appendBlockParam(merge, i32_t);
     const cond = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .gt, .lhs = a, .rhs = b } });
     try func.appendIf(entry, cond, .{ .target = merge, .args = &.{a} }, .{ .target = merge, .args = &.{b} });
-    func.setTerminator(merge, .{ .ret = r });
+    func.setTerminator(merge, .{ .ret = ir.function.Ret.one(r) });
 
     const src = try emitFunction(std.testing.allocator, &func, "maxi");
     defer std.testing.allocator.free(src);

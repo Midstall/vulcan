@@ -155,12 +155,12 @@ pub fn vfmul_vv(vd: VReg, vs2: VReg, vs1: VReg) u32 {
 pub fn vfdiv_vv(vd: VReg, vs2: VReg, vs1: VReg) u32 {
     return opfvv(0b100000, vd, vs2, vs1);
 }
-// Fused multiply-add/sub family (OPFVV): unlike the plain arithmetic ops above, these
+// Fused multiply-add/sub family (OPFVV). Unlike the plain arithmetic ops above, these
 // accumulate INTO vd (vd is a third source operand as well as the destination), so the
 // assembler operand order is conventionally written `vd, vs1, vs2` (the two multiplicands)
 // rather than the `vd, vs2, vs1` used for vfadd/vfsub/etc above. vs1/vs2 still land in the
-// same bit fields as `opfvv` expects; only the argument order in these wrappers changes to
-// match the assembler mnemonic. Field layout and funct6 values cross-checked byte-for-byte
+// same bit fields as `opfvv` expects. Only the argument order in these wrappers changes to
+// match the assembler mnemonic. Field layout and funct6 values are cross-checked byte-for-byte
 // against `zig cc -target riscv64-linux-musl` (LLVM's assembler) output for
 // `vfmacc.vv v3,v1,v2` / `vfmsac.vv v3,v1,v2` / `vfnmsac.vv v3,v1,v2`.
 /// `vfmacc.vv vd, vs1, vs2`: vd = vs1*vs2 + vd.
@@ -329,14 +329,22 @@ pub fn fmv_d_x(rd: FReg, rs1: Reg) u32 {
     return @as(u32, 0b1010011) | (fnum(rd) << 7) | (num(rs1) << 15) | (@as(u32, 0b1111001) << 25);
 }
 
-// Scalar fused multiply-add family (R4-type, one rounding instead of two - legal because
-// Vulcan permits fp-contraction). Layout: rs3[31:27] fmt[26:25] rs2[24:20] rs1[19:15]
-// rm[14:12] rd[11:7] opcode[6:0]. fmt: 00 = single (.s), 01 = double (.d). rm = 111 (dynamic).
-// One opcode per variant (unlike the et-soc VPU's `vpuPsFma`, which packs all four into one
-// opcode via a `sel` field): FMADD = 0x43, FMSUB = 0x47, FNMSUB = 0x4B, FNMADD = 0x4F (deferred,
-// unused by the fusion in isel.zig). Confirmed against `disasm.zig`'s independently-written `fma`
-// decoder (already verified against llvm-objdump: see "decodes RV64 word ops, FMA, and base
-// pseudos") - the golden word there round-trips through these encoders in the tests below.
+/// `fmv.x.d rd, rs1` (move a float register's 64 bits into an integer register, no convert, RV64).
+/// The lp64d variadic rule passes an ANONYMOUS double argument in an integer a-register, so a
+/// double held in an f-register is bit-copied here into its integer arg slot.
+pub fn fmv_x_d(rd: Reg, rs1: FReg) u32 {
+    return @as(u32, 0b1010011) | (num(rd) << 7) | (fnum(rs1) << 15) | (@as(u32, 0b1110001) << 25);
+}
+
+// Scalar fused multiply-add family (R4-type). It uses one rounding step instead of two,
+// which is legal because Vulcan permits fp-contraction. Layout: rs3[31:27] fmt[26:25]
+// rs2[24:20] rs1[19:15] rm[14:12] rd[11:7] opcode[6:0]. fmt: 00 = single (.s), 01 = double
+// (.d). rm = 111 (dynamic). Each variant has its own opcode (unlike the et-soc VPU's
+// `vpuPsFma`, which packs all four into one opcode via a `sel` field): FMADD = 0x43,
+// FMSUB = 0x47, FNMSUB = 0x4B, FNMADD = 0x4F (deferred, unused by the fusion in isel.zig).
+// This is confirmed against `disasm.zig`'s independently written `fma` decoder (already
+// verified against llvm-objdump: see "decodes RV64 word ops, FMA, and base pseudos"). The
+// golden word there round-trips through these encoders in the tests below.
 fn fma4Type(opcode: u7, fmt: u2, rd: FReg, rs1: FReg, rs2: FReg, rs3: FReg) u32 {
     return @as(u32, opcode) |
         (fnum(rd) << 7) |
@@ -426,8 +434,8 @@ pub fn fmv_d(rd: FReg, rs: FReg) u32 {
 // its single-precision sibling with bit 25 set. The loads/stores are new width-1 (`funct3 = 001`)
 // LOAD-FP / STORE-FP forms. All encoders below were validated byte-for-byte against
 // `riscv64-unknown-elf-as -march=rv64gc_zfh` (golden words in the unit test at the bottom of this
-// file). Only reached when a caller threads `ModelCaps.zfh = true`; the default emulation path
-// (see isel.zig) never emits any of these, so it stays byte-identical.
+// file). This is only reached when a caller sets `ModelCaps.zfh = true`. The default emulation
+// path (see isel.zig) never emits any of these, so it stays byte-identical.
 
 /// `flh rd, imm(rs1)` (load half-precision float, `rs1` is an integer base). LOAD-FP `funct3 = 001`
 /// (width 1 = half), sibling of `flw` (010) and `fld` (011).
@@ -481,13 +489,13 @@ pub fn fle_h(rd: Reg, rs1: FReg, rs2: FReg) u32 {
     return fpCmp(0b1010010, 0b000, rd, rs1, rs2);
 }
 
-/// `fcvt.s.h rd, rs1` (half -> single, always exact so the rounding mode is ignored; the assembler
-/// emits rm = 000, matched here). rs2 selector = 00010 (source is half).
+/// `fcvt.s.h rd, rs1` (half -> single, always exact so the rounding mode is ignored. The
+/// assembler emits rm = 000, matched here). rs2 selector = 00010 (source is half).
 pub fn fcvt_s_h(rd: FReg, rs1: FReg) u32 {
     return @as(u32, 0b1010011) | (fnum(rd) << 7) | (@as(u32, 0b000) << 12) | (fnum(rs1) << 15) | (@as(u32, 0b00010) << 20) | (@as(u32, 0b0100000) << 25);
 }
 
-/// `fcvt.h.s rd, rs1` (single -> half, rounds; dynamic rounding). fmt = half, rs2 selector = 0 (S).
+/// `fcvt.h.s rd, rs1` (single -> half, rounds with dynamic rounding). fmt = half, rs2 selector = 0 (S).
 pub fn fcvt_h_s(rd: FReg, rs1: FReg) u32 {
     return @as(u32, 0b1010011) | (fnum(rd) << 7) | (@as(u32, 0b111) << 12) | (fnum(rs1) << 15) | (@as(u32, 0b00000) << 20) | (@as(u32, 0b0100010) << 25);
 }
@@ -497,7 +505,7 @@ pub fn fcvt_d_h(rd: FReg, rs1: FReg) u32 {
     return @as(u32, 0b1010011) | (fnum(rd) << 7) | (@as(u32, 0b000) << 12) | (fnum(rs1) << 15) | (@as(u32, 0b00010) << 20) | (@as(u32, 0b0100001) << 25);
 }
 
-/// `fcvt.h.d rd, rs1` (double -> half, rounds; dynamic rounding). fmt = half, rs2 selector = 00001 (D).
+/// `fcvt.h.d rd, rs1` (double -> half, rounds with dynamic rounding). fmt = half, rs2 selector = 00001 (D).
 pub fn fcvt_h_d(rd: FReg, rs1: FReg) u32 {
     return @as(u32, 0b1010011) | (fnum(rd) << 7) | (@as(u32, 0b111) << 12) | (fnum(rs1) << 15) | (@as(u32, 0b00001) << 20) | (@as(u32, 0b0100010) << 25);
 }
@@ -512,12 +520,12 @@ pub fn fcvt_wu_h(rd: Reg, rs1: FReg) u32 {
     return @as(u32, 0b1010011) | (num(rd) << 7) | (@as(u32, 0b001) << 12) | (fnum(rs1) << 15) | (@as(u32, 0b00001) << 20) | (@as(u32, 0b1100010) << 25);
 }
 
-/// `fcvt.h.w rd, rs1` (signed 32-bit integer -> half, rounds; dynamic rounding). rs2 = 0 (W source).
+/// `fcvt.h.w rd, rs1` (signed 32-bit integer -> half, rounds with dynamic rounding). rs2 = 0 (W source).
 pub fn fcvt_h_w(rd: FReg, rs1: Reg) u32 {
     return @as(u32, 0b1010011) | (fnum(rd) << 7) | (@as(u32, 0b111) << 12) | (num(rs1) << 15) | (@as(u32, 0b00000) << 20) | (@as(u32, 0b1101010) << 25);
 }
 
-/// `fcvt.h.wu rd, rs1` (unsigned 32-bit integer -> half, rounds; dynamic rounding). rs2 = 00001 (WU).
+/// `fcvt.h.wu rd, rs1` (unsigned 32-bit integer -> half, rounds with dynamic rounding). rs2 = 00001 (WU).
 pub fn fcvt_h_wu(rd: FReg, rs1: Reg) u32 {
     return @as(u32, 0b1010011) | (fnum(rd) << 7) | (@as(u32, 0b111) << 12) | (num(rs1) << 15) | (@as(u32, 0b00001) << 20) | (@as(u32, 0b1101010) << 25);
 }
@@ -579,7 +587,7 @@ pub fn fdiv_ps(fd: FReg, fs1: FReg, fs2: FReg) u32 {
 }
 
 /// PS fused multiply-add: R4-type, opcode 0x5B (1011011). `sel` (bits [26:25]) picks
-/// the variant: 00=madd, 01=msub, 10=nmsub, 11=nmadd (instructions.vh:220-223); `fs3`
+/// the variant: 00=madd, 01=msub, 10=nmsub, 11=nmadd (instructions.vh:220-223). `fs3`
 /// (the accumulate operand) sits at bits [31:27]. Unlike scalar RV32F, which spends
 /// four opcodes on this, the VPU packs all four variants into one opcode via `sel`.
 fn vpuPsFma(sel: u2, funct3: u3, fd: FReg, fs1: FReg, fs2: FReg, fs3: FReg) u32 {
@@ -636,7 +644,7 @@ pub fn fbcx_ps(fd: FReg, rs1: Reg) u32 {
 /// 0x7B, instructions.vh:236 (`111000000XXXXXXXX010XXXXX1111011`).
 ///
 /// RTL-DERIVED FIELD PLACEMENT (the feasibility report flagged this field as
-/// spec-approximate; verified here against `vpu_decoder.v:122` and `vpu_ctrl.v`).
+/// spec-approximate). This is verified here against `vpu_decoder.v:122` and `vpu_ctrl.v`.
 /// `FMVS_X_PS`'s decode row sets `ren1=Y, ren2=N, ren3=N` with no swap, so
 /// `vpu_ctrl.v` reads the source through `id_ra1 = id_core_inst_int[VPU_INST_REN1_RA_SEL]`,
 /// i.e. `fs1` is the standard rs1 slot, bits [19:15] (NOT the rs2 slot, which the
@@ -660,15 +668,15 @@ pub fn fmvs_x_ps(rd: Reg, fs1: FReg, index: u3) u32 {
 /// `mov_m_x(0, .x0, 0xFF)`.
 ///
 /// RTL-DERIVED FIELD PLACEMENT (the feasibility report flagged the md/imm8 split as
-/// spec-approximate; verified here against `vpu_mask.v` and `intpipe_decode.v`).
+/// spec-approximate). This is verified here against `vpu_mask.v` and `intpipe_decode.v`.
 /// `vpu_mask.v`'s F2 stage computes `f2_regmask_wdata = f2_in1[7:0] | f2_imm[7:0]` for
 /// this op: `f2_in1` is the bypassed value of `xs`, read via the standard rs1 slot
 /// bits [19:15] (`MOV_M_X`'s decode row sets `fromint=Y`, and
-/// `intpipe_decode.v:417` reads it through `A1_RS1`); `f2_imm` is
+/// `intpipe_decode.v:417` reads it through `A1_RS1`). `f2_imm` is
 /// `{inst[24:20], inst[14:12]}` (the `maskop` case of `vpu_ctrl.v`'s imm mux), an
 /// 8-bit immediate split across the rs2 slot (high 5 bits) and the rm/funct3 slot
 /// (low 3 bits). The destination mask register `md` sits in the low 3 bits of the
-/// standard rd slot, bits [9:7]; the casex's `...XXX00XXX...` hardwires bits [11:10]
+/// standard rd slot, bits [9:7]. The casex's `...XXX00XXX...` hardwires bits [11:10]
 /// to 0, which a `u3` for `md` satisfies by construction.
 pub fn mov_m_x(md: u3, xs: Reg, imm8: u8) u32 {
     return @as(u32, 0b1111011) |
@@ -679,14 +687,15 @@ pub fn mov_m_x(md: u3, xs: Reg, imm8: u8) u32 {
         (@as(u32, 0b0101011) << 25);
 }
 
-// et-soc pi (packed-integer), 8-lane int32 SIMD - the integer sibling of the PS
-// (packed-single f32) unit above. Same opcode families (0x7B for reg-reg/unary ops,
-// 0x5F for immediate broadcast), but funct3 here is a REAL operand selector, not a
-// rounding mode as it is for PS: funct7[31:25] picks the op family, funct3[14:12]
-// picks the variant within it. All MATCH/MASK constants below are authoritative,
-// extracted from binutils esperanto-opc.h (not RTL-derived like the PS lane-extract
-// and mask-write ops above). No emulator or silicon runs these here, so correctness
-// is checked only against esperanto-opc.h's match/mask pairs in the tests below.
+// et-soc pi (packed-integer), 8-lane int32 SIMD. It is the integer sibling of the PS
+// (packed-single f32) unit above. It uses the same opcode families (0x7B for
+// reg-reg/unary ops, 0x5F for immediate broadcast), but funct3 here is a REAL
+// operand selector, not a rounding mode as it is for PS: funct7[31:25] picks the op
+// family, and funct3[14:12] picks the variant within it. All MATCH/MASK constants
+// below are authoritative, extracted from binutils esperanto-opc.h (not RTL-derived
+// like the PS lane-extract and mask-write ops above). No emulator or silicon runs
+// these here, so correctness is checked only against esperanto-opc.h's match/mask
+// pairs in the tests below.
 
 /// pi reg-reg R-type: opcode 0x7B (1111011). Same field layout as `vpuPsRType`
 /// above, but `funct3` is a real operand selector here (e.g. signed vs. unsigned,
@@ -781,9 +790,9 @@ pub fn fxor_pi(fd: FReg, fs1: FReg, fs2: FReg) u32 {
     return vpuPiRType(0b0000011, 0b100, fd, fs1, fs2);
 }
 
-/// `feq.pi fd, fs1, fs2` (per-lane compare; result is -1/0 written into `fd`'s
-/// lanes, NOT a GPR - unlike the scalar `feq.s` above, which writes an integer
-/// register). MATCH 0xa600207b.
+/// `feq.pi fd, fs1, fs2` (per-lane compare). The result is -1/0 written into `fd`'s
+/// lanes, NOT a GPR. This is unlike the scalar `feq.s` above, which writes an integer
+/// register. MATCH 0xa600207b.
 pub fn feq_pi(fd: FReg, fs1: FReg, fs2: FReg) u32 {
     return vpuPiRType(0b1010011, 0b010, fd, fs1, fs2);
 }
@@ -808,9 +817,9 @@ pub fn fle_pi(fd: FReg, fs1: FReg, fs2: FReg) u32 {
 
 /// pi saturate: unary R-type, opcode 0x7B. Unlike the reg-reg ops above, the field
 /// at bits [24:20] (a register operand's `rs2` slot in `vpuPiRType`) is NOT a
-/// register here - it's a fixed sub-selector distinguishing the signed and
-/// unsigned clamp variants. MASK 0xfff0707f (funct7 + the whole sub-selector field
-/// + funct3 + opcode all care; `rd`/`rs1`, the real operands, don't).
+/// register here. It is a fixed sub-selector that picks the signed or unsigned
+/// clamp variant. MASK 0xfff0707f (funct7, the whole sub-selector field, funct3,
+/// and opcode all care; `rd`/`rs1`, the real operands, do not).
 fn vpuPiSat(funct7: u7, funct3: u3, sel: u5, fd: FReg, fs1: FReg) u32 {
     return @as(u32, 0b1111011) |
         (fnum(fd) << 7) |
@@ -827,8 +836,8 @@ pub fn fsat8_pi(fd: FReg, fs1: FReg) u32 {
 }
 
 /// `fsatu8.pi fd, fs1` (clamp each int32 lane into the unsigned uint8 range).
-/// MATCH 0x0610307b - sub-selector = 1 is the *only* bit distinguishing this from
-/// `fsat8_pi` (bit 20 of the word).
+/// MATCH 0x0610307b. Sub-selector = 1 is the *only* bit that distinguishes this
+/// from `fsat8_pi` (bit 20 of the word).
 pub fn fsatu8_pi(fd: FReg, fs1: FReg) u32 {
     return vpuPiSat(0b0000011, 0b011, 1, fd, fs1);
 }
@@ -859,9 +868,9 @@ pub fn fcvt_pw_ps(fd: FReg, fs1: FReg) u32 {
 }
 
 /// `fbci.pi fd, imm`: broadcast an immediate into all 8 int32 lanes of `fd`.
-/// Opcode 0x5F - only the opcode is authoritative here (MATCH base 0x0000005f,
-/// MASK 0x0000007f per esperanto-opc.h; no funct3/rd/imm field placement is
-/// confirmed against it).
+/// Opcode 0x5F. Only the opcode is authoritative here (MATCH base 0x0000005f,
+/// MASK 0x0000007f per esperanto-opc.h). No funct3/rd/imm field placement is
+/// confirmed against it.
 ///
 /// UNVERIFIED FIELD LAYOUT: this encoder makes the conservative, `lui`-shaped
 /// guess that the immediate is a 20-bit U-type-style hi field at bits [31:12]
@@ -1230,26 +1239,26 @@ pub fn prefetch_r(rs1: Reg, offset: i12) u32 {
 }
 
 // et-soc tensor/matmul unit (CORE-ET Erbium): a pure CSR-write protocol, NOT a set
-// of tensor instructions. Every op is `csrw <csr>, rs1` writing a packed 64-bit
-// descriptor (built by the packers below); some ops also take a second packed value
-// through x31 (stride, and for tensor_load a stride|id pair). Bit layouts below are
-// copied field-for-field from the golden software header
+// of tensor instructions. Every op is `csrw <csr>, rs1`. It writes a packed 64-bit
+// descriptor built by the packers below. Some ops also take a second packed value
+// through x31 (stride, and for tensor_load a stride|id pair). Bit layouts below come
+// field-for-field from the golden software header
 // `et-platform/et-common-libs/include/etsoc/isa/tensors.h` (the `tensor_fma`,
-// `tensor_load`, and `tensor_store` inline helpers), and the tensor_fma layout is
-// additionally cross-checked bit-by-bit against a hand-written matmul kernel
-// (`/tmp/etsoc-build/matmul/mm.s`) that ran correctly on sw-sysemu: its descriptor
+// `tensor_load`, and `tensor_store` inline helpers). The tensor_fma layout is
+// also cross-checked bit-by-bit against a hand-written matmul kernel
+// (`/tmp/etsoc-build/matmul/mm.s`) that ran correctly on sw-sysemu. Its descriptor
 // `0x0008800000002001` (fp32, A 2x2, B 2x4, K=2, scp_loc_a=0, scp_loc_b=2,
-// first_pass=1) decodes to exactly bits {51, 47, 13, 0} set, matching this layout's
-// a_rows-1=1@51, a_cols-1=1@47, scp_b=2@[19:12] (bit13), first_pass=1@0 - see the
+// first_pass=1) decodes to exactly bits {51, 47, 13, 0} set. This matches this layout's
+// a_rows-1=1@51, a_cols-1=1@47, scp_b=2@[19:12] (bit13), first_pass=1@0. See the
 // test below. Unlike the packers, whose callers pass human-meaningful counts (rows,
 // not rows-1), tensors.h's own C wrappers take the pre-adjusted field values
-// directly; the assembly comments in mm.s spell out the distinction ("arows_f=1
+// directly. The assembly comments in mm.s spell out the distinction ("arows_f=1
 // (->2)"). tensor_store's layout has no executed proof in mm.s (the kernel reads C
 // back with `fsw.ps` instead of `tensor_store`), so it is encoded verbatim from
-// tensors.h only - flagged for Task 3's sw-sysemu differential test to confirm.
+// tensors.h only. This is flagged for a future sw-sysemu differential test to confirm.
 
 /// TensorFMA element type (tensors.h `opcode` field, bits [3:1] of the descriptor).
-/// fp32 stays fp32; fp16 inputs accumulate to fp32; int8 inputs accumulate to int32.
+/// fp32 stays fp32. fp16 inputs accumulate to fp32. int8 inputs accumulate to int32.
 pub const TensorType = enum(u3) {
     fp32 = 0,
     fp16 = 1,
@@ -1267,9 +1276,9 @@ pub const CSR_TENSOR_STORE: u12 = 0x87f;
 /// tensor_quant CSR number: runs the requantize epilogue (int32 -> scale ->
 /// saturate -> pack to int8) in place on the vector register file.
 pub const CSR_TENSOR_QUANT: u12 = 0x806;
-/// mcache_control CSR number: the L1 scratchpad enable state machine. Must be
-/// sequenced `csrw 0x7e0, 1` then `csrw 0x7e0, 3` - writing 3 directly is a silent
-/// no-op, and any subsequent tensor op then raises tensor_error bit 4 (SCP disabled).
+/// mcache_control CSR number: the L1 scratchpad enable state machine. Sequence it as
+/// `csrw 0x7e0, 1` then `csrw 0x7e0, 3`. Writing 3 directly is a silent no-op, and any
+/// subsequent tensor op then raises tensor_error bit 4 (SCP disabled).
 pub const CSR_MCACHE_CONTROL: u12 = 0x7e0;
 
 /// tensor_wait event id: tensor_load with id=0 has completed.
@@ -1289,12 +1298,13 @@ pub const TENSOR_WAIT_QUANT: u64 = 10;
 /// to the vector register file (f0.. two f-regs per row). Layout (tensors.h
 /// `tensor_fma`, all fields relative to bit 0): 56:55 = b_cols/4 - 1, 54:51 =
 /// a_rows - 1, 50:47 = a_cols - 1 (the K dimension), 46:43 = aoffset (A's starting
-/// column), bit23 = tenc_loc (0 = C lives in the vector regfile - the only mode this
-/// packer exposes; hardcode tenb_loc=0 too, matching the L1-scratchpad-only path
-/// used here), bit22 = tenb_unsigned (B), bit21 = tena_unsigned (A) - the hardware
-/// reads bit22 as the B operand's sign flag and bit21 as A's (sw-sysemu ub/ua), bit20 = tenb_loc
-/// (hardcoded 0 = SCP), 19:12 = scp_loc_b, 11:4 = scp_loc_a, 3:1 = type, bit0 =
-/// first_pass (1 = fresh C, 0 = accumulate into existing C).
+/// column), bit23 = tenc_loc (0 = C lives in the vector regfile, the only mode this
+/// packer exposes, and it also hardcodes tenb_loc=0, matching the L1-scratchpad-only
+/// path used here), bit22 = tenb_unsigned (B), bit21 = tena_unsigned (A). The
+/// hardware reads bit22 as the B operand's sign flag and bit21 as A's sign flag
+/// (sw-sysemu ub/ua). bit20 = tenb_loc (hardcoded 0 = SCP), 19:12 = scp_loc_b,
+/// 11:4 = scp_loc_a, 3:1 = type, bit0 = first_pass (1 = fresh C, 0 = accumulate
+/// into existing C).
 pub fn packTensorFma(
     type_: TensorType,
     a_rows: u5,
@@ -1349,8 +1359,8 @@ pub fn packTensorLoad(dst_scp_line: u6, num_lines: u5, addr: u64, use_coop: bool
 /// rs1`: the memory stride between consecutive loaded lines, plus a 1-bit id
 /// (matched by the corresponding `tensor_wait` event, `TENSOR_WAIT_LOAD_0/1`).
 /// tensors.h masks `stride` with the narrower `0xFFFFFFFFFFC0` (also clearing the
-/// top 16 bits); this clears only the low 6 (64-byte alignment), which is
-/// equivalent for any realistic (non-canonical-high-bit) stride value.
+/// top 16 bits). This function clears only the low 6 bits (64-byte alignment),
+/// which is equivalent for any realistic (non-canonical-high-bit) stride value.
 pub fn tensorLoadX31(stride: u64, id: u1) u64 {
     return (stride & ~@as(u64, 0x3f)) | id;
 }
@@ -1364,13 +1374,13 @@ pub fn tensorLoadX31(stride: u64, id: u1) u64 {
 /// `rows - 1` and writes that-plus-one rows, hence this packer's `rows` param is
 /// the actual row count. Layout: 63:62 = reg_stride, 61:57 = start_reg, 56:55 =
 /// cols, then `addr` masked to `addr & 0xFFFFFFFFFFF0` (tensors.h uses this
-/// literal 48-bit-wide, 16-byte-aligned mask for the CSR-embedded addr - narrower
+/// literal 48-bit-wide, 16-byte-aligned mask for the CSR-embedded addr, narrower
 /// than tensor_load's 64-byte mask, copied verbatim since it is the golden
 /// source), 54:51 = rows - 1, 50:49 = coop_store, 3:0 = reserved (0).
 ///
 /// UNCONFIRMED: no proof kernel exercises tensor_store (mm.s reads TenC back with
 /// plain `fsw.ps` instead), so this layout is taken from tensors.h only and is not
-/// cross-checked against an executed descriptor. Flagged for Task 3's sw-sysemu
+/// cross-checked against an executed descriptor. Flagged for a future sw-sysemu
 /// differential test.
 pub fn packTensorStore(start_reg: u5, reg_stride: u2, cols: u2, rows: u5, addr: u64, coop_store: u2) u64 {
     const rows_field: u4 = @intCast(rows - 1);
@@ -1385,10 +1395,11 @@ pub fn packTensorStore(start_reg: u5, reg_stride: u2, cols: u2, rows: u5, addr: 
 
 /// Pack the x31 value that must be set immediately before `csrw CSR_TENSOR_STORE,
 /// rs1`: the memory stride between consecutive stored rows. tensors.h masks with
-/// the literal (and, relative to tensor_load/tensor_store's own addr mask,
-/// inconsistent - likely a copy/paste artifact in the golden header) 44-bit-wide
-/// `0xFFFFFFFFFF0`, copied verbatim here rather than "cleaned up", since matching
-/// the golden source bit-for-bit is safer pending Task 3's sysemu confirmation.
+/// the literal 44-bit-wide `0xFFFFFFFFFF0`. This mask is inconsistent with
+/// tensor_load's/tensor_store's own addr mask (likely a copy/paste artifact in the
+/// golden header), but it is copied verbatim here rather than "cleaned up", since
+/// matching the golden source bit-for-bit is safer pending a future sysemu
+/// confirmation.
 pub fn tensorStoreX31(stride: u64) u64 {
     return stride & 0xFFFFFFFFFF0;
 }
@@ -1669,9 +1680,9 @@ test "encodes the arithmetic and bitwise R-type instructions" {
 // et-soc VPU (CORE-ET Erbium) packed-single tests. No emulator decodes these custom
 // opcodes, so correctness is checked against the RTL `casex` match patterns in
 // core-et/rtl/inc/instructions.vh (care mask = the pattern's fixed bits, match = their
-// required values; the `X` bits are operand fields and are masked out), plus a couple
-// of full-word encodings pinned by hand so operand field *placement* (not just the
-// opcode) is validated too.
+// required values). The `X` bits are operand fields and are masked out. There are also
+// a couple of full-word encodings pinned by hand so operand field *placement* (not just
+// the opcode) is validated too.
 
 test "encodes et-soc VPU packed-single arithmetic (RTL-mask validated)" {
     // FADD_PS/FSUB_PS/FMUL_PS/FDIV_PS: instructions.vh:211-214, opcode 0x7B (1111011),
@@ -1724,7 +1735,7 @@ test "encodes et-soc VPU lane extract and mask write (RTL-derived field position
     // Care = funct7[31:25] | rs2-top-2[24:23] | funct3[14:12] | opcode[6:0].
     const fmvs_care: u32 = 0xFF80707F;
     try std.testing.expectEqual(@as(u32, 0xE000207B), fmvs_x_ps(.x5, .f11, 0) & fmvs_care);
-    // fs1 sits at the rs1 slot [19:15]; index sits at [22:20], not the rs1 slot (this
+    // fs1 sits at the rs1 slot [19:15]. Index sits at [22:20], not the rs1 slot (this
     // is the field swap the feasibility report's draft got backwards).
     const lane = fmvs_x_ps(.x5, .f11, 5);
     try std.testing.expectEqual(@as(u32, 11), (lane >> 15) & 0x1F); // fs1 = f11
@@ -1826,7 +1837,7 @@ test "encodes et-soc pi convert (esperanto-opc.h MATCH-verified)" {
 }
 
 test "encodes et-soc pi broadcast immediate (opcode-only MATCH; imm layout is a guess)" {
-    // Only the opcode (bits [6:0]) is authoritative per esperanto-opc.h; confirm the
+    // Only the opcode (bits [6:0]) is authoritative per esperanto-opc.h. Confirm the
     // all-zero form hits it and that rd/imm land where the U-type-style guess puts them.
     try std.testing.expectEqual(@as(u32, 0x0000005f), fbci_pi(.f0, 0));
     try std.testing.expectEqual(@as(u32, 0x5f), fbci_pi(.f0, 0) & 0x7f);
@@ -1870,7 +1881,7 @@ test "packTensorFma field placement" {
     try std.testing.expectEqual(@as(u64, 0), int8_first_pass_off & 1); // first_pass cleared
     try std.testing.expectEqual(@as(u64, 3), (int8_first_pass_off >> 1) & 0x7); // int8 = 3
 
-    // scp_a occupies bits [11:4]; scp_b occupies bits [19:12] (confirmed above by
+    // scp_a occupies bits [11:4]. scp_b occupies bits [19:12] (confirmed above by
     // the proof value's scp_b=2 landing at bit 13).
     const with_scp_a = packTensorFma(.fp32, 2, 2, 4, 0, 0xAB, 0, false, false, false, true);
     try std.testing.expectEqual(@as(u64, 0xAB), (with_scp_a >> 4) & 0xFF);
@@ -1909,7 +1920,7 @@ test "packTensorLoad field placement" {
     try std.testing.expectEqual(@as(u64, 0x1000), d & 0xFFFFFFFFFFC0); // addr, 64B aligned
 
     // Cross-check against mm.s: `la t0, matdata; ori t0, t0, 3; csrw 0x83f, t0` with
-    // no use_tmask/use_coop/use_tenb/dst_start set - only num_lines-1=3 lands below
+    // no use_tmask/use_coop/use_tenb/dst_start set. Only num_lines-1=3 lands below
     // the (64-byte-aligned) address bits, matching a plain `addr | 3`.
     const proof_addr: u64 = 0x2000; // stand-in 64-byte-aligned address
     const proof = packTensorLoad(0, 4, proof_addr, false, false, false);

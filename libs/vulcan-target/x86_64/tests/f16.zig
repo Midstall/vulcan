@@ -59,7 +59,7 @@ fn selectTail32(func: *Function, b: ir.function.Block, t: Types, bits: Value, se
     const sh = try func.appendArithImm(b, t.i32, .shl, sel, 3); // sel * 8
     const shifted = try func.appendInst(b, t.u32, .{ .arith = .{ .op = .shr, .lhs = bits, .rhs = sh } });
     const masked = try func.appendArithImm(b, t.u32, .bit_and, shifted, 0xFF);
-    func.setTerminator(b, .{ .ret = masked });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(masked) });
 }
 
 /// The 64-bit counterpart, for an f64 result (sel = 0..7).
@@ -67,7 +67,7 @@ fn selectTail64(func: *Function, b: ir.function.Block, t: Types, bits: Value, se
     const sh = try func.appendArithImm(b, t.i32, .shl, sel, 3);
     const shifted = try func.appendInst(b, t.u64, .{ .arith = .{ .op = .shr, .lhs = bits, .rhs = sh } });
     const masked = try func.appendArithImm(b, t.u64, .bit_and, shifted, 0xFF);
-    func.setTerminator(b, .{ .ret = masked });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(masked) });
 }
 
 /// Compile `func` and reassemble its `nbytes`-wide result by running it once per byte index with

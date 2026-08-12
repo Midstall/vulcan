@@ -342,7 +342,10 @@ const Emitter = struct {
         var ret_val: ?Value = null;
         for (0..n) |i| {
             if (self.func.terminator(@enumFromInt(i))) |t| switch (t) {
-                .ret => |maybe| ret_val = maybe,
+                .ret => |r| {
+                    if (r.count > 1) return error.UnsupportedConstruct; // multi-value struct return not yet lowered (M4d-c)
+                    ret_val = if (r.count == 1) r.values[0] else null;
+                },
                 .jump => {},
             };
         }
@@ -551,16 +554,18 @@ const Emitter = struct {
             try self.emit(&self.body, op.BranchConditional, &.{ self.idFor(iff.cond), labels[@intFromEnum(iff.then.target)], labels[@intFromEnum(iff.@"else".target)] });
         } else if (self.func.terminator(block)) |t| switch (t) {
             .jump => |j| try self.emit(&self.body, op.Branch, &.{labels[@intFromEnum(j.target)]}),
-            .ret => |maybe| {
+            .ret => |r| {
                 // `discard` (fragment kill) is a `ret` block tagged `cf.discard`: emit
                 // OpKill instead of writing the output and returning.
                 if (self.cfAttr(block, "discard") != null) {
                     try self.emit(&self.body, op.Kill, &.{});
                 } else {
                     if (shader) |sc| try self.emitOutputStore(sc);
-                    if (maybe) |v| {
-                        try self.emit(&self.body, op.ReturnValue, &.{self.idFor(v)});
-                    } else try self.emit(&self.body, op.Return, &.{});
+                    switch (r.count) {
+                        0 => try self.emit(&self.body, op.Return, &.{}),
+                        1 => try self.emit(&self.body, op.ReturnValue, &.{self.idFor(r.values[0])}),
+                        else => return error.UnsupportedConstruct, // multi-value struct return not yet lowered (M4d-c)
+                    }
                 }
             },
         } else {
@@ -1279,7 +1284,7 @@ test "emits a scalar function and reads it back (round-trip through the frontend
     const y = try func.appendBlockParam(b, t);
     const xy = try func.appendInst(b, t, .{ .arith = .{ .op = .mul, .lhs = x, .rhs = y } });
     const r = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = xy, .rhs = x } });
-    func.setTerminator(b, .{ .ret = r });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
 
     const words = try emitModule(allocator, &func, "f");
     defer allocator.free(words);
@@ -1316,7 +1321,7 @@ test "an f16 function emits OpTypeFloat 16, the Float16 capability, f16 arithmet
     const one = try func.appendInst(b, f16t, .{ .fconst = 1.0 });
     const sc = try func.appendInst(b, f16t, .{ .arith = .{ .op = .mul, .lhs = s, .rhs = one } });
     const widened = try func.appendInst(b, f32t, .{ .convert = .{ .value = sc } });
-    func.setTerminator(b, .{ .ret = widened });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(widened) });
 
     const words = try emitModule(allocator, &func, "f");
     defer allocator.free(words);
@@ -1385,7 +1390,7 @@ test "a non-f16 module does not emit the Float16 capability" {
     const x = try func.appendBlockParam(b, t);
     const y = try func.appendBlockParam(b, t);
     const r = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = y } });
-    func.setTerminator(b, .{ .ret = r });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
 
     const words = try emitModule(allocator, &func, "f");
     defer allocator.free(words);
@@ -1405,7 +1410,7 @@ test "composite (vector) f16 is rejected, only scalar f16 is supported" {
     const vec = try func.types.intern(.{ .vector = .{ .elem = f16t, .len = 4 } });
     const b = try func.appendBlock();
     const x = try func.appendBlockParam(b, vec);
-    func.setTerminator(b, .{ .ret = x });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(x) });
 
     try testing.expectError(error.UnsupportedConstruct, emitModule(allocator, &func, "f"));
 }
@@ -1422,7 +1427,7 @@ test "emits a fragment shader entry point (in -> out)" {
     const xm = try func.appendInst(b, f32t, .{ .arith = .{ .op = .mul, .lhs = x, .rhs = two } });
     const one = try func.appendInst(b, f32t, .{ .fconst = 1.0 });
     const y = try func.appendInst(b, f32t, .{ .arith = .{ .op = .add, .lhs = xm, .rhs = one } });
-    func.setTerminator(b, .{ .ret = y });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(y) });
 
     const words = try emitShader(allocator, &func, .{
         .stage = .fragment,

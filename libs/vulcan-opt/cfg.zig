@@ -123,7 +123,7 @@ test "cfg of a diamond has the right edges" {
     try func.setJump(b1, b3, &.{x});
     const y = try func.appendInst(b2, i32_t, .{ .iconst = 2 });
     try func.setJump(b2, b3, &.{y});
-    func.setTerminator(b3, .{ .ret = v });
+    func.setTerminator(b3, .{ .ret = ir.function.Ret.one(v) });
 
     var cfg = try build(allocator, &func);
     defer cfg.deinit(allocator);

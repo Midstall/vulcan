@@ -120,7 +120,7 @@ fn loopShape(func: *const Function, all_loops: []const loops.Loop, loop: *const 
     }
     const iff = if_inst orelse return null;
     if (func.terminator(header)) |term| switch (term) {
-        .ret => |v| if (v != null) return null,
+        .ret => |r| if (r.count != 0) return null,
         .jump => return null,
     };
 
@@ -366,7 +366,7 @@ fn buildStridedSum(func: *Function) !void {
     const ni = try func.appendArithImm(body, i32_t, .add, bi, 1);
     try func.setJump(body, loop, &.{ ni, np, ns });
 
-    func.setTerminator(done, .{ .ret = ds });
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(ds) });
 }
 
 /// The same shape as `buildStridedSum`, minus the load: `p` still walks by a constant stride, but
@@ -397,7 +397,7 @@ fn buildNoLoad(func: *Function) !void {
     const ni = try func.appendArithImm(body, i32_t, .add, bi, 1);
     try func.setJump(body, loop, &.{ ni, np });
 
-    func.setTerminator(done, .{ .ret = null });
+    func.setTerminator(done, .{ .ret = ir.function.Ret.none() });
 }
 
 fn countPrefetches(func: *const Function) usize {

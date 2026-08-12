@@ -324,6 +324,8 @@ fn isPure(op: function.Opcode) bool {
         // A prefetch hint behaves like store here (effectful, not droppable).
         // A matmul writes the `c` memory, likewise effectful.
         .load, .store, .prefetch, .matmul, .@"if", .call, .call_indirect => false,
+        // These mutate or read the `va_list` object at `list`, like `load`/`store` above.
+        .va_start, .va_arg, .va_end => false,
     };
 }
 
@@ -397,6 +399,9 @@ fn applySubst(func: *Function, subst: *const Subst) void {
                 st.ptr = sub(subst, st.ptr);
             },
             .prefetch => |*pf| pf.ptr = sub(subst, pf.ptr),
+            .va_start => |*vs| vs.list = sub(subst, vs.list),
+            .va_arg => |*va| va.list = sub(subst, va.list),
+            .va_end => |*ve| ve.list = sub(subst, ve.list),
             .dot => |*d| {
                 d.acc = sub(subst, d.acc);
                 d.a = sub(subst, d.a);
@@ -408,9 +413,13 @@ fn applySubst(func: *Function, subst: *const Subst) void {
                 mm.c = sub(subst, mm.c);
             },
             .struct_new => |sn| substList(func, subst, sn.fields),
-            .call => |c| substList(func, subst, c.args),
+            .call => |*c| {
+                if (c.ret_dest) |*rd| rd.* = sub(subst, rd.*); // The register-return dest is a use.
+                substList(func, subst, c.args);
+            },
             .call_indirect => |*c| {
                 c.target = sub(subst, c.target);
+                if (c.ret_dest) |*rd| rd.* = sub(subst, rd.*); // The register-return dest is a use.
                 substList(func, subst, c.args);
             },
             .@"if" => |*cf| {
@@ -423,8 +432,8 @@ fn applySubst(func: *Function, subst: *const Subst) void {
     for (0..func.blockCount()) |bi| {
         const term = func.terminatorPtr(@enumFromInt(bi));
         if (term.*) |*t| switch (t.*) {
-            .ret => |*v| {
-                if (v.*) |vv| v.* = sub(subst, vv);
+            .ret => |*r| {
+                for (r.values[0..r.count]) |*vv| vv.* = sub(subst, vv.*);
             },
             .jump => |*j| substList(func, subst, j.args),
         };
@@ -496,6 +505,9 @@ fn countUses(func: *const Function, uses: []u32) void {
                     uses[@intFromEnum(st.ptr)] += 1;
                 },
                 .prefetch => |pf| uses[@intFromEnum(pf.ptr)] += 1,
+                .va_start => |vs| uses[@intFromEnum(vs.list)] += 1,
+                .va_arg => |va| uses[@intFromEnum(va.list)] += 1,
+                .va_end => |ve| uses[@intFromEnum(ve.list)] += 1,
                 .dot => |d| {
                     uses[@intFromEnum(d.acc)] += 1;
                     uses[@intFromEnum(d.a)] += 1;
@@ -509,12 +521,14 @@ fn countUses(func: *const Function, uses: []u32) void {
                 .struct_new => |sn| for (func.valueList(sn.fields)) |f| {
                     uses[@intFromEnum(f)] += 1;
                 },
-                .call => |c| for (func.valueList(c.args)) |arg| {
-                    uses[@intFromEnum(arg)] += 1;
+                .call => |c| {
+                    for (func.valueList(c.args)) |arg| uses[@intFromEnum(arg)] += 1;
+                    if (c.ret_dest) |rd| uses[@intFromEnum(rd)] += 1; // ret_dest is a use too.
                 },
                 .call_indirect => |c| {
                     uses[@intFromEnum(c.target)] += 1;
                     for (func.valueList(c.args)) |arg| uses[@intFromEnum(arg)] += 1;
+                    if (c.ret_dest) |rd| uses[@intFromEnum(rd)] += 1; // ret_dest is a use too.
                 },
                 .@"if" => |cf| {
                     uses[@intFromEnum(cf.cond)] += 1;
@@ -524,7 +538,7 @@ fn countUses(func: *const Function, uses: []u32) void {
             }
         }
         if (func.terminator(block)) |term| switch (term) {
-            .ret => |v| if (v) |vv| {
+            .ret => |r| for (r.slice()) |vv| {
                 uses[@intFromEnum(vv)] += 1;
             },
             .jump => |j| for (func.blockArgs(j)) |arg| {
@@ -556,8 +570,8 @@ test "legalize splits struct params across an if edge" {
     try func.appendIf(block0, c, .{ .target = block1, .args = &.{s} }, .{ .target = block2 });
 
     const f0 = try func.appendInst(block1, i32_t, .{ .extract = .{ .aggregate = p, .index = 0 } });
-    func.setTerminator(block1, .{ .ret = f0 });
-    func.setTerminator(block2, .{ .ret = null });
+    func.setTerminator(block1, .{ .ret = function.Ret.one(f0) });
+    func.setTerminator(block2, .{ .ret = function.Ret.none() });
 
     var before = try verify.verify(std.testing.allocator, &func, .low);
     defer before.deinit();
@@ -590,7 +604,7 @@ test "legalize splits struct params across a jump edge" {
     try func.setJump(block0, block1, &.{s});
 
     const f0 = try func.appendInst(block1, i32_t, .{ .extract = .{ .aggregate = p, .index = 0 } });
-    func.setTerminator(block1, .{ .ret = f0 });
+    func.setTerminator(block1, .{ .ret = function.Ret.one(f0) });
 
     var before = try verify.verify(std.testing.allocator, &func, .low);
     defer before.deinit();
@@ -615,7 +629,7 @@ test "legalize splits a struct entry parameter into scalars" {
     const entry = try func.appendBlock();
     const p = try func.appendBlockParam(entry, st);
     const f0 = try func.appendInst(entry, i32_t, .{ .extract = .{ .aggregate = p, .index = 0 } });
-    func.setTerminator(entry, .{ .ret = f0 });
+    func.setTerminator(entry, .{ .ret = function.Ret.one(f0) });
 
     var before = try verify.verify(std.testing.allocator, &func, .low);
     defer before.deinit();
@@ -630,7 +644,9 @@ test "legalize splits a struct entry parameter into scalars" {
     // The struct parameter became two scalar parameters. The return forwards to
     // the first field parameter.
     try std.testing.expectEqual(@as(usize, 2), func.blockParams(entry).len);
-    try std.testing.expectEqual(function.Terminator{ .ret = func.blockParams(entry)[0] }, func.terminator(entry).?);
+    const ret1 = func.terminator(entry).?.ret;
+    try std.testing.expectEqual(@as(u8, 1), ret1.count);
+    try std.testing.expectEqual(func.blockParams(entry)[0], ret1.values[0]);
 }
 
 test "legalize folds constant arithmetic" {
@@ -642,7 +658,7 @@ test "legalize folds constant arithmetic" {
     const x = try func.appendInst(entry, i32_t, .{ .iconst = 10 });
     const y = try func.appendInst(entry, i32_t, .{ .iconst = 20 });
     const sum = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = y } });
-    func.setTerminator(entry, .{ .ret = sum });
+    func.setTerminator(entry, .{ .ret = function.Ret.one(sum) });
 
     try legalize(std.testing.allocator, &func);
 
@@ -660,7 +676,7 @@ test "legalize folds a constant arith operand into arith_imm" {
     const x = try func.appendBlockParam(entry, i32_t);
     const c = try func.appendInst(entry, i32_t, .{ .iconst = 7 });
     const sum = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = c } });
-    func.setTerminator(entry, .{ .ret = sum });
+    func.setTerminator(entry, .{ .ret = function.Ret.one(sum) });
 
     try legalize(std.testing.allocator, &func);
 
@@ -681,7 +697,7 @@ test "legalize strength-reduces multiply by a power of two to a shift" {
     const x = try func.appendBlockParam(entry, i32_t);
     const c = try func.appendInst(entry, i32_t, .{ .iconst = 8 });
     const prod = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .mul, .lhs = x, .rhs = c } });
-    func.setTerminator(entry, .{ .ret = prod });
+    func.setTerminator(entry, .{ .ret = function.Ret.one(prod) });
 
     try legalize(std.testing.allocator, &func);
 
@@ -705,7 +721,7 @@ test "legalize strength-reduces unsigned divide and remainder by a power of two"
     const m = try func.appendInst(entry, u32_t, .{ .arith = .{ .op = .rem, .lhs = x, .rhs = d } });
     _ = try func.appendInst(entry, u32_t, .{ .arith = .{ .op = .add, .lhs = q, .rhs = m } });
     const sum = func.blockInsts(entry)[func.blockInsts(entry).len - 1];
-    func.setTerminator(entry, .{ .ret = func.instResult(sum).? });
+    func.setTerminator(entry, .{ .ret = function.Ret.one(func.instResult(sum).?) });
 
     try legalize(std.testing.allocator, &func);
 
@@ -726,7 +742,7 @@ test "legalize removes dead pure instructions" {
     const entry = try func.appendBlock();
     const a = try func.appendBlockParam(entry, i32_t);
     _ = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .add, .lhs = a, .rhs = a } }); // dead
-    func.setTerminator(entry, .{ .ret = a });
+    func.setTerminator(entry, .{ .ret = function.Ret.one(a) });
 
     try legalize(std.testing.allocator, &func);
 
@@ -751,14 +767,16 @@ test "legalize forwards through nested structs" {
 
     const got_inner = try func.appendInst(entry, inner_t, .{ .extract = .{ .aggregate = outer, .index = 0 } });
     const got_b = try func.appendInst(entry, i32_t, .{ .extract = .{ .aggregate = got_inner, .index = 1 } });
-    func.setTerminator(entry, .{ .ret = got_b });
+    func.setTerminator(entry, .{ .ret = function.Ret.one(got_b) });
 
     try legalize(std.testing.allocator, &func);
 
     var after = try verify.verify(std.testing.allocator, &func, .low);
     defer after.deinit();
     try std.testing.expect(after.ok());
-    try std.testing.expectEqual(function.Terminator{ .ret = b }, func.terminator(entry).?);
+    const ret2 = func.terminator(entry).?.ret;
+    try std.testing.expectEqual(@as(u8, 1), ret2.count);
+    try std.testing.expectEqual(b, ret2.values[0]);
 }
 
 test "legalize eliminates struct/extract and passes the low profile" {
@@ -774,7 +792,7 @@ test "legalize eliminates struct/extract and passes the low profile" {
     const st = try func.types.intern(.{ .@"struct" = &.{ i32_t, i32_t } });
     const s = try func.appendStructNew(entry, st, &.{ a, b });
     const f0 = try func.appendInst(entry, i32_t, .{ .extract = .{ .aggregate = s, .index = 0 } });
-    func.setTerminator(entry, .{ .ret = f0 });
+    func.setTerminator(entry, .{ .ret = function.Ret.one(f0) });
 
     // Before: the struct type makes it fail the low profile.
     var before = try verify.verify(std.testing.allocator, &func, .low);
@@ -787,5 +805,7 @@ test "legalize eliminates struct/extract and passes the low profile" {
     var after = try verify.verify(std.testing.allocator, &func, .low);
     defer after.deinit();
     try std.testing.expect(after.ok());
-    try std.testing.expectEqual(function.Terminator{ .ret = a }, func.terminator(entry).?);
+    const ret3 = func.terminator(entry).?.ret;
+    try std.testing.expectEqual(@as(u8, 1), ret3.count);
+    try std.testing.expectEqual(a, ret3.values[0]);
 }

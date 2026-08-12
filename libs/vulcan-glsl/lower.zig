@@ -567,7 +567,7 @@ pub fn compileShaderStage(allocator: std.mem.Allocator, source: []const u8, stag
     // jump-to-continuation (overwriting it with `ret`), leaving the continuation's phi
     // params - which carry a vector return value - undefined (the glmark2 light-phong FS,
     // `gl_FragColor += compute_color(...)`, produced a CompositeConstruct of undefined ids).
-    func.setTerminator(l.block, .{ .ret = null }); // outputs flow through stored variables
+    func.setTerminator(l.block, .{ .ret = ir.function.Ret.none() }); // outputs flow through stored variables
 
     // Build the named-uniform-block records. Each block's members were appended to
     // `uniform_members` (they lower as default-block uniforms); locate them by name to
@@ -934,7 +934,7 @@ fn lowerFunction(allocator: std.mem.Allocator, f: parser.Function, user_fns: []c
     for (f.body) |stmt| {
         if (try lowerStmt(&l, f.ret, stmt)) returned = true;
     }
-    if (!returned) func.setTerminator(l.block, .{ .ret = null });
+    if (!returned) func.setTerminator(l.block, .{ .ret = ir.function.Ret.none() });
     return func;
 }
 
@@ -990,8 +990,8 @@ fn lowerStmtInner(l: *L, ret_ty: Type, stmt: parser.Stmt) Error!bool {
                 const v = try lowerExpr(l, e);
                 if (v != .scalar) return error.Unsupported; // vector return needs multi-value IR
                 const c = try coerce(l, v.scalar, ret_ty);
-                l.func.setTerminator(l.block, .{ .ret = c.value });
-            } else l.func.setTerminator(l.block, .{ .ret = null });
+                l.func.setTerminator(l.block, .{ .ret = ir.function.Ret.one(c.value) });
+            } else l.func.setTerminator(l.block, .{ .ret = ir.function.Ret.none() });
             return true;
         },
         .decl => |d| {
@@ -1043,7 +1043,7 @@ fn lowerStmtInner(l: *L, ret_ty: Type, stmt: parser.Stmt) Error!bool {
         },
         .discard_ => {
             // Fragment kill: terminate the block, tagged so the SPIR-V emitter emits OpKill.
-            l.func.setTerminator(l.block, .{ .ret = null });
+            l.func.setTerminator(l.block, .{ .ret = ir.function.Ret.none() });
             try l.func.addAttr(.{ .block = l.block }, .{ .custom = .{ .namespace = "cf", .key = "discard", .value = .{ .int = 0 } } });
             return true;
         },

@@ -1,13 +1,15 @@
-//! AArch64 instruction selection: lowers an IR function to A64 machine words.
-//! Covers int/float arith (incl. div/rem/shifts), comparisons, select, the high-IR
-//! `if`, jumps with block-param edge moves, ret/call, NEON vectors, and stack memory.
+//! AArch64 instruction selection. It lowers an IR function to A64 machine words.
+//! It covers integer and float arithmetic (including divide, remainder, and shifts),
+//! comparisons, select, the high-IR `if`, jumps with block-param edge moves,
+//! return and call, NEON vectors, and stack memory.
 //!
-//! Linear-scan register allocation with spilling. Live intervals (def..last-use)
-//! are scanned in start order from a register pool (caller-saved x9..x12 plus unused
-//! arg regs for a leaf, callee-saved x19..x28 for a non-leaf). On pool exhaustion a
-//! result spills to a stack slot. Block parameters are never spilled, keeping edge
-//! moves simple. A non-leaf opens a frame saving lr and its callee-saved registers.
-//! alloca/spill slots live above them.
+//! It uses linear-scan register allocation with spilling. Live intervals (from the
+//! definition to the last use) are scanned in start order from a register pool
+//! (caller-saved x9 to x12 plus unused argument registers for a leaf function,
+//! callee-saved x19 to x28 for a non-leaf function). When the pool runs out,
+//! a result spills to a stack slot. Block parameters are never spilled. This keeps
+//! edge moves simple. A non-leaf function opens a frame that saves lr and its
+//! callee-saved registers. Alloca and spill slots live above them.
 
 const std = @import("std");
 const ir = @import("vulcan-ir");
@@ -160,14 +162,25 @@ fn roundToHalf(allocator: std.mem.Allocator, code: *std.ArrayList(u32), reg: Reg
     try code.append(allocator, encode.fcvtSfromH(reg, reg));
 }
 
-/// Where an argument/parameter is passed: which file, and its index within that
-/// file (registers x0..x7 / v0..v7, or a stack slot when the index is >= 8).
-const ArgLoc = struct { class: Class, idx: usize };
+/// Where an argument or parameter is passed: which file, and its index within that
+/// file (registers x0-x7 / v0-v7, or a stack slot when the index is 8 or more). `sret_ptr` marks
+/// the AAPCS64 hidden result pointer. It travels in the indirect-result register
+/// `x8`, outside the x0-x7 argument pool. It consumes no ordinary argument register, so its
+/// `idx`/`class` are not read for register placement.
+const ArgLoc = struct { class: Class, idx: usize, sret_ptr: bool = false };
 
-fn computeArgLocs(func: *const Function, values: []const Value, out: []ArgLoc) void {
+/// Assign each of `values` its ABI argument location. When `sret` is true, the FIRST
+/// value is the hidden result pointer. It is marked `sret_ptr` (it rides in `x8`, not the x0-x7
+/// pool), and the remaining values fill x0-x7 / v0-v7 from the start as if it were absent. With
+/// `sret` false this is the plain positional assignment.
+fn computeArgLocs(func: *const Function, values: []const Value, out: []ArgLoc, sret: bool) void {
     var gi: usize = 0;
     var fi: usize = 0;
     for (values, 0..) |v, k| {
+        if (sret and k == 0) {
+            out[k] = .{ .class = .gpr, .idx = 0, .sret_ptr = true };
+            continue;
+        }
         if (regClass(func, v) == .fpr) {
             out[k] = .{ .class = .fpr, .idx = fi };
             fi += 1;
@@ -181,8 +194,17 @@ fn computeArgLocs(func: *const Function, values: []const Value, out: []ArgLoc) v
 const Move = struct { src: Reg, dst: Reg };
 pub const Fixup = struct { at: usize, target: u32 };
 
-/// A relocation: the word index of a `bl` whose target is the named symbol.
-pub const Reloc = struct { offset: usize, symbol: []const u8 };
+/// What an emitted relocation patches: a `bl`'s call target (the default), one
+/// half of a direct `global_addr`'s `adrp`+`add` pair (the page delta / the page-offset
+/// lo12, resolved together once the symbol's runtime address is known), or one half of a
+/// GOT-indirect `global_addr`'s `adrp`+`ldr` pair (`.got_pg` patches the adrp to the GOT
+/// entry's page, `.got_lo12` patches the ldr's imm12 to the GOT entry's lo12>>3).
+pub const Kind = enum { call, adrp_pg, add_pgoff, got_pg, got_lo12 };
+
+/// A relocation: the word index of an instruction whose immediate names a symbol,
+/// patched once the symbol's address is known (a later task for `.adrp_pg`/`.add_pgoff`).
+/// Today only `.call`, a `bl`, is actually resolved by `link.zig`.
+pub const Reloc = struct { offset: usize, symbol: []const u8, kind: Kind = .call };
 
 /// Machine words plus the call relocations for the linker to resolve.
 /// One row of the source-line table: the byte offset (from the function start) where a new
@@ -202,7 +224,7 @@ pub const Compiled = struct {
 };
 
 /// Where a value lives at a given program point: a register or a stack spill slot. A whole-life
-/// value has one location for its entire range (today's `reg`/`spill`); a split value has several,
+/// value has one location for its entire range (today's `reg`/`spill`). A split value has several,
 /// selected by position through `segments`.
 const Location = union(enum) { reg: Reg, slot: u32 };
 
@@ -211,15 +233,15 @@ const Location = union(enum) { reg: Reg, slot: u32 };
 /// position, so a lookup at any position at or after the def resolves to some segment.
 const Segment = struct { from: u32, loc: Location };
 
-/// One precomputed control-flow-edge move (Task 8), translated from a `wimmer.Move`: shuffle `src`
+/// One precomputed control-flow-edge move, translated from a `wimmer.Move`. It shuffles `src`
 /// into `dst`, where `class` (0 gpr, 1 fpr) selects the move/load/store width. The shared allocator
 /// already ORDERED these into a valid parallel-move sequence (every source read before it is
-/// overwritten, cycles broken and slot->slot shuffles routed through the class scratch), so the
+/// overwritten, cycles broken and slot-to-slot shuffles routed through the class scratch), so the
 /// emitter replays them op-by-op with no reordering.
 const EdgeMove = struct { src: Location, dst: Location, class: u16 };
 
-/// The ordered move list on one control-flow edge `pred -> succ` (Task 7's `wimmer.EdgeMoves`,
-/// translated into this backend's `Location` space). Keyed by the block pair so emission can find
+/// The ordered move list on one control-flow edge `pred -> succ` (translated from `wimmer.EdgeMoves`
+/// into this backend's `Location` space). Keyed by the block pair so emission can find
 /// the moves for the edge it is currently lowering (the block being emitted plus the jump target,
 /// including the forwarding blocks `splitCriticalEdges` inserted).
 const EdgeMoveSet = struct { pred: Block, succ: Block, moves: []EdgeMove };
@@ -227,24 +249,24 @@ const EdgeMoveSet = struct { pred: Block, succ: Block, moves: []EdgeMove };
 /// A store or reload the emitter must insert at a split boundary. `at` is the instruction position
 /// the action lands before (the position at which the pool was exhausted for a tail split). `store`
 /// writes the victim's register to its new slot before the taker overwrites the register at `at`.
-/// `reload` (Task 5) brings a value back into a register. `value` selects the ldr/str form
-/// (vector vs fp vs gpr). `slot_to_slot` (Wimmer bridge gap #7) re-homes a spilled value from one
-/// slot to another WITHOUT ever holding it in a value register: `emitSplitAction` expands it into a
-/// reload-then-store pair through the class scratch (`reg`/`move_from` stay at their defaults and
+/// `reload` brings a value back into a register. `value` selects the ldr/str form
+/// (vector vs fp vs gpr). `slot_to_slot` re-homes a spilled value from one
+/// slot to another WITHOUT ever holding it in a value register. `emitSplitAction` expands it into a
+/// reload-then-store pair through the class scratch. `reg`/`move_from` stay at their defaults and
 /// are never read for this kind, since the scratch register is implied by `value`'s class, not
-/// carried in the action).
+/// carried in the action.
 const SplitAction = struct {
     at: u32,
     kind: enum { store, reload, move, slot_to_slot },
     value: Value,
     reg: Reg,
     slot: u32 = 0,
-    /// The SOURCE register of a `.move` (a register-to-register re-home at a split point); `reg` is
-    /// the destination. Only the shared Wimmer translation produces `.move`; the native `allocate`
+    /// The SOURCE register of a `.move` (a register-to-register re-home at a split point). `reg` is
+    /// the destination. Only the shared Wimmer translation produces `.move`. The native `allocate`
     /// never does, so it leaves this at its default and the native drain never reads it.
     move_from: Reg = .zr,
-    /// The SOURCE slot of a `.slot_to_slot` re-home; `slot` is the destination. Only the shared
-    /// Wimmer translation produces `.slot_to_slot`; the native `allocate` never does.
+    /// The SOURCE slot of a `.slot_to_slot` re-home. `slot` is the destination. Only the shared
+    /// Wimmer translation produces `.slot_to_slot`. The native `allocate` never does.
     move_from_slot: u32 = 0,
 };
 
@@ -293,8 +315,8 @@ const Allocation = struct {
 /// `compileFunction` callers in `link.zig`/`object.zig`): no loop-header alignment padding, the
 /// base-ISA f16 EMULATION (an f16 held as its f32 widening in an S register, rounded per-op with
 /// `fcvt`), and the `fuse_*` flags at their base-ISA-available defaults. `fuse_cmp_branch` gates
-/// the compare-into-branch fold (see `fusesIntoNextIf`); the rest are foundation only (no fold
-/// reads them yet, so they are inert either way).
+/// the compare-into-branch fold (see `fusesIntoNextIf`). The rest are foundation only. No fold
+/// reads them yet, so they are inert either way.
 pub const ModelCaps = struct {
     /// Loop-header alignment in bytes (0 disables it). See `compileFunction`'s doc comment.
     fetch_align: u16 = 0,
@@ -303,15 +325,15 @@ pub const ModelCaps = struct {
     /// `features.aarch64.fp16` (FEAT_FP16) is true (see `selectFunctionForModel`). When false the
     /// f16 lowering is byte-identical to the pre-FEAT_FP16 emulation.
     fp16: bool = false,
-    /// Fuse a compare into its consumer branch (CMP+Bcc -> a single conditional branch on flags).
+    /// Fuse a compare into its consumer branch (CMP+Bcc becomes a single conditional branch on flags).
     /// Base-ISA on every aarch64 core, so true by default. Gates `fusesIntoNextIf` (see its doc
-    /// comment); false falls back to materializing the boolean with `cset` then testing it with
+    /// comment). When false, it falls back to materializing the boolean with `cset` then testing it with
     /// `cbnz`, exactly as if the icmp/if pair were never eligible to fuse.
     fuse_cmp_branch: bool = true,
     /// Fuse an arithmetic op's flag-setting form into its consumer branch (e.g. ADDS+Bcc). Base-
     /// ISA on every aarch64 core, so true by default. Gates `Ctx.fuse_arith_branch`, which the
     /// arith-branch fold (`fusesArithIntoBranch`) reads at both the arith-skip site and the S-form
-    /// emit site; false falls back to materializing the arith plainly and keeping the separate
+    /// emit site. When false, it falls back to materializing the arith plainly and keeping the separate
     /// `cmp` in the fused compare-and-branch path, exactly as if the arith/icmp/if triple were
     /// never eligible to fold.
     fuse_arith_branch: bool = true,
@@ -333,7 +355,7 @@ pub fn selectFunction(allocator: std.mem.Allocator, func: *const Function) Error
 }
 
 /// Like `selectFunction`, but pads loop-header blocks with nops so they land on a
-/// `fetch_align`-byte boundary (a performance hint from the microarch model; 0
+/// `fetch_align`-byte boundary (a performance hint from the microarch model, 0
 /// disables it). Never changes the function's result, only where headers fall.
 pub fn selectFunctionAligned(allocator: std.mem.Allocator, func: *const Function, fetch_align: u16) Error![]u32 {
     const compiled = try compileFunction(allocator, func, .{ .fetch_align = fetch_align });
@@ -345,7 +367,7 @@ pub fn selectFunctionAligned(allocator: std.mem.Allocator, func: *const Function
 /// Compile `func` tuned to `model`: the machine-level hooks read the model's `fetch_align`
 /// (loop-header alignment), `features.aarch64.fp16` (whether to use native FEAT_FP16 half
 /// arithmetic instead of the emulation), and `fuse_cmp_branch` (whether the compare-into-branch
-/// fold runs). An inert model (fetch_align 0, fp16 false, fuse_cmp_branch true - the base-ISA
+/// fold runs). An inert model (fetch_align 0, fp16 false, fuse_cmp_branch true, the base-ISA
 /// default) makes this byte-identical to `selectFunction`. Builds the full `ModelCaps` and calls
 /// `compileFunction` directly rather than through `selectFunctionAligned`, since that narrower
 /// entry point only ever carries `fetch_align`.
@@ -446,7 +468,7 @@ fn alignPadWords(words: usize, fetch_align: u16) usize {
 /// Rewrite `work` in place so address folding is SOUND under the fold-agnostic Wimmer allocator.
 /// The shared allocator sees only the actual IR operands, so for a foldable
 /// `p = arith_imm.add(base, imm); load(p)` it keeps `p` live to the load and lets `base` die at the
-/// add, then reuses base's register - and emitting the fold (`[base, #imm]`, add dropped) would read a
+/// add, then reuses base's register. Emitting the fold (`[base, #imm]`, add dropped) would then read a
 /// stale register. This rewrite makes the fold visible to the allocator INSTEAD of hiding it:
 ///   1. Repoint every folded load/store's `ptr` operand directly to its fold BASE, so the shared
 ///      `buildIntervals` sees `base` used AT the load/store position and keeps its live range correct.
@@ -496,21 +518,21 @@ fn applyFoldRewrite(func: *Function, fold: *const addrfold.Analysis) void {
 /// padding falls straight through into the header and every branch fixup is patched from
 /// `block_start` (recorded after padding), so it can never change what the function computes.
 ///
-/// The register allocator is the SHARED Wimmer-Franz linear-scan-on-SSA allocator (Wimmer cutover
-/// SP1, the production flip): the scan runs on the SPLIT CFG, its target-independent `Allocation`
+/// The register allocator is the SHARED Wimmer-Franz linear-scan-on-SSA allocator. The scan runs
+/// on the SPLIT CFG, its target-independent `Allocation`
 /// is translated into this backend's own representation by `translateAllocation`, and the
 /// battle-tested `emitFromAllocation` turns it into machine code. There is NO fallback to the
 /// retired native linear scan.
 pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps: ModelCaps) Error!Compiled {
-    // aarch64 is the reference f16 backend (f16 roadmap Task 3). By default f16 is EMULATED: an
+    // aarch64 is the reference f16 backend. By default f16 is EMULATED: an
     // f16 value lives in an S register as its f32 WIDENING (a value exactly representable in
     // half). The boundaries do the rounding via base-ISA `fcvt` (no FEAT_FP16): a memory
     // load is `ldr h; fcvt s,h`, a store is `fcvt h,s; str h`, every arithmetic result and
     // narrowing convert rounds to nearest-even half with `fcvt h,s; fcvt s,h`. Under `fp16` the
     // Native path holds the f16 in an H register and uses the single-rounded H-form ops directly
     // (no widen/narrow). The other backends still reject f16 via `functionUsesF16` (kept for
-    // them); aarch64 no longer does.
-    // Only SCALAR f16 is handled; f16 nested in a vector/aggregate would fall through to the
+    // them). Aarch64 no longer does.
+    // Only SCALAR f16 is handled. f16 nested in a vector or aggregate would fall through to the
     // raw-vector path and miscompile the half lanes, so reject that composite case cleanly.
     if (ir.function.functionUsesCompositeF16(func)) return error.Unsupported;
     if (func.blockCount() == 0) return error.Unsupported;
@@ -520,7 +542,7 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
     // forwarding blocks and retargets `if` edges), but the public entry points are `*const Function`
     // and a caller may reuse or SHARE its function across backends (the wasm-vs-aarch64 differential
     // does exactly this), so we must not touch the input. We split on an independently-owned deep
-    // `clone` and compile that; the caller's function is left byte-for-byte pristine. This keeps every
+    // `clone` and compile that. The caller's function is left byte-for-byte pristine. This keeps every
     // public *const signature (`selectFunction`, `selectFunctionForModel`, link/object) unchanged.
     var work = try func.clone(allocator);
     defer work.deinit();
@@ -542,7 +564,7 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
     // Address-mode folding is a PRE-ALLOCATION IR REWRITE so it is SOUND under the fold-agnostic
     // shared Wimmer allocator (which sees only the actual IR operands and keeps a frozen `wimmer.zig`).
     // `analyze` recognizes each foldable `p = arith_imm.add(base, imm); load/store(p)` and which adds
-    // die once folded; `applyFoldRewrite` then repoints each folded mem op's `ptr` to `base` and drops
+    // die once folded. `applyFoldRewrite` then repoints each folded mem op's `ptr` to `base` and drops
     // the dead adds IN THE CLONE. After that the allocator sees `base` used at the load/store and keeps
     // its live range correct, so emitting `[base, #off]` reads the right register. The SAME analysis is
     // threaded to `emitFromAllocation`: `folds` is keyed by the surviving mem inst, so `baseOf` returns
@@ -566,7 +588,7 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
     var compiled = try emitFromAllocation(allocator, &work, caps, &alloc, &fold);
     errdefer compiled.deinit(allocator);
 
-    // Every `Reloc.symbol` is a BORROWED slice into the emitting function's symbol storage; the
+    // Every `Reloc.symbol` is a BORROWED slice into the emitting function's symbol storage. The
     // contract is that those names outlive `Compiled` (the caller's function does). Emission borrowed
     // them from the CLONE, whose storage `work.deinit` frees on return, so re-point each name to the
     // original `func`'s identical, longer-lived symbol string (the clone re-interned symbols 1:1, so
@@ -577,7 +599,7 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
 }
 
 /// The `func`-owned symbol string equal to `name`. Every emitted relocation names a callee the
-/// function interned (a `call`'s `symbol` indexes `func.symbols`), so a match always exists; a miss
+/// function interned (a `call`'s `symbol` indexes `func.symbols`), so a match always exists. A miss
 /// would be a codegen bug, not a runtime condition.
 fn rebindSymbolName(func: *const Function, name: []const u8) []const u8 {
     var i: u32 = 0;
@@ -595,7 +617,7 @@ fn rebindSymbolName(func: *const Function, name: []const u8) []const u8 {
 /// vector round-trips all 128 bits, a scalar FP the low 64, a GPR the low 64), exactly as
 /// `loadOp`/`storeResult` do, so a stored value always reloads whole. Shared by the per-instruction
 /// and terminator drains in `emitFromAllocation`. The native `allocate` only ever produces
-/// `store`/`reload`, so those two arms are byte-identical to before this extraction; `move` and
+/// `store`/`reload`, so those two arms are byte-identical to before this extraction. `move` and
 /// `slot_to_slot` are reachable only through the shared Wimmer translation.
 fn emitSplitAction(allocator: std.mem.Allocator, code: *std.ArrayList(u32), func: *const Function, spill_base: usize, act: SplitAction) Error!void {
     switch (act.kind) {
@@ -637,7 +659,7 @@ fn emitSplitAction(allocator: std.mem.Allocator, code: *std.ArrayList(u32), func
             // for gpr, `fp_move`/v27 for fpr, so it never collides with a live value), then store the
             // scratch straight back out to `slot`. The shared allocator now expands slot->slot moves
             // through the class scratch itself (`orderMoves`), so the Wimmer path no longer produces
-            // this kind; the arm stays for defensive completeness (the native `allocate` never emits
+            // this kind. The arm stays for defensive completeness (the native `allocate` never emits
             // it either). The scratch is reserved, so this touch can never conflict with a live value.
             const off_src: u15 = @intCast(spill_base + act.move_from_slot * 16);
             const off_dst: u15 = @intCast(spill_base + act.slot * 16);
@@ -655,19 +677,42 @@ fn emitSplitAction(allocator: std.mem.Allocator, code: *std.ArrayList(u32), func
     }
 }
 
+/// Store a struct-BY-VALUE `.registers` return's register set into the
+/// dest slot whose frame ADDRESS is already in `base`. Each `pieces[0..count]` entry is one return
+/// eightbyte. An integer piece stores the next GPR (x0, x1) as a full 8-byte `str`. A float piece
+/// stores the next FPR (v0..v3) at its own width (`strFp` double for 8 bytes, single for 4). The
+/// two banks count independently, matching the ret-placement order. A pure-integer return keeps
+/// the same behavior byte-for-byte (each `str x{gp}, [base + i*8]`).
+fn emitStructRetStore(allocator: std.mem.Allocator, code: *std.ArrayList(u32), pieces: [4]ir.function.RetPiece, count: u8, base: Reg) Error!void {
+    const gpr_ret = [_]Reg{ .x0, .x1 };
+    const fpr_ret = [4]Reg{ @enumFromInt(0), @enumFromInt(1), @enumFromInt(2), @enumFromInt(3) };
+    var gp_i: usize = 0;
+    var fp_i: usize = 0;
+    for (0..count) |i| {
+        const p = pieces[i];
+        if (p.fp) {
+            try code.append(allocator, encode.strFp(fpr_ret[fp_i], base, @intCast(p.offset), p.bytes == 8));
+            fp_i += 1;
+        } else {
+            try code.append(allocator, encode.strOff(gpr_ret[gp_i], base, @intCast(p.offset)));
+            gp_i += 1;
+        }
+    }
+}
+
 /// Emit A64 machine code from a finished `Allocation` (the second half of `compileFunction`, split
 /// out so the shared Wimmer allocator can drive the SAME battle-tested emission through
 /// `compileFunctionWimmer`). This is a PURE extraction of everything after `allocate`: prologue and
 /// frame, the per-block/instruction loop reading each value's location through `Ctx.locationAt`, the
 /// split-boundary action drain, block-edge moves, and the epilogue. `caps` carries the model seams
-/// (`fetch_align`, `fp16`); an inert `.{}` reproduces `selectFunction`'s output exactly. `nblocks`
+/// (`fetch_align`, `fp16`). An inert `.{}` reproduces `selectFunction`'s output exactly. `nblocks`
 /// and `leaf` are recomputed from `func` (identical to the values `compileFunction` passed to
 /// `allocate`), so the extraction is byte-identical for every existing caller.
 fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps: ModelCaps, alloc: *Allocation, fold: *const addrfold.Analysis) Error!Compiled {
     const fetch_align = caps.fetch_align;
     // Native half arithmetic (FEAT_FP16) vs the base-ISA emulation, gated on the model feature.
     // `fp16 == false` (every non-model caller) keeps the emulation, byte-identical to before this
-    // capability existed; only `selectFunctionForModel` under a FEAT_FP16 model sets it true.
+    // capability existed. Only `selectFunctionForModel` under a FEAT_FP16 model sets it true.
     const fp16 = caps.fp16;
     const nblocks = func.blockCount();
     const leaf = isLeaf(func);
@@ -717,10 +762,19 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
     // whole (a scalar wastes the upper 8 bytes). The base is 16-aligned for `ldr q`.
     const spill_base = alignUp(alloca_base + alloca_bytes, 16);
     const spill_bytes = alloc.spill_count * 16;
+    // AAPCS64 variadic register save area (ONLY for a variadic definition): a 64-byte GP block
+    // (x0..x7) then a 128-byte VR block (q0..q7), reserved ABOVE the spill slots at a 16-byte
+    // aligned offset (the `str q` block is naturally 16-aligned). `va_start` makes `__gr_top`/
+    // `__vr_top` point at the END of each block. A non-variadic function reserves nothing here,
+    // so `va_end` collapses to `spill_base + spill_bytes` and its frame is byte-identical.
+    const va_reg_base = if (func.is_variadic) alignUp(spill_base + spill_bytes, 16) else 0;
+    const gr_save_off = va_reg_base; // x0..x7 -> [sp + gr_save_off ..], end (top) at +64
+    const vr_save_off = va_reg_base + 64; // q0..q7 -> [sp + vr_save_off ..], end (top) at +128
+    const va_end = if (func.is_variadic) va_reg_base + 192 else spill_base + spill_bytes;
     const frame: usize = if (!leaf)
-        alignUp(@max(spill_base + spill_bytes, lr_bytes), 16)
-    else if (spill_base + spill_bytes > 0)
-        alignUp(spill_base + spill_bytes, 16)
+        alignUp(@max(va_end, lr_bytes), 16)
+    else if (va_end > 0)
+        alignUp(va_end, 16)
     else
         0;
     const lr_off = outgoing_bytes;
@@ -754,14 +808,48 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
         for (alloc.saved_gpr.items, 0..) |r, i| try code.append(allocator, encode.strOff(r, sp, @intCast(gpr_saved_base + 8 * i)));
         for (alloc.saved_fpr.items, 0..) |r, i| try code.append(allocator, encode.strFp(r, sp, @intCast(fpr_saved_base + 8 * i), true));
     }
+    // AAPCS64 variadic register save: spill EVERY incoming argument register into its save area
+    // BEFORE the argument-homing moves below (which may overwrite x0..x7), and before the body
+    // (a leaf may reuse x1..x7 as scratch). Both blocks are filled unconditionally (AAPCS64 has
+    // no AL-style vector-count gate). Only a variadic definition reaches here, so a normal
+    // prologue is byte-identical.
+    if (func.is_variadic) {
+        var gi: u5 = 0;
+        while (gi < 8) : (gi += 1) {
+            try code.append(allocator, encode.strOff(@enumFromInt(gi), sp, @intCast(gr_save_off + @as(usize, gi) * 8)));
+        }
+        var vi: u5 = 0;
+        while (vi < 8) : (vi += 1) {
+            try code.append(allocator, encode.strQ(@enumFromInt(vi), sp, @intCast(vr_save_off + @as(usize, vi) * 16)));
+        }
+    }
     // Move register arguments into their parameter registers (a leaf keeps them
     // pinned, so no move), and load stack parameters (the 9th onward) from the
     // caller's outgoing-argument area.
     const eparams = func.blockParams(@enumFromInt(0));
     const plocs = try allocator.alloc(ArgLoc, eparams.len);
     defer allocator.free(plocs);
-    computeArgLocs(func, eparams, plocs);
+    computeArgLocs(func, eparams, plocs, func.sret);
     for (eparams, plocs) |p, l| {
+        // The hidden result pointer arrives in `x8` (the AAPCS64 indirect-result
+        // register), NOT an x0-x7 argument register. Home it into wherever the allocator placed
+        // this value, unconditionally (unlike an ordinary leaf param, its value does NOT already
+        // sit in its allocated register). The pointer is always a gpr, so only gpr forms are
+        // needed. It can be split, whole-life spilled, or whole-life in a register.
+        if (l.sret_ptr) {
+            if (alloc.segments.get(p)) |segs| {
+                switch (segs[0].loc) {
+                    .reg => |first_reg| if (first_reg != .x8) try code.append(allocator, encode.mov(first_reg, .x8)),
+                    .slot => |slot| try code.append(allocator, encode.strOff(.x8, sp, @intCast(spill_base + slot * 16))),
+                }
+            } else if (alloc.reg.get(p) == null) {
+                try code.append(allocator, encode.strOff(.x8, sp, @intCast(spill_base + alloc.spill.get(p).? * 16)));
+            } else {
+                const pr = alloc.reg.get(p).?;
+                if (pr != .x8) try code.append(allocator, encode.mov(pr, .x8));
+            }
+            continue;
+        }
         // A SPLIT entry param (Wimmer bridge gap #4): under pressure the shared allocator can
         // re-home a param's interval one or more times, leaving its first home in `segments`
         // instead of `alloc.reg`/`alloc.spill` (see `translateAllocation`, which builds the
@@ -823,9 +911,9 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
             }
             continue;
         }
-        // A spilled parameter (e.g. a vector input that crosses a call - the callee-saved FP
-        // registers only preserve the low 64 bits, so a lane vector must live on the stack):
-        // store its incoming argument (register or caller stack slot) into its spill slot.
+        // A spilled parameter (for example a vector input that crosses a call, where the
+        // callee-saved FP registers only preserve the low 64 bits, so a lane vector must live
+        // on the stack): store its incoming argument (register or caller stack slot) into its spill slot.
         if (alloc.reg.get(p) == null) {
             const slot_off: u15 = @intCast(spill_base + alloc.spill.get(p).? * 16);
             if (l.idx < 8) {
@@ -871,6 +959,9 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
         .spill_base = spill_base,
         .alloca_base = alloca_base,
         .alloca_off = &alloca_off,
+        .frame = frame,
+        .gr_save_off = gr_save_off,
+        .vr_save_off = vr_save_off,
         .fp16 = fp16,
         .fuse_cmp_branch = caps.fuse_cmp_branch,
         .fuse_arith_branch = caps.fuse_arith_branch,
@@ -1023,7 +1114,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     }
                     // Arith-branch fold: this add/sub/and is the single-use operand of an
                     // immediately-following icmp eq/ne 0 that feeds the next if. Skip its
-                    // materialization here; `emitIf` re-checks the SAME `fusesArithIntoBranch`
+                    // materialization here. `emitIf` re-checks the SAME `fusesArithIntoBranch`
                     // predicate and emits the flag-setting S-form (adds/subs/ands) whose Z flag is
                     // (result == 0) plus the `b.cc`, so the arith is emitted exactly once. Checked
                     // after the fma/shift consumer folds (an integer add is never an fma consumer,
@@ -1043,7 +1134,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     // kept.
                     if (a.op == .shl and fusesIntoNextShiftAdd(func, insts, inst_idx, caps.fuse_shift_add)) continue;
                     // Arith-branch fold (immediate form): this add/sub of a u12 immediate is the
-                    // single-use operand of an icmp eq/ne 0 feeding the next if. Skip it; `emitIf`
+                    // single-use operand of an icmp eq/ne 0 feeding the next if. Skip it. `emitIf`
                     // emits the flag-setting `addsImm`/`subsImm` + `b.cc` under the SAME predicate.
                     if (isArithBranchProducer(func, insts, inst_idx, caps.fuse_arith_branch and caps.fuse_cmp_branch)) continue;
                     const result = func.instResult(inst).?;
@@ -1087,7 +1178,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                         const rl = try ctx.loadOp(allocator, &code, cmp.lhs, fp_spill_op[0]);
                         const rr = try ctx.loadOp(allocator, &code, cmp.rhs, fp_spill_op[1]);
                         const rd = ctx.resultReg(result);
-                        // Native f16 (fp16) compares in the H form; emulation compares the S-held
+                        // Native f16 (fp16) compares in the H form. Emulation compares the S-held
                         // f32 widening (fkindOf yields `.single`, byte-identical to before).
                         try code.append(allocator, encode.fcmp(rl, rr, fkindOf(func, cmp.lhs, fp16)));
                         try code.append(allocator, encode.cset(rd, condForFloat(cmp.op)));
@@ -1130,7 +1221,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                         const el = try ctx.loadOp(allocator, &code, s.@"else", fp_spill_op[1]);
                         const rd = ctx.resultReg(result);
                         try code.append(allocator, encode.cmp(c, .zr));
-                        // Native f16 (fp16) selects in the H form; emulation selects the S-held
+                        // Native f16 (fp16) selects in the H form. Emulation selects the S-held
                         // f32 widening (fkindOf yields `.single`, byte-identical to before).
                         try code.append(allocator, encode.fcsel(rd, tr, el, .ne, fkindOf(func, result, fp16)));
                         try storeResult(allocator, &code, ctx, result, rd);
@@ -1153,7 +1244,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                         // int -> float: scvtf/ucvtf. NATIVE (fp16) converts straight into the H
                         // view (single-rounded, no fixup). EMULATION lands an int->f16 in the S
                         // view first (isDouble(f16) is false), then rounds to nearest-even half so
-                        // the S reg holds an exact half; fkindOf yields `.single` there, keeping
+                        // the S reg holds an exact half. fkindOf yields `.single` there, keeping
                         // the emulation encoding byte-identical.
                         try code.append(allocator, encode.cvtIntToFloat(rd, src, fkindOf(func, result, fp16), isSignedInt(func, cv.value)));
                         if (isHalf(func, result) and !fp16) try roundToHalf(allocator, &code, rd);
@@ -1204,7 +1295,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                         }
                     } else {
                         // int <-> int. Widening sign/zero-extends by the SOURCE signedness (sbfm for a
-                        // signed source, ubfm for unsigned); same-width or narrowing keeps the low
+                        // signed source, ubfm for unsigned). Same-width or narrowing keeps the low
                         // bits, byte-identical to the previous unconditional mov for those cases.
                         const src_bits = intBitsOf(func, cv.value);
                         const dst_bits = intBitsOf(func, result);
@@ -1248,7 +1339,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                         // f16 float-math unary (sqrt/ceil/floor/trunc/nearest) is not lowered on
                         // either f16 path: the emulation holds f16 as an f32 (an fsqrt.s would leave
                         // an un-narrowed f32), and the native path holds it in an H register (an
-                        // fsqrt.s would mis-read the low 32 bits). No front-end emits it today; reject
+                        // fsqrt.s would mis-read the low 32 bits). No front-end emits it today. Reject
                         // cleanly rather than silently miscompile (mirrors the wasm backend).
                         if (isHalf(func, result)) return error.Unsupported;
                         const d = isDouble(func, result);
@@ -1270,9 +1361,35 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     try emitFrameImm(allocator, &code, false, rd, sp, off);
                     try storeResult(allocator, &code, ctx, result, rd);
                 },
+                .global_addr => |ga| {
+                    const result = func.instResult(inst).?;
+                    const rd = ctx.resultReg(result);
+                    const name = func.symbolName(ga.symbol);
+                    if (ga.via_got) {
+                        // GOT-indirect symbol address (a data import): `adrp rd, got(sym)@PAGE`
+                        // then `ldr rd, [rd, #got(sym)@LO12]`, loading the symbol's address FROM
+                        // the GOT entry. Both immediates are zero placeholders. `.got_pg` patches
+                        // the adrp's page delta and `.got_lo12` patches the ldr's imm12 (the GOT
+                        // entry's lo12>>3) once the entry's runtime address is known.
+                        try relocs.append(allocator, .{ .offset = code.items.len, .symbol = name, .kind = .got_pg });
+                        try code.append(allocator, encode.adrp(rd, 0));
+                        try relocs.append(allocator, .{ .offset = code.items.len, .symbol = name, .kind = .got_lo12 });
+                        try code.append(allocator, encode.ldrOff(rd, rd, 0));
+                    } else {
+                        // PC-relative symbol address: `adrp rd, sym@PAGE` then
+                        // `add rd, rd, sym@PAGEOFF`. Both immediates are zero here (a
+                        // later task patches the two relocations once the symbol's
+                        // runtime address is known).
+                        try relocs.append(allocator, .{ .offset = code.items.len, .symbol = name, .kind = .adrp_pg });
+                        try code.append(allocator, encode.adrp(rd, 0));
+                        try relocs.append(allocator, .{ .offset = code.items.len, .symbol = name, .kind = .add_pgoff });
+                        try code.append(allocator, encode.addImm64(rd, rd, 0));
+                    }
+                    try storeResult(allocator, &code, ctx, result, rd);
+                },
                 .load => {
                     // A folded load addresses `[base, #off]` directly: `baseOf` yields the fold base
-                    // (the add's lhs) and `offOf` the displacement; both are the raw ptr and 0 when
+                    // (the add's lhs) and `offOf` the displacement. Both are the raw ptr and 0 when
                     // unfolded, so the non-folding case is byte-identical.
                     const result = func.instResult(inst).?;
                     const base = try ctx.loadOp(allocator, &code, fold.baseOf(func, inst), spill_op[0]); // ptr is a gpr
@@ -1328,7 +1445,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     try storeResult(allocator, &code, ctx, result, rd);
                 },
                 .call => |c| {
-                    try ctx.emitCallArgs(allocator, &code, func.valueList(c.args));
+                    try ctx.emitCallArgs(allocator, &code, func.valueList(c.args), c.sret);
                     try relocs.append(allocator, .{ .offset = code.items.len, .symbol = func.symbolName(c.symbol) });
                     try code.append(allocator, encode.bl(0));
                     if (func.instResult(inst)) |result| {
@@ -1336,18 +1453,35 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                         try code.append(allocator, if (regClass(func, result) == .fpr) encode.fmovReg(rd, @enumFromInt(0)) else encode.mov(rd, .x0));
                         try storeResult(allocator, &code, ctx, result, rd);
                     }
+                    if (c.ret_dest) |dest| {
+                        // A struct returned in registers. The callee left
+                        // each eightbyte in the next return register of its bank (integer x0/x1,
+                        // float v0..v3). REMATERIALIZE the dest's frame address (an alloca, available
+                        // after the call, never a value clobbered by it) into a scratch that is not
+                        // a return register, then store each return register into `[dest + offset]`.
+                        const doff = alloca_base + alloca_off.get(dest).?;
+                        try emitFrameImm(allocator, &code, false, spill_op[0], sp, doff);
+                        try emitStructRetStore(allocator, &code, c.ret_pieces, c.ret_regs, spill_op[0]);
+                    }
                 },
                 .call_indirect => |c| {
                     // Stage the target address into a scratch register that survives the
                     // argument moves (x0..x7), then `blr`.
                     const tsrc = try ctx.loadOp(allocator, &code, c.target, spill_op[0]);
                     try code.append(allocator, encode.mov(scratch_imm, tsrc));
-                    try ctx.emitCallArgs(allocator, &code, func.valueList(c.args));
+                    try ctx.emitCallArgs(allocator, &code, func.valueList(c.args), c.sret);
                     try code.append(allocator, encode.blr(scratch_imm));
                     if (func.instResult(inst)) |result| {
                         const rd = ctx.resultReg(result);
                         try code.append(allocator, if (regClass(func, result) == .fpr) encode.fmovReg(rd, @enumFromInt(0)) else encode.mov(rd, .x0));
                         try storeResult(allocator, &code, ctx, result, rd);
+                    }
+                    if (c.ret_dest) |dest| {
+                        // Store the register-return eightbytes into the
+                        // dest slot, rematerializing its frame address. See the direct `.call` arm.
+                        const doff = alloca_base + alloca_off.get(dest).?;
+                        try emitFrameImm(allocator, &code, false, spill_op[0], sp, doff);
+                        try emitStructRetStore(allocator, &code, c.ret_pieces, c.ret_regs, spill_op[0]);
                     }
                 },
                 .@"if" => |cf| {
@@ -1375,6 +1509,12 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     if (@intFromEnum(rd) != @intFromEnum(fp_move)) try code.append(allocator, encode.movVec(rd, fp_move));
                     try storeResult(allocator, &code, ctx, result, rd);
                 },
+                // AAPCS64 variadic define side. `va_start` seeds the `va_list`, `va_arg`
+                // fetches the next unnamed argument (register save area or overflow stack), and
+                // `va_end` is a no-op (the `va_list` owns no resource).
+                .va_start => |vs| try ctx.emitVaStart(allocator, &code, vs.list),
+                .va_arg => |va| try ctx.emitVaArg(allocator, &code, va.list, func.instResult(inst).?),
+                .va_end => {},
                 else => return error.Unsupported,
             }
         }
@@ -1397,25 +1537,71 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
             action_cursor += 1;
         }
         if (!terminated) {
-            switch (func.terminator(block) orelse Terminator{ .ret = null }) {
-                .ret => |v| {
-                    if (v) |value| {
-                        // The return value is a non-param value, so its location is read through
-                        // `locationAt` at the terminator position (ctx.pos == block_end here). With no
-                        // splits this is byte-identical to today's direct `reg`/`spill` reads.
-                        if (regClass(func, value) == .fpr) {
-                            const vec = isVector(func, value);
-                            switch (ctx.locationAt(value)) {
-                                .slot => |slot| {
-                                    const off: u15 = @intCast(spill_base + slot * 16);
-                                    try code.append(allocator, if (vec) encode.ldrQ(@enumFromInt(0), sp, off) else encode.ldrFp(@enumFromInt(0), sp, off, true));
-                                },
-                                .reg => |src| if (@intFromEnum(src) != 0) try code.append(allocator, if (vec) encode.movVec(@enumFromInt(0), src) else encode.fmovReg(@enumFromInt(0), src)),
+            switch (func.terminator(block) orelse Terminator{ .ret = ir.function.Ret.none() }) {
+                .ret => |ret_vals| {
+                    switch (ret_vals.count) {
+                        0 => {},
+                        1 => {
+                            const value = ret_vals.values[0];
+                            // The return value is a non-param value, so its location is read through
+                            // `locationAt` at the terminator position (ctx.pos == block_end here). With no
+                            // splits this is byte-identical to today's direct `reg`/`spill` reads.
+                            if (regClass(func, value) == .fpr) {
+                                const vec = isVector(func, value);
+                                switch (ctx.locationAt(value)) {
+                                    .slot => |slot| {
+                                        const off: u15 = @intCast(spill_base + slot * 16);
+                                        try code.append(allocator, if (vec) encode.ldrQ(@enumFromInt(0), sp, off) else encode.ldrFp(@enumFromInt(0), sp, off, true));
+                                    },
+                                    .reg => |src| if (@intFromEnum(src) != 0) try code.append(allocator, if (vec) encode.movVec(@enumFromInt(0), src) else encode.fmovReg(@enumFromInt(0), src)),
+                                }
+                            } else switch (ctx.locationAt(value)) {
+                                .slot => |slot| try code.append(allocator, encode.ldrOff(.x0, sp, @intCast(spill_base + slot * 16))),
+                                .reg => |src| if (src != .x0) try code.append(allocator, encode.mov(.x0, src)),
                             }
-                        } else switch (ctx.locationAt(value)) {
-                            .slot => |slot| try code.append(allocator, encode.ldrOff(.x0, sp, @intCast(spill_base + slot * 16))),
-                            .reg => |src| if (src != .x0) try code.append(allocator, encode.mov(.x0, src)),
-                        }
+                        },
+                        else => {
+                            // A small struct returned BY VALUE across two
+                            // register banks. Each value is one eightbyte, routed by its OWN type to
+                            // the next return register of its bank: an integer eightbyte into x0/x1,
+                            // a float eightbyte (an HFA member) into v0..v3. The two banks count
+                            // independently. aarch64 returns at most 2 integer eightbytes or a
+                            // 4-member HFA, so the count never exceeds 4 (a bigger struct is `.sret`).
+                            if (ret_vals.count > 4) return error.Unsupported;
+                            // Stage each eightbyte into a dedicated scratch of its bank first (GPR
+                            // x13/x14, FPR v24..v27, none a return register), so placing one eightbyte
+                            // into a return register cannot clobber another that still lives in one
+                            // (the source registers can overlap the return set in any permutation).
+                            const gpr_ret = [_]Reg{ .x0, .x1 };
+                            const fpr_ret = [4]Reg{ @enumFromInt(0), @enumFromInt(1), @enumFromInt(2), @enumFromInt(3) };
+                            const fpr_scratch = [4]Reg{ @enumFromInt(24), @enumFromInt(25), @enumFromInt(26), @enumFromInt(27) };
+                            var dst: [4]Reg = undefined;
+                            var staged: [4]Reg = undefined;
+                            var is_fp: [4]bool = undefined;
+                            var gp_i: usize = 0;
+                            var fp_i: usize = 0;
+                            for (ret_vals.slice(), 0..) |value, i| {
+                                if (regClass(func, value) == .fpr) {
+                                    if (isVector(func, value)) return error.Unsupported; // HFA members are scalar
+                                    const scr = fpr_scratch[fp_i];
+                                    const src = try ctx.loadOp(allocator, &code, value, scr);
+                                    if (src != scr) try code.append(allocator, encode.fmovReg(scr, src));
+                                    staged[i] = scr;
+                                    dst[i] = fpr_ret[fp_i];
+                                    is_fp[i] = true;
+                                    fp_i += 1;
+                                } else {
+                                    const scr = spill_op[gp_i];
+                                    const src = try ctx.loadOp(allocator, &code, value, scr);
+                                    if (src != scr) try code.append(allocator, encode.mov(scr, src));
+                                    staged[i] = scr;
+                                    dst[i] = gpr_ret[gp_i];
+                                    is_fp[i] = false;
+                                    gp_i += 1;
+                                }
+                            }
+                            for (0..ret_vals.count) |i| try code.append(allocator, if (is_fp[i]) encode.fmovReg(dst[i], staged[i]) else encode.mov(dst[i], staged[i]));
+                        },
                     }
                     if (!leaf) {
                         for (alloc.saved_gpr.items, 0..) |r, i| try code.append(allocator, encode.ldrOff(r, sp, @intCast(gpr_saved_base + 8 * i)));
@@ -1469,18 +1655,26 @@ const Ctx = struct {
     spill_base: usize,
     alloca_base: usize,
     alloca_off: *std.AutoHashMapUnmanaged(Value, u32),
+    /// AAPCS64 variadic define side. It is meaningful only when `func.is_variadic` is true. It is 0
+    /// otherwise, since no `va_*` op is ever emitted then. `frame` is the total `sub sp` amount, so
+    /// `va_start` can address the first incoming STACK arg (`sp + frame`). `gr_save_off`/`vr_save_off`
+    /// are the sp offsets of the prologue's GP (64B) / VR (128B) register save areas. `va_start` sets
+    /// `__gr_top`/`__vr_top` to their ENDS (`+64` / `+128`).
+    frame: usize = 0,
+    gr_save_off: usize = 0,
+    vr_save_off: usize = 0,
     /// Whether to lower f16 with NATIVE FEAT_FP16 H-form ops instead of the emulation. Threaded
-    /// from `compileFunction`'s `caps.fp16`; false for every non-model caller (byte-identical).
+    /// from `compileFunction`'s `caps.fp16`. It is false for every non-model caller (byte-identical).
     fp16: bool = false,
     /// Whether to fuse a compare into its consumer branch (`cmp; b.cc` instead of `cmp; cset` then
-    /// a separate test-and-branch). Threaded from `compileFunction`'s `caps.fuse_cmp_branch`; true
+    /// a separate test-and-branch). Threaded from `compileFunction`'s `caps.fuse_cmp_branch`. It is true
     /// for every non-model caller (byte-identical to before this capability existed). Must agree
     /// with the icmp-skip site's `caps.fuse_cmp_branch` check in `emitFromAllocation` (the dual-check
     /// pair around `fusesIntoNextIf`), so the two never disagree on whether a given icmp/if fuses.
     fuse_cmp_branch: bool = true,
     /// Whether to fold a flag-setting arithmetic op into its consumer branch (the arith-branch
     /// fold: `arith; icmp ==/!= 0; if` -> one S-form `adds`/`subs`/`ands` plus `b.cc`). Threaded
-    /// from `compileFunction`'s `caps.fuse_arith_branch`; true for every non-model caller. This
+    /// from `compileFunction`'s `caps.fuse_arith_branch`. It is true for every non-model caller. This
     /// fold lives INSIDE the fused compare-and-branch path, so it also requires `fuse_cmp_branch`.
     /// Must agree with the arith-skip site's `caps.fuse_arith_branch and caps.fuse_cmp_branch`
     /// check in `emitFromAllocation` (both gate `fusesArithIntoBranch`), so the two never disagree
@@ -1491,7 +1685,7 @@ const Ctx = struct {
     pos: u32 = 0,
     /// The block currently being emitted (the PREDECESSOR of any edge this block terminates in).
     /// `emitMoves` reads it with the jump target to key into the precomputed `edge_moves`. Defaults
-    /// to the entry block; the emission loop sets it per block.
+    /// to the entry block. The emission loop sets it per block.
     block: Block = @enumFromInt(0),
 
     /// The location of `v` at the current instruction position (`self.pos`): its active segment if
@@ -1541,9 +1735,89 @@ const Ctx = struct {
         };
     }
 
+    /// Expand `va_start(list)` (AAPCS64): write the five `va_list` fields at `[list]` (`list` is the
+    /// object's ADDRESS): `void* __stack @0`, `void* __gr_top @8`, `void* __vr_top @16`,
+    /// `i32 __gr_offs @24`, `i32 __vr_offs @28`. `__stack` points at the first incoming STACK arg
+    /// (`sp + frame`). `__gr_top`/`__vr_top` point at the ENDS of the prologue's GP/VR save areas. The
+    /// negative offsets start past the named register args, so the first `va_arg` reads the first
+    /// UNNAMED argument. `scratch_imm` (x16) is the only value scratch (the list base stays read-only
+    /// in its own register or `spill_op[0]`), so no allocated value is clobbered.
+    fn emitVaStart(self: Ctx, allocator: std.mem.Allocator, code: *std.ArrayList(u32), list: Value) Error!void {
+        const counts = namedRegCounts(self.func);
+        const lp = try self.loadOp(allocator, code, list, spill_op[0]); // base ptr (own reg or x13), read-only
+        // __stack = &(first incoming stack arg) = sp + frame.
+        try emitFrameImm(allocator, code, false, scratch_imm, sp, self.frame);
+        try code.append(allocator, encode.strOff(scratch_imm, lp, 0));
+        // __gr_top = &(end of GP save area) = sp + gr_save_off + 64.
+        try emitFrameImm(allocator, code, false, scratch_imm, sp, self.gr_save_off + 64);
+        try code.append(allocator, encode.strOff(scratch_imm, lp, 8));
+        // __vr_top = &(end of VR save area) = sp + vr_save_off + 128.
+        try emitFrameImm(allocator, code, false, scratch_imm, sp, self.vr_save_off + 128);
+        try code.append(allocator, encode.strOff(scratch_imm, lp, 16));
+        // __gr_offs = -(8 * (8 - num_named_gp)), a negative i32 (0 once every GP slot is consumed).
+        const gr_offs: i32 = -@as(i32, @intCast(8 * (8 - counts.gp)));
+        try loadConst(allocator, code, scratch_imm, gr_offs);
+        try code.append(allocator, encode.strW(scratch_imm, lp, 24));
+        // __vr_offs = -(16 * (8 - num_named_fp)).
+        const vr_offs: i32 = -@as(i32, @intCast(16 * (8 - counts.fp)));
+        try loadConst(allocator, code, scratch_imm, vr_offs);
+        try code.append(allocator, encode.strW(scratch_imm, lp, 28));
+    }
+
+    /// Expand `va_arg(list, result-type)` (AAPCS64): fetch the next variadic argument and advance the
+    /// `va_list` at `[list]`. Two shapes by result class:
+    ///   INT/pointer: `if __gr_offs < 0 { p = __gr_top + __gr_offs; __gr_offs += 8 } else
+    ///     { p = __stack; __stack += 8 }`; `result = *p`.
+    ///   DOUBLE/float: the same over `__vr_offs`/`__vr_top` with save-area stride 16 (the stack
+    ///     stride stays 8).
+    /// The list base stays read-only in its own register (or x13 via `loadOp`). `scratch_imm` (x16)
+    /// holds the signed offset, `scratch_move` (x17) the argument pointer (it survives to the load),
+    /// and `spill_op[1]` (x14) a transient. The compare + b.ge/b are local branches backpatched within
+    /// this instruction (never crossing a block, so no `fixups` entry).
+    fn emitVaArg(self: Ctx, allocator: std.mem.Allocator, code: *std.ArrayList(u32), list: Value, result: Value) Error!void {
+        const func = self.func;
+        const is_fp = regClass(func, result) == .fpr;
+        const off_field: u14 = if (is_fp) 28 else 24; // __vr_offs @28 / __gr_offs @24
+        const top_field: u15 = if (is_fp) 16 else 8; // __vr_top @16 / __gr_top @8
+        const save_stride: u12 = if (is_fp) 16 else 8; // VR slot 16 bytes / GP slot 8 bytes
+        const w = scratch_imm; // x16: the signed __*_offs (sign-extended to 64 bits)
+        const p = scratch_move; // x17: the argument pointer, live until the load
+        const tmp = spill_op[1]; // x14: transient (the top / the bumped value)
+
+        const lp = try self.loadOp(allocator, code, list, spill_op[0]); // base ptr (read-only)
+        try code.append(allocator, encode.ldrsw(w, lp, off_field)); // w = (i64)(i32)__*_offs
+        try code.append(allocator, encode.cmp64(w, .zr)); // compare w with 0 (signed)
+        const br_to_stack = code.items.len;
+        try code.append(allocator, encode.bcc(.ge, 0)); // w >= 0 -> overflow (stack) path
+
+        // Register path: p = __*_top + w ; __*_offs += stride ; write the offset back.
+        try code.append(allocator, encode.ldrOff(tmp, lp, top_field)); // tmp = __*_top
+        try code.append(allocator, encode.add64(p, tmp, w)); // p = top + w (w is negative)
+        try code.append(allocator, encode.addImm64(w, w, save_stride)); // w += stride
+        try code.append(allocator, encode.strW(w, lp, off_field)); // store the low 32 bits back
+        const br_to_load = code.items.len;
+        try code.append(allocator, encode.b(0)); // jump to the shared load
+
+        // Overflow path: p = __stack ; __stack += 8 ; write it back.
+        const stack_target = code.items.len;
+        try code.append(allocator, encode.ldrOff(p, lp, 0)); // p = __stack
+        try code.append(allocator, encode.addImm64(tmp, p, 8)); // tmp = p + 8
+        try code.append(allocator, encode.strOff(tmp, lp, 0)); // __stack = tmp
+
+        // Shared load: result = *p (per the result's type/width).
+        const load_target = code.items.len;
+        const rd = self.resultReg(result);
+        try emitLoad(allocator, code, func, result, rd, p, 0, self.fp16);
+        try storeResult(allocator, code, self, result, rd);
+
+        // Backpatch the two local branches (signed byte displacement = word delta * 4).
+        code.items[br_to_stack] = encode.bcc(.ge, @intCast((@as(i64, @intCast(stack_target)) - @as(i64, @intCast(br_to_stack))) * 4));
+        code.items[br_to_load] = encode.b(@intCast((@as(i64, @intCast(load_target)) - @as(i64, @intCast(br_to_load))) * 4));
+    }
+
     /// Emit the fused multiply-add/sub for a float `add`/`sub` (`op`, `lhs`, `rhs`) whose
     /// single-use, immediately-preceding operand is the float `mul` (`mul`, defining
-    /// `mul_result`) - see `fusesIntoNextArith` for the shared eligibility check. Loads the
+    /// `mul_result`). See `fusesIntoNextArith` for the shared eligibility check. Loads the
     /// mul's own operands directly (its materialization was skipped by the caller) plus the
     /// add/sub's OTHER operand (the accumulator).
     ///
@@ -1563,7 +1837,7 @@ const Ctx = struct {
     ///   add(mul(a,b), c) = a*b+c -> fmla: Vd = Vd + Vn*Vm, Vd preloaded with c
     ///   sub(c, mul(a,b)) = c-a*b -> fmls: Vd = Vd - Vn*Vm, Vd preloaded with c
     /// (`fusesIntoNextArith` never fuses the third vector shape, sub(mul,c) = a*b-c, since
-    /// no single NEON instruction expresses it - that shape stays on the separate
+    /// no single NEON instruction expresses it. That shape stays on the separate
     /// fmul+fsub path in `binary`.)
     ///
     /// Nothing runs between the (skipped) mul and this add/sub, so the mul's operand
@@ -1609,7 +1883,7 @@ const Ctx = struct {
 
     /// Emit the fused shifted-register add/sub for an integer `add`/`sub` (`op`, `lhs`,
     /// `rhs`) whose single-use, immediately-preceding operand is the constant left shift
-    /// `arith_imm{.shl, b, k}` (`shl`, defining `shl_result`) - see `fusesIntoNextShiftAdd`
+    /// `arith_imm{.shl, b, k}` (`shl`, defining `shl_result`). See `fusesIntoNextShiftAdd`
     /// for the shared eligibility check. Folds `a + (b << k)` / `a - (b << k)` into one
     /// `add`/`sub xd, xn, xm, lsl #k`. Loads the add/sub's OTHER operand (`rn`, the addend
     /// or minuend) and the shift's own operand `b` (`rm`) directly, since the shl's
@@ -1687,7 +1961,7 @@ const Ctx = struct {
             });
             // In the emulation path an f16 op is done in the S (f32) form, then its result is rounded to
             // nearest-even half so the S register again holds an exact half value (correct per-op
-            // IEEE f16 semantics; the operands were already exact halves). fp mul/add fusion is
+            // IEEE f16 semantics, since the operands were already exact halves). fp mul/add fusion is
             // disabled for f16 in `fusesIntoNextArith`, so this rounds every op individually.
             // Native (fp16): the H-form op is already single-rounded to half, so no re-rounding.
             if (isHalf(self.func, result) and !self.fp16) try roundToHalf(allocator, code, rd);
@@ -1805,7 +2079,7 @@ const Ctx = struct {
             branch = .{ .reg = cond };
         }
 
-        // Layout selection. THEN and ELSE are the two successor blocks; NEXT is the block emitted right
+        // Layout selection. THEN and ELSE are the two successor blocks. NEXT is the block emitted right
         // after this one (or null at the last block). Whichever edge targets NEXT can fall through, so
         // its branch is elided. THEN is checked first, so a degenerate `if` with THEN == ELSE == NEXT
         // takes the THEN-fall-through layout (elides one branch, both edges still reach the same block).
@@ -1919,7 +2193,7 @@ const Ctx = struct {
         defer fpr_moves.deinit(allocator);
         for (args, params) |arg, param| {
             const dst = self.alloc.reg.get(param).?; // params are never split, so a whole-life register
-            // A register-resident edge argument moves; a spilled one is reloaded below. The argument's
+            // A register-resident edge argument moves. A spilled one is reloaded below. The argument's
             // location is read at the current (terminator) position so a split argument uses its active
             // segment. With no splits this is exactly today's `reg`/`spill` reads.
             switch (self.locationAt(arg)) {
@@ -2010,19 +2284,26 @@ const Ctx = struct {
     /// path CANNOT assume that: the shared allocator's register choices can make an earlier argument's
     /// destination ABI register alias a later argument's still-unread source (a real permutation, e.g.
     /// a 3-cycle rotation), so the sequential moves would clobber. It emits the setup as a parallel
-    /// move instead: (1) stack-passed stores first, while every source register is still intact;
-    /// (2) the register-resident register arguments as a `parallelMove` into their ABI registers,
-    /// breaking cycles through the reserved scratch (`scratch_move`/`fp_move`); (3) the slot-resident
+    /// move instead: (1) stack-passed stores first, while every source register is still intact.
+    /// (2) The register-resident register arguments as a `parallelMove` into their ABI registers,
+    /// breaking cycles through the reserved scratch (`scratch_move`/`fp_move`). (3) The slot-resident
     /// register arguments reloaded straight into their ABI register, after the permutation has read
     /// every source. A slot-sourced argument holds its value in memory, so it is never clobbered by an
     /// earlier move and is safe to reload last.
-    fn emitCallArgs(self: Ctx, allocator: std.mem.Allocator, code: *std.ArrayList(u32), args: []const Value) Error!void {
+    fn emitCallArgs(self: Ctx, allocator: std.mem.Allocator, code: *std.ArrayList(u32), args: []const Value, sret: bool) Error!void {
         const locs = try allocator.alloc(ArgLoc, args.len);
         defer allocator.free(locs);
-        computeArgLocs(self.func, args, locs);
+        computeArgLocs(self.func, args, locs, sret);
 
         if (!self.alloc.edge_move_driven) {
             for (args, locs) |arg, loc| {
+                // The hidden result pointer goes to `x8`, outside the x0-x7 pool.
+                // Read its source (still intact, this runs before any x0-x7 move) and move it in.
+                if (loc.sret_ptr) {
+                    const src = try self.loadOp(allocator, code, arg, spill_op[0]);
+                    try code.append(allocator, encode.mov(.x8, src));
+                    continue;
+                }
                 const target: Reg = @enumFromInt(@as(u5, @intCast(loc.idx)));
                 if (loc.class == .fpr) {
                     const src = try self.loadOp(allocator, code, arg, fp_spill_op[0]);
@@ -2040,9 +2321,16 @@ const Ctx = struct {
             return;
         }
 
-        // Phase 1: stack-passed arguments (idx >= 8) store first, before the register permutation
-        // overwrites any ABI register a store still needs to read.
+        // Phase 1: the hidden result pointer to `x8` and stack-passed arguments
+        // (idx >= 8) store first, both BEFORE the register permutation overwrites any ABI register
+        // a store or the `x8` move still needs to read. `x8` is not an allocatable register, so no
+        // value lives there and no later parallel move reads it as a source.
         for (args, locs) |arg, loc| {
+            if (loc.sret_ptr) {
+                const src = try self.loadOp(allocator, code, arg, spill_op[0]);
+                try code.append(allocator, encode.mov(.x8, src));
+                continue;
+            }
             if (loc.idx < 8) continue;
             if (loc.class == .fpr) return error.Unsupported; // fp stack args not handled (matches native)
             const src = try self.loadOp(allocator, code, arg, spill_op[0]);
@@ -2055,6 +2343,7 @@ const Ctx = struct {
         var fpr_moves: std.ArrayList(Move) = .empty;
         defer fpr_moves.deinit(allocator);
         for (args, locs) |arg, loc| {
+            if (loc.sret_ptr) continue; // already moved to x8 in phase 1
             if (loc.idx >= 8) continue;
             const target: Reg = @enumFromInt(@as(u5, @intCast(loc.idx)));
             switch (self.locationAt(arg)) {
@@ -2073,6 +2362,7 @@ const Ctx = struct {
         // Phase 2b: slot-resident register arguments reload into their ABI register (the permutation
         // above has already read every source register, so overwriting one now is safe).
         for (args, locs) |arg, loc| {
+            if (loc.sret_ptr) continue; // already moved to x8 in phase 1
             if (loc.idx >= 8) continue;
             const target: Reg = @enumFromInt(@as(u5, @intCast(loc.idx)));
             switch (self.locationAt(arg)) {
@@ -2095,6 +2385,22 @@ const Ctx = struct {
 /// Store `result` (held in `reg`) to its spill slot iff its location at its def position is a
 /// slot. A value that stays in a register at its def emits nothing (a later split, if any, would
 /// store at the split point). With no splits this is exactly today's spill-if-spilled behavior.
+/// The AAPCS64 count of this variadic function's FIXED parameters that landed in argument registers:
+/// integer/pointer params consume x-registers (cap 8), float/double params consume v-registers (cap
+/// 8). `va_start` seeds `__gr_offs`/`__vr_offs` from these so the first `va_arg` reads the first
+/// UNNAMED argument. The classification (`regClass`) is exactly the prologue's param-homing split.
+const NamedRegCounts = struct { gp: u32, fp: u32 };
+fn namedRegCounts(func: *const Function) NamedRegCounts {
+    const eparams = func.blockParams(@enumFromInt(0));
+    const n_fixed = @min(func.num_fixed_params, @as(u32, @intCast(eparams.len)));
+    var gp: u32 = 0;
+    var fp: u32 = 0;
+    for (eparams[0..n_fixed]) |p| {
+        if (regClass(func, p) == .fpr) fp += 1 else gp += 1;
+    }
+    return .{ .gp = @min(gp, 8), .fp = @min(fp, 8) };
+}
+
 fn storeResult(allocator: std.mem.Allocator, code: *std.ArrayList(u32), ctx: Ctx, result: Value, reg: Reg) Error!void {
     switch (ctx.locationAt(result)) {
         .reg => {},
@@ -2189,7 +2495,7 @@ fn linearize(allocator: std.mem.Allocator, func: *const Function, fold: *const a
     @memset(is_param, false);
     for (last_use) |*l| l.* = 0;
     @memset(def_block, 0);
-    // A value starts intra-splittable iff it is not a parameter; the walk below clears it on any
+    // A value starts intra-splittable iff it is not a parameter. The walk below clears it on any
     // edge-argument use or any use outside its def block.
     for (is_intra, 0..) |*flag, i| flag.* = !is_param[i];
 
@@ -2337,7 +2643,7 @@ fn aarch64ClassOf(ctx: *const anyopaque, func: *const Function, v: Value) u16 {
 }
 
 /// `RegDescription.useKind` for aarch64: every operand needs a register (aarch64 cannot fold a spill
-/// slot into an arithmetic operand). This is the conservative default; a backend that can read memory
+/// slot into an arithmetic operand). This is the conservative default. A backend that can read memory
 /// operands relaxes specific opcodes. Unused parameters are the generic hook shape.
 fn aarch64UseKind(ctx: *const anyopaque, func: *const Function, inst: ir.function.Inst, operand: Value) wimmer.UseKind {
     _ = ctx;
@@ -2352,26 +2658,30 @@ fn aarch64UseKind(ctx: *const anyopaque, func: *const Function, inst: ir.functio
 /// names x_n (x0..x30), fpr class index n names v_n (v0..v31), the two classes disambiguating the
 /// shared 0..31 index space. This MIRRORS the existing `allocate`: the leaf/non-leaf pools match its
 /// pool-building loop, entry params pin the ABI arg registers via `computeArgLocs`, and call sites
-/// use `linearize`'s call positions so the numbering matches emission. Task 1 builds only the
-/// description (no allocation runs). The caller owns the result and must `deinit` it.
+/// use `linearize`'s call positions so the numbering matches emission. This function builds only the
+/// description. No allocation runs here. The caller owns the result and must `deinit` it.
 ///
 /// Call-clobber approximation: class 1's per-call clobber lists ALL fp registers v0..v31, i.e. the
 /// caller-saved fp regs PLUS the callee-saved v8..v15. The extra v8..v15 encodes the vector quirk
 /// (a 128-bit vector in a callee-saved fp reg loses its upper half across a call, since AAPCS only
 /// preserves the low 64 bits) without type info at description-build time. It over-clobbers scalar
-/// floats slightly (a scalar float is also forced out of v8..v15 across a call); Task 2's interval
+/// floats slightly (a scalar float is also forced out of v8..v15 across a call). A later interval
 /// builder may refine it to vector-only. Entry stack params (arg index >= 8) are NOT pre-colored
-/// here (they arrive on the stack); the Task 2 interval builder handles them.
+/// here (they arrive on the stack). The interval builder handles them.
 pub fn aarch64RegDescription(allocator: std.mem.Allocator, func: *const Function) Error!wimmer.RegDescription {
     const leaf = isLeaf(func);
 
     const eparams = func.blockParams(@enumFromInt(0));
     const plocs = try allocator.alloc(ArgLoc, eparams.len);
     defer allocator.free(plocs);
-    computeArgLocs(func, eparams, plocs);
+    computeArgLocs(func, eparams, plocs, func.sret);
     var n_gpr: usize = 0;
     var n_fpr: usize = 0;
     for (plocs) |l| {
+        // The hidden result pointer rides in `x8`, not an x0-x7 argument register,
+        // so it must NOT count against the used-argument-register tally that decides which unused
+        // arg registers a leaf may add to its allocatable pool.
+        if (l.sret_ptr) continue;
         if (l.class == .gpr) n_gpr += 1 else n_fpr += 1;
     }
 
@@ -2388,8 +2698,16 @@ pub fn aarch64RegDescription(allocator: std.mem.Allocator, func: *const Function
         for (16..24) |r| try fpr_alloc.append(allocator, @intCast(r));
         for (@min(n_fpr, 8)..8) |r| try fpr_alloc.append(allocator, @intCast(r));
     } else {
-        for (19..29) |r| try gpr_alloc.append(allocator, @intCast(r));
-        for (8..16) |r| try fpr_alloc.append(allocator, @intCast(r));
+        for (19..29) |r| try gpr_alloc.append(allocator, @intCast(r)); // callee-saved x19..x28
+        // ALSO offer the caller-saved temporaries x9..x12 to a non-leaf function. Every call
+        // clobbers them (they are in the per-call clobber list below), so the allocator can only
+        // place a value there when it does NOT live across a call. It works for a short-lived temporary, such
+        // as the address arithmetic feeding a WIDE call's arguments. Without them a non-leaf
+        // function had only 10 GPRs, too few for a call that already pins 8 argument values, which
+        // is the "too many live params" wall a `fprintf(f, fmt, a0..a8)` hits. x13..x17 stay out:
+        // they are the isel's fixed reload/immediate/move scratch (see their `const` definitions).
+        for (9..13) |r| try gpr_alloc.append(allocator, @intCast(r)); // caller-saved temps x9..x12
+        for (8..16) |r| try fpr_alloc.append(allocator, @intCast(r)); // callee-saved v8..v15
     }
 
     // Callee-saved sets: x19..x28 (gpr), v8..v15 (fpr).
@@ -2412,10 +2730,14 @@ pub fn aarch64RegDescription(allocator: std.mem.Allocator, func: *const Function
     classes[1] = .{ .name = "fpr", .allocatable = fpr_alloc_owned, .callee_saved = fpr_cs, .slot_bytes = 16 };
 
     // Entry params: the first 8 gpr params pin x0..x7, the first 8 fp params pin v0..v7. Params with
-    // arg index >= 8 arrive on the stack and are left for the Task 2 interval builder.
+    // arg index >= 8 arrive on the stack and are left for the interval builder.
     var ef: std.ArrayList(wimmer.FixedAssign) = .empty;
     errdefer ef.deinit(allocator);
     for (eparams, plocs) |p, l| {
+        // The hidden result pointer arrives in `x8`, which is NOT allocatable, so it
+        // gets no fixed assign. It is treated like a stack parameter (left for the interval builder,
+        // homed from `x8` by the prologue), so the allocator is free to place it anywhere.
+        if (l.sret_ptr) continue;
         if (l.idx < 8) {
             const class: u16 = if (l.class == .fpr) 1 else 0;
             try ef.append(allocator, .{ .value = p, .class = class, .reg = @intCast(l.idx) });
@@ -2477,11 +2799,11 @@ pub fn aarch64RegDescription(allocator: std.mem.Allocator, func: *const Function
 /// `translateAllocation`, `emitFromAllocation`), but takes `func` by MUTABLE pointer and splits its
 /// edges IN PLACE (no clone) with INERT `.{}` caps and no address folding, so a test can build two
 /// identical functions and compare this against the production path. `compileFunction` is now the
-/// SAME allocator (the Wimmer cutover flip), so there is no longer a separate native `allocate` to
-/// differ from; this entry survives as the mutable-in-place, inert-caps compile the harness drives.
+/// SAME allocator, so there is no longer a separate native `allocate` to
+/// differ from. This entry survives as the mutable-in-place, inert-caps compile the harness drives.
 ///
-/// Scope (Wimmer cutover Task 3): LEAF functions, including CROSS-BLOCK ones (loops, diamonds,
-/// lifetime holes, critical edges), AND NOW NON-LEAF functions too (the leaf-only gate is open):
+/// Scope: LEAF functions, including CROSS-BLOCK ones (loops, diamonds,
+/// lifetime holes, critical edges), AND NON-LEAF functions too (the leaf-only gate is open):
 /// `aarch64RegDescription`/`wimmer.allocate` are already non-leaf-capable (per-call clobber lists,
 /// callee-saved pools), and `translateAllocation`'s remaining bridge gaps still bail
 /// `error.Unsupported` for the non-leaf shapes they cannot yet express FAITHFULLY (never a silent
@@ -2497,8 +2819,8 @@ pub fn aarch64RegDescription(allocator: std.mem.Allocator, func: *const Function
 /// Critical edges are split up front so the shared allocator's edge-move resolution has a block to
 /// place its shuffle on, and the translated `edge_moves` drive emission.
 ///
-/// Takes `func` by mutable pointer because `splitCriticalEdges` inserts forwarding blocks in place;
-/// all downstream numbering (the RegDescription, the scan, and emission) runs on the SPLIT CFG. A
+/// Takes `func` by mutable pointer because `splitCriticalEdges` inserts forwarding blocks in place.
+/// All downstream numbering (the RegDescription, the scan, and emission) runs on the SPLIT CFG. A
 /// differential caller that must keep an unmutated reference builds two identical functions and
 /// compiles one each way (see the cross-block tests).
 pub fn compileFunctionWimmer(allocator: std.mem.Allocator, func: *Function) Error!Compiled {
@@ -2535,13 +2857,13 @@ fn aarch64Slot(class: u16, wimmer_slot: u32, gpr_slots: u32) u32 {
 /// Translate a finished shared `wimmer.Allocation` into this backend's own `Allocation` so the
 /// existing emission can consume it. A whole-life value (one segment) lands in the `reg`/`spill`
 /// maps (so the prologue's direct `reg` reads and the callee-saved collection from
-/// `walloc.used_callee_saved` see it directly); a genuinely split value lands in `segments`, which
+/// `walloc.used_callee_saved` see it directly). A genuinely split value lands in `segments`, which
 /// `locationAt` resolves per position. Each intra-block segment transition becomes a drain action
 /// (store / reload / register move). Entry params are required to be whole-life: a LEAF param must
-/// stay in its ABI arg register (the leaf hint, since a leaf's prologue emits no param move); a
+/// stay in its ABI arg register (the leaf hint, since a leaf's prologue emits no param move). A
 /// NON-LEAF param may land in any register (the non-leaf prologue always emits
-/// `mov allocated_reg, incoming_abi_reg`, so an off-ABI whole-life placement - e.g. a value live
-/// across a call parked in a callee-saved register - is realized by that move, Wimmer bridge gap
+/// `mov allocated_reg, incoming_abi_reg`, so an off-ABI whole-life placement, for example a value live
+/// across a call parked in a callee-saved register, is realized by that move, Wimmer bridge gap
 /// #5). A split or slot-resident entry param (gap #4) lands in `alloc.spill` (whole-life,
 /// immediately spilled: the existing spilled-param prologue code already stores the incoming
 /// argument straight into the slot, no param-specific handling needed) or `alloc.segments`
@@ -2569,7 +2891,7 @@ fn translateAllocation(allocator: std.mem.Allocator, func: *const Function, wall
     const eparams = func.blockParams(@enumFromInt(0));
     const plocs = try allocator.alloc(ArgLoc, eparams.len);
     defer allocator.free(plocs);
-    computeArgLocs(func, eparams, plocs);
+    computeArgLocs(func, eparams, plocs, func.sret);
 
     var it = walloc.segments.iterator();
     while (it.next()) |e| {
@@ -2591,10 +2913,13 @@ fn translateAllocation(allocator: std.mem.Allocator, func: *const Function, wall
                     // entry-param loop always emits `mov allocated_reg, incoming_abi_reg` for a
                     // non-leaf (isel.zig ~676-681), so an off-ABI whole-life placement (gap #5, e.g.
                     // a value live across a call parked in a callee-saved register) is realized by
-                    // that move; just record the allocated register below.
+                    // that move. Just record the allocated register below.
+                    // The hidden result pointer arrives in `x8` and the prologue
+                    // ALWAYS moves it into its allocated register, so it may sit anywhere and the
+                    // ABI-register guard below does not apply to it.
                     if (leaf) {
                         if (param_loc) |pl| {
-                            if (pl.idx < 8 and @as(usize, ri) != pl.idx) return error.Unsupported;
+                            if (!pl.sret_ptr and pl.idx < 8 and @as(usize, ri) != pl.idx) return error.Unsupported;
                         }
                     }
                     try alloc.reg.put(allocator, value, @enumFromInt(@as(u5, @intCast(ri))));
@@ -2617,7 +2942,7 @@ fn translateAllocation(allocator: std.mem.Allocator, func: *const Function, wall
         // Nothing between this `alloc` and the `put` can error (the fill loop and `translateLoc` are
         // infallible), so there is NO errdefer freeing `segs` here: on a `put` failure the explicit
         // catch below frees it, and after `put` succeeds `alloc.segments` OWNS it, so any later error
-        // (an `actions.append` OOM; `translateTransition` itself is infallible) is freed exactly once
+        // (an `actions.append` OOM. `translateTransition` itself is infallible) is freed exactly once
         // by the function-level `errdefer alloc.deinit`. An errdefer here would double-free that
         // owned slice.
         const segs = try allocator.alloc(Segment, wsegs.len);
@@ -2630,17 +2955,17 @@ fn translateAllocation(allocator: std.mem.Allocator, func: *const Function, wall
         };
         // The intra-block re-home actions for these transitions are NOT derived here: the shared
         // allocator already emitted them into `walloc.actions`, ORDERED per same-position cluster into
-        // a hazard-free parallel-move sequence (Task 5). Consuming that list below (rather than
+        // a hazard-free parallel-move sequence. Consuming that list below (rather than
         // re-deriving raw per-transition actions and policing them) is what makes the same-position
         // drain always safe and lets the ad-hoc hazard detector retire.
     }
 
     // Consume the shared allocator's already-ordered intra-block actions. Each is one primitive
-    // transfer at its position (`src -> dst` in the shared per-class `Location` space); map both sides
+    // transfer at its position (`src -> dst` in the shared per-class `Location` space). Map both sides
     // into this backend's uniform-slot `Location` and turn it into the matching `SplitAction`. The
     // list is ascending by `at` with each same-position cluster in hazard-free order, so appending it
     // verbatim and draining in order never clobbers a live value (the retired `hasSamePosRegHazard`).
-    // A cross-block location change is NOT here (it is an edge move, translated below); only genuine
+    // A cross-block location change is NOT here (it is an edge move, translated below). Only genuine
     // mid-block re-homes appear.
     for (walloc.actions) |wa| {
         std.debug.assert(wa.class == 0 or wa.class == 1);
@@ -2664,7 +2989,7 @@ fn translateAllocation(allocator: std.mem.Allocator, func: *const Function, wall
     std.mem.sort(Reg, alloc.saved_gpr.items, {}, regLessThan);
     std.mem.sort(Reg, alloc.saved_fpr.items, {}, regLessThan);
 
-    // Control-flow-edge moves (Task 7 -> Task 8): the shared allocator already ordered each edge's
+    // Control-flow-edge moves: the shared allocator already ordered each edge's
     // moves into a valid parallel-move sequence, so translate each `wimmer.Location` into this
     // backend's `Location` (per-class slot -> uniform 16-byte slot) keyed by the (pred, succ) block
     // pair and hand the ordered list to emission verbatim. `edge_move_driven` makes emission replay
@@ -2777,6 +3102,11 @@ fn forEachOperand(
             f(ctx, fold.baseOf(func, inst), false);
         },
         .prefetch => |pf| f(ctx, pf.ptr, false),
+        // Not yet expanded by this backend, but still visited here so
+        // regalloc sees `list` as a use ahead of that.
+        .va_start => |vs| f(ctx, vs.list, false),
+        .va_arg => |va| f(ctx, va.list, false),
+        .va_end => |ve| f(ctx, ve.list, false),
         .dot => |d| {
             f(ctx, d.acc, false);
             f(ctx, d.a, false);
@@ -2788,10 +3118,14 @@ fn forEachOperand(
             f(ctx, mmv.c, false);
         },
         .struct_new => |sn| for (func.valueList(sn.fields)) |fld| f(ctx, fld, false),
-        .call => |c| for (func.valueList(c.args)) |a| f(ctx, a, false),
+        .call => |c| {
+            for (func.valueList(c.args)) |a| f(ctx, a, false);
+            if (c.ret_dest) |rd| f(ctx, rd, false); // the register-return dest, read post-call
+        },
         .call_indirect => |c| {
             f(ctx, c.target, false);
             for (func.valueList(c.args)) |a| f(ctx, a, false);
+            if (c.ret_dest) |rd| f(ctx, rd, false); // the register-return dest, read post-call
         },
         .@"if" => |cf| {
             f(ctx, cf.cond, false);
@@ -2802,7 +3136,7 @@ fn forEachOperand(
 }
 
 /// Visit every operand VALUE used by a terminator, calling `f(ctx, value, is_edge_arg)`. The
-/// `.jump` arguments are edge args; the `.ret` value is an ordinary operand. Terminator analogue of
+/// `.jump` arguments are edge args. The `.ret` value is an ordinary operand. Terminator analogue of
 /// `forEachOperand`.
 fn forEachTermOperand(
     func: *const Function,
@@ -2811,7 +3145,7 @@ fn forEachTermOperand(
     comptime f: fn (@TypeOf(ctx), Value, bool) void,
 ) void {
     switch (term) {
-        .ret => |v| if (v) |vv| f(ctx, vv, false),
+        .ret => |r| for (r.slice()) |vv| f(ctx, vv, false),
         .jump => |j| for (func.blockArgs(j)) |a| f(ctx, a, true),
     }
 }
@@ -2838,13 +3172,13 @@ fn forEachTermUse(func: *const Function, term: Terminator, last_use: []u32, pos:
 /// materialization (`cmp; cset`) is skipped and the if emits a fused `cmp; b.cc` on
 /// the icmp's operands (see `emitIf`). This is the ONE eligibility predicate shared by
 /// the icmp-skip and the fused emitIf, so they never disagree (no dangling or doubled
-/// compare). It is gated to integer operands (the gpr compare path); float and vector
+/// compare). It is gated to integer operands (the gpr compare path). Float and vector
 /// compares keep the current materialize-then-test path. The immediately-preceding +
 /// single-use conditions make skipping the boolean register-safe: nothing runs between
 /// the icmp and the if, so the icmp's operand registers still hold their values at the
 /// if, and no other reader needs the boolean.
 ///
-/// This predicate itself carries no model gate; both call sites (the icmp-skip in
+/// This predicate itself carries no model gate. Both call sites (the icmp-skip in
 /// `emitFromAllocation` and the fused branch in `Ctx.emitIf`) additionally require
 /// `caps.fuse_cmp_branch` (threaded onto `Ctx` as `fuse_cmp_branch`) before honoring it, so a
 /// model without the fusion falls back to the materialize-then-test path unchanged.
@@ -2878,14 +3212,14 @@ fn fusesIntoNextIf(func: *const Function, insts: []const ir.function.Inst, idx: 
 /// fused `b.cc` branches on eq/ne, eliding the separate `cmp #0`. This is the ONE eligibility
 /// predicate shared by BOTH the arith-skip (in the `.arith`/`.arith_imm` arms, via
 /// `isArithBranchProducer`) and the S-form emit (in `Ctx.emitIf`), so the two never disagree (no
-/// dangling or doubled arith, no stale-flags branch) - mirrors `fusesIntoNextIf`/`fusesIntoNextArith`.
+/// dangling or doubled arith, no stale-flags branch). It mirrors `fusesIntoNextIf`/`fusesIntoNextArith`.
 ///
 /// `enabled` carries `caps.fuse_arith_branch and caps.fuse_cmp_branch` (the fold requires both:
 /// it lives inside the compare-and-branch path, so a model without either falls back to the plain
 /// arith + cmp + branch at both sites and stays byte-identical).
 ///
 /// Scope (bounded for correctness): eq/ne ONLY (the S-form's Z flag is exactly (result == 0), the
-/// eq/ne-against-0 relation; lt/le/gt/ge need N/V reasoning and stay on the plain cmp path). The
+/// eq/ne-against-0 relation. lt/le/gt/ge need N/V reasoning and stay on the plain cmp path). The
 /// icmp RHS must be a literal `iconst 0`. Register `add`/`sub`/`bit_and`, or `add`/`sub` with an
 /// immediate that fits u12 (a `bit_and` immediate would need a bitmask-encoded `ands` immediate,
 /// too complex, so it falls back). Integer / GPR only, all three adjacent in one block, and the
@@ -2910,7 +3244,7 @@ fn fusesArithIntoBranch(func: *const Function, insts: []const ir.function.Inst, 
     const arith_inst = insts[if_idx - 2];
     const arith_result = func.instResult(arith_inst) orelse return false;
     if (cmp.lhs != arith_result) return false;
-    // Integer / GPR only (the S-forms are GPR ALU ops; a float/vector arith routes elsewhere).
+    // Integer / GPR only (the S-forms are GPR ALU ops. A float/vector arith routes elsewhere).
     if (isVector(func, arith_result) or regClass(func, arith_result) != .gpr) return false;
     // Wide (64-bit or ptr) results are admitted too: `Ctx.emitArithBranch` width-selects the
     // S-form (64-bit `subs64`/`adds64`/`ands64` when the result is wide, the 32-bit forms
@@ -2926,7 +3260,7 @@ fn fusesArithIntoBranch(func: *const Function, insts: []const ir.function.Inst, 
             // A shift that fuses into this add/sub (shift_add) is skipped and folded into a
             // shifted-register add, so its shifted operand is never materialized in a register.
             // Reject the arith-branch fold there so the S-form never reads an unmaterialized
-            // operand (the two folds are mutually exclusive; fall back to plain arith + cmp +
+            // operand (the two folds are mutually exclusive. Fall back to plain arith + cmp +
             // branch). Checked with shift_add enabled unconditionally since it is on by default:
             // when it is off the shl IS materialized and this is merely conservative, and both
             // fold sites share this predicate so they still agree.
@@ -2947,7 +3281,7 @@ fn fusesArithIntoBranch(func: *const Function, insts: []const ir.function.Inst, 
 
 /// Whether the arith at `insts[inst_idx]` is the producer of an arith-branch fold, i.e. the `if`
 /// two instructions later folds it (with the icmp between). The arith-skip sites in the
-/// `.arith`/`.arith_imm` arms call this to `continue` past the arith's materialization; the S-form
+/// `.arith`/`.arith_imm` arms call this to `continue` past the arith's materialization. The S-form
 /// is then emitted by `Ctx.emitIf` under the SAME `fusesArithIntoBranch` predicate, so the arith
 /// is emitted exactly once. `enabled` carries `caps.fuse_arith_branch and caps.fuse_cmp_branch`.
 fn isArithBranchProducer(func: *const Function, insts: []const ir.function.Inst, inst_idx: usize, enabled: bool) bool {
@@ -2956,8 +3290,8 @@ fn isArithBranchProducer(func: *const Function, insts: []const ir.function.Inst,
 }
 
 /// Whether `v`'s type is a vector over a float element (the only vector shape arith
-/// fusion ever sees today - `<4 x f32>` per `binary`'s vector path; `dot` is a separate
-/// IR op over int8 vectors and never reaches here).
+/// fusion ever sees today, `<4 x f32>` per `binary`'s vector path). `dot` is a separate
+/// IR op over int8 vectors and never reaches here.
 fn isFloatVector(func: *const Function, v: Value) bool {
     return switch (func.types.type_kind(func.valueType(v))) {
         .vector => |vec| func.types.type_kind(vec.elem) == .float,
@@ -2967,11 +3301,11 @@ fn isFloatVector(func: *const Function, v: Value) bool {
 
 /// Whether the float `mul` at `insts[idx]` fuses into an immediately-following `add`/`sub`
 /// that consumes its result as a fused multiply-add/subtract (one rounding instead of
-/// two - legal because Vulcan permits fp-contraction). When it fuses, the mul's
+/// two, legal because Vulcan permits fp-contraction). When it fuses, the mul's
 /// materialization is skipped and the add/sub emits fmadd/fmsub/fnmsub (scalar) or
 /// fmla/fmls (vector) on the mul's own operands (see `Ctx.emitFusedArith`). This is the ONE
 /// eligibility predicate shared by the mul-skip and the fused add/sub emission, so they
-/// never disagree (no dangling or doubled multiply) - mirrors `fusesIntoNextIf`. Gated to
+/// never disagree (no dangling or doubled multiply). It mirrors `fusesIntoNextIf`. Gated to
 /// float operands (scalar or vector): integer `add(mul,c)` has no rounding to fuse away and
 /// is never an fma. For a vector mul, only the two shapes a single NEON instruction can
 /// express are allowed: `add(mul,c)` = a*b+c -> FMLA, and `sub(c,mul)` = c-a*b -> FMLS.
@@ -2990,7 +3324,7 @@ fn fusesIntoNextArith(func: *const Function, insts: []const ir.function.Inst, id
     if (mul.op != .mul) return false;
     const vector = isVector(func, mul.lhs);
     // Float operands only: regClass != .fpr means an integer scalar mul (no rounding to
-    // fuse away); a vector mul must have a float element (see `isFloatVector`).
+    // fuse away). A vector mul must have a float element (see `isFloatVector`).
     if (vector) {
         if (!isFloatVector(func, mul.lhs)) return false;
     } else if (regClass(func, mul.lhs) != .fpr) {
@@ -3025,7 +3359,7 @@ fn fusesIntoNextArith(func: *const Function, insts: []const ir.function.Inst, id
 /// `a + (b << k)` / `a - (b << k)` into ONE shifted-register add/sub
 /// (`add xd, xn, xm, lsl #k`, see `Ctx.emitShiftAdd`). This is the ONE eligibility predicate
 /// shared by the shl-skip (in the `.arith_imm` arm) and the fused emit (in the `.arith`
-/// arm), so they never disagree (no dangling or doubled shift) - mirrors `fusesIntoNextArith`.
+/// arm), so they never disagree (no dangling or doubled shift). It mirrors `fusesIntoNextArith`.
 /// `enabled` carries `caps.fuse_shift_add`, so a model without the fusion (or the flag off)
 /// falls back to the plain shift-then-add path at BOTH sites and stays byte-identical.
 ///
@@ -3123,6 +3457,15 @@ fn usesOfInInst(func: *const Function, inst: ir.function.Inst, v: Value) usize {
         .prefetch => |pf| {
             if (pf.ptr == v) c += 1;
         },
+        .va_start => |vs| {
+            if (vs.list == v) c += 1;
+        },
+        .va_arg => |va| {
+            if (va.list == v) c += 1;
+        },
+        .va_end => |ve| {
+            if (ve.list == v) c += 1;
+        },
         .dot => |d| {
             if (d.acc == v) c += 1;
             if (d.a == v) c += 1;
@@ -3161,7 +3504,7 @@ fn usesOfInInst(func: *const Function, inst: ir.function.Inst, v: Value) usize {
 fn usesOfInTerm(func: *const Function, term: Terminator, v: Value) usize {
     var c: usize = 0;
     switch (term) {
-        .ret => |x| if (x) |xx| {
+        .ret => |r| for (r.slice()) |xx| {
             if (xx == v) c += 1;
         },
         .jump => |j| for (func.blockArgs(j)) |a| {
@@ -3203,6 +3546,9 @@ fn markUsedBitset(func: *const Function, inst: ir.function.Inst, fold: *const ad
             setUsed(row, fold.baseOf(func, inst));
         },
         .prefetch => |pf| setUsed(row, pf.ptr),
+        .va_start => |vs| setUsed(row, vs.list),
+        .va_arg => |va| setUsed(row, va.list),
+        .va_end => |ve| setUsed(row, ve.list),
         .dot => |d| {
             setUsed(row, d.acc);
             setUsed(row, d.a);
@@ -3229,7 +3575,7 @@ fn markUsedBitset(func: *const Function, inst: ir.function.Inst, fold: *const ad
 
 fn markUsedTermBitset(func: *const Function, term: Terminator, row: []bool) void {
     switch (term) {
-        .ret => |v| if (v) |vv| setUsed(row, vv),
+        .ret => |r| for (r.slice()) |vv| setUsed(row, vv),
         .jump => |j| for (func.blockArgs(j)) |a| setUsed(row, a),
     }
 }
@@ -3411,7 +3757,7 @@ fn emitLoad(
     off: u32,
     fp16: bool,
 ) Error!void {
-    // A folded load addresses `[base, #off]`; a non-folded load passes off = 0, which every encoder
+    // A folded load addresses `[base, #off]`. A non-folded load passes off = 0, which every encoder
     // below reproduces byte-identically to its old zero-displacement form. `aarch64FoldOffset`
     // guarantees off fits the per-size scaled range, so the `@intCast`es cannot truncate.
     if (isVector(func, result)) {
@@ -3453,7 +3799,7 @@ fn emitStore(
     off: u32,
     fp16: bool,
 ) Error!void {
-    // A folded store addresses `[base, #off]`; a non-folded store passes off = 0, which every encoder
+    // A folded store addresses `[base, #off]`. A non-folded store passes off = 0, which every encoder
     // below reproduces byte-identically to its old zero-displacement form. `aarch64FoldOffset`
     // guarantees off fits the per-size scaled range, so the `@intCast`es cannot truncate.
     if (isVector(func, value)) {
@@ -3466,7 +3812,7 @@ fn emitStore(
             // half in the H view, so `str h` writes it directly. EMULATION: the value is an S-held
             // f32 widening, so narrow it first (`fcvt h,s`) into a fixed scratch (fp_move, v27,
             // outside every allocation pool) so `val`, which may still be live, is never clobbered
-            // (fcvt h zeroes the upper bits of its destination register); the narrow is lossless
+            // (fcvt h zeroes the upper bits of its destination register). The narrow is lossless
             // since the S value is already an exact half.
             if (fp16) {
                 try code.append(allocator, encode.strHfp(val, base, @intCast(off)));
@@ -3624,7 +3970,7 @@ test "selects a straight-line arithmetic function" {
     const y = try func.appendBlockParam(b, t);
     const prod = try func.appendInst(b, t, .{ .arith = .{ .op = .mul, .lhs = x, .rhs = y } });
     const sum = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = prod, .rhs = x } });
-    func.setTerminator(b, .{ .ret = sum });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(sum) });
 
     const code = try selectFunction(allocator, &func);
     defer allocator.free(code);
@@ -3635,10 +3981,73 @@ test "selects a straight-line arithmetic function" {
     try std.testing.expectEqual(encode.ret(), code[code.len - 1]);
 }
 
+test "via_got global_addr lowers to adrp+ldr with got_pg/got_lo12 relocs (GOT-indirect)" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr_t = try func.types.intern(.ptr);
+    const b = try func.appendBlock();
+    const g = try func.appendGlobalAddrGot(b, ptr_t, "G");
+    const v = try func.appendInst(b, i32t, .{ .load = .{ .ptr = g } });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(v) });
+
+    var compiled = try compileFunction(allocator, &func, .{});
+    defer compiled.deinit(allocator);
+
+    // The GOT relocs must be present and name the direct halves absent.
+    var got_pg: ?usize = null;
+    var got_lo12: ?usize = null;
+    for (compiled.relocs) |r| {
+        try std.testing.expect(r.kind != .adrp_pg and r.kind != .add_pgoff);
+        if (r.kind == .got_pg) got_pg = r.offset;
+        if (r.kind == .got_lo12) got_lo12 = r.offset;
+    }
+    try std.testing.expect(got_pg != null);
+    try std.testing.expect(got_lo12 != null);
+    // The got_lo12 reloc's word directly follows the got_pg's word: adrp then ldr.
+    try std.testing.expectEqual(got_pg.? + 1, got_lo12.?);
+    // The page word is an adrp (op=1, bits[28:24]=10000) and the lo12 word is a
+    // 64-bit unsigned-offset ldr (0xF9400000 family), NOT an add-immediate.
+    try std.testing.expectEqual(@as(u32, 0x90000000), compiled.code[got_pg.?] & 0x9F000000);
+    try std.testing.expectEqual(@as(u32, 0xF9400000), compiled.code[got_lo12.?] & 0xFFC00000);
+    // Its base register is the adrp's destination (rn == rt of the ldr, offset 0).
+    const ldr_word = compiled.code[got_lo12.?];
+    try std.testing.expectEqual((ldr_word >> 5) & 0x1f, ldr_word & 0x1f);
+}
+
+test "direct global_addr stays adrp+add with adrp_pg/add_pgoff relocs (control, byte-identical)" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr_t = try func.types.intern(.ptr);
+    const b = try func.appendBlock();
+    const g = try func.appendGlobalAddr(b, ptr_t, "G");
+    const v = try func.appendInst(b, i32t, .{ .load = .{ .ptr = g } });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(v) });
+
+    var compiled = try compileFunction(allocator, &func, .{});
+    defer compiled.deinit(allocator);
+
+    var adrp_pg: ?usize = null;
+    var add_pgoff: ?usize = null;
+    for (compiled.relocs) |r| {
+        try std.testing.expect(r.kind != .got_pg and r.kind != .got_lo12);
+        if (r.kind == .adrp_pg) adrp_pg = r.offset;
+        if (r.kind == .add_pgoff) add_pgoff = r.offset;
+    }
+    try std.testing.expect(adrp_pg != null);
+    try std.testing.expect(add_pgoff != null);
+    try std.testing.expectEqual(@as(u32, 0x90000000), compiled.code[adrp_pg.?] & 0x9F000000);
+    // An add-immediate (0x91000000 family), NOT a load.
+    try std.testing.expectEqual(@as(u32, 0x91000000), compiled.code[add_pgoff.?] & 0xFF800000);
+}
+
 test "an f16 function now compiles on aarch64 (the reference f16 backend, no reject gate)" {
-    // Task 3 replaced the Task-2 rejection gate with real f16 lowering. A function that adds
+    // Real f16 lowering replaced the old rejection gate. A function that adds
     // two f16 values must now compile (it emits the S-form fadd plus the round-to-half
-    // narrow/widen); the executable differentials in tests/native.zig prove correctness.
+    // narrow/widen). The executable differentials in tests/native.zig prove correctness.
     const allocator = std.testing.allocator;
     var func = Function.init(allocator);
     defer func.deinit();
@@ -3647,7 +4056,7 @@ test "an f16 function now compiles on aarch64 (the reference f16 backend, no rej
     const x = try func.appendBlockParam(b, f16_t);
     const y = try func.appendBlockParam(b, f16_t);
     const sum = try func.appendInst(b, f16_t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = y } });
-    func.setTerminator(b, .{ .ret = sum });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(sum) });
 
     const code = try selectFunction(allocator, &func);
     defer allocator.free(code);
@@ -3702,7 +4111,7 @@ test "intra-block predicate and use positions" {
 
     // X is used by a normal instruction in b1, a different block than its def.
     const xuse = try func.appendInst(b1, t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = p } });
-    func.setTerminator(b1, .{ .ret = xuse });
+    func.setTerminator(b1, .{ .ret = ir.function.Ret.one(xuse) });
 
     var lin = try debugLiveness(allocator, &func);
     defer lin.deinit(allocator);
@@ -3760,7 +4169,7 @@ test "emitSplitAction .slot_to_slot expands to reload+store through the gpr scra
     const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const b = try func.appendBlock();
     const v = try func.appendBlockParam(b, t);
-    func.setTerminator(b, .{ .ret = v });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(v) });
 
     var code: std.ArrayList(u32) = .empty;
     defer code.deinit(allocator);
@@ -3779,7 +4188,7 @@ test "emitSplitAction .slot_to_slot expands to reload+store through the fpr scra
     const t = try func.types.intern(.{ .float = .f64 });
     const b = try func.appendBlock();
     const v = try func.appendBlockParam(b, t);
-    func.setTerminator(b, .{ .ret = v });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(v) });
 
     var code: std.ArrayList(u32) = .empty;
     defer code.deinit(allocator);
@@ -3800,7 +4209,7 @@ test "emitSplitAction .slot_to_slot round-trips a full 128-bit vector through th
     const v4 = try func.types.intern(.{ .vector = .{ .len = 4, .elem = f32_t } });
     const b = try func.appendBlock();
     const v = try func.appendBlockParam(b, v4);
-    func.setTerminator(b, .{ .ret = v });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(v) });
 
     var code: std.ArrayList(u32) = .empty;
     defer code.deinit(allocator);

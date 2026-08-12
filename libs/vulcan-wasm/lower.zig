@@ -741,9 +741,9 @@ fn lowerFunction(allocator: std.mem.Allocator, ctx: Ctx, ft: FuncType, body: []c
     // reachable fall-off returns the top of stack for a result function.
     if (func.terminator(l.block) == null) {
         if (reachable and ft.results.len != 0) {
-            func.setTerminator(l.block, .{ .ret = stack.getLastOrNull() orelse return error.InvalidWasm });
+            func.setTerminator(l.block, .{ .ret = ir.function.Ret.one(stack.getLastOrNull() orelse return error.InvalidWasm) });
         } else {
-            func.setTerminator(l.block, .{ .ret = null });
+            func.setTerminator(l.block, .{ .ret = ir.function.Ret.none() });
         }
     }
     return func;
@@ -897,9 +897,9 @@ fn emitBrTable(l: *L, control: *std.ArrayList(Frame), c: *Cursor, reachable: *bo
 
 fn emitReturn(l: *L, ft: FuncType, reachable: *bool) Error!void {
     if (ft.results.len == 0) {
-        l.func.setTerminator(l.block, .{ .ret = null });
+        l.func.setTerminator(l.block, .{ .ret = ir.function.Ret.none() });
     } else {
-        l.func.setTerminator(l.block, .{ .ret = l.stack.getLastOrNull() orelse return error.InvalidWasm });
+        l.func.setTerminator(l.block, .{ .ret = ir.function.Ret.one(l.stack.getLastOrNull() orelse return error.InvalidWasm) });
     }
     reachable.* = false;
 }

@@ -1,24 +1,24 @@
-//! Address-mode folding (Task 8), executed under qemu-i386. A load or store whose pointer is a
+//! Address-mode folding, executed under qemu-i386. A load or store whose pointer is a
 //! foldable `arith_imm.add(base, imm)` addresses `[base + disp32]` directly: the address-add is
-//! dropped and the mem op carries a signed-32 displacement. x86-32 has no load-pair, so the win is
-//! add-elision plus the folded displacement, mirroring x86-64's Task 5 integration.
+//! dropped and the memory op carries a signed 32-bit displacement. x86-32 has no load-pair, so the win
+//! is add-elision plus the folded displacement, mirroring x86-64's own address-fold integration.
 //!
-//! Every buffer lives IN THE GUEST as a run of consecutive `alloca` slots. `computeAllocaSlots` lays
+//! Every buffer lives in the guest as a run of consecutive `alloca` slots. `computeAllocaSlots` lays
 //! same-size, same-alignment allocas out back-to-back, so `buf0 + size*j` is exactly `buf_j`. Each
 //! alloca is kept alive by an instruction that references it (an init store, or the address-add whose
 //! base it is), so none is dropped before the frame is sized. Loads and stores stay in program order,
 //! so an init store always precedes the folded load that reads it back.
 //!
-//! Each test also proves the fold FIRED: `foldedMemOps` disassembles the compiled code and counts
+//! Each test also proves the fold fired: `foldedMemOps` disassembles the compiled code and counts
 //! memory accesses that carry a nonzero displacement off a base register other than esp. A spill,
 //! alloca, or frame access addresses off esp, so filtering base != esp isolates the folded memory
-//! ops. Without folding every mem op addresses `[base]` (no displacement) and the count is zero, so a
-//! stuck assertion catches a fold that silently stopped firing.
+//! ops. Without folding, every memory op addresses `[base]` (no displacement) and the count is zero, so
+//! a stuck assertion catches a fold that silently stopped firing.
 //!
-//! x86-32 is integer-only (bits <= 32), so unlike the x86-64/riscv64 addrfold suites there is no
+//! x86-32 is integer-only (bits <= 32), so unlike the x86-64 and riscv64 addrfold suites there is no
 //! floating-point fold case here.
 //!
-//! Results are checked modulo 256 (a process exit code / native return is read as one byte), so the
+//! Results are checked modulo 256 (a process exit code or native return is read as one byte), so the
 //! sweep values are chosen to differ in their low byte.
 
 const std = @import("std");
@@ -34,10 +34,10 @@ const i32k = ir.types.TypeKind{ .int = .{ .signedness = .signed, .bits = 32 } };
 const i16k = ir.types.TypeKind{ .int = .{ .signedness = .signed, .bits = 16 } };
 const i8k = ir.types.TypeKind{ .int = .{ .signedness = .signed, .bits = 8 } };
 
-/// Count memory accesses in `func`'s compiled code that carry a NONZERO displacement off a base
-/// register other than esp. A folded constant-index load/store disassembles as `mov reg, dword ptr
+/// Count memory accesses in `func`'s compiled code that carry a nonzero displacement off a base
+/// register other than esp. A folded constant-index load or store disassembles as `mov reg, dword ptr
 /// [base + off]` and the like, with off != 0 and base != esp. Spill, alloca, and frame accesses
-/// address off esp, so requiring base != esp excludes them. Zero unless address folding fired.
+/// address off esp, so requiring base != esp excludes them. This is zero unless address folding fired.
 fn foldedMemOps(allocator: std.mem.Allocator, func: *Function) !usize {
     const code = try isel.selectFunction(allocator, func);
     defer allocator.free(code);
@@ -52,8 +52,8 @@ fn foldedMemOps(allocator: std.mem.Allocator, func: *Function) !usize {
         const inner = line[lb + 1 .. rb]; // e.g. "ebx + 4" or "esp + 8" or "eax"
         const base_end = std.mem.indexOfScalar(u8, inner, ' ') orelse inner.len;
         const base = inner[0..base_end];
-        if (std.mem.eql(u8, base, "esp")) continue; // spill / alloca / frame, not a fold
-        // A folded access carries a displacement (" + N" or " - N"); a plain `[base]` load does not.
+        if (std.mem.eql(u8, base, "esp")) continue; // spill, alloca, or frame access, not a fold
+        // A folded access carries a displacement (" + N" or " - N"). A plain `[base]` load does not.
         if (std.mem.indexOf(u8, inner, " + ") != null or std.mem.indexOf(u8, inner, " - ") != null) count += 1;
     }
     return count;
@@ -94,7 +94,7 @@ fn buildCopy(allocator: std.mem.Allocator) !Function {
     var dst: [copy_n]Value = undefined;
     for (0..copy_n) |j| src[j] = try func.appendInst(e, ptr_t, .{ .alloca = .{ .elem = i32_t } });
     for (0..copy_n) |j| dst[j] = try func.appendInst(e, ptr_t, .{ .alloca = .{ .elem = i32_t } });
-    // Initialize each src slot (references every src alloca so none is DCE'd) to arg + j.
+    // Initialize each src slot (this references every src alloca, so none is dead-code-eliminated) to arg + j.
     for (0..copy_n) |j| {
         const jv = try func.appendInst(e, i32_t, .{ .iconst = @intCast(j) });
         const v = try func.appendInst(e, i32_t, .{ .arith = .{ .op = .add, .lhs = arg, .rhs = jv } });
@@ -119,7 +119,7 @@ fn buildCopy(allocator: std.mem.Allocator) !Function {
         const w = try func.appendInst(e, i32_t, .{ .load = .{ .ptr = rp } });
         acc = if (acc) |a| try func.appendInst(e, i32_t, .{ .arith = .{ .op = .add, .lhs = a, .rhs = w } }) else w;
     }
-    func.setTerminator(e, .{ .ret = acc.? });
+    func.setTerminator(e, .{ .ret = ir.function.Ret.one(acc.?) });
     return func;
 }
 
@@ -169,7 +169,7 @@ fn buildNarrowSum(allocator: std.mem.Allocator, comptime kind: ir.types.TypeKind
         const v = try func.appendInst(e, elem_t, .{ .load = .{ .ptr = p } }); // sign/zero-extends into 32 bits
         acc = if (acc) |a| try func.appendInst(e, i32_t, .{ .arith = .{ .op = .add, .lhs = a, .rhs = v } }) else v;
     }
-    func.setTerminator(e, .{ .ret = acc.? });
+    func.setTerminator(e, .{ .ret = ir.function.Ret.one(acc.?) });
     return func;
 }
 
@@ -195,17 +195,17 @@ test "x86-32 addrfold: byte/half constant-index loads fold and compute" {
     }
 }
 
-// --- test 3: a CROSS-BLOCK folded load (the correctness invariant) ----------------------------------
+// --- test 3: a cross-block folded load (the correctness invariant) ----------------------------------
 
 const xblock_pressure = 8;
 
-/// f(arg, cond): in ENTRY, buf1 = arg and `p = buf0 + 4` (= buf1's address, a DEAD add: its only use
-/// is the load in the successor). On cond > 0, `then_b` first builds several live values (so the free
-/// list would hand a temp `buf0`'s register if `buf0` were treated as dead after entry), then loads
-/// [p] (folds to `4(buf0)`) and reduces. The load's pointer use must be attributed to `buf0` in the
-/// SUCCESSOR block, so `buf0` stays live across the branch; miss the reroute and a temp steals its
-/// register and the folded load reads a garbage address. Expected(cond>0) = arg + sum(cond + k),
-/// k in 1..P; Expected(cond<=0) = cond.
+/// f(arg, cond): in the entry block, buf1 = arg and `p = buf0 + 4` (= buf1's address, a dead add: its
+/// only use is the load in the successor). On cond > 0, `then_b` first builds several live values (so
+/// the free list would hand a temp `buf0`'s register if `buf0` were treated as dead after entry), then
+/// loads [p] (folds to `4(buf0)`) and reduces. The load's pointer use must be attributed to `buf0` in
+/// the successor block, so `buf0` stays live across the branch. Miss the reroute and a temp steals its
+/// register, and the folded load reads a garbage address. Expected(cond>0) = arg + sum(cond + k),
+/// for k in 1..P; Expected(cond<=0) = cond.
 fn buildCrossBlock(allocator: std.mem.Allocator) !Function {
     var func = Function.init(allocator);
     errdefer func.deinit();
@@ -222,13 +222,13 @@ fn buildCrossBlock(allocator: std.mem.Allocator) !Function {
     const buf1 = try func.appendInst(entry, ptr_t, .{ .alloca = .{ .elem = i32_t } });
     try func.appendStore(entry, arg, buf1); // buf1 = arg (own pointer, references buf1)
     // buf0 is referenced only by this address-add, whose result feeds solely the successor's load: a
-    // dead add, so buf0's ONLY successor liveness flows through the folded load's baseOf.
+    // dead add, so buf0's only successor liveness flows through the folded load's baseOf.
     const p = try func.appendInst(entry, ptr_t, .{ .arith_imm = .{ .op = .add, .lhs = buf0, .imm = 4 } });
     const zero = try func.appendInst(entry, i32_t, .{ .iconst = 0 });
     const c = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .gt, .lhs = cond, .rhs = zero } });
     try func.appendIf(entry, c, .{ .target = then_b, .args = &.{} }, .{ .target = else_b, .args = &.{} });
 
-    // then_b: build the pressure BEFORE the folded load so a stolen base register is read by the load.
+    // then_b: build the pressure before the folded load, so a stolen base register is read by the load.
     var vals: [xblock_pressure]Value = undefined;
     for (0..xblock_pressure) |k| {
         vals[k] = try func.appendInst(then_b, i32_t, .{ .arith_imm = .{ .op = .add, .lhs = cond, .imm = @intCast(k + 1) } });
@@ -236,8 +236,8 @@ fn buildCrossBlock(allocator: std.mem.Allocator) !Function {
     const w = try func.appendInst(then_b, i32_t, .{ .load = .{ .ptr = p } }); // folds to 4(buf0) = buf1 = arg
     var acc = w;
     for (0..xblock_pressure) |k| acc = try func.appendInst(then_b, i32_t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = vals[k] } });
-    func.setTerminator(then_b, .{ .ret = acc });
-    func.setTerminator(else_b, .{ .ret = cond });
+    func.setTerminator(then_b, .{ .ret = ir.function.Ret.one(acc) });
+    func.setTerminator(else_b, .{ .ret = ir.function.Ret.one(cond) });
     return func;
 }
 
@@ -263,10 +263,10 @@ test "x86-32 addrfold: a CROSS-BLOCK folded load computes correctly" {
     }
 }
 
-// --- test 4: a base whose add has a NON-folded consumer keeps the add -------------------------------
+// --- test 4: a base whose add has a non-folded consumer keeps the add -------------------------------
 
-/// f(arg): buf1 = arg; `p = buf0 + 4` (= buf1's address). `p` feeds the folded load [p] AND a plain
-/// `p - buf0` subtraction (a non-folded use), so `p` is NOT dead and the address-add MUST still be
+/// f(arg): buf1 = arg; `p = buf0 + 4` (= buf1's address). `p` feeds the folded load [p] and a plain
+/// `p - buf0` subtraction (a non-folded use), so `p` is not dead, and the address-add must still be
 /// emitted. `p - buf0 = 4`, so return `load(4(buf0)) + 4 = arg + 4`. If the add were wrongly elided,
 /// the subtraction would read a garbage `p` and the result would diverge.
 fn buildLiveAdd(allocator: std.mem.Allocator) !Function {
@@ -284,7 +284,7 @@ fn buildLiveAdd(allocator: std.mem.Allocator) !Function {
     const v = try func.appendInst(e, i32_t, .{ .load = .{ .ptr = p } }); // folds to 4(buf0) = arg
     const d = try func.appendInst(e, i32_t, .{ .arith = .{ .op = .sub, .lhs = p, .rhs = buf0 } }); // = 4, keeps p live
     const r = try func.appendInst(e, i32_t, .{ .arith = .{ .op = .add, .lhs = v, .rhs = d } }); // arg + 4
-    func.setTerminator(e, .{ .ret = r });
+    func.setTerminator(e, .{ .ret = ir.function.Ret.one(r) });
     return func;
 }
 

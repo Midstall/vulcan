@@ -19,14 +19,15 @@ pub const Addr = struct { base: Value, off: i64 };
 pub const Analysis = struct {
     /// The load/store instructions that folded, and the base+offset they fold to.
     folds: std.AutoHashMapUnmanaged(Inst, Addr),
-    /// `arith_imm.add` instructions whose result is used only by folded mem ops (dead once
-    /// the fold is applied and the backend stops reading the add's result).
+    /// `arith_imm.add` instructions whose result is used only by folded mem ops. They become dead
+    /// once the fold is applied and the backend stops reading the add's result.
     dead_adds: std.AutoHashMapUnmanaged(Inst, void),
 
     /// A no-fold analysis: nothing folds, no add is dead. `baseOf` returns the raw ptr, `offOf`
-    /// returns 0, and `isDeadAdd` is false for every instruction. Backends thread this through the
-    /// fold-agnostic paths (a Wimmer differential compile, a liveness debug hook) so those paths are
-    /// byte-identical to before folding existed. Holds no allocation, so it never needs `deinit`.
+    /// returns 0, and `isDeadAdd` is false for every instruction. Backends thread this through
+    /// fold-agnostic paths, for example a Wimmer differential compile or a liveness debug hook, so
+    /// those paths stay byte-identical to before folding existed. It holds no allocation, so it
+    /// never needs `deinit`.
     pub const empty: Analysis = .{ .folds = .empty, .dead_adds = .empty };
 
     pub fn deinit(self: *Analysis, allocator: std.mem.Allocator) void {
@@ -53,8 +54,8 @@ pub const Analysis = struct {
     }
 };
 
-/// The raw, unfolded pointer operand of a load or store. Asserts on any other opcode: callers
-/// only ever pass a mem_inst that came from `folds`/a load/store scan.
+/// The raw, unfolded pointer operand of a load or store. It asserts on any other opcode. Callers
+/// only ever pass a mem_inst that came from `folds` or a load/store scan.
 fn rawPtr(func: *const Function, mem_inst: Inst) Value {
     return switch (func.opcode(mem_inst)) {
         .load => |l| l.ptr,
@@ -63,11 +64,11 @@ fn rawPtr(func: *const Function, mem_inst: Inst) Value {
     };
 }
 
-/// Build the address-fold analysis for `func`. `foldOffset` is the target predicate: given a
-/// load/store instruction whose pointer is defined by an `arith_imm.add`, it returns the byte
-/// offset to fold (always equal to the add's imm) if that imm is within the target's addressing
+/// Build the address-fold analysis for `func`. `foldOffset` is the target predicate. Given a
+/// load or store instruction whose pointer is defined by an `arith_imm.add`, it returns the byte
+/// offset to fold, always equal to the add's imm, if that imm is within the target's addressing
 /// range for the op's access size, else null. This function does the "ptr defined by
-/// arith_imm.add" recognition and base extraction; `foldOffset` only judges size and range.
+/// arith_imm.add" recognition and base extraction. `foldOffset` only judges size and range.
 pub fn analyze(
     allocator: std.mem.Allocator,
     func: *const Function,
@@ -140,8 +141,9 @@ pub fn analyze(
 }
 
 /// Count every use of every value across the whole function: every Value-carrying operand of
-/// every instruction (exhaustive over every `Opcode` tag) plus every terminator edge. Mirrors
-/// `libs/vulcan-opt/dce.zig`'s `countUses`, the reference exhaustive whole-function use walk.
+/// every instruction, exhaustive over every `Opcode` tag, plus every terminator edge. This
+/// mirrors `libs/vulcan-opt/dce.zig`'s `countUses`, the reference exhaustive whole-function use
+/// walk.
 fn countUses(func: *const Function, uses: []u32) void {
     const block_count = func.blockCount();
     var bi: usize = 0;
@@ -173,6 +175,9 @@ fn countUses(func: *const Function, uses: []u32) void {
                     uses[@intFromEnum(st.ptr)] += 1;
                 },
                 .prefetch => |pf| uses[@intFromEnum(pf.ptr)] += 1,
+                .va_start => |vs| uses[@intFromEnum(vs.list)] += 1,
+                .va_arg => |va| uses[@intFromEnum(va.list)] += 1,
+                .va_end => |ve| uses[@intFromEnum(ve.list)] += 1,
                 .dot => |d| {
                     uses[@intFromEnum(d.acc)] += 1;
                     uses[@intFromEnum(d.a)] += 1;
@@ -186,12 +191,14 @@ fn countUses(func: *const Function, uses: []u32) void {
                 .struct_new => |sn| for (func.valueList(sn.fields)) |f| {
                     uses[@intFromEnum(f)] += 1;
                 },
-                .call => |c| for (func.valueList(c.args)) |arg| {
-                    uses[@intFromEnum(arg)] += 1;
+                .call => |c| {
+                    for (func.valueList(c.args)) |arg| uses[@intFromEnum(arg)] += 1;
+                    if (c.ret_dest) |rd| uses[@intFromEnum(rd)] += 1;
                 },
                 .call_indirect => |c| {
                     uses[@intFromEnum(c.target)] += 1;
                     for (func.valueList(c.args)) |arg| uses[@intFromEnum(arg)] += 1;
+                    if (c.ret_dest) |rd| uses[@intFromEnum(rd)] += 1;
                 },
                 .@"if" => |cf| {
                     uses[@intFromEnum(cf.cond)] += 1;
@@ -201,7 +208,7 @@ fn countUses(func: *const Function, uses: []u32) void {
             }
         }
         if (func.terminator(block)) |term| switch (term) {
-            .ret => |v| if (v) |vv| {
+            .ret => |r| for (r.slice()) |vv| {
                 uses[@intFromEnum(vv)] += 1;
             },
             .jump => |j| for (func.blockArgs(j)) |arg| {
@@ -240,7 +247,7 @@ test "recognizes a load whose ptr is arith_imm.add and records base+off" {
     const base = try func.appendBlockParam(b, ptr_t);
     const p = try func.appendArithImm(b, ptr_t, .add, base, 8);
     const load = try func.appendInst(b, i32_t, .{ .load = .{ .ptr = p } });
-    func.setTerminator(b, .{ .ret = load });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(load) });
     const load_inst = func.definingInst(load).?;
 
     var analysis = try analyze(allocator, &func, TestCtx{}, testFoldOffset);
@@ -263,7 +270,7 @@ test "a load whose ptr is a block param does not fold" {
     const b = try func.appendBlock();
     const base = try func.appendBlockParam(b, ptr_t);
     const load = try func.appendInst(b, i32_t, .{ .load = .{ .ptr = base } });
-    func.setTerminator(b, .{ .ret = load });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(load) });
     const load_inst = func.definingInst(load).?;
 
     var analysis = try analyze(allocator, &func, TestCtx{}, testFoldOffset);
@@ -286,7 +293,7 @@ test "a load whose ptr is a reg+reg arith (not arith_imm) does not fold" {
     const idx = try func.appendBlockParam(b, ptr_t);
     const p = try func.appendInst(b, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = idx } });
     const load = try func.appendInst(b, i32_t, .{ .load = .{ .ptr = p } });
-    func.setTerminator(b, .{ .ret = load });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(load) });
 
     var analysis = try analyze(allocator, &func, TestCtx{}, testFoldOffset);
     defer analysis.deinit(allocator);
@@ -305,7 +312,7 @@ test "a load whose ptr is arith_imm.sub does not fold" {
     const base = try func.appendBlockParam(b, ptr_t);
     const p = try func.appendArithImm(b, ptr_t, .sub, base, 8);
     const load = try func.appendInst(b, i32_t, .{ .load = .{ .ptr = p } });
-    func.setTerminator(b, .{ .ret = load });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(load) });
 
     var analysis = try analyze(allocator, &func, TestCtx{}, testFoldOffset);
     defer analysis.deinit(allocator);
@@ -325,7 +332,7 @@ test "foldOffset returning null (out of range imm) leaves the op unfolded" {
     // 200 is out of the test predicate's [0, 100] range.
     const p = try func.appendArithImm(b, ptr_t, .add, base, 200);
     const load = try func.appendInst(b, i32_t, .{ .load = .{ .ptr = p } });
-    func.setTerminator(b, .{ .ret = load });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(load) });
     const load_inst = func.definingInst(load).?;
 
     var analysis = try analyze(allocator, &func, TestCtx{}, testFoldOffset);
@@ -350,7 +357,7 @@ test "baseOf and offOf return the raw ptr and 0 for an unfolded op" {
     const v = try func.appendBlockParam(b, i32_t);
     // A store whose ptr is a raw block param, never even reaching arith_imm recognition.
     try func.appendStore(b, v, base);
-    func.setTerminator(b, .{ .ret = null });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
     const store_inst = func.blockInsts(b)[0];
 
     var analysis = try analyze(allocator, &func, TestCtx{}, testFoldOffset);
@@ -372,7 +379,7 @@ test "an add used only by a folded load is dead" {
     const base = try func.appendBlockParam(b, ptr_t);
     const p = try func.appendArithImm(b, ptr_t, .add, base, 8);
     const load = try func.appendInst(b, i32_t, .{ .load = .{ .ptr = p } });
-    func.setTerminator(b, .{ .ret = load });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(load) });
     const add_inst = func.definingInst(p).?;
 
     var analysis = try analyze(allocator, &func, TestCtx{}, testFoldOffset);
@@ -394,7 +401,7 @@ test "an add used by a folded load AND a ret is not dead" {
     const load = try func.appendInst(b, i32_t, .{ .load = .{ .ptr = p } });
     _ = load;
     // p is also returned directly, so a use of it survives the fold and it stays live.
-    func.setTerminator(b, .{ .ret = p });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(p) });
     const add_inst = func.definingInst(p).?;
 
     var analysis = try analyze(allocator, &func, TestCtx{}, testFoldOffset);
@@ -418,7 +425,7 @@ test "cross-block: an add in the entry block feeding a load in a successor folds
     const p = try func.appendArithImm(entry, ptr_t, .add, q, 8);
     try func.setJump(entry, b_block, &.{});
     const load = try func.appendInst(b_block, i32_t, .{ .load = .{ .ptr = p } });
-    func.setTerminator(b_block, .{ .ret = load });
+    func.setTerminator(b_block, .{ .ret = ir.function.Ret.one(load) });
     const load_inst = func.definingInst(load).?;
     const add_inst = func.definingInst(p).?;
 

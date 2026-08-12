@@ -459,11 +459,11 @@ test "a mask that clears only already-zero bits is removed" {
     const x = try func.appendBlockParam(b, t);
     const lo = try func.appendArithImm(b, t, .bit_and, x, 0xFF); // lo: high bits known 0
     const redundant = try func.appendArithImm(b, t, .bit_and, lo, 0xFFFF); // clears only known-0 bits
-    func.setTerminator(b, .{ .ret = redundant });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(redundant) });
 
     try testing.expect(try runOnce(allocator, &func));
     // The redundant `& 0xFFFF` now forwards `lo` directly.
-    try testing.expectEqual(lo, func.terminator(b).?.ret.?);
+    try testing.expectEqual(lo, func.terminator(b).?.ret.values[0]);
 }
 
 test "a zero-extend of a truncation of an already-narrow value is eliminated" {
@@ -477,10 +477,10 @@ test "a zero-extend of a truncation of an already-narrow value is eliminated" {
     const s = try func.appendArithImm(b, u64t, .bit_and, p, 0xFFFFFFFF); // high 32 known 0
     const n = try func.appendInst(b, u32t, .{ .convert = .{ .value = s } }); // narrow to u32
     const w = try func.appendInst(b, u64t, .{ .convert = .{ .value = n } }); // widen back to u64
-    func.setTerminator(b, .{ .ret = w });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(w) });
 
     try testing.expect(try runOnce(allocator, &func));
-    try testing.expectEqual(s, func.terminator(b).?.ret.?); // round-trip recovered s
+    try testing.expectEqual(s, func.terminator(b).?.ret.values[0]); // round-trip recovered s
 }
 
 test "a sign-extend round-trip of a known-nonnegative value is eliminated" {
@@ -494,10 +494,10 @@ test "a sign-extend round-trip of a known-nonnegative value is eliminated" {
     const s = try func.appendArithImm(b, i64t, .bit_and, p, 0x7FFFFFFF); // nonnegative, fits i32
     const n = try func.appendInst(b, i32t, .{ .convert = .{ .value = s } });
     const w = try func.appendInst(b, i64t, .{ .convert = .{ .value = n } });
-    func.setTerminator(b, .{ .ret = w });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(w) });
 
     try testing.expect(try runOnce(allocator, &func));
-    try testing.expectEqual(s, func.terminator(b).?.ret.?);
+    try testing.expectEqual(s, func.terminator(b).?.ret.values[0]);
 }
 
 test "a widen of a truncation is kept when the high bits are not known" {
@@ -510,7 +510,7 @@ test "a widen of a truncation is kept when the high bits are not known" {
     const s = try func.appendBlockParam(b, u64t); // unknown high bits
     const n = try func.appendInst(b, u32t, .{ .convert = .{ .value = s } });
     const w = try func.appendInst(b, u64t, .{ .convert = .{ .value = n } });
-    func.setTerminator(b, .{ .ret = w });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(w) });
 
     try testing.expect(!try runOnce(allocator, &func)); // truncation may lose bits, keep the round-trip
 }
@@ -523,7 +523,7 @@ test "a mask that clears a possibly-set bit is kept" {
     const b = try func.appendBlock();
     const x = try func.appendBlockParam(b, t);
     const masked = try func.appendArithImm(b, t, .bit_and, x, 0xFF); // clears real bits of unknown x
-    func.setTerminator(b, .{ .ret = masked });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(masked) });
 
     try testing.expect(!try runOnce(allocator, &func)); // not redundant, left alone
 }
@@ -540,9 +540,9 @@ test "a mask clearing the high bits after a logical shift is removed, after an a
         const x = try func.appendBlockParam(b, t);
         const y = try func.appendArithImm(b, t, .shr, x, 8);
         const z = try func.appendArithImm(b, t, .bit_and, y, clear_top_8);
-        func.setTerminator(b, .{ .ret = z });
+        func.setTerminator(b, .{ .ret = ir.function.Ret.one(z) });
         try testing.expect(try runOnce(allocator, &func));
-        try testing.expectEqual(y, func.terminator(b).?.ret.?);
+        try testing.expectEqual(y, func.terminator(b).?.ret.values[0]);
     }
     // Signed: `x >>s 8` sign-fills the top 8 bits, so they are not known 0 and the mask must stay.
     {
@@ -553,7 +553,7 @@ test "a mask clearing the high bits after a logical shift is removed, after an a
         const x = try func.appendBlockParam(b, t);
         const y = try func.appendArithImm(b, t, .shr, x, 8);
         const z = try func.appendArithImm(b, t, .bit_and, y, clear_top_8);
-        func.setTerminator(b, .{ .ret = z });
+        func.setTerminator(b, .{ .ret = ir.function.Ret.one(z) });
         try testing.expect(!try runOnce(allocator, &func)); // mask is not redundant
     }
 }
@@ -569,7 +569,7 @@ test "eq against zero folds to false when a bit is known one" {
     const set = try func.appendArithImm(b, t, .bit_or, x, 1); // bit 0 known 1
     const zero = try func.appendInst(b, t, .{ .iconst = 0 });
     const eq = try func.appendInst(b, bool_t, .{ .icmp = .{ .op = .eq, .lhs = set, .rhs = zero } });
-    func.setTerminator(b, .{ .ret = eq });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(eq) });
 
     try testing.expect(try runOnce(allocator, &func));
     // (x | 1) == 0 is always false; the icmp is now a constant 0.
@@ -1062,7 +1062,7 @@ test "knownbits: a zext result has known-0 high bits (analyze)" {
     const b = try func.appendBlock();
     const p = try func.appendBlockParam(b, u8t); // fully unknown 8-bit value
     const z = try func.appendInst(b, u32t, .{ .convert = .{ .value = p } }); // zext to u32
-    func.setTerminator(b, .{ .ret = z });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(z) });
 
     const bits = try analyze(allocator, &func);
     defer allocator.free(bits);
@@ -1286,11 +1286,11 @@ test "knownbits: redundant mask removed via a convert's known-0 high bits" {
     const z = try func.appendInst(b, u32t, .{ .convert = .{ .value = x } });
     // m clears only bits 8..31, which are already known 0 in z, so it is redundant.
     const m = try func.appendArithImm(b, u32t, .bit_and, z, 0xFF);
-    func.setTerminator(b, .{ .ret = m });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(m) });
 
     try testing.expect(try runOnce(allocator, &func));
     // The redundant `& 0xFF` now forwards `z` directly.
-    try testing.expectEqual(z, func.terminator(b).?.ret.?);
+    try testing.expectEqual(z, func.terminator(b).?.ret.values[0]);
 }
 
 test "knownbits: icmp eq folds to false via a convert's known-bit conflict" {
@@ -1306,7 +1306,7 @@ test "knownbits: icmp eq folds to false via a convert's known-bit conflict" {
         const z = try func.appendInst(b, u32t, .{ .convert = .{ .value = x } }); // bit 8 known 0
         const c = try func.appendInst(b, u32t, .{ .iconst = 0x100 }); // bit 8 known 1: conflict
         const eq = try func.appendInst(b, bool_t, .{ .icmp = .{ .op = .eq, .lhs = z, .rhs = c } });
-        func.setTerminator(b, .{ .ret = eq });
+        func.setTerminator(b, .{ .ret = ir.function.Ret.one(eq) });
 
         try testing.expect(try runOnce(allocator, &func));
         try testing.expectEqual(@as(i64, 0), func.opcode(func.definingInst(eq).?).iconst);
@@ -1322,7 +1322,7 @@ test "knownbits: icmp eq folds to false via a convert's known-bit conflict" {
         const z = try func.appendInst(b, u32t, .{ .convert = .{ .value = x } });
         const c = try func.appendInst(b, u32t, .{ .iconst = 0x100 });
         const ne = try func.appendInst(b, bool_t, .{ .icmp = .{ .op = .ne, .lhs = z, .rhs = c } });
-        func.setTerminator(b, .{ .ret = ne });
+        func.setTerminator(b, .{ .ret = ir.function.Ret.one(ne) });
 
         try testing.expect(try runOnce(allocator, &func));
         try testing.expectEqual(@as(i64, 1), func.opcode(func.definingInst(ne).?).iconst);
@@ -1344,10 +1344,10 @@ test "knownbits: redundant mask removed via an add's known-0 low bits" {
     // bits is redundant.
     const clear_low_8: i64 = @bitCast(@as(u64, 0xFFFFFF00));
     const m = try func.appendArithImm(b, t, .bit_and, s, clear_low_8);
-    func.setTerminator(b, .{ .ret = m });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(m) });
 
     try testing.expect(try runOnce(allocator, &func));
-    try testing.expectEqual(s, func.terminator(b).?.ret.?);
+    try testing.expectEqual(s, func.terminator(b).?.ret.values[0]);
 }
 
 test "knownbits: redundant sign/zero extend still fires after the convert transfer became precise (no regression)" {
@@ -1366,8 +1366,8 @@ test "knownbits: redundant sign/zero extend still fires after the convert transf
     const s = try func.appendArithImm(b, u64t, .bit_and, p, 0xFFFFFFFF); // high 32 known 0
     const n = try func.appendInst(b, u32t, .{ .convert = .{ .value = s } }); // narrow to u32
     const w = try func.appendInst(b, u64t, .{ .convert = .{ .value = n } }); // widen back to u64
-    func.setTerminator(b, .{ .ret = w });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(w) });
 
     try testing.expect(try runOnce(allocator, &func));
-    try testing.expectEqual(s, func.terminator(b).?.ret.?); // round-trip recovered s, no regression
+    try testing.expectEqual(s, func.terminator(b).?.ret.values[0]); // round-trip recovered s, no regression
 }

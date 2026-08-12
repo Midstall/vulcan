@@ -151,7 +151,7 @@ test "dominators of a diamond" {
     try func.setJump(b1, b3, &.{x});
     const y = try func.appendInst(b2, i32_t, .{ .iconst = 2 });
     try func.setJump(b2, b3, &.{y});
-    func.setTerminator(b3, .{ .ret = v });
+    func.setTerminator(b3, .{ .ret = ir.function.Ret.one(v) });
 
     var doms = try compute(allocator, &func);
     defer doms.deinit(allocator);
@@ -180,7 +180,7 @@ test "unreachable blocks are flagged and map their idom to themselves" {
     const ev = try func.appendBlockParam(exit, t);
     const ov = try func.appendBlockParam(orphan, t);
     try func.setJump(entry, exit, &.{x});
-    func.setTerminator(exit, .{ .ret = ev });
+    func.setTerminator(exit, .{ .ret = ir.function.Ret.one(ev) });
     try func.setJump(orphan, exit, &.{ov}); // dead edge into exit
 
     var doms = try compute(allocator, &func);

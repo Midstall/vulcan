@@ -431,12 +431,17 @@ fn blockUsesValueFromBlock(func: *const Function, block: Block, def_bi: u32, def
             .load => |ld| if (usesB(def_block, ld.ptr, def_bi)) return true,
             .store => |st| if (usesB(def_block, st.value, def_bi) or usesB(def_block, st.ptr, def_bi)) return true,
             .prefetch => |pf| if (usesB(def_block, pf.ptr, def_bi)) return true,
-            .call => |c| for (func.valueList(c.args)) |arg| {
-                if (usesB(def_block, arg, def_bi)) return true;
+            .va_start => |vs| if (usesB(def_block, vs.list, def_bi)) return true,
+            .va_arg => |va| if (usesB(def_block, va.list, def_bi)) return true,
+            .va_end => |ve| if (usesB(def_block, ve.list, def_bi)) return true,
+            .call => |c| {
+                for (func.valueList(c.args)) |arg| if (usesB(def_block, arg, def_bi)) return true;
+                if (c.ret_dest) |d| if (usesB(def_block, d, def_bi)) return true; // SM14 M4d-c: the struct-return destination is a call operand
             },
             .call_indirect => |c| {
                 if (usesB(def_block, c.target, def_bi)) return true;
                 for (func.valueList(c.args)) |arg| if (usesB(def_block, arg, def_bi)) return true;
+                if (c.ret_dest) |d| if (usesB(def_block, d, def_bi)) return true; // SM14 M4d-c
             },
             .dot => |d| if (usesB(def_block, d.acc, def_bi) or usesB(def_block, d.a, def_bi) or usesB(def_block, d.b, def_bi)) return true,
             .matmul => |mm| if (usesB(def_block, mm.a, def_bi) or usesB(def_block, mm.b, def_bi) or usesB(def_block, mm.c, def_bi)) return true,
@@ -448,7 +453,7 @@ fn blockUsesValueFromBlock(func: *const Function, block: Block, def_bi: u32, def
         }
     }
     if (func.terminator(block)) |term| switch (term) {
-        .ret => |value| if (value) |v| {
+        .ret => |r| for (r.slice()) |v| {
             if (usesB(def_block, v, def_bi)) return true;
         },
         .jump => |j| for (func.blockArgs(j)) |arg| {
@@ -464,6 +469,8 @@ fn hasSideEffect(func: *const Function, block: Block) bool {
     for (func.blockInsts(block)) |inst| {
         switch (func.opcode(inst)) {
             .store, .call, .call_indirect, .prefetch, .matmul => return true,
+            // SM12 T3: mutate/read the `va_list` object at `list`, like `store`/`prefetch` above.
+            .va_start, .va_arg, .va_end => return true,
             .iconst,
             .fconst,
             .arith,
@@ -575,7 +582,7 @@ fn evalFunc(func: *const Function, inputs: []const i64) !i64 {
             const cf = func.opcode(if_inst).@"if";
             next_edge = if (vals[@intFromEnum(cf.cond)] != 0) cf.then else cf.@"else";
         } else if (func.terminator(cur)) |term| switch (term) {
-            .ret => |v| return if (v) |vv| vals[@intFromEnum(vv)] else 0,
+            .ret => |r| return if (r.count > 0) vals[@intFromEnum(r.values[0])] else 0,
             .jump => |j| next_edge = j,
         } else return 0; // implicit ret void
 
@@ -644,7 +651,7 @@ test "a jump through an identity-forwarding block is redirected to its target" {
     const dp = try func.appendBlockParam(dest, t);
     try func.setJump(entry, mid, &.{x});
     try func.setJump(mid, dest, &.{mp}); // mid forwards its param straight through
-    func.setTerminator(dest, .{ .ret = dp });
+    func.setTerminator(dest, .{ .ret = ir.function.Ret.one(dp) });
 
     try testing.expect(try runOnce(allocator, &func));
     const term = func.terminator(entry).?;
@@ -669,8 +676,8 @@ test "an if edge into a forwarding block is redirected" {
     const op = try func.appendBlockParam(other, t);
     try func.appendIf(entry, c, .{ .target = mid, .args = &.{x} }, .{ .target = other, .args = &.{x} });
     try func.setJump(mid, dest, &.{mp});
-    func.setTerminator(other, .{ .ret = op });
-    func.setTerminator(dest, .{ .ret = dp });
+    func.setTerminator(other, .{ .ret = ir.function.Ret.one(op) });
+    func.setTerminator(dest, .{ .ret = ir.function.Ret.one(dp) });
 
     try testing.expect(try runOnce(allocator, &func));
     const cf = func.opcode(func.blockInsts(entry)[0]).@"if";
@@ -692,7 +699,7 @@ test "a block that computes something is not a forwarder" {
     try func.setJump(entry, mid, &.{x});
     const doubled = try func.appendArithImm(mid, t, .mul, mp, 2); // mid does real work
     try func.setJump(mid, dest, &.{doubled});
-    func.setTerminator(dest, .{ .ret = dp });
+    func.setTerminator(dest, .{ .ret = ir.function.Ret.one(dp) });
 
     try testing.expect(!try runOnce(allocator, &func)); // mid is not a pure forwarder
     try testing.expectEqual(mid, func.terminator(entry).?.jump.target);
@@ -716,9 +723,9 @@ test "jumpthread: constant-param implied branch threads non-duplicating" {
     const c_true = try func.appendInst(entry, bool_t, .{ .iconst = 1 });
     try func.setJump(entry, b, &.{ c_true, x });
     try func.appendIf(b, c, .{ .target = d, .args = &.{xp} }, .{ .target = e, .args = &.{} });
-    func.setTerminator(d, .{ .ret = dp });
+    func.setTerminator(d, .{ .ret = ir.function.Ret.one(dp) });
     const em = try func.appendInst(e, t, .{ .iconst = -1 });
-    func.setTerminator(e, .{ .ret = em });
+    func.setTerminator(e, .{ .ret = ir.function.Ret.one(em) });
 
     // Execution before threading, over an input sweep.
     var expected: [7]i64 = undefined;
@@ -753,11 +760,11 @@ test "jumpthread: correlated branch threads non-duplicating" {
     // P branches on v to B and B branches on the SAME v, so on P's then-edge v is known TRUE.
     try func.appendIf(p, v, .{ .target = b, .args = &.{} }, .{ .target = x_block, .args = &.{} });
     try func.appendIf(b, v, .{ .target = d, .args = &.{x} }, .{ .target = e, .args = &.{} });
-    func.setTerminator(d, .{ .ret = dp });
+    func.setTerminator(d, .{ .ret = ir.function.Ret.one(dp) });
     const em = try func.appendInst(e, t, .{ .iconst = 7 });
-    func.setTerminator(e, .{ .ret = em });
+    func.setTerminator(e, .{ .ret = ir.function.Ret.one(em) });
     const xm = try func.appendInst(x_block, t, .{ .iconst = 9 });
-    func.setTerminator(x_block, .{ .ret = xm });
+    func.setTerminator(x_block, .{ .ret = ir.function.Ret.one(xm) });
 
     var expected: [8]i64 = undefined;
     for (0..8) |i| {
@@ -798,10 +805,10 @@ test "jumpthread: correlated branch on the else edge threads to the else success
     // B sits on P's ELSE edge, so on P->B v is known FALSE, selecting B's else-successor E.
     try func.appendIf(p, v, .{ .target = x_block, .args = &.{} }, .{ .target = b, .args = &.{} });
     try func.appendIf(b, v, .{ .target = d, .args = &.{x} }, .{ .target = e, .args = &.{x} });
-    func.setTerminator(d, .{ .ret = dp });
-    func.setTerminator(e, .{ .ret = ep });
+    func.setTerminator(d, .{ .ret = ir.function.Ret.one(dp) });
+    func.setTerminator(e, .{ .ret = ir.function.Ret.one(ep) });
     const xm = try func.appendInst(x_block, t, .{ .iconst = 5 });
-    func.setTerminator(x_block, .{ .ret = xm });
+    func.setTerminator(x_block, .{ .ret = ir.function.Ret.one(xm) });
 
     var expected: [8]i64 = undefined;
     for (0..8) |i| {
@@ -853,9 +860,9 @@ test "jumpthread: tail-duplicates a block computing a value used in the threaded
     try func.setJump(entry, b, &.{ c_true, x });
     const y = try func.appendArithImm(b, t, .add, xp, 1);
     try func.appendIf(b, c, .{ .target = d, .args = &.{y} }, .{ .target = e, .args = &.{} });
-    func.setTerminator(d, .{ .ret = dp });
+    func.setTerminator(d, .{ .ret = ir.function.Ret.one(dp) });
     const em = try func.appendInst(e, t, .{ .iconst = -1 });
-    func.setTerminator(e, .{ .ret = em });
+    func.setTerminator(e, .{ .ret = ir.function.Ret.one(em) });
 
     const before_blocks = func.blockCount();
     var expected: [7]i64 = undefined;
@@ -903,9 +910,9 @@ test "jumpthread: tail-duplicates a side-effecting B so the effect runs on the t
     // non-dup is unsound. Tail-dup reruns the store on the threaded path.
     try func.appendStore(b, xp, slot);
     try func.appendIf(b, c, .{ .target = d, .args = &.{xp} }, .{ .target = e, .args = &.{} });
-    func.setTerminator(d, .{ .ret = dp });
+    func.setTerminator(d, .{ .ret = ir.function.Ret.one(dp) });
     const em = try func.appendInst(e, t, .{ .iconst = 0 });
-    func.setTerminator(e, .{ .ret = em });
+    func.setTerminator(e, .{ .ret = ir.function.Ret.one(em) });
 
     var expected: [7]i64 = undefined;
     for (0..7) |i| expected[i] = try evalFunc(&func, &.{@as(i64, @intCast(i)) - 3});
@@ -945,9 +952,9 @@ test "jumpthread: the bloat budget caps tail duplication of an oversized block" 
     var acc = xp;
     for (0..tail_dup_block_cap + 2) |_| acc = try func.appendArithImm(b, t, .add, acc, 1);
     try func.appendIf(b, c, .{ .target = d, .args = &.{acc} }, .{ .target = e, .args = &.{} });
-    func.setTerminator(d, .{ .ret = dp });
+    func.setTerminator(d, .{ .ret = ir.function.Ret.one(dp) });
     const em = try func.appendInst(e, t, .{ .iconst = 0 });
-    func.setTerminator(e, .{ .ret = em });
+    func.setTerminator(e, .{ .ret = ir.function.Ret.one(em) });
 
     try testing.expect(!try runOnce(allocator, &func)); // over the per-block cap: not duplicated
     try testing.expectEqual(b, func.terminator(entry).?.jump.target); // entry still jumps B
@@ -975,9 +982,9 @@ test "jumpthread: an edge is NOT threaded when B dominates the target (dominance
     const z = try func.appendArithImm(b, t, .mul, xp, 2);
     try func.appendIf(b, cp, .{ .target = s, .args = &.{} }, .{ .target = e, .args = &.{} });
     const w = try func.appendArithImm(s, t, .add, z, 1); // dominance-use of z, defined in B
-    func.setTerminator(s, .{ .ret = w });
+    func.setTerminator(s, .{ .ret = ir.function.Ret.one(w) });
     const em = try func.appendInst(e, t, .{ .iconst = 0 });
-    func.setTerminator(e, .{ .ret = em });
+    func.setTerminator(e, .{ .ret = ir.function.Ret.one(em) });
 
     // The original function is well formed: B dominates S so z's dominance-use verifies.
     try verifyClean(allocator, &func);
@@ -1010,7 +1017,7 @@ test "jumpthread: reaches a fixpoint and terminates on a small loop" {
     try func.appendIf(h, cond, .{ .target = body, .args = &.{i} }, .{ .target = exit, .args = &.{i} });
     const inc = try func.appendArithImm(body, t, .add, bi, 1);
     try func.setJump(body, h, &.{inc});
-    func.setTerminator(exit, .{ .ret = ep });
+    func.setTerminator(exit, .{ .ret = ir.function.Ret.one(ep) });
 
     try testing.expect(!try runOnce(allocator, &func)); // no implied edge, so no change (and no hang)
     try verifyClean(allocator, &func);
@@ -1044,9 +1051,9 @@ test "jumpthread: a dispatch shape with tail-dup reaches a fixpoint (terminates,
     try func.setJump(c_blk, b, &.{ c_true, x });
     const y = try func.appendArithImm(b, t, .add, xp, 1);
     try func.appendIf(b, cp, .{ .target = d, .args = &.{y} }, .{ .target = e, .args = &.{} });
-    func.setTerminator(d, .{ .ret = dp });
+    func.setTerminator(d, .{ .ret = ir.function.Ret.one(dp) });
     const em = try func.appendInst(e, t, .{ .iconst = -1 });
-    func.setTerminator(e, .{ .ret = em });
+    func.setTerminator(e, .{ .ret = ir.function.Ret.one(em) });
 
     const before_blocks = func.blockCount();
     var expected: [2]i64 = undefined;

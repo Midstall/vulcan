@@ -29,8 +29,19 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "vulcan-ir", .module = vulcan_ir }},
     });
 
+    // The shared static ELF linker: parse relocatable objects, resolve relocations,
+    // bind external calls through per-arch GOT stubs, and wrap the result in a static
+    // executable. Imports only `std` (defines its own ELF/reloc structs), so the target
+    // seam can depend on it without a dependency cycle.
+    const vulcan_link = b.addModule("vulcan-link", .{
+        .root_source_file = b.path("libs/vulcan-link.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // The target seam: register sets, ABI, encoding, and codegen per target. Also
-    // sees the SPIR-V frontend so it can execution-validate SPIR-V -> IR -> native.
+    // sees the SPIR-V frontend so it can execution-validate SPIR-V -> IR -> native,
+    // and the shared linker for object linking/JIT/executable emission.
     const vulcan_target = b.addModule("vulcan-target", .{
         .root_source_file = b.path("libs/vulcan-target.zig"),
         .target = target,
@@ -39,6 +50,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "vulcan-ir", .module = vulcan_ir },
             .{ .name = "vulcan-opt", .module = vulcan_opt },
             .{ .name = "vulcan-spirv", .module = vulcan_spirv },
+            .{ .name = "vulcan-link", .module = vulcan_link },
         },
     });
 
@@ -64,6 +76,17 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "vulcan-ir", .module = vulcan_ir },
             .{ .name = "vulcan-spirv", .module = vulcan_spirv },
+        },
+    });
+
+    // The C frontend: parse C source and lower it to Vulcan IR.
+    const vulcan_cc = b.addModule("vulcan-cc", .{
+        .root_source_file = b.path("libs/vulcan-cc.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "vulcan-ir", .module = vulcan_ir },
+            .{ .name = "vulcan-target", .module = vulcan_target },
         },
     });
 
@@ -97,6 +120,41 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "vulcan-glsl", .module = vulcan_glsl }},
     }) });
     b.installArtifact(glsl_cli);
+
+    // The Vulcan C Compiler driver executable (clang-compatible CLI surface, SM1).
+    // Hoisted into a `const` module (SM15 M5a) so both the exe and its in-file `parseArgs`
+    // tests below share one module, same pattern as `vulcan_ld_module`.
+    const vcc_module = b.createModule(.{
+        .root_source_file = b.path("frontends/vcc.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "vulcan-cc", .module = vulcan_cc },
+            .{ .name = "vulcan-target", .module = vulcan_target },
+            .{ .name = "vulcan-link", .module = vulcan_link },
+        },
+    });
+    const vcc_cli = b.addExecutable(.{ .name = "vcc", .root_module = vcc_module });
+    b.installArtifact(vcc_cli);
+
+    // The `ld.vulcan` linker frontend CLI: a standalone driver over the shared static
+    // linker (`vulcan-link`), so the linker is usable with any compiler's `.o`/`.a`
+    // output, not just Vulcan's own frontends. Only `run`/`main` (what actually ships)
+    // depends on `vulcan-link`; `vulcan-target`/`vulcan-ir` are pulled into the module
+    // solely for the in-file test's synthetic `.o` inputs. Hoisted into a `const` so
+    // both the exe and its test below share one module.
+    const vulcan_ld_module = b.createModule(.{
+        .root_source_file = b.path("frontends/vulcan-ld.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "vulcan-link", .module = vulcan_link },
+            .{ .name = "vulcan-target", .module = vulcan_target },
+            .{ .name = "vulcan-ir", .module = vulcan_ir },
+        },
+    });
+    const vulcan_ld_cli = b.addExecutable(.{ .name = "ld.vulcan", .root_module = vulcan_ld_module });
+    b.installArtifact(vulcan_ld_cli);
 
     // The deliverable follows `-Dtarget`'s OS: a no-OS target installs the freestanding
     // proof object. Any hosted/UEFI target installs the Wasm runner, whose `main` is the
@@ -189,6 +247,21 @@ pub fn build(b: *std.Build) void {
     const target_tests = b.addTest(.{ .root_module = vulcan_target });
     test_step.dependOn(&b.addRunArtifact(target_tests).step);
 
+    // The shared linker's own unit tests (std-only: ELF parsing + RVC-compression
+    // primitives). Object-input link tests live in the riscv64 consumer tests.
+    const link_tests = b.addTest(.{ .root_module = vulcan_link });
+    test_step.dependOn(&b.addRunArtifact(link_tests).step);
+
+    // `ld.vulcan`'s own CLI test: builds synthetic `.o`/`.a` inputs, drives `run`
+    // directly (no process spawn), and natively executes the produced ELF.
+    const vulcan_ld_tests = b.addTest(.{ .root_module = vulcan_ld_module });
+    test_step.dependOn(&b.addRunArtifact(vulcan_ld_tests).step);
+
+    // `vcc`'s own `parseArgs` tests (SM15 M5a): drives the flag-classification/version-probe
+    // surface IN-PROCESS (no process spawn), same pattern as `vulcan_ld_tests` above.
+    const vcc_tests_cli = b.addTest(.{ .root_module = vcc_module });
+    test_step.dependOn(&b.addRunArtifact(vcc_tests_cli).step);
+
     // Wimmer-Franz allocator target-abstraction unit tests: assert the aarch64 RegDescription
     // (pools, entry-param pinning, call clobbers, scratch) the shared allocator consumes.
     const wimmer_tests = b.addTest(.{ .root_module = b.createModule(.{
@@ -234,6 +307,88 @@ pub fn build(b: *std.Build) void {
         },
     }) });
     test_step.dependOn(&b.addRunArtifact(c_exec).step);
+
+    // C frontend execution tests: lower C to IR, JIT on the host, and diff against gcc.
+    const cc_exec = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("libs/vulcan-cc/tests/native.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "vulcan-cc", .module = vulcan_cc },
+            .{ .name = "vulcan-target", .module = vulcan_target },
+            .{ .name = "vulcan-opt", .module = vulcan_opt },
+            .{ .name = "vulcan-ir", .module = vulcan_ir },
+            .{ .name = "vulcan-link", .module = vulcan_link },
+        },
+    }) });
+    test_step.dependOn(&b.addRunArtifact(cc_exec).step);
+
+    // SM11 Task 3: external direct calls, proven end to end - the C frontend lowers a call to
+    // a declared-external function into an undefined-symbol call that the SM10 dynamic linker
+    // resolves to a real `.so` PLT import (native aarch64 + qemu x86_64/i386/riscv64).
+    const cc_external = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("libs/vulcan-cc/tests/external_linkage.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "vulcan-cc", .module = vulcan_cc },
+            .{ .name = "vulcan-target", .module = vulcan_target },
+            .{ .name = "vulcan-opt", .module = vulcan_opt },
+            .{ .name = "vulcan-ir", .module = vulcan_ir },
+            .{ .name = "vulcan-link", .module = vulcan_link },
+        },
+    }) });
+    test_step.dependOn(&b.addRunArtifact(cc_external).step);
+
+    // SM15 M5c CAPSTONE: the default-executable AUTOLINK, proven by RUNNING the linked binary.
+    // The freshly built `vcc` binary's path is handed to the test through a `build_options`
+    // module (`vcc_cli.getEmittedBin()` also makes the test depend on that binary, so it is
+    // built first). The test drives `vcc hello.c -o hello` with no hand-supplied crt/`-lc`/
+    // `--dynamic-linker`, runs `./hello`, and asserts its output - skipping when the host
+    // toolchain (gcc/crt/glibc/loader) is absent.
+    const vcc_autolink_opts = b.addOptions();
+    vcc_autolink_opts.addOptionPath("vcc_bin", vcc_cli.getEmittedBin());
+    const cc_autolink = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("libs/vulcan-cc/tests/autolink.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "build_options", .module = vcc_autolink_opts.createModule() },
+        },
+    }) });
+    test_step.dependOn(&b.addRunArtifact(cc_autolink).step);
+
+    // SM12 Task 1: the variadic frontend foundation (`...`, `__builtin_va_list`,
+    // `<stdarg.h>`, default argument promotions, the IR call `is_variadic`/`num_fixed`
+    // flags). SM12 Task 2 adds the backend call-side end-to-end tests (a vcc program that
+    // CALLS real glibc `printf`, linked against `libc.so.6` and run under the real `ld.so`),
+    // so the module now also imports `vulcan-target` and `vulcan-link`.
+    const cc_variadic = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("libs/vulcan-cc/tests/variadic.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "vulcan-cc", .module = vulcan_cc },
+            .{ .name = "vulcan-target", .module = vulcan_target },
+            .{ .name = "vulcan-ir", .module = vulcan_ir },
+            .{ .name = "vulcan-link", .module = vulcan_link },
+        },
+    }) });
+    test_step.dependOn(&b.addRunArtifact(cc_variadic).step);
+
+    // SM13 M3a Task 5 (CAPSTONE): VCC's own preprocessor - `SystemPredef` (Task 3) +
+    // `FsResolver` (Task 4) + the char-literal/`__has_*` (Task 1) and variadic-macro (Task 2)
+    // work underneath - reduces the REAL host glibc `#include <stdio.h>` chain to no-error.
+    // Only needs `vulcan-cc` itself (pure preprocessing, no lowering/codegen/linking).
+    const cc_preproc_glibc = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("libs/vulcan-cc/tests/preproc_glibc.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "vulcan-cc", .module = vulcan_cc },
+        },
+    }) });
+    test_step.dependOn(&b.addRunArtifact(cc_preproc_glibc).step);
 
     // JS backend execution tests: emit JS from IR, run it with Node.js, cross-check against
     // the native answer. Skips when no Node is found.
@@ -375,6 +530,24 @@ pub fn build(b: *std.Build) void {
     }) });
     test_step.dependOn(&b.addRunArtifact(microarch_e2e).step);
 
+    // SM10 P2c Task 4: runtime `-target` dispatch. For each of the 4 backends, emits
+    // an `int main(void){return 42;}` object via `native.writeObjectDataFor` (host-
+    // independent - the switch dispatches to that backend's own object writer
+    // regardless of which arch this test binary itself runs on), links + wraps it in
+    // a runnable ELF, and executes it: natively for aarch64, under qemu-<arch> for
+    // the other three (skips cleanly if that qemu isn't installed).
+    const cross_target = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("libs/vulcan-target/tests/cross_target.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "vulcan-ir", .module = vulcan_ir },
+            .{ .name = "vulcan-target", .module = vulcan_target },
+            .{ .name = "vulcan-link", .module = vulcan_link },
+        },
+    }) });
+    test_step.dependOn(&b.addRunArtifact(cross_target).step);
+
     // GLSL frontend tests: parsing/lowering (IR only), plus execution (GLSL -> IR ->
     // host JIT -> run) for scalar functions.
     const glsl_tests = b.addTest(.{ .root_module = vulcan_glsl });
@@ -391,6 +564,9 @@ pub fn build(b: *std.Build) void {
         },
     }) });
     test_step.dependOn(&b.addRunArtifact(glsl_exec).step);
+
+    const cc_tests = b.addTest(.{ .root_module = vulcan_cc });
+    test_step.dependOn(&b.addRunArtifact(cc_tests).step);
 
     // The freestanding object is a compile check too (no run), so `test` keeps the core
     // building for whatever target is selected.

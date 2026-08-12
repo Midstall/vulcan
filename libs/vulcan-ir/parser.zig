@@ -468,6 +468,9 @@ const FunctionParser = struct {
             try self.recordValue(result);
             return result;
         }
+        // TODO: is_variadic/num_fixed do not round-trip here yet. This arm and the
+        // void-call arm in parseVoidCall both build a plain, non-variadic call. Fix this
+        // before any variadic call is serialized, in bitcode, LTO, or text IR.
         if (std.mem.eql(u8, op, "call")) {
             self.skipWs();
             const ty = try self.parseType();
@@ -710,16 +713,28 @@ const FunctionParser = struct {
     fn parseRet(self: *FunctionParser, block: Block) Error!void {
         self.skipWs();
         if (self.peek() == 'v') {
-            // Could be `void` or a value reference `vN`.
+            // Could be `void` or a comma-separated value-reference list `vN, vM, ...`.
             if (std.mem.startsWith(u8, self.src[self.pos..], "void") and
                 (self.pos + 4 >= self.src.len or !isWordChar(self.src[self.pos + 4])))
             {
                 self.pos += 4;
-                self.func.setTerminator(block, .{ .ret = null });
+                self.func.setTerminator(block, .{ .ret = function.Ret.none() });
                 return;
             }
-            const value = try self.parseValueRef();
-            self.func.setTerminator(block, .{ .ret = value });
+            var values: [4]Value = undefined;
+            var count: usize = 0;
+            while (true) {
+                if (count >= values.len) return error.InvalidSyntax;
+                values[count] = try self.parseValueRef();
+                count += 1;
+                self.skipWs();
+                if (self.tryChar(',')) {
+                    self.skipWs();
+                    continue;
+                }
+                break;
+            }
+            self.func.setTerminator(block, .{ .ret = function.Ret.many(values[0..count]) });
             return;
         }
         return error.InvalidSyntax;

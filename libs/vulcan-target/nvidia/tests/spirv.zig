@@ -226,7 +226,7 @@ test "SASS: a lowered division compiles to a kernel (register reuse)" {
     const x = try func.appendBlockParam(b, t);
     const y = try func.appendBlockParam(b, t);
     const q = try func.appendInst(b, t, .{ .arith = .{ .op = .div, .lhs = x, .rhs = y } });
-    func.setTerminator(b, .{ .ret = q });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(q) });
 
     try std.testing.expect(try opt.lowerdiv.run(allocator, &func));
     var kernel = try isel.compileKernel(allocator, &func);

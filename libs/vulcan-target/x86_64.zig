@@ -24,6 +24,8 @@ const tests = struct {
     pub const f16_emulation = @import("x86_64/tests/f16.zig");
     pub const wimmer_diff = @import("x86_64/tests/wimmer_diff.zig");
     pub const addrfold = @import("x86_64/tests/addrfold.zig");
+    pub const link_native = @import("x86_64/tests/link_native.zig");
+    pub const dynamic = @import("x86_64/tests/dynamic.zig");
 };
 
 test {

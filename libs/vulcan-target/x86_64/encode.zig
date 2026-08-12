@@ -1,15 +1,16 @@
-//! x86-64 instruction encoding. Each encoder returns an `Inst` (byte buffer + length,
-//! x86 instructions are at most 15 bytes). Validated by execution under qemu-x86_64
-//! (tests/qemu.zig) plus the encoding tests here against known machine code.
+//! x86-64 instruction encoding. Each encoder returns an `Inst` (a byte buffer and a length).
+//! An x86 instruction is at most 15 bytes long. Tests validate the encoders in two ways:
+//! execution under qemu-x86_64 (tests/qemu.zig), and the encoding tests here, which check
+//! the output against known machine code.
 //!
-//! Encoding model (64-bit operand size): a REX prefix `0x48 | R | X | B` (W=1 for 64-bit,
-//! R/B extend the ModRM reg/rm fields to r8..r15), the opcode, then a register-direct
-//! ModRM byte `0xC0 | (reg<<3) | rm`.
+//! Encoding model for a 64-bit operand size: a REX prefix `0x48 | R | X | B` (W=1 selects
+//! 64-bit, R and B extend the ModRM reg and rm fields to r8..r15), then the opcode, then a
+//! register-direct ModRM byte `0xC0 | (reg<<3) | rm`.
 
 const std = @import("std");
 
-/// A 64-bit general register. The low 3 bits are the hardware encoding. r8..r15
-/// have bit 3 set and need a REX prefix bit.
+/// A 64-bit general register. The low 3 bits give the hardware encoding. r8..r15
+/// have bit 3 set, so they need a REX prefix bit.
 pub const Reg = enum(u4) {
     rax = 0,
     rcx = 1,
@@ -33,8 +34,8 @@ fn n(r: Reg) u8 {
     return @intFromEnum(r);
 }
 
-/// An SSE/AVX vector register (xmm0..xmm15). The same 0..15 index space as `Reg` but a
-/// separate physical register file, addressed by the SSE opcodes below.
+/// An SSE/AVX vector register (xmm0..xmm15). It uses the same 0..15 index space as `Reg`,
+/// but it is a separate physical register file. The SSE opcodes below address it.
 pub const Xmm = enum(u4) {
     xmm0 = 0,
     xmm1,
@@ -58,8 +59,8 @@ fn xn(x: Xmm) u8 {
     return @intFromEnum(x);
 }
 
-/// A two-xmm SSE op: `prefix` (F3/F2/66), `0F`, `op`, register-direct ModRM (reg = dst,
-/// rm = src). A REX byte is inserted only when an operand is xmm8..15.
+/// A two-xmm SSE op: `prefix` (F3/F2/66), `0F`, `op`, then a register-direct ModRM byte
+/// (reg = dst, rm = src). This inserts a REX byte only when an operand is xmm8..15.
 fn sseRR(prefix: u8, op: u8, dst: Xmm, src: Xmm) Inst {
     const r = xn(dst);
     const b = xn(src);
@@ -89,7 +90,7 @@ pub fn divss(dst: Xmm, src: Xmm) Inst {
     return sseRR(0xF3, 0x5E, dst, src);
 }
 
-/// A cross-file SSE op between an xmm `reg` field and a general `rm` field (e.g. movd).
+/// An SSE op between an xmm `reg` field and a general-register `rm` field, for example movd.
 fn sseXmmGpr(prefix: u8, op: u8, x: Xmm, g: Reg) Inst {
     const r = xn(x);
     const b = n(g);
@@ -113,8 +114,8 @@ pub fn movdFromXmm(dst: Reg, src: Xmm) Inst {
 pub fn cvtsi2ss(dst: Xmm, src: Reg) Inst {
     return sseXmmGpr(0xF3, 0x2A, dst, src);
 }
-/// `cvttss2si dst, src` (F3 0F 2C /r): convert (with truncation) a scalar single to a 32-bit
-/// signed integer in a general register. ModRM reg = the general dst, rm = the xmm src.
+/// `cvttss2si dst, src` (F3 0F 2C /r): convert a scalar single to a 32-bit signed integer in a
+/// general register, with truncation. ModRM reg is the general dst, rm is the xmm src.
 pub fn cvttss2si(dst: Reg, src: Xmm) Inst {
     const r = n(dst);
     const b = xn(src);
@@ -126,8 +127,8 @@ pub fn cvttss2si(dst: Reg, src: Xmm) Inst {
     return Inst.of(&.{ 0xF3, 0x0F, 0x2C, mod });
 }
 
-/// A two-xmm PACKED op with no mandatory prefix (`[REX] 0F op modrm`): the packed-single
-/// SSE forms addps/subps/mulps/divps and the packed move movups.
+/// A two-xmm packed op with no mandatory prefix (`[REX] 0F op modrm`). This covers the
+/// packed-single SSE forms addps/subps/mulps/divps and the packed move movups.
 fn ssePacked(op: u8, dst: Xmm, src: Xmm) Inst {
     const r = xn(dst);
     const b = xn(src);
@@ -156,7 +157,7 @@ pub fn movupsRR(dst: Xmm, src: Xmm) Inst {
     return ssePacked(0x10, dst, src);
 }
 /// Packed bitwise `andps`/`andnps`/`orps dst, src` (0F 54/55/56 /r). andnps computes
-/// `dst = (NOT dst) AND src`. All SSE1, so present on the x86-64 baseline.
+/// `dst = (NOT dst) AND src`. All three are SSE1, so every x86-64 CPU has them.
 pub fn andps(dst: Xmm, src: Xmm) Inst {
     return ssePacked(0x54, dst, src);
 }
@@ -166,8 +167,9 @@ pub fn andnps(dst: Xmm, src: Xmm) Inst {
 pub fn orps(dst: Xmm, src: Xmm) Inst {
     return ssePacked(0x56, dst, src);
 }
-/// Packed compare `cmpps dst, src, imm8` (0F C2 /r ib): per lane `dst = predicate(dst, src) ?
-/// all-ones : all-zero`. imm predicates: 0=EQ 1=LT 2=LE 4=NEQ 5=NLT 6=NLE (ordered 0/1/2/4).
+/// Packed compare `cmpps dst, src, imm8` (0F C2 /r ib). For each lane, `dst = predicate(dst,
+/// src) ? all-ones : all-zero`. imm selects the predicate: 0=EQ, 1=LT, 2=LE, 4=NEQ, 5=NLT,
+/// 6=NLE. Predicates 0, 1, 2, and 4 are ordered compares.
 pub fn cmpps(dst: Xmm, src: Xmm, imm: u8) Inst {
     const r = xn(dst);
     const b = xn(src);
@@ -179,14 +181,16 @@ pub fn cmpps(dst: Xmm, src: Xmm, imm: u8) Inst {
     return Inst.of(&.{ 0x0F, 0xC2, mod, imm });
 }
 
-// AVX (256-bit YMM) via the VEX prefix. AVX instructions are three-operand (dst = src1 op
-// src2) and 256 bits wide (VEX.L = 1). Always uses the 3-byte VEX (C4 ...) form so any of
-// ymm0..15 can appear in any operand. `vvvv` holds src1 in 1's-complement. For ops without
-// a src1 it is unused, encoded as register 0 (its inverted field then reads 1111).
+// AVX (256-bit YMM) uses the VEX prefix. An AVX instruction is three-operand (dst = src1 op
+// src2) and 256 bits wide (VEX.L = 1). The encoders here always use the 3-byte VEX (C4 ...)
+// form, so any of ymm0..15 can appear in any operand. `vvvv` holds src1 in 1's-complement
+// form. For an op with no src1, `vvvv` is unused: it is encoded as register 0, so its
+// inverted field reads 1111.
 
-/// 3-byte VEX, register-direct: ModRM.reg = `reg`, ModRM.rm = `rm`, VEX.vvvv = `vvvv`
-/// (register numbers, `vvvv` = 0 means unused). `pp` selects the implied prefix (00 none,
-/// 01 = 66, 10 = F3, 11 = F2), `mmmmm` the opcode map (00001 = 0F, 00011 = 0F3A).
+/// A 3-byte VEX prefix, register-direct: ModRM.reg = `reg`, ModRM.rm = `rm`, VEX.vvvv =
+/// `vvvv` (register numbers, `vvvv` = 0 means unused). `pp` selects the implied prefix (00 =
+/// none, 01 = 66, 10 = F3, 11 = F2). `mmmmm` selects the opcode map (00001 = 0F, 00011 =
+/// 0F3A).
 fn vex3(reg: u8, rm: u8, vvvv: u8, opcode: u8, pp: u2, mmmmm: u5, imm: ?u8) Inst {
     const not_r: u8 = (~(reg >> 3)) & 1;
     const not_b: u8 = (~(rm >> 3)) & 1;
@@ -198,7 +202,7 @@ fn vex3(reg: u8, rm: u8, vvvv: u8, opcode: u8, pp: u2, mmmmm: u5, imm: ?u8) Inst
     return Inst.of(&.{ 0xC4, byte2, byte3, opcode, mod });
 }
 
-/// A 256-bit packed-single AVX op (`dst = src1 op src2`): VEX.NDS.256.0F.WIG `op` /r.
+/// A 256-bit packed-single AVX op, `dst = src1 op src2`: VEX.NDS.256.0F.WIG `op` /r.
 fn vexPacked256(op: u8, dst: Xmm, src1: Xmm, src2: Xmm) Inst {
     return vex3(xn(dst), xn(src2), xn(src1), op, 0b00, 0b00001, null);
 }
@@ -214,23 +218,25 @@ pub fn vmulps(dst: Xmm, src1: Xmm, src2: Xmm) Inst {
 pub fn vdivps(dst: Xmm, src1: Xmm, src2: Xmm) Inst {
     return vexPacked256(0x5E, dst, src1, src2);
 }
-/// `vmovups ymm, ymm` (VEX.256.0F.WIG 10 /r): copy a whole 256-bit register (vvvv unused).
+/// `vmovups ymm, ymm` (VEX.256.0F.WIG 10 /r): copy a whole 256-bit register. vvvv is unused.
 pub fn vmovupsRR(dst: Xmm, src: Xmm) Inst {
     return vex3(xn(dst), xn(src), 0, 0x10, 0b00, 0b00001, null);
 }
 /// `vinsertf128 ymm1, ymm2, xmm3, imm8` (VEX.256.66.0F3A.W0 18 /r ib): put `src2`'s 128 bits
-/// into the half of `dst` chosen by `imm` (0 = low, 1 = high), the other half from `src1`.
+/// into the half of `dst` chosen by `imm` (0 = low, 1 = high). The other half comes from `src1`.
 pub fn vinsertf128(dst: Xmm, src1: Xmm, src2: Xmm, imm: u8) Inst {
     return vex3(xn(dst), xn(src2), xn(src1), 0x18, 0b01, 0b00011, imm);
 }
 /// `vextractf128 xmm1, ymm2, imm8` (VEX.256.66.0F3A.W0 19 /r ib): extract the 128-bit half
-/// of `src` selected by `imm` into `dst`. The store-form ModRM puts src in reg, dst in rm.
+/// of `src` chosen by `imm` into `dst`. This is a store-form op, so ModRM puts src in reg
+/// and dst in rm.
 pub fn vextractf128(dst: Xmm, src: Xmm, imm: u8) Inst {
     return vex3(xn(src), xn(dst), 0, 0x19, 0b01, 0b00011, imm);
 }
 
-/// A 256-bit `vmovups` to/from `[rsp+disp]` (VEX.256.0F.WIG `op`, ModRM mod=10 reg=x rm=SIB,
-/// SIB base=rsp, disp32): spill/reload a whole ymm. vvvv and the SIB index are unused.
+/// A 256-bit `vmovups` to or from `[rsp+disp]` (VEX.256.0F.WIG `op`, ModRM mod=10 reg=x
+/// rm=SIB, SIB base=rsp, disp32): spill or reload a whole ymm register. vvvv and the SIB
+/// index are unused.
 fn vexStack(op: u8, x: Xmm, disp: i32) Inst {
     const u: u32 = @bitCast(disp);
     const r = xn(x);
@@ -246,20 +252,20 @@ pub fn vmovupsLoad(dst: Xmm, disp: i32) Inst {
 pub fn vmovupsStore(disp: i32, src: Xmm) Inst {
     return vexStack(0x11, src, disp);
 }
-/// `ucomiss a, b` (0F 2E /r): unordered compare two scalar singles, setting ZF/PF/CF like
-/// an integer `cmp a, b` (PF marks an unordered/NaN result).
+/// `ucomiss a, b` (0F 2E /r): unordered compare of two scalar singles. It sets ZF, PF, and CF
+/// the same way an integer `cmp a, b` does. PF marks an unordered or NaN result.
 pub fn ucomiss(a: Xmm, b: Xmm) Inst {
     return ssePacked(0x2E, a, b);
 }
 
-// F16C (half<->single conversion). Both ops are VEX-only (there is NO legacy SSE encoding)
-// and operate on 128-bit registers, so they need the 3-byte VEX with L=0 rather than the
-// L=1 form the AVX helpers above use. `vex128` is that L=0 variant of `vex3`.
+// F16C converts between half and single precision. Both ops are VEX-only: there is no legacy
+// SSE encoding. Both operate on 128-bit registers, so they need the 3-byte VEX with L=0
+// rather than the L=1 form the AVX helpers above use. `vex128` is that L=0 variant of `vex3`.
 
-/// A 3-byte VEX (register-direct) at 128-bit width (VEX.L=0, VEX.W=0). Otherwise identical
-/// to `vex3`: ModRM.reg = `reg`, ModRM.rm = `rm`, VEX.vvvv = `vvvv` (0 means unused, encoded
-/// as 1111). `pp` selects the implied prefix (01 = 66), `mmmmm` the opcode map (00010 = 0F38,
-/// 00011 = 0F3A).
+/// A 3-byte VEX prefix, register-direct, at 128-bit width (VEX.L=0, VEX.W=0). Otherwise
+/// identical to `vex3`: ModRM.reg = `reg`, ModRM.rm = `rm`, VEX.vvvv = `vvvv` (0 means
+/// unused, encoded as 1111). `pp` selects the implied prefix (01 = 66). `mmmmm` selects the
+/// opcode map (00010 = 0F38, 00011 = 0F3A).
 fn vex128(reg: u8, rm: u8, vvvv: u8, opcode: u8, pp: u2, mmmmm: u5, imm: ?u8) Inst {
     const not_r: u8 = (~(reg >> 3)) & 1;
     const not_b: u8 = (~(rm >> 3)) & 1;
@@ -272,22 +278,24 @@ fn vex128(reg: u8, rm: u8, vvvv: u8, opcode: u8, pp: u2, mmmmm: u5, imm: ?u8) In
 }
 
 /// `vcvtph2ps dst, src` (VEX.128.66.0F38.W0 13 /r): widen the four packed IEEE halves in the
-/// low 64 bits of `src` to four packed f32 in `dst`. Lane 0 is the scalar half we hold; the
-/// other lanes widen harmlessly. Has no NDS operand, so vvvv is unused (1111).
+/// low 64 bits of `src` to four packed f32 values in `dst`. Lane 0 holds the scalar half. The
+/// other lanes widen with no ill effect. This has no NDS operand, so vvvv is unused (1111).
 pub fn vcvtph2ps(dst: Xmm, src: Xmm) Inst {
     return vex128(xn(dst), xn(src), 0, 0x13, 0b01, 0b00010, null);
 }
 
-/// `vcvtps2ph dst, src, imm8` (VEX.128.66.0F3A.W0 1D /r ib): narrow the four packed f32 in
-/// `src` to four packed IEEE halves in the low 64 bits of `dst` (zeroing dst[127:64]). This is
-/// a STORE-form op, so ModRM.reg is the SOURCE and ModRM.rm the DESTINATION. imm8 with bit2=0
-/// selects the rounding mode from bits1:0 (0 = round-to-nearest-even), NOT MXCSR.
+/// `vcvtps2ph dst, src, imm8` (VEX.128.66.0F3A.W0 1D /r ib): narrow the four packed f32
+/// values in `src` to four packed IEEE halves in the low 64 bits of `dst`, and zero
+/// dst[127:64]. This is a store-form op, so ModRM.reg is the source and ModRM.rm is the
+/// destination. When imm8 bit 2 is 0, bits 1:0 select the rounding mode directly (0 = round
+/// to nearest even). MXCSR is not used.
 pub fn vcvtps2ph(dst: Xmm, src: Xmm, imm: u8) Inst {
     return vex128(xn(src), xn(dst), 0, 0x1D, 0b01, 0b00011, imm);
 }
 
-// Double-precision (scalar f64) SSE2: the same encoders with an F2 prefix, plus the 64-bit
-// conversions, ucomisd (66 prefix), and the f32<->f64 conversions (xx 0F 5A).
+// Scalar double-precision (f64) SSE2 ops: the same encoders with an F2 prefix, plus the
+// 64-bit conversions, ucomisd (66 prefix), and the f32/f64 conversions in both directions
+// (xx 0F 5A).
 /// Scalar double-precision `addsd`/`subsd`/`mulsd`/`divsd dst, src` (F2 0F 58/5C/59/5E /r).
 pub fn addsd(dst: Xmm, src: Xmm) Inst {
     return sseRR(0xF2, 0x58, dst, src);
@@ -301,11 +309,12 @@ pub fn mulsd(dst: Xmm, src: Xmm) Inst {
 pub fn divsd(dst: Xmm, src: Xmm) Inst {
     return sseRR(0xF2, 0x5E, dst, src);
 }
-/// `ucomisd a, b` (66 0F 2E /r): the f64 unordered compare (flags like ucomiss).
+/// `ucomisd a, b` (66 0F 2E /r): the f64 unordered compare. It sets flags the same way
+/// ucomiss does.
 pub fn ucomisd(a: Xmm, b: Xmm) Inst {
     return sseRR(0x66, 0x2E, a, b);
 }
-/// `cvtss2sd dst, src` (F3 0F 5A) widens f32 to f64. `cvtsd2ss` (F2 0F 5A) narrows.
+/// `cvtss2sd dst, src` (F3 0F 5A) widens an f32 to an f64. `cvtsd2ss` (F2 0F 5A) narrows it back.
 pub fn cvtss2sd(dst: Xmm, src: Xmm) Inst {
     return sseRR(0xF3, 0x5A, dst, src);
 }
@@ -320,7 +329,7 @@ pub fn sqrtss(dst: Xmm, src: Xmm) Inst {
 pub fn sqrtsd(dst: Xmm, src: Xmm) Inst {
     return sseRR(0xF2, 0x51, dst, src);
 }
-/// Packed single-precision `sqrtps dst, src` (0F 51 /r): per-lane square root (SSE1).
+/// Packed single-precision `sqrtps dst, src` (0F 51 /r): a per-lane square root. This is SSE1.
 pub fn sqrtps(dst: Xmm, src: Xmm) Inst {
     return ssePacked(0x51, dst, src);
 }
@@ -357,7 +366,8 @@ pub fn roundsd(dst: Xmm, src: Xmm, imm: u8) Inst {
     }
     return Inst.of(&.{ 0x66, 0x0F, 0x3A, 0x0B, mod, imm });
 }
-/// `cvtsi2sd dst, src` (F2 0F 2A /r): 32-bit signed int in a gpr to a scalar double.
+/// `cvtsi2sd dst, src` (F2 0F 2A /r): convert a 32-bit signed int in a general register to
+/// a scalar double.
 pub fn cvtsi2sd(dst: Xmm, src: Reg) Inst {
     return sseXmmGpr(0xF2, 0x2A, dst, src);
 }
@@ -372,8 +382,9 @@ pub fn cvttsd2si(dst: Reg, src: Xmm) Inst {
     }
     return Inst.of(&.{ 0xF2, 0x0F, 0x2C, mod });
 }
-/// `movq dst, src`: copy all 64 bits between a general register and an xmm low lane (66 REX.W
-/// 0F 6E to load, 66 REX.W 0F 7E to read out). Used to materialize an f64 constant.
+/// `movq dst, src`: copy all 64 bits between a general register and an xmm register's low
+/// lane (66 REX.W 0F 6E to load, 66 REX.W 0F 7E to read out). This materializes an f64
+/// constant.
 fn movqXmmGpr(op: u8, x: Xmm, g: Reg) Inst {
     const r = xn(x);
     const b = n(g);
@@ -403,7 +414,8 @@ pub fn movImm64(dst: Reg, imm: u64) Inst {
 }
 
 /// `insertps dst, src, imm8` (66 0F 3A 21 /r ib): insert a lane of `src` into `dst`. With
-/// imm = lane<<4 this copies src's lane 0 into dst's lane `lane` (src-lane and zero-mask 0).
+/// imm = lane<<4, this copies src's lane 0 into dst's lane `lane` (src-lane and zero-mask
+/// both 0).
 pub fn insertps(dst: Xmm, src: Xmm, imm: u8) Inst {
     const r = xn(dst);
     const b = xn(src);
@@ -414,8 +426,8 @@ pub fn insertps(dst: Xmm, src: Xmm, imm: u8) Inst {
     }
     return Inst.of(&.{ 0x66, 0x0F, 0x3A, 0x21, mod, imm });
 }
-/// `pshufd dst, src, imm8` (66 0F 70 /r ib): shuffle 32-bit lanes. With imm = lane this puts
-/// src's lane `lane` into dst's lane 0 (used to extract a lane to a scalar position).
+/// `pshufd dst, src, imm8` (66 0F 70 /r ib): shuffle 32-bit lanes. With imm = lane, this puts
+/// src's lane `lane` into dst's lane 0. This extracts a lane to a scalar position.
 pub fn pshufd(dst: Xmm, src: Xmm, imm: u8) Inst {
     const r = xn(dst);
     const b = xn(src);
@@ -442,16 +454,17 @@ pub const Inst = struct {
     }
 };
 
-/// REX prefix for a 64-bit op with ModRM `reg` and `rm` register operands.
+/// The REX prefix for a 64-bit op with ModRM `reg` and `rm` register operands.
 fn rexW(reg: Reg, rm: Reg) u8 {
     return 0x48 | (@as(u8, @intFromBool(n(reg) >= 8)) << 2) | @intFromBool(n(rm) >= 8);
 }
 
 /// The REX prefix for a two-register op at the requested operand size, or null when none is
-/// needed. `w` = true selects 64-bit operand size (REX.W). At 32-bit operand size a REX.B/REX.R
-/// is still required to name r8..r15, so a REX with W=0 is emitted then. When neither applies
-/// (32-bit and both operands are rax..rdi), no REX byte is emitted at all: a bare 0x40 is legal
-/// but non-canonical, and omitting it keeps the 32-bit encodings minimal.
+/// needed. `w` = true selects a 64-bit operand size (REX.W). At a 32-bit operand size, a
+/// REX.B or REX.R bit is still needed to name r8..r15, so this emits a REX with W=0 then.
+/// When neither applies (32-bit, and both operands are rax..rdi), it emits no REX byte at
+/// all. A bare 0x40 is legal but non-canonical, and omitting it keeps the 32-bit encodings
+/// small.
 fn rexRR(reg: Reg, rm: Reg, w: bool) ?u8 {
     const ext: u8 = (@as(u8, @intFromBool(n(reg) >= 8)) << 2) | @intFromBool(n(rm) >= 8);
     if (w) return 0x48 | ext;
@@ -459,24 +472,25 @@ fn rexRR(reg: Reg, rm: Reg, w: bool) ?u8 {
     return null;
 }
 
-/// Register-direct ModRM byte (mod = 11).
+/// A register-direct ModRM byte (mod = 11).
 fn modrm(reg: Reg, rm: Reg) u8 {
     return 0xC0 | ((n(reg) & 7) << 3) | (n(rm) & 7);
 }
 
-/// A two-register ALU op: `opcode` with `reg` as the source and `rm` as the destination (the
-/// `/r` form, e.g. ADD/SUB/MOV r/m, r). `w` picks the operand size: true = 64-bit (REX.W),
-/// false = 32-bit. A 32-bit op auto-zeroes the upper 32 bits of its destination register, so
-/// i32/i16/i8 values stay clean and every downstream width-sensitive op reads the right value.
+/// A two-register ALU op: `opcode` with `reg` as the source and `rm` as the destination. This
+/// is the `/r` form, for example ADD/SUB/MOV r/m, r. `w` picks the operand size: true selects
+/// 64-bit (REX.W), false selects 32-bit. A 32-bit op auto-zeroes the upper 32 bits of its
+/// destination register, so an i32, i16, or i8 value stays clean, and every later
+/// width-sensitive op reads the correct value.
 fn aluRR(opcode: u8, src: Reg, dst: Reg, w: bool) Inst {
     if (rexRR(src, dst, w)) |rex| return Inst.of(&.{ rex, opcode, modrm(src, dst) });
     return Inst.of(&.{ opcode, modrm(src, dst) });
 }
 
-/// `mov dst, imm` loading an immediate. `w` = true is `mov r64, imm32` (REX.W C7 /0), which
-/// SIGN-extends the imm32 to 64 bits. `w` = false is `mov r32, imm32` (B8+rd id), which
-/// ZERO-extends into the full 64-bit register, keeping a <=32-bit result clean in its upper
-/// half. No REX is emitted for a 32-bit mov to rax..rdi.
+/// `mov dst, imm` loads an immediate. `w` = true selects `mov r64, imm32` (REX.W C7 /0), which
+/// sign-extends the imm32 to 64 bits. `w` = false selects `mov r32, imm32` (B8+rd id), which
+/// zero-extends into the full 64-bit register, so a result of 32 bits or fewer stays clean in
+/// its upper half. This emits no REX for a 32-bit mov to rax..rdi.
 pub fn movImm(dst: Reg, imm: i32, w: bool) Inst {
     const u: u32 = @bitCast(imm);
     if (w) return Inst.of(&.{
@@ -488,7 +502,7 @@ pub fn movImm(dst: Reg, imm: i32, w: bool) Inst {
         @truncate(u >> 16),
         @truncate(u >> 24),
     });
-    // 32-bit `mov r32, imm32`: zero-extends. r8..r15 need REX.B (W=0), rax..rdi need none.
+    // A 32-bit `mov r32, imm32` zero-extends. r8..r15 need REX.B (W=0). rax..rdi need no REX.
     if (n(dst) >= 8) return Inst.of(&.{
         0x41,
         0xB8 | (n(dst) & 7),
@@ -506,9 +520,19 @@ pub fn movImm(dst: Reg, imm: i32, w: bool) Inst {
     });
 }
 
-/// `mov dst, src` (89 /r: store the reg operand into the r/m operand). Always 64-bit: a plain
-/// register copy is width-agnostic (a clean i32 stays clean, a dirty upper half is cleaned by
-/// the next width-sensitive op that reads it), so this stays REX.W for byte-identical moves.
+/// `mov al, imm8` (B0 ib): set AL to `imm`. The System V variadic-call convention requires AL
+/// to hold the number of vector (xmm) registers used to pass arguments, so a variadic callee
+/// such as `printf` knows how many xmm registers to spill into its register save area. This
+/// is a 2-byte form that touches only AL, the low byte of RAX. RAX is caller-saved and holds
+/// no argument here.
+pub fn movAlImm(imm: u8) Inst {
+    return Inst.of(&.{ 0xB0, imm });
+}
+
+/// `mov dst, src` (89 /r: store the reg operand into the r/m operand). This is always 64-bit.
+/// A plain register copy does not depend on width: a clean i32 stays clean, and the next
+/// width-sensitive op that reads a dirty upper half cleans it. So this always uses REX.W, to
+/// keep every move byte-identical.
 pub fn movReg(dst: Reg, src: Reg) Inst {
     return aluRR(0x89, src, dst, true);
 }
@@ -538,16 +562,16 @@ pub fn xorr(dst: Reg, src: Reg, w: bool) Inst {
     return aluRR(0x31, src, dst, w);
 }
 
-/// `imul dst, src` (0F AF /r: dst = dst * src). Two-operand signed multiply. `w` picks the
-/// operand size (a 32-bit imul zero-extends its 32-bit product into the destination).
+/// `imul dst, src` (0F AF /r: dst = dst * src). A two-operand signed multiply. `w` picks the
+/// operand size. A 32-bit imul zero-extends its 32-bit product into the destination.
 pub fn imul(dst: Reg, src: Reg, w: bool) Inst {
     if (rexRR(dst, src, w)) |rex| return Inst.of(&.{ rex, 0x0F, 0xAF, modrm(dst, src) });
     return Inst.of(&.{ 0x0F, 0xAF, modrm(dst, src) });
 }
 
 /// The optional REX prefix for a single-register op at operand size `w`, given whether that
-/// register is r8..r15 (`ext`). true = 64-bit (REX.W), false = 32-bit (REX.B only if extended,
-/// otherwise no REX at all so the encoding stays minimal).
+/// register is r8..r15 (`ext`). `w` = true selects 64-bit (REX.W). `w` = false selects 32-bit:
+/// REX.B only if `ext` is true, otherwise no REX at all, so the encoding stays small.
 fn rexOne(ext: bool, w: bool) ?u8 {
     if (w) return 0x48 | @as(u8, @intFromBool(ext));
     if (ext) return 0x41; // REX.B, W=0
@@ -555,7 +579,7 @@ fn rexOne(ext: bool, w: bool) ?u8 {
 }
 
 /// An ALU op against a 32-bit immediate (81 /digit id): ADD=/0, OR=/1, AND=/4, SUB=/5,
-/// XOR=/6. `w` picks the operand size (REX.W for 64-bit, none/REX.B for 32-bit).
+/// XOR=/6. `w` picks the operand size: REX.W for 64-bit, no REX or REX.B for 32-bit.
 pub fn aluImm(digit: u3, dst: Reg, imm: i32, w: bool) Inst {
     const u: u32 = @bitCast(imm);
     const mrm: u8 = 0xC0 | (@as(u8, digit) << 3) | (n(dst) & 7);
@@ -563,8 +587,8 @@ pub fn aluImm(digit: u3, dst: Reg, imm: i32, w: bool) Inst {
     return Inst.of(&.{ 0x81, mrm, @truncate(u), @truncate(u >> 8), @truncate(u >> 16), @truncate(u >> 24) });
 }
 
-/// `imul dst, src, imm32` (69 /r id): dst = src * imm (three-operand). `w` picks the operand
-/// size.
+/// `imul dst, src, imm32` (69 /r id): dst = src * imm. This is the three-operand form. `w`
+/// picks the operand size.
 pub fn imulImm(dst: Reg, src: Reg, imm: i32, w: bool) Inst {
     const u: u32 = @bitCast(imm);
     const mrm = modrm(dst, src);
@@ -572,44 +596,44 @@ pub fn imulImm(dst: Reg, src: Reg, imm: i32, w: bool) Inst {
     return Inst.of(&.{ 0x69, mrm, @truncate(u), @truncate(u >> 8), @truncate(u >> 16), @truncate(u >> 24) });
 }
 
-/// A shift of `dst` by an immediate count (C1 /digit ib): SHL=/4, SHR=/5, SAR=/7. `w` picks the
-/// operand size: a 32-bit shr/sar shifts within 32 bits (filling from bit 31), which is what an
-/// i32 needs, where a 64-bit shift would cross bit 31/32.
+/// A shift of `dst` by an immediate count (C1 /digit ib): SHL=/4, SHR=/5, SAR=/7. `w` picks
+/// the operand size. A 32-bit shr/sar shifts within 32 bits, filling from bit 31. An i32
+/// needs this, since a 64-bit shift would cross the bit 31/32 boundary.
 pub fn shiftImm(digit: u3, dst: Reg, imm8: u8, w: bool) Inst {
     const mrm: u8 = 0xC0 | (@as(u8, digit) << 3) | (n(dst) & 7);
     if (rexOne(n(dst) >= 8, w)) |rex| return Inst.of(&.{ rex, 0xC1, mrm, imm8 });
     return Inst.of(&.{ 0xC1, mrm, imm8 });
 }
 
-/// `cqo` (REX.W 99): sign-extend RAX into RDX:RAX (the 64-bit dividend for `idiv`).
+/// `cqo` (REX.W 99): sign-extend RAX into RDX:RAX, the 64-bit dividend for `idiv`.
 pub fn cqo() Inst {
     return Inst.of(&.{ 0x48, 0x99 });
 }
 
-/// `cdq` (99, no REX.W): sign-extend EAX into EDX:EAX (the 32-bit dividend for a 32-bit `idiv`).
+/// `cdq` (99, no REX.W): sign-extend EAX into EDX:EAX, the 32-bit dividend for a 32-bit `idiv`.
 pub fn cdq() Inst {
     return Inst.of(&.{0x99});
 }
 
-/// `idiv src` (F7 /7): signed divide (RDX:RAX or EDX:EAX by `src`), quotient -> (R/E)AX,
-/// remainder -> (R/E)DX. `src` must not be RAX or RDX. `w` picks the operand size.
+/// `idiv src` (F7 /7): a signed divide of RDX:RAX or EDX:EAX by `src`. The quotient goes to
+/// (R/E)AX, the remainder to (R/E)DX. `src` must not be RAX or RDX. `w` picks the operand size.
 pub fn idiv(src: Reg, w: bool) Inst {
     const mrm: u8 = 0xC0 | (7 << 3) | (n(src) & 7);
     if (rexOne(n(src) >= 8, w)) |rex| return Inst.of(&.{ rex, 0xF7, mrm });
     return Inst.of(&.{ 0xF7, mrm });
 }
 
-/// `div src` (F7 /6): unsigned divide (RDX:RAX or EDX:EAX by `src`, clear the high half first).
-/// `w` picks the operand size: a 32-bit div reads only EAX (the low 32 bits) as the dividend, so
-/// a dirty upper half of RAX is correctly ignored.
+/// `div src` (F7 /6): an unsigned divide of RDX:RAX or EDX:EAX by `src`. Clear the high half
+/// first. `w` picks the operand size. A 32-bit div reads only EAX, the low 32 bits, as the
+/// dividend, so it correctly ignores a dirty upper half of RAX.
 pub fn divu(src: Reg, w: bool) Inst {
     const mrm: u8 = 0xC0 | (6 << 3) | (n(src) & 7);
     if (rexOne(n(src) >= 8, w)) |rex| return Inst.of(&.{ rex, 0xF7, mrm });
     return Inst.of(&.{ 0xF7, mrm });
 }
 
-/// A shift of `dst` by the count in CL (D3 /digit). `shl` = /4, `shr` = /5 (logical), `sar` =
-/// /7 (arithmetic). `w` picks the operand size.
+/// A shift of `dst` by the count held in CL (D3 /digit). `shl` = /4. `shr` = /5, a logical
+/// shift. `sar` = /7, an arithmetic shift. `w` picks the operand size.
 fn shiftCl(digit: u8, dst: Reg, w: bool) Inst {
     const mrm: u8 = 0xC0 | (digit << 3) | (n(dst) & 7);
     if (rexOne(n(dst) >= 8, w)) |rex| return Inst.of(&.{ rex, 0xD3, mrm });
@@ -625,19 +649,27 @@ pub fn sarCl(dst: Reg, w: bool) Inst {
     return shiftCl(7, dst, w);
 }
 
-/// `cmp a, b` (39 /r): compute `a - b` and set flags (operands unchanged). `w` picks the
-/// operand size, so an i32 compare sets flags from the low 32 bits only.
+/// `cmp a, b` (39 /r): compute `a - b` and set flags, without changing the operands. `w`
+/// picks the operand size, so an i32 compare sets flags from the low 32 bits only.
 pub fn cmp(a: Reg, b: Reg, w: bool) Inst {
     return aluRR(0x39, b, a, w);
 }
 
-/// `test a, b` (85 /r): compute `a & b` and set flags. `test r, r` tests for zero. `w` picks
-/// the operand size.
+/// `test a, b` (85 /r): compute `a & b` and set flags. `test r, r` tests whether `r` is zero.
+/// `w` picks the operand size.
 pub fn testReg(a: Reg, b: Reg, w: bool) Inst {
     return aluRR(0x85, b, a, w);
 }
 
-/// A condition code (the low nibble of the Jcc/SETcc opcode).
+/// `test al, al` (84 C0): set flags from the low byte of RAX only. The System V variadic
+/// prologue decides whether to save xmm registers based on AL, the count of vector registers
+/// the caller used. So it must test exactly AL, not EAX. The `mov al, imm8` caller convention
+/// leaves EAX's upper bytes dirty.
+pub fn testAlAl() Inst {
+    return Inst.of(&.{ 0x84, 0xC0 });
+}
+
+/// A condition code: the low nibble of the Jcc/SETcc opcode.
 pub const Cond = enum(u8) {
     e = 0x4, // equal / zero
     ne = 0x5, // not equal
@@ -649,14 +681,14 @@ pub const Cond = enum(u8) {
     ae = 0x3, // unsigned >=
     be = 0x6, // unsigned <=
     a = 0x7, // unsigned >
-    p = 0xA, // parity (an unordered/NaN float compare)
-    np = 0xB, // not parity (an ordered float compare)
+    p = 0xA, // parity: an unordered or NaN float compare
+    np = 0xB, // not parity: an ordered float compare
 };
 
-/// The logical inverse of a condition. In the x86 condition-code encoding bit 0 toggles the
-/// sense, so the inverse is the paired code: e<->ne, l<->ge, le<->g, b<->ae, be<->a, p<->np.
-/// Used to fall through the ELSE edge of an `if` by branching to the else label on the inverted
-/// predicate (jnz becomes jz). Exhaustive over `Cond` so a newly added condition forces a
+/// The logical inverse of a condition. In the x86 condition-code encoding, bit 0 toggles the
+/// sense, so the inverse is the paired code: e/ne, l/ge, le/g, b/ae, be/a, p/np. This lets an
+/// `if` fall through the else edge, by branching to the else label on the inverted predicate
+/// (jnz becomes jz). The switch covers every `Cond`, so a newly added condition forces a
 /// matching inverse here.
 pub fn invertCond(cond: Cond) Cond {
     return switch (cond) {
@@ -680,9 +712,9 @@ pub fn cmovcc(dst: Reg, src: Reg, cond: Cond) Inst {
     return Inst.of(&.{ rexW(dst, src), 0x0F, 0x40 | @intFromEnum(cond), modrm(dst, src) });
 }
 
-/// `setcc dst8` (0F 90+cc): set the low byte of `dst` to 0/1 from the flags. A REX
-/// prefix is always emitted so the low byte (spl/sil/... for regs 4..7, r8b.. for
-/// 8..15) is addressed, never the legacy ah/ch/dh/bh.
+/// `setcc dst8` (0F 90+cc): set the low byte of `dst` to 0 or 1 from the flags. This always
+/// emits a REX prefix, so the encoding addresses the low byte (spl/sil/... for regs 4..7,
+/// r8b.. for 8..15), and never the legacy ah/ch/dh/bh.
 pub fn setcc(dst: Reg, cond: Cond) Inst {
     return Inst.of(&.{ 0x40 | @as(u8, @intFromBool(n(dst) >= 8)), 0x0F, 0x90 | @intFromEnum(cond), 0xC0 | (n(dst) & 7) });
 }
@@ -692,7 +724,40 @@ pub fn movzxByte(dst: Reg, src: Reg) Inst {
     return Inst.of(&.{ rexW(dst, src), 0x0F, 0xB6, modrm(dst, src) });
 }
 
-/// `jcc rel32` (0F 80+cc cd): branch when the condition holds. `rel` is from the
+/// `movsx dst, src8` (REX.W 0F BE /r): sign-extend `src`'s low byte into the full 64-bit `dst`.
+pub fn movsxByte(dst: Reg, src: Reg) Inst {
+    return Inst.of(&.{ rexW(dst, src), 0x0F, 0xBE, modrm(dst, src) });
+}
+
+/// `movzx dst, src16` (REX.W 0F B7 /r): zero-extend `src`'s low word into the full 64-bit `dst`.
+pub fn movzxWord(dst: Reg, src: Reg) Inst {
+    return Inst.of(&.{ rexW(dst, src), 0x0F, 0xB7, modrm(dst, src) });
+}
+
+/// `movsx dst, src16` (REX.W 0F BF /r): sign-extend `src`'s low word into the full 64-bit `dst`.
+pub fn movsxWord(dst: Reg, src: Reg) Inst {
+    return Inst.of(&.{ rexW(dst, src), 0x0F, 0xBF, modrm(dst, src) });
+}
+
+/// `movsxd dst, src32` (REX.W 63 /r): sign-extend `src`'s low 32 bits into the full 64-bit
+/// `dst`. This is the register-to-register counterpart of `movsxdFromMem`. It is needed
+/// because a 32-bit ALU result auto-zero-extends into its 64-bit register (an architectural
+/// rule), which is wrong for a signed widening convert. A negative i32 must sign-extend, not
+/// zero-extend, into an i64.
+pub fn movsxdReg(dst: Reg, src: Reg) Inst {
+    return Inst.of(&.{ rexW(dst, src), 0x63, modrm(dst, src) });
+}
+
+/// `mov dst32, src32` (89 /r, no REX.W): a 32-bit register copy. Unlike `movReg`, which
+/// always uses REX.W, this only touches the low 32 bits. The architectural 32-bit-write side
+/// effect zero-extends the upper 32 bits of `dst`, regardless of what `src`'s upper half
+/// held. That is the correct unsigned 32-to-64 widening convert, independent of whether
+/// `src` was already clean.
+pub fn movReg32(dst: Reg, src: Reg) Inst {
+    return aluRR(0x89, src, dst, false);
+}
+
+/// `jcc rel32` (0F 80+cc cd): branch when the condition holds. `rel` is measured from the
 /// end of the instruction.
 pub fn jcc(cond: Cond, rel: i32) Inst {
     const u: u32 = @bitCast(rel);
@@ -705,8 +770,8 @@ pub fn jmp(rel: i32) Inst {
     return Inst.of(&.{ 0xE9, @truncate(u), @truncate(u >> 8), @truncate(u >> 16), @truncate(u >> 24) });
 }
 
-/// `mov dst, [rsp + disp32]` (REX.W 8B /r): load a stack slot (the RSP base needs a
-/// SIB byte, 0x24).
+/// `mov dst, [rsp + disp32]` (REX.W 8B /r): load a stack slot. The RSP base needs a
+/// SIB byte, 0x24.
 pub fn movFromStack(dst: Reg, disp: i32) Inst {
     const u: u32 = @bitCast(disp);
     return Inst.of(&.{ rexW(dst, .rax), 0x8B, 0x84 | ((n(dst) & 7) << 3), 0x24, @truncate(u), @truncate(u >> 8), @truncate(u >> 16), @truncate(u >> 24) });
@@ -718,8 +783,9 @@ pub fn movToStack(disp: i32, src: Reg) Inst {
     return Inst.of(&.{ rexW(src, .rax), 0x89, 0x84 | ((n(src) & 7) << 3), 0x24, @truncate(u), @truncate(u >> 8), @truncate(u >> 16), @truncate(u >> 24) });
 }
 
-/// An SSE load/store to `[rsp + disp32]` (the RSP base needs the 0x24 SIB byte). `prefix`
-/// null = packed (movups), 0xF3 = scalar single (movss). REX.R is added for xmm8..15.
+/// An SSE load or store to `[rsp + disp32]`. The RSP base needs the 0x24 SIB byte. `prefix`
+/// null selects packed (movups), 0xF3 selects scalar single (movss). REX.R is added for
+/// xmm8..15.
 fn sseStack(prefix: ?u8, op: u8, x: Xmm, disp: i32) Inst {
     const u: u32 = @bitCast(disp);
     const r = xn(x);
@@ -750,6 +816,12 @@ pub fn movssLoad(dst: Xmm, disp: i32) Inst {
 pub fn movssStore(disp: i32, src: Xmm) Inst {
     return sseStack(0xF3, 0x11, src, disp);
 }
+/// `movsd [rsp+disp], xmm` (F2 0F 11): spill a scalar double (exactly 8 bytes, unlike the
+/// 16-byte `movups`). This stores a `double` struct-return eightbyte without overwriting the
+/// eight bytes past it.
+pub fn movsdStore(disp: i32, src: Xmm) Inst {
+    return sseStack(0xF2, 0x11, src, disp);
+}
 /// `movups xmm, [rsp+disp]` / `movups [rsp+disp], xmm` (0F 10 / 11): reload/spill a vector.
 pub fn movupsLoad(dst: Xmm, disp: i32) Inst {
     return sseStack(null, 0x10, dst, disp);
@@ -757,11 +829,18 @@ pub fn movupsLoad(dst: Xmm, disp: i32) Inst {
 pub fn movupsStore(disp: i32, src: Xmm) Inst {
     return sseStack(null, 0x11, src, disp);
 }
+/// `movaps [rsp+disp], xmm` (0F 29 /r): store an aligned 16-byte SSE register. The System V
+/// variadic prologue uses this for the register-save-area xmm block. The save area sits at a
+/// 16-byte-aligned frame offset, so the aligned form is safe. REX.R is added for xmm8..15.
+pub fn movapsStore(disp: i32, src: Xmm) Inst {
+    return sseStack(null, 0x29, src, disp);
+}
 
-/// A general `mov` to/from `[base + disp32]` with an ARBITRARY base register (mod=10,
-/// disp32). The data register is the ModRM `reg` field, the base the `rm` field. A base
-/// of rsp(4)/r12 needs the 0x24 SIB byte, and rm=rbp(5) is fine at mod=10 (disp32 explicit).
-/// `op` is 0x8B for a load (mov r, [base+disp]) or 0x89 for a store (mov [base+disp], r).
+/// A general `mov` to or from `[base + disp32]` with an arbitrary base register (mod=10,
+/// disp32). The data register is the ModRM `reg` field, the base is the `rm` field. A base
+/// of rsp(4) or r12 needs the 0x24 SIB byte. rm=rbp(5) is fine at mod=10, since disp32 is
+/// explicit. `op` is 0x8B for a load (mov r, [base+disp]) or 0x89 for a store (mov
+/// [base+disp], r).
 fn movMem(op: u8, data: Reg, base: Reg, disp: i32) Inst {
     const u: u32 = @bitCast(disp);
     const r = n(data);
@@ -781,7 +860,7 @@ pub fn movFromMem(dst: Reg, base: Reg, disp: i32) Inst {
 pub fn movToMem(base: Reg, disp: i32, src: Reg) Inst {
     return movMem(0x89, src, base, disp);
 }
-/// A memory mov without REX.W (32-bit operand): reads/writes 4 bytes. A 32-bit load
+/// A memory mov without REX.W, a 32-bit operand: reads or writes 4 bytes. A 32-bit load
 /// zero-extends into the full 64-bit register.
 fn movMem32(op: u8, data: Reg, base: Reg, disp: i32) Inst {
     const u: u32 = @bitCast(disp);
@@ -824,10 +903,53 @@ pub fn movsxdFromMem(dst: Reg, base: Reg, disp: i32) Inst {
     return movMem(0x63, dst, base, disp);
 }
 
-/// `movzx dst, word ptr [base+disp32]` (0F B7 /r): load 16 bits, zero-extended into the 32-bit
-/// (and thus the full 64-bit) register. Used to bring an IEEE half out of memory before it is
-/// widened to f32. A base of rsp/r12 (rm low bits = 100) needs the 0x24 SIB byte; r8..15 base
-/// or dst needs a REX bit.
+/// `add dst, qword [base+disp32]` (REX.W 03 /r): add the 64-bit value at `[base+disp]` into
+/// `dst`. The `va_arg` expansion uses this to compute `p = reg_save_area + offset` in one op.
+/// The offset, already in `dst`, and the save-area base, in memory, need no third register.
+pub fn addRegMem(dst: Reg, base: Reg, disp: i32) Inst {
+    return movMem(0x03, dst, base, disp);
+}
+
+/// An ALU op with an 8-bit sign-extended immediate against a memory operand `[base+disp32]`
+/// (83 /digit ib): ADD=/0, SUB=/5, and so on. `w` picks the operand size, REX.W for a 64-bit
+/// memory location, else 32-bit. The `va_arg` expansion uses this to bump a `va_list` offset
+/// field in place (`add dword [list], 8`, `add qword [list+8], 8`) with no register at all. A
+/// base of rsp/r12 needs the 0x24 SIB byte, and r8..15 needs REX.B.
+pub fn aluMemImm8(digit: u3, base: Reg, disp: i32, imm8: i8, w: bool) Inst {
+    const u: u32 = @bitCast(disp);
+    const b = n(base);
+    const modrm_byte: u8 = 0x80 | (@as(u8, digit) << 3) | (b & 7); // mod=10, reg=digit, rm=base
+    const need_rex = w or b >= 8;
+    const rex: u8 = 0x40 | (@as(u8, @intFromBool(w)) << 3) | @intFromBool(b >= 8);
+    const sib = (b & 7) == 4; // rsp/r12 base needs a SIB byte
+    var buf: [9]u8 = undefined;
+    var i: usize = 0;
+    if (need_rex) {
+        buf[i] = rex;
+        i += 1;
+    }
+    buf[i] = 0x83;
+    i += 1;
+    buf[i] = modrm_byte;
+    i += 1;
+    if (sib) {
+        buf[i] = 0x24;
+        i += 1;
+    }
+    buf[i] = @truncate(u);
+    buf[i + 1] = @truncate(u >> 8);
+    buf[i + 2] = @truncate(u >> 16);
+    buf[i + 3] = @truncate(u >> 24);
+    i += 4;
+    buf[i] = @bitCast(imm8);
+    i += 1;
+    return Inst.of(buf[0..i]);
+}
+
+/// `movzx dst, word ptr [base+disp32]` (0F B7 /r): load 16 bits, zero-extended into the
+/// 32-bit register (and so into the full 64-bit register). This brings an IEEE half out of
+/// memory before it is widened to f32. A base of rsp/r12 (rm low bits = 100) needs the 0x24
+/// SIB byte. An r8..15 base or dst needs a REX bit.
 pub fn movzxWordFromMem(dst: Reg, base: Reg, disp: i32) Inst {
     const u: u32 = @bitCast(disp);
     const r = n(dst);
@@ -858,8 +980,8 @@ pub fn movzxWordFromMem(dst: Reg, base: Reg, disp: i32) Inst {
 }
 
 /// `mov word ptr [base+disp32], src` (66 89 /r): store the low 16 bits of `src`. The 66
-/// operand-size prefix (before any REX) makes it a 16-bit store, so exactly 2 bytes are
-/// written (an IEEE half). A base of rsp/r12 needs the 0x24 SIB byte; r8..15 needs a REX bit.
+/// operand-size prefix, before any REX, makes this a 16-bit store, so it writes exactly 2
+/// bytes, an IEEE half. A base of rsp/r12 needs the 0x24 SIB byte. r8..15 needs a REX bit.
 pub fn movToMem16(base: Reg, disp: i32, src: Reg) Inst {
     const u: u32 = @bitCast(disp);
     const r = n(src);
@@ -890,17 +1012,17 @@ pub fn movToMem16(base: Reg, disp: i32, src: Reg) Inst {
     return Inst.of(buf[0 .. i + 4]);
 }
 
-/// `mov byte ptr [base+disp32], src` (88 /r): store the low 8 bits of `src` (exactly 1 byte).
-/// A REX prefix is emitted whenever the source names one of spl/bpl/sil/dil (register index
-/// 4..7) so the low byte is addressed rather than the legacy ah/ch/dh/bh, and also for any
-/// r8..15 source or base. A base of rsp/r12 needs the 0x24 SIB byte.
+/// `mov byte ptr [base+disp32], src` (88 /r): store the low 8 bits of `src`, exactly 1 byte.
+/// This emits a REX prefix whenever the source names one of spl/bpl/sil/dil (register index
+/// 4..7), so the encoding addresses the low byte rather than the legacy ah/ch/dh/bh, and also
+/// for any r8..15 source or base. A base of rsp/r12 needs the 0x24 SIB byte.
 pub fn movToMem8(base: Reg, disp: i32, src: Reg) Inst {
     const u: u32 = @bitCast(disp);
     const r = n(src);
     const b = n(base);
     const modrm_byte: u8 = 0x80 | ((r & 7) << 3) | (b & 7); // mod=10 (disp32), reg=src, rm=base
-    // Any source register index >= 4 needs a REX prefix to select spl/bpl/sil/dil/r8b..r15b as
-    // an 8-bit operand (without REX, indices 4..7 mean ah/ch/dh/bh).
+    // A source register index of 4 or more needs a REX prefix to select spl/bpl/sil/dil/
+    // r8b..r15b as an 8-bit operand. Without REX, indices 4..7 mean ah/ch/dh/bh.
     const need_rex = r >= 4 or b >= 8;
     const rex: u8 = 0x40 | (@as(u8, @intFromBool(r >= 8)) << 2) | @intFromBool(b >= 8);
     const sib = (b & 7) == 4;
@@ -924,10 +1046,11 @@ pub fn movToMem8(base: Reg, disp: i32, src: Reg) Inst {
     return Inst.of(buf[0 .. i + 4]);
 }
 
-/// A sign/zero-extending narrow load `movsx`/`movzx dst32, byte/word ptr [base+disp32]` (two-
-/// byte opcode `0F op`). The destination is a 32-bit register (no REX.W), so the load extends
-/// into 32 bits and the 32-bit write auto-zeroes the upper 32, keeping an i8/i16 result clean.
-/// A base of rsp/r12 needs the 0x24 SIB byte; an r8..15 dst or base needs a REX bit.
+/// A sign- or zero-extending narrow load, `movsx`/`movzx dst32, byte/word ptr [base+disp32]`,
+/// using a two-byte opcode `0F op`. The destination is a 32-bit register (no REX.W), so the
+/// load extends into 32 bits, and the 32-bit write auto-zeroes the upper 32 bits, keeping an
+/// i8 or i16 result clean. A base of rsp/r12 needs the 0x24 SIB byte. An r8..15 dst or base
+/// needs a REX bit.
 fn extMem(op: u8, dst: Reg, base: Reg, disp: i32) Inst {
     const u: u32 = @bitCast(disp);
     const r = n(dst);
@@ -969,16 +1092,42 @@ pub fn movsxWordFromMem(dst: Reg, base: Reg, disp: i32) Inst {
     return extMem(0xBF, dst, base, disp);
 }
 
-/// `lea dst, [rsp + disp32]` (REX.W 8D /r): materialize a stack address (e.g. an alloca slot).
-/// The rsp base needs the 0x24 SIB byte, mod=10 for the disp32 form.
+/// `lea dst, [rsp + disp32]` (REX.W 8D /r): materialize a stack address, for example an
+/// alloca slot. The rsp base needs the 0x24 SIB byte, mod=10 for the disp32 form.
 pub fn leaFromStack(dst: Reg, disp: i32) Inst {
     const u: u32 = @bitCast(disp);
     return Inst.of(&.{ rexW(dst, .rax), 0x8D, 0x84 | ((n(dst) & 7) << 3), 0x24, @truncate(u), @truncate(u >> 8), @truncate(u >> 16), @truncate(u >> 24) });
 }
 
-/// An SSE load/store to `[base + disp32]` with an arbitrary base register. `prefix` null =
-/// packed (movups), 0xF3 = scalar single (movss). REX is added for an xmm8..15 data register
-/// or an r8..15 base. A base of rsp/r12 (rm low bits = 100) needs the 0x24 SIB byte.
+/// `lea dst, [rip + disp32]` (REX.W 8D /r): materialize a PC-relative symbol address, a
+/// `global_addr`. Mod=00, rm=101 is the RIP-relative special case (no SIB, no base
+/// register), so the `rm` side of the REX contributes nothing. The trailing `.rax`
+/// argument to `rexW` mirrors `leaFromStack`'s trick: it picks a low (REX.B=0) register
+/// for a field that is not a real general-register operand.
+pub fn leaRipRel(dst: Reg, disp: i32) Inst {
+    const u: u32 = @bitCast(disp);
+    const modrm_byte: u8 = 0x05 | ((n(dst) & 7) << 3);
+    return Inst.of(&.{ rexW(dst, .rax), 0x8D, modrm_byte, @truncate(u), @truncate(u >> 8), @truncate(u >> 16), @truncate(u >> 24) });
+}
+
+/// `mov dst, qword [rip + disp32]` (REX.W 8B /r): load a 64-bit value from a PC-relative
+/// address into `dst`, a GOT-indirect `global_addr` (`via_got`). Byte-identical to
+/// `leaRipRel`, except the opcode is `0x8B` (mov r64, r/m64), not `0x8D` (lea). `lea`
+/// computes the address `rip+disp32`. This instead reads the 8 bytes there, the symbol's
+/// address that the loader wrote into the GOT slot. It uses the same mod=00, rm=101
+/// RIP-relative ModRM form (no SIB, no base register), so the `rm` side of the REX
+/// contributes nothing, and the trailing `.rax` argument to `rexW` picks a low (REX.B=0)
+/// register for a field that is not a real general-register operand.
+pub fn movRipRel(dst: Reg, disp: i32) Inst {
+    const u: u32 = @bitCast(disp);
+    const modrm_byte: u8 = 0x05 | ((n(dst) & 7) << 3);
+    return Inst.of(&.{ rexW(dst, .rax), 0x8B, modrm_byte, @truncate(u), @truncate(u >> 8), @truncate(u >> 16), @truncate(u >> 24) });
+}
+
+/// An SSE load or store to `[base + disp32]` with an arbitrary base register. `prefix` null
+/// selects packed (movups), 0xF3 selects scalar single (movss). REX is added for an xmm8..15
+/// data register or an r8..15 base. A base of rsp/r12 (rm low bits = 100) needs the 0x24 SIB
+/// byte.
 fn sseMem(prefix: ?u8, op: u8, x: Xmm, base: Reg, disp: i32) Inst {
     const u: u32 = @bitCast(disp);
     const r = xn(x);
@@ -1029,15 +1178,15 @@ pub fn movupsStoreMem(base: Reg, disp: i32, src: Xmm) Inst {
     return sseMem(null, 0x11, src, base, disp);
 }
 
-/// `call rel32` (E8 cd): a relative call. `rel` is from the end of the instruction.
-/// The 4-byte displacement is the last 4 bytes (the relocation target).
+/// `call rel32` (E8 cd): a relative call. `rel` is measured from the end of the instruction.
+/// The 4-byte displacement is the last 4 bytes, and is the relocation target.
 pub fn callRel(rel: i32) Inst {
     const u: u32 = @bitCast(rel);
     return Inst.of(&.{ 0xE8, @truncate(u), @truncate(u >> 8), @truncate(u >> 16), @truncate(u >> 24) });
 }
 
-/// `call r64` (FF /2): an indirect call through a register. No REX.W (call defaults to
-/// 64-bit operand size in long mode); r8..r15 need the REX.B extension bit.
+/// `call r64` (FF /2): an indirect call through a register. This needs no REX.W, since call
+/// defaults to a 64-bit operand size in long mode. r8..r15 need the REX.B extension bit.
 pub fn callReg(reg: Reg) Inst {
     const rn = n(reg);
     const mrm: u8 = 0xD0 | (rn & 7); // ModRM mod=11, reg field=/2, rm=reg
@@ -1045,17 +1194,17 @@ pub fn callReg(reg: Reg) Inst {
     return Inst.of(&.{ 0xFF, mrm });
 }
 
-/// `push r64` (0x50+rd): push a 64-bit register onto the stack (rsp -= 8). No REX.W (push
-/// defaults to 64-bit operand size in long mode); r8..r15 need the REX.B extension bit, so
-/// `push r12` is `0x41 0x54`.
+/// `push r64` (0x50+rd): push a 64-bit register onto the stack (rsp -= 8). This needs no
+/// REX.W, since push defaults to a 64-bit operand size in long mode. r8..r15 need the REX.B
+/// extension bit, so `push r12` is `0x41 0x54`.
 pub fn pushReg(r: Reg) Inst {
     const rn = n(r);
     if (rn >= 8) return Inst.of(&.{ 0x41, 0x50 | (rn & 7) });
     return Inst.of(&.{0x50 | rn});
 }
 
-/// `pop r64` (0x58+rd): pop the top of stack into a 64-bit register (rsp += 8). No REX.W;
-/// r8..r15 need the REX.B extension bit, so `pop r12` is `0x41 0x5C`.
+/// `pop r64` (0x58+rd): pop the top of the stack into a 64-bit register (rsp += 8). This
+/// needs no REX.W. r8..r15 need the REX.B extension bit, so `pop r12` is `0x41 0x5C`.
 pub fn popReg(r: Reg) Inst {
     const rn = n(r);
     if (rn >= 8) return Inst.of(&.{ 0x41, 0x58 | (rn & 7) });

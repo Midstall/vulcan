@@ -64,7 +64,7 @@ fn returnType(func: *const Function) ?Type {
     for (0..func.blockCount()) |bi| {
         const block: Block = @enumFromInt(@as(u32, @intCast(bi)));
         if (func.terminator(block)) |term| switch (term) {
-            .ret => |v| if (v) |vv| return func.valueType(vv),
+            .ret => |r| if (r.count > 0) return func.valueType(r.values[0]),
             .jump => {},
         };
     }
@@ -186,7 +186,7 @@ test "JS backend: add two ints and run" {
     const a = try func.appendBlockParam(entry, i32_t);
     const b = try func.appendBlockParam(entry, i32_t);
     const sum = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .add, .lhs = a, .rhs = b } });
-    func.setTerminator(entry, .{ .ret = sum });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(sum) });
 
     const r = runJsInt(std.testing.io, allocator, &func, &.{ .{ .int = 20 }, .{ .int = 22 } }) catch |err| switch (err) {
         error.NoEngine => return error.SkipZigTest,
@@ -205,7 +205,7 @@ test "JS backend: 32-bit integer wrapping" {
     const a = try func.appendBlockParam(entry, i32_t);
     // a * a for a large a must wrap to 32 bits like the native backends, not grow unbounded.
     const sq = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = a } });
-    func.setTerminator(entry, .{ .ret = sq });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(sq) });
 
     const r = runJsInt(std.testing.io, allocator, &func, &.{.{ .int = 100000 }}) catch |err| switch (err) {
         error.NoEngine => return error.SkipZigTest,
@@ -280,7 +280,7 @@ test "JS backend: f16 multiply rounds a non-half-representable product" {
     const a = try func.appendInst(entry, f16_t, .{ .fconst = 1.1 });
     const b = try func.appendInst(entry, f16_t, .{ .fconst = 1.1 });
     const prod = try func.appendInst(entry, f16_t, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = b } });
-    func.setTerminator(entry, .{ .ret = prod });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(prod) });
 
     const ah: f16 = 1.1;
     const bh: f16 = 1.1;
@@ -298,7 +298,7 @@ test "JS backend: f16 add" {
     const a = try func.appendInst(entry, f16_t, .{ .fconst = 0.1 });
     const b = try func.appendInst(entry, f16_t, .{ .fconst = 0.2 });
     const sum = try func.appendInst(entry, f16_t, .{ .arith = .{ .op = .add, .lhs = a, .rhs = b } });
-    func.setTerminator(entry, .{ .ret = sum });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(sum) });
 
     const ah: f16 = 0.1;
     const bh: f16 = 0.2;
@@ -316,7 +316,7 @@ test "JS backend: f32 -> f16 convert rounds a value f16 cannot hold exactly" {
     const entry = try func.appendBlock();
     const x = try func.appendBlockParam(entry, f32_t);
     const h = try func.appendInst(entry, f16_t, .{ .convert = .{ .value = x } });
-    func.setTerminator(entry, .{ .ret = h });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(h) });
 
     const pi_f32: f32 = 3.14159274; // not exactly representable in f16
     const expected: f16 = @floatCast(pi_f32);
@@ -333,7 +333,7 @@ test "JS backend: int -> f16 convert rounds a value f16 cannot hold exactly" {
     const entry = try func.appendBlock();
     const n = try func.appendBlockParam(entry, i32_t);
     const h = try func.appendInst(entry, f16_t, .{ .convert = .{ .value = n } });
-    func.setTerminator(entry, .{ .ret = h });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(h) });
 
     // 12345 needs 14 significant bits; f16 keeps only 11 (1 implicit + 10 explicit), so the
     // conversion must round, not truncate silently.
@@ -356,7 +356,7 @@ test "JS backend: alloca, store, load round-trip" {
     try func.appendStore(entry, a, p);
     const x = try func.appendInst(entry, i32_t, .{ .load = .{ .ptr = p } });
     const sum = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = b } });
-    func.setTerminator(entry, .{ .ret = sum });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(sum) });
 
     const r = runJsInt(std.testing.io, allocator, &func, &.{ .{ .int = 10 }, .{ .int = 5 } }) catch |err| switch (err) {
         error.NoEngine => return error.SkipZigTest,
@@ -383,7 +383,7 @@ test "JS backend: array alloca with computed pointer store/load" {
     const val = try func.appendArithImm(e, i32_t, .add, scaled, 1);
     try func.appendStore(e, val, p);
     const got = try func.appendInst(e, i32_t, .{ .load = .{ .ptr = p } });
-    func.setTerminator(e, .{ .ret = got });
+    func.setTerminator(e, .{ .ret = ir.function.Ret.one(got) });
 
     const r = runJsInt(std.testing.io, allocator, &func, &.{.{ .int = 3 }}) catch |err| switch (err) {
         error.NoEngine => return error.SkipZigTest,
@@ -407,7 +407,7 @@ test "JS backend: struct construction and extract" {
     const f1 = try func.appendInst(entry, i32_t, .{ .extract = .{ .aggregate = s, .index = 1 } });
     const scaled = try func.appendArithImm(entry, i32_t, .mul, f0, 10);
     const sum = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .add, .lhs = scaled, .rhs = f1 } });
-    func.setTerminator(entry, .{ .ret = sum });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(sum) });
 
     const r = runJsInt(std.testing.io, allocator, &func, &.{ .{ .int = 4 }, .{ .int = 5 } }) catch |err| switch (err) {
         error.NoEngine => return error.SkipZigTest,
@@ -431,7 +431,7 @@ test "JS backend: slice construction and length extract" {
     const buf = try func.appendInst(e, ptr_t, .{ .alloca = .{ .elem = i32_t } });
     const s = try func.appendStructNew(e, slice_t, &.{ buf, n });
     const len = try func.appendInst(e, i64_t, .{ .extract = .{ .aggregate = s, .index = 1 } });
-    func.setTerminator(e, .{ .ret = len });
+    func.setTerminator(e, .{ .ret = ir.function.Ret.one(len) });
 
     const r = runJsInt(std.testing.io, allocator, &func, &.{.{ .int = 42 }}) catch |err| switch (err) {
         error.NoEngine => return error.SkipZigTest,
@@ -458,7 +458,7 @@ test "JS backend: vector pack, element-wise add, and extract" {
     const x0 = try func.appendInst(entry, f32_t, .{ .extract = .{ .aggregate = vs, .index = 0 } });
     const x1 = try func.appendInst(entry, f32_t, .{ .extract = .{ .aggregate = vs, .index = 1 } });
     const r = try func.appendInst(entry, f32_t, .{ .arith = .{ .op = .add, .lhs = x0, .rhs = x1 } });
-    func.setTerminator(entry, .{ .ret = r });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(r) });
 
     const got = runJsF32(std.testing.io, allocator, &func, &.{ .{ .float = 1.0 }, .{ .float = 2.0 }, .{ .float = 10.0 }, .{ .float = 20.0 } }) catch |err| switch (err) {
         error.NoEngine => return error.SkipZigTest,
@@ -502,7 +502,7 @@ test "JS backend: module with a cross-function call" {
     const gb = try g.appendBlock();
     const gx = try g.appendBlockParam(gb, gi);
     const gm = try g.appendArithImm(gb, gi, .mul, gx, 3);
-    g.setTerminator(gb, .{ .ret = gm });
+    g.setTerminator(gb, .{ .ret = ir.function.Ret.one(gm) });
 
     var f = Function.init(allocator);
     defer f.deinit();
@@ -512,7 +512,7 @@ test "JS backend: module with a cross-function call" {
     const fbp = try f.appendBlockParam(fb, fi);
     const called = try f.appendCall(fb, fi, "g", &.{fa});
     const fsum = try f.appendInst(fb, fi, .{ .arith = .{ .op = .add, .lhs = called, .rhs = fbp } });
-    f.setTerminator(fb, .{ .ret = fsum });
+    f.setTerminator(fb, .{ .ret = ir.function.Ret.one(fsum) });
 
     const module = try js.emitModule(allocator, &.{ .{ .name = "g", .func = &g }, .{ .name = "f", .func = &f } });
     defer allocator.free(module);
@@ -543,7 +543,7 @@ test "JS backend: call_indirect through a global function reference" {
     const x = try func.appendBlockParam(e, i32_t);
     const fp = try func.appendGlobalAddr(e, ptr_t, "triple");
     const r = try func.appendCallIndirect(e, i32_t, fp, &.{x});
-    func.setTerminator(e, .{ .ret = r });
+    func.setTerminator(e, .{ .ret = ir.function.Ret.one(r) });
 
     const body = try js.emitFunction(allocator, &func, "f");
     defer allocator.free(body);
@@ -575,7 +575,7 @@ test "JS backend: global_addr reads an external data global" {
     const e = try func.appendBlock();
     const gp = try func.appendGlobalAddr(e, ptr_t, "g_value");
     const v = try func.appendInst(e, i32_t, .{ .load = .{ .ptr = gp } });
-    func.setTerminator(e, .{ .ret = v });
+    func.setTerminator(e, .{ .ret = ir.function.Ret.one(v) });
 
     const body = try js.emitFunction(allocator, &func, "f");
     defer allocator.free(body);

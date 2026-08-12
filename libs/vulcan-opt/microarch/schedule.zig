@@ -31,6 +31,10 @@ fn movable(op: ir.function.Opcode) bool {
         .iconst, .fconst, .arith, .arith_imm, .icmp, .select, .struct_new, .extract, .convert, .unary, .alloca, .global_addr, .dot => true,
         // matmul writes the `c` memory: a barrier, like store/prefetch, not reordered.
         .load, .store, .prefetch, .matmul, .@"if", .call, .call_indirect => false,
+        // SM12 T3: `va_start`/`va_arg`/`va_end` all read/mutate the `va_list` object at
+        // `list` (a later backend expansion turns `va_arg` into a load-then-advance) - a
+        // barrier, like `load`/`store`, not freely reordered.
+        .va_start, .va_arg, .va_end => false,
     };
 }
 
@@ -73,6 +77,9 @@ fn collectOperands(
             try buf.append(allocator, st.ptr);
         },
         .prefetch => |pf| try buf.append(allocator, pf.ptr),
+        .va_start => |vs| try buf.append(allocator, vs.list),
+        .va_arg => |va| try buf.append(allocator, va.list),
+        .va_end => |ve| try buf.append(allocator, ve.list),
         .dot => |d| {
             try buf.append(allocator, d.acc);
             try buf.append(allocator, d.a);
@@ -266,7 +273,7 @@ test "issues independent high-latency ops early to hide latency (single-issue ri
     const v4 = try func.appendInst(block, i32_t, .{ .arith = .{ .op = .mul, .lhs = v0, .rhs = v0 } });
     const v5 = try func.appendInst(block, i32_t, .{ .arith = .{ .op = .add, .lhs = v4, .rhs = v1 } });
     const v6 = try func.appendInst(block, i32_t, .{ .arith = .{ .op = .add, .lhs = v3, .rhs = v5 } });
-    func.setTerminator(block, .{ .ret = v6 });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(v6) });
 
     try run(std.testing.allocator, &func, registry.modelFor(.@"river-rc1.s"));
 
@@ -287,7 +294,7 @@ test "a dependent chain stays in order and verifies for a wide out-of-order mode
     const v2 = try func.appendInst(block, i32_t, .{ .arith = .{ .op = .add, .lhs = v0, .rhs = v1 } });
     const v3 = try func.appendInst(block, i32_t, .{ .arith = .{ .op = .add, .lhs = v2, .rhs = v0 } });
     const v4 = try func.appendInst(block, i32_t, .{ .arith = .{ .op = .add, .lhs = v3, .rhs = v0 } });
-    func.setTerminator(block, .{ .ret = v4 });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(v4) });
 
     try run(std.testing.allocator, &func, registry.modelFor(.@"ampere-altra"));
 
@@ -312,7 +319,7 @@ test "priority follows the model latency: the higher-latency independent op sche
     const mul = try func.appendInst(block, i32_t, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = b } });
     const add = try func.appendInst(block, i32_t, .{ .arith = .{ .op = .add, .lhs = a, .rhs = b } });
     const use = try func.appendInst(block, i32_t, .{ .arith = .{ .op = .add, .lhs = mul, .rhs = add } });
-    func.setTerminator(block, .{ .ret = use });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(use) });
 
     try run(std.testing.allocator, &func, registry.modelFor(.@"et-soc"));
     try expectEqualSlices(Inst, &.{
@@ -330,7 +337,7 @@ fn buildAddThenMul(func: *Function) !struct { block: Block, add: Value, mul: Val
     const add = try func.appendInst(block, i32_t, .{ .arith = .{ .op = .add, .lhs = a, .rhs = b } });
     const mul = try func.appendInst(block, i32_t, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = b } });
     const use = try func.appendInst(block, i32_t, .{ .arith = .{ .op = .add, .lhs = add, .rhs = mul } });
-    func.setTerminator(block, .{ .ret = use });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(use) });
     return .{ .block = block, .add = add, .mul = mul, .use = use };
 }
 
@@ -367,7 +374,7 @@ fn windowTestLatency(op: ir.function.Opcode) u32 {
             .mul, .mulh => 5,
             .div, .rem, .add, .sub, .bit_and, .bit_or, .bit_xor, .shl, .shr => 1,
         },
-        .arith_imm, .iconst, .fconst, .icmp, .select, .struct_new, .extract, .convert, .unary, .alloca, .global_addr, .load, .store, .prefetch, .dot, .matmul, .@"if", .call, .call_indirect => 1,
+        .arith_imm, .iconst, .fconst, .icmp, .select, .struct_new, .extract, .convert, .unary, .alloca, .global_addr, .load, .store, .prefetch, .dot, .matmul, .@"if", .call, .call_indirect, .va_start, .va_arg, .va_end => 1,
     };
 }
 fn windowTestUnit(op: ir.function.Opcode) UnitClass {
@@ -433,7 +440,7 @@ fn buildWindowBlock(func: *Function) !struct {
     const v4 = try func.appendInst(block, i32_t, .{ .arith = .{ .op = .add, .lhs = v3, .rhs = a } });
     const far = try func.appendInst(block, i32_t, .{ .arith = .{ .op = .add, .lhs = b, .rhs = b } });
     const use = try func.appendInst(block, i32_t, .{ .arith = .{ .op = .add, .lhs = v4, .rhs = far } });
-    func.setTerminator(block, .{ .ret = use });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(use) });
     return .{ .block = block, .v4 = v4, .far = far, .use = use };
 }
 

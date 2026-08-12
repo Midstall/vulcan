@@ -23,6 +23,8 @@ const tests = struct {
     pub const native = @import("x86/tests/native.zig");
     pub const addrfold = @import("x86/tests/addrfold.zig");
     pub const wimmer_diff = @import("x86/tests/wimmer_diff.zig");
+    pub const link_native = @import("x86/tests/link_native.zig");
+    pub const dynamic = @import("x86/tests/dynamic.zig");
 };
 
 test {

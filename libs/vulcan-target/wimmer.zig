@@ -1,13 +1,12 @@
 //! Shared, target-independent Wimmer-Franz register allocator (Wimmer & Franz, CGO 2010).
-//! This module owns the ALGORITHM; each backend owns ENCODING and a `RegDescription` that
-//! describes its register model to the allocator. This first task defines only the target
-//! abstraction TYPES (no allocation algorithm yet); the scan and resolution follow in later tasks.
+//! This module owns the ALGORITHM. Each backend owns ENCODING and supplies a `RegDescription`
+//! that describes its register model to the allocator.
 //!
-//! Physical registers are an ABSTRACTION here: the allocator only ever sees a `u16` register
-//! INDEX within a class. The backend chooses a stable numbering and maps the index back to its own
-//! register enum. See each backend's `*RegDescription` for the numbering it picked (aarch64 uses
-//! the register's own enum integer value, so gpr class index n names x_n and fpr class index n
-//! names v_n).
+//! Physical registers are an ABSTRACTION here. The allocator only ever sees a `u16` register
+//! INDEX within a class. The backend picks a stable numbering and maps the index back to its
+//! own register enum. See each backend's `*RegDescription` for the numbering it picked. For
+//! example, aarch64 uses the register's own enum integer value. So gpr class index n names x_n,
+//! and fpr class index n names v_n.
 
 const std = @import("std");
 const ir = @import("vulcan-ir");
@@ -19,21 +18,23 @@ const Function = ir.function.Function;
 const Terminator = ir.function.Terminator;
 const Jump = ir.function.Jump;
 
-/// The only failure mode of interval construction is running out of memory.
+/// Interval construction can fail only with an out-of-memory error.
 pub const Error = std.mem.Allocator.Error;
 
-/// Where a value lives at a program point: a physical register (a class-relative INDEX) or a spill
-/// slot. The class is implied by the value's `classOf`.
+/// Where a value lives at a program point: a physical register (a class-relative INDEX) or a
+/// spill slot. The value's `classOf` sets the class.
 pub const Location = union(enum) { reg: u16, slot: u32 };
 
-/// Whether an operand use requires a register. `must_have_register` operands cannot read from a
-/// spill slot on this target (the safe conservative default); `should_have_register` operands may
-/// fold/reload from a slot (a target that can, e.g. x86 memory operands, relaxes specific opcodes).
+/// Whether an operand use requires a register. A `must_have_register` operand cannot read from a
+/// spill slot on this target. This is the safe, conservative default. A `should_have_register`
+/// operand may fold or reload from a slot. A target that supports this, for example x86 memory
+/// operands, relaxes specific opcodes.
 pub const UseKind = enum { must_have_register, should_have_register };
 
-/// One register class (e.g. gpr vs fpr). `allocatable` is the set of physical register INDICES the
-/// scan may hand out for this class; `callee_saved` is the subset that needs prologue save/restore
-/// when used; `slot_bytes` is the spill-slot size for a value of this class.
+/// One register class, for example gpr or fpr. `allocatable` is the set of physical register
+/// INDICES the scan may hand out for this class. `callee_saved` is the subset that needs a
+/// prologue save and restore when used. `slot_bytes` is the spill-slot size for a value of this
+/// class.
 pub const RegClass = struct {
     name: []const u8,
     allocatable: []const u16,
@@ -41,21 +42,23 @@ pub const RegClass = struct {
     slot_bytes: u16,
 };
 
-/// A per-class set of register indices clobbered at some point (used by `CallSite`).
+/// A per-class set of register indices clobbered at some point. Used by `CallSite`.
 pub const ClassRegs = struct { class: u16, regs: []const u16 };
 
-/// A call at position `pos` clobbers `clobbered` (one `ClassRegs` per affected class). The allocator
-/// turns each into a fixed interval so no value survives the call in a clobbered register.
+/// A call at position `pos` clobbers `clobbered`, one `ClassRegs` per affected class. The
+/// allocator turns each into a fixed interval, so no value survives the call in a clobbered
+/// register.
 pub const CallSite = struct { pos: u32, clobbered: []const ClassRegs };
 
-/// An entry parameter (or any value) pre-colored to a fixed physical register of a class (the ABI
-/// argument registers at function entry).
+/// An entry parameter, or any value, pre-colored to a fixed physical register of a class. This
+/// covers the ABI argument registers at function entry.
 pub const FixedAssign = struct { value: Value, class: u16, reg: u16 };
 
-/// A backend's description of its register model for one function. Built per-function because the
-/// allocatable sets can differ by function (aarch64 leaf vs non-leaf pools). `classOf` and `useKind`
-/// receive the backend `ctx` so they can consult backend helpers. `aarch64RegDescription` (and each
-/// future backend's builder) allocates the owned slices; call `deinit` to free them.
+/// A backend's description of its register model for one function. It is built per function
+/// because the allocatable sets can differ by function, for example aarch64 leaf vs non-leaf
+/// pools. `classOf` and `useKind` receive the backend `ctx`, so they can consult backend helpers.
+/// `aarch64RegDescription`, and each backend's builder, allocates the owned slices. Call `deinit`
+/// to free them.
 pub const RegDescription = struct {
     classes: []const RegClass,
     classOf: *const fn (ctx: *const anyopaque, func: *const Function, v: Value) u16,
@@ -65,9 +68,10 @@ pub const RegDescription = struct {
     scratch: []const u16,
     ctx: *const anyopaque,
 
-    /// Free every owned slice the backend builder allocated: each class's `allocatable`/`callee_saved`,
-    /// the `classes` slice, each call site's per-class `regs` and its `clobbered` slice, the
-    /// `call_sites` slice, `entry_fixed`, and `scratch`. Class names and `ctx` are not owned (static).
+    /// Free every owned slice the backend builder allocated: each class's `allocatable` and
+    /// `callee_saved`, the `classes` slice, each call site's per-class `regs` and its `clobbered`
+    /// slice, the `call_sites` slice, `entry_fixed`, and `scratch`. Class names and `ctx` are
+    /// static, so they are not owned.
     pub fn deinit(self: *RegDescription, allocator: std.mem.Allocator) void {
         for (self.classes) |c| {
             allocator.free(c.allocatable);
@@ -86,20 +90,20 @@ pub const RegDescription = struct {
 };
 
 // ===========================================================================
-// Task 2: lifetime intervals (BUILDINTERVALS, Wimmer & Franz Fig 4).
+// Lifetime intervals (BUILDINTERVALS, Wimmer & Franz Fig 4).
 //
 // A value's lifetime is a set of half-open live RANGES with HOLES between the
 // regions where it is dead, plus the positions it is USED at. Physical
 // registers are constrained by FIXED intervals: one per call-clobbered
 // register (blocking it over each call) and one per entry parameter (pinning
-// its ABI register at function entry). No allocation happens here; the scan
-// (Task 3) consumes these.
+// its ABI register at function entry). No allocation happens here. The scan
+// step that follows consumes these intervals.
 //
 // Position numbering matches the aarch64 backend's `linearize` EXACTLY, so the
-// `RegDescription.call_sites` positions (built with that same numbering) line
-// up: blocks are walked in block-index order 0..nblocks (NOT reverse-post
-// order), a block's parameter row shares the block's start position, then +1
-// per instruction and +1 for the terminator slot. Blocks are numbered
+// `RegDescription.call_sites` positions, built with that same numbering, line
+// up. Blocks are walked in block-index order 0..nblocks (NOT reverse-post
+// order). A block's parameter row shares the block's start position, then adds
+// 1 per instruction and 1 for the terminator slot. Blocks are numbered
 // contiguously: `block_from[bi+1] == block_to[bi]`.
 // ===========================================================================
 
@@ -110,16 +114,16 @@ pub const Range = struct { from: u32, to: u32 };
 pub const UsePos = struct { pos: u32, kind: UseKind };
 
 /// One lifetime interval. A VALUE interval (`fixed_reg == null`) describes where an SSA value is
-/// live and used. A FIXED interval (`fixed_reg != null`) blocks a physical register over its ranges:
-/// call-clobber fixed intervals carry `value == null`, while an entry-parameter fixed interval keeps
-/// `value` set to the pinned parameter so the scan can honor the ABI hint.
+/// live and used. A FIXED interval (`fixed_reg != null`) blocks a physical register over its
+/// ranges. A call-clobber fixed interval carries `value == null`. An entry-parameter fixed
+/// interval keeps `value` set to the pinned parameter, so the scan can honor the ABI hint.
 pub const Interval = struct {
     value: ?Value,
     class: u16,
     fixed_reg: ?u16,
     ranges: []Range, // ascending, disjoint, merged
     uses: []UsePos, // ascending by `pos`
-    location: ?Location = null, // filled by the scan (Task 3+); null here
+    location: ?Location = null, // filled by the scan, null here
 
     /// The interval's first live position. Programmer error to call on an empty interval.
     pub fn start(self: *const Interval) u32 {
@@ -161,7 +165,7 @@ pub const Interval = struct {
             const lo = @max(a.from, b.from);
             const hi = @min(a.to, b.to);
             if (lo < hi) return lo;
-            // Advance whichever range ends first; it cannot intersect any later range of the other.
+            // Advance whichever range ends first. It cannot intersect any later range of the other.
             if (a.to < b.to) i += 1 else j += 1;
         }
         return null;
@@ -229,6 +233,9 @@ fn visitOperands(func: *const Function, inst: Inst, ctx: anytype, comptime f: fn
             f(ctx, st.ptr, false);
         },
         .prefetch => |pf| f(ctx, pf.ptr, false),
+        .va_start => |vs| f(ctx, vs.list, false),
+        .va_arg => |va| f(ctx, va.list, false),
+        .va_end => |ve| f(ctx, ve.list, false),
         .dot => |d| {
             f(ctx, d.acc, false);
             f(ctx, d.a, false);
@@ -240,10 +247,14 @@ fn visitOperands(func: *const Function, inst: Inst, ctx: anytype, comptime f: fn
             f(ctx, mm.c, false);
         },
         .struct_new => |sn| for (func.valueList(sn.fields)) |fld| f(ctx, fld, false),
-        .call => |c| for (func.valueList(c.args)) |a| f(ctx, a, false),
+        .call => |c| {
+            for (func.valueList(c.args)) |a| f(ctx, a, false);
+            if (c.ret_dest) |rd| f(ctx, rd, false); // the register-return dest, read post-call
+        },
         .call_indirect => |c| {
             f(ctx, c.target, false);
             for (func.valueList(c.args)) |a| f(ctx, a, false);
+            if (c.ret_dest) |rd| f(ctx, rd, false); // the register-return dest, read post-call
         },
         .@"if" => |cf| {
             f(ctx, cf.cond, false);
@@ -257,7 +268,7 @@ fn visitOperands(func: *const Function, inst: Inst, ctx: anytype, comptime f: fn
 /// arguments are edge arguments (uses in this block, flowing into the successor's parameters).
 fn visitTermOperands(func: *const Function, term: Terminator, ctx: anytype, comptime f: fn (@TypeOf(ctx), Value, bool) void) void {
     switch (term) {
-        .ret => |v| if (v) |vv| f(ctx, vv, false),
+        .ret => |r| for (r.slice()) |vv| f(ctx, vv, false),
         .jump => |j| for (func.blockArgs(j)) |a| f(ctx, a, true),
     }
 }
@@ -282,9 +293,9 @@ pub fn buildIntervals(allocator: std.mem.Allocator, func: *const Function, desc:
     @memset(def_pos, 0);
     @memset(is_def, false);
 
-    // Per-value range/use builders. Ranges are appended raw (possibly overlapping) and normalized
-    // once at the end; a raw-append plus a single sort/merge is simpler than an incremental
-    // insert-and-merge and gives the same disjoint result.
+    // Per-value range and use builders. Ranges are appended raw, and possibly overlapping, then
+    // normalized once at the end. A raw append plus a single sort and merge is simpler than an
+    // incremental insert-and-merge step, and it gives the same disjoint result.
     const range_lists = try allocator.alloc(std.ArrayList(Range), nval);
     defer allocator.free(range_lists);
     for (range_lists) |*rl| rl.* = .empty;
@@ -327,8 +338,8 @@ pub fn buildIntervals(allocator: std.mem.Allocator, func: *const Function, desc:
             const vi = @intFromEnum(v);
             self.used_row[vi] = true;
             const kind: UseKind = if (self.term_kind)
-                // A ret value or block-param move is a register move at the block boundary; no target
-                // folds a spill slot there, so it needs a register.
+                // A ret value or block-param move is a register move at the block boundary. No
+                // target folds a spill slot there, so it needs a register.
                 .must_have_register
             else
                 self.desc.useKind(self.desc.ctx, self.func, self.inst, v);
@@ -404,11 +415,12 @@ pub fn buildIntervals(allocator: std.mem.Allocator, func: *const Function, desc:
         pos += 1;
     }
 
-    // --- Liveness fixpoint: live_out[b] = union of successors' live_in; live_in[b] = used[b] union
-    // (live_out[b] minus defined[b]). Back-edges make a loop header's live-in flow into the body's
-    // live-out, so loop-carried values stay live across the whole body with no separate loop pass.
-    // A block parameter is `defined` in its block, so it is never live-in from an edge; the edge
-    // ARGUMENT that feeds it is `used` in the predecessor. Monotonic, so the fixpoint terminates. ---
+    // --- Liveness fixpoint: live_out[b] is the union of successors' live_in. live_in[b] is used[b]
+    // union (live_out[b] minus defined[b]). Back-edges make a loop header's live-in flow into the
+    // body's live-out, so loop-carried values stay live across the whole body with no separate
+    // loop pass. A block parameter is `defined` in its block, so it is never live-in from an edge.
+    // The edge ARGUMENT that feeds it is `used` in the predecessor. The computation is monotonic,
+    // so the fixpoint terminates. ---
     const live_in = try allocator.alloc(bool, nblocks * nval);
     defer allocator.free(live_in);
     const live_out = try allocator.alloc(bool, nblocks * nval);
@@ -605,36 +617,37 @@ fn appendFixedIntervals(allocator: std.mem.Allocator, func: *const Function, des
 }
 
 // ===========================================================================
-// Task 3: the linear scan (LINEARSCAN, Wimmer & Franz Fig 5) plus
-// TRYALLOCATEFREEREG (Fig 6), extended by Task 4 with ALLOCATEBLOCKEDREG
-// (Fig 7), SPLITINTERVAL, and spill-slot assignment. The scan now handles
-// register pressure: when no whole register is free it splits live ranges and
-// spills, so a value may span MULTIPLE intervals with different locations. The
-// output is the full `Allocation` the later resolution/emission tasks consume:
-// its per-value multi-segment map, per-class slot counts, and
+// The linear scan (LINEARSCAN, Wimmer & Franz Fig 5) plus TRYALLOCATEFREEREG
+// (Fig 6), extended with ALLOCATEBLOCKEDREG (Fig 7), SPLITINTERVAL, and
+// spill-slot assignment. The scan now handles register pressure. When no
+// whole register is free, it splits live ranges and spills, so a value may
+// span MULTIPLE intervals with different locations. The output is the full
+// `Allocation` the later resolution and emission steps consume: its
+// per-value multi-segment map, per-class slot counts, and
 // `used_callee_saved`.
 // ===========================================================================
 
 /// One placement of a value: from position `from`, the value lives at `loc`. A value that never
-/// splits has a single segment. Task 4's splitter produces multi-segment values.
+/// splits has a single segment. The splitter produces multi-segment values.
 pub const Segment = struct { from: u32, loc: Location };
 
-/// A data move the resolver emits (Task 5/7): move `src` to `dst` within `class`. `value` is the IR
-/// value whose bits this move transfers, carried so a backend can look up its type and pick the
-/// width-appropriate move/store/load (e.g. x86 movups for a 128-bit vector vs vmovups for 256-bit).
-/// Populated for EVERY move, including the scratch cycle-break and slot<->slot routing steps, each of
-/// which routes one specific value's bits through the class scratch. aarch64/riscv64 emit their
-/// vector moves at a fixed width, so they ignore this field.
+/// A data move the resolver emits: move `src` to `dst` within `class`. `value` is the IR value
+/// whose bits this move transfers. It is carried so a backend can look up its type and pick the
+/// width-appropriate move, store, or load, for example x86 movups for a 128-bit vector vs vmovups
+/// for 256-bit. It is populated for EVERY move, including the scratch cycle-break and
+/// slot-to-slot routing steps. Each of these routes one specific value's bits through the class
+/// scratch. aarch64 and riscv64 emit their vector moves at a fixed width, so they ignore this
+/// field.
 pub const Move = struct { src: Location, dst: Location, class: u16, value: Value };
 
-/// An intra-block spill/reload/move the resolver emits at position `at` (Task 5). A same-position
-/// CLUSTER of these is a parallel move (all sources read from the pre-instruction state, all
-/// destinations written), so `buildAllocation` orders each cluster through the SAME routine the
-/// control-flow edges use (`orderMoves`): every source is read before it is overwritten, register
-/// cycles are broken through the class scratch, and a slot->slot shuffle is expanded through the
+/// An intra-block spill, reload, or move the resolver emits at position `at`. A same-position
+/// CLUSTER of these is a parallel move: all sources read from the pre-instruction state, and all
+/// destinations are written. So `buildAllocation` orders each cluster through the SAME routine the
+/// control-flow edges use, `orderMoves`. Every source is read before it is overwritten, register
+/// cycles are broken through the class scratch, and a slot-to-slot shuffle is expanded through the
 /// scratch too. `value` carries the IR value whose bits the action transfers, so a width-aware
-/// backend can pick the move/store/load form (and it survives the scratch routing, each step
-/// carrying the routed value). Draining the resulting list in order is hazard-free.
+/// backend can pick the move, store, or load form. It survives the scratch routing, since each
+/// step carries the routed value. Draining the resulting list in order is hazard-free.
 pub const Action = struct {
     at: u32,
     kind: enum { store, reload, move },
@@ -644,28 +657,27 @@ pub const Action = struct {
     value: Value,
 };
 
-/// The parallel move set on a control-flow edge (Task 7): resolution and block-param moves. Unused
-/// here.
+/// The parallel move set on a control-flow edge: resolution and block-param moves. Unused here.
 pub const EdgeMoves = struct { pred: Block, succ: Block, moves: []Move };
 
 /// A callee-saved physical register that the allocation actually used, so the prologue must save it.
 pub const UsedSaved = struct { class: u16, reg: u16 };
 
-/// The register allocation result. Task 3 fills `segments` (one register segment per value),
-/// `slot_count_per_class` (all zero, nothing spills yet), and `used_callee_saved`. The remaining
-/// fields belong to later tasks and stay empty here.
+/// The register allocation result. The scan fills `segments`, one register segment per value,
+/// `slot_count_per_class`, all zero until something spills, and `used_callee_saved`. The
+/// remaining fields belong to later processing steps and stay empty here.
 pub const Allocation = struct {
     segments: std.AutoHashMapUnmanaged(Value, []Segment) = .empty,
     actions: []Action = &.{},
     edge_moves: []EdgeMoves = &.{},
     slot_count_per_class: []u32 = &.{},
     used_callee_saved: []UsedSaved = &.{},
-    /// True when some value's location CHANGES across a block boundary (a segment transition whose
-    /// two sides fall in different blocks). Realizing that change needs a control-flow-edge move, the
-    /// job of the cross-block resolution task (Task 7); the intra-block `actions` here do NOT cover
-    /// it. A backend emitting from this allocation before that task exists must bail when this is set
-    /// rather than silently drop the edge move. False for a single-block function or any function
-    /// whose every value keeps one location per block.
+    /// True when some value's location CHANGES across a block boundary. This is a segment
+    /// transition whose two sides fall in different blocks. Realizing that change needs a
+    /// control-flow-edge move, the job of cross-block resolution. The intra-block `actions` here
+    /// do NOT cover it. A backend that emits from this allocation before resolution runs must bail
+    /// when this flag is set, rather than silently drop the edge move. This is false for a
+    /// single-block function, or any function whose every value keeps one location per block.
     needs_resolution: bool = false,
 
     /// Free every owned slice: each value's segment slice and the map itself, the action slice, each
@@ -684,10 +696,10 @@ pub const Allocation = struct {
 };
 
 /// `allocate`'s failure modes: out of memory, or `error.Unsupported` when a single position demands
-/// more simultaneous must-have registers than the class has (Task 6b: the bail is BACK, deliberately,
-/// matching the OLD allocator's "too many live params" rejection of the same shape). Task 4's splitter
-/// handles every OTHER register-pressure case by splitting and spilling. This is the residual case
-/// where nothing is left to split.
+/// more simultaneous must-have registers than the class has. This bail is deliberate. It matches
+/// the OLD allocator's "too many live params" rejection of the same shape. The splitter handles
+/// every OTHER register-pressure case by splitting and spilling. This is the residual case where
+/// nothing is left to split.
 pub const AllocateError = Error || error{Unsupported};
 
 /// A free-until position meaning "never conflicts". Program positions never reach it.
@@ -700,9 +712,10 @@ fn intervalStartLessThan(_: void, a: *Interval, b: *Interval) bool {
     return a.start() < b.start();
 }
 
-/// The physical register an interval currently occupies: a fixed interval blocks its `fixed_reg`, a
-/// placed value interval lives in its assigned register. Programmer error to call on an unplaced or
-/// spilled value interval (Task 3 keeps every active/inactive value in a register).
+/// The physical register an interval currently occupies. A fixed interval blocks its `fixed_reg`.
+/// A placed value interval lives in its assigned register. It is a programmer error to call this
+/// on an unplaced or spilled value interval, since the scan keeps every active or inactive value
+/// in a register.
 fn assignedReg(it: *const Interval) u16 {
     if (it.fixed_reg) |fr| return fr;
     return switch (it.location.?) {
@@ -746,11 +759,12 @@ fn entryHint(desc: *const RegDescription, v: Value, class: u16) ?u16 {
 }
 
 /// TRYALLOCATEFREEREG (Wimmer & Franz Fig 6), without the splitting tail. Compute `freeUntilPos` for
-/// every candidate register of `current`'s class (its class pool plus its entry-param hint register),
-/// clamp it by the active and inactive intervals that occupy those registers, then pick the register
-/// free the longest (ties broken toward the hint). Return that register when it covers `current`'s
-/// whole lifetime, otherwise null. A null result means either no register is free at all or a
-/// register is free for a prefix only, both of which require a split this task defers to Task 4.
+/// every candidate register of `current`'s class, its class pool plus its entry-param hint
+/// register. Clamp it by the active and inactive intervals that occupy those registers, then pick
+/// the register free the longest, with ties broken toward the hint. Return that register when it
+/// covers `current`'s whole lifetime, otherwise null. A null result means either no register is
+/// free at all, or a register is free for a prefix only. Both cases require a split, which this
+/// function defers to the blocked-register path.
 fn tryAllocateFreeReg(
     current: *const Interval,
     active: []const *Interval,
@@ -819,7 +833,7 @@ fn tryAllocateFreeReg(
     const reg = chosen.?;
 
     // A register free at least to `current.end()` (half-open) covers the whole interval. Anything
-    // less would need a split, which Task 3 does not do.
+    // less would need a split, which this function does not do.
     if (free_until[reg] >= current.end()) return reg;
     return null;
 }
@@ -832,18 +846,19 @@ fn sameValue(a: *const Interval, b: *const Interval) bool {
     return av == bv;
 }
 
-/// Allocate registers for `func` using the shared linear scan with live-range splitting. Builds
-/// intervals, seeds the call-clobber fixed intervals into `inactive` so they are visible before
-/// their first range (CHANGE 1, the fixed-interval visibility crux), runs LINEARSCAN with
-/// `allocateBlockedReg` (Fig 7) + `splitInterval` under register pressure, then collapses each
-/// value's (possibly multi-interval) placement into a multi-segment `Allocation`. The caller owns
-/// the result and releases it with `Allocation.deinit`.
+/// Allocate registers for `func` using the shared linear scan with live-range splitting. It
+/// builds intervals, then seeds the call-clobber fixed intervals into `inactive` so they are
+/// visible before their first range. This is the fixed-interval visibility rule the scan depends
+/// on. It runs LINEARSCAN with `allocateBlockedReg` (Fig 7) and `splitInterval` under register
+/// pressure, then collapses each value's placement, possibly across multiple intervals, into a
+/// multi-segment `Allocation`. The caller owns the result and releases it with
+/// `Allocation.deinit`.
 pub fn allocate(allocator: std.mem.Allocator, func: *const Function, desc: *const RegDescription) AllocateError!Allocation {
     const intervals = try buildIntervals(allocator, func, desc);
     defer freeIntervals(allocator, intervals);
 
-    // Split children are heap-allocated intervals born during the scan; tracked here so their owned
-    // `ranges`/`uses` and the interval box itself are freed even on an error path.
+    // Split children are heap-allocated intervals born during the scan. They are tracked here, so
+    // their owned `ranges`, `uses`, and the interval box itself are freed even on an error path.
     var children: std.ArrayList(*Interval) = .empty;
     defer {
         for (children.items) |c| {
@@ -859,13 +874,13 @@ pub fn allocate(allocator: std.mem.Allocator, func: *const Function, desc: *cons
     defer allocator.free(slots);
     @memset(slots, 0);
 
-    // The worklist (`unhandled`) is a priority queue: value intervals and entry-param fixed
-    // intervals sorted ascending by start, popped from the front, with split children re-inserted in
-    // sorted position. CHANGE 1: a CALL-CLOBBER fixed interval (`value == null`) is taken OUT of the
-    // worklist and seeded directly into `inactive` (its first range is at a call, a hole at position
-    // 0), so `tryAllocateFreeReg`/`allocateBlockedReg` see the clobber at every EARLIER position. An
-    // entry-param fixed interval stays in the worklist (a hint realized when popped, skip-clamped for
-    // its own value), never a hard block.
+    // The worklist (`unhandled`) is a priority queue. It holds value intervals and entry-param
+    // fixed intervals sorted ascending by start, popped from the front, with split children
+    // re-inserted in sorted position. A CALL-CLOBBER fixed interval (`value == null`) is taken OUT
+    // of the worklist and seeded directly into `inactive`, since its first range is at a call, a
+    // hole at position 0. This lets `tryAllocateFreeReg` and `allocateBlockedReg` see the clobber
+    // at every EARLIER position. An entry-param fixed interval stays in the worklist. It is a hint
+    // realized when popped, skip-clamped for its own value, never a hard block.
     var unhandled: std.ArrayList(*Interval) = .empty;
     defer unhandled.deinit(allocator);
     var active: std.ArrayList(*Interval) = .empty;
@@ -883,9 +898,9 @@ pub fn allocate(allocator: std.mem.Allocator, func: *const Function, desc: *cons
     }
     std.mem.sort(*Interval, unhandled.items, {}, intervalStartLessThan);
 
-    // The scan is a worklist loop. Every split child starts strictly after the interval it came from,
-    // so total intervals are bounded by (values x positions); the guard asserts that bound to catch a
-    // splitting bug that would otherwise loop forever.
+    // The scan is a worklist loop. Every split child starts strictly after the interval it came
+    // from, so the total interval count is bounded by (values x positions). The guard asserts that
+    // bound, to catch a splitting bug that would otherwise loop forever.
     const max_pos = maxEndPosition(intervals);
     const iter_bound: usize = intervals.len + intervals.len * (@as(usize, max_pos) + 1);
     var iters: usize = 0;
@@ -896,8 +911,9 @@ pub fn allocate(allocator: std.mem.Allocator, func: *const Function, desc: *cons
         const position = current.start();
 
         // Expire or deactivate active intervals. Ranges are half-open, so `end() <= position` means
-        // the interval's last live position is behind us (handled); a live interval that does not
-        // cover `position` sits in a hole (inactive). `swapRemove` reorders, which is fine here.
+        // the interval's last live position is behind us, and it is handled. A live interval that
+        // does not cover `position` sits in a hole, so it becomes inactive. `swapRemove` reorders
+        // the list, which is fine here.
         var ai: usize = 0;
         while (ai < active.items.len) {
             const it = active.items[ai];
@@ -924,7 +940,7 @@ pub fn allocate(allocator: std.mem.Allocator, func: *const Function, desc: *cons
         }
 
         // An entry-param fixed interval realizes its ABI pin: occupy its register over `[0, 1)`.
-        // (Call-clobber fixed intervals never enter the worklist; they were seeded into `inactive`.)
+        // Call-clobber fixed intervals never enter the worklist. They were seeded into `inactive`.
         if (current.fixed_reg != null) {
             current.location = .{ .reg = current.fixed_reg.? };
             try active.append(allocator, current);
@@ -941,11 +957,11 @@ pub fn allocate(allocator: std.mem.Allocator, func: *const Function, desc: *cons
         }
     }
 
-    // Task 9: in a test/debug build, verify the completed allocation before lowering it. A firing
-    // assert here means the scan produced an UNSOUND allocation (a real bug), caught now instead of as
-    // a downstream miscompile. Gated on `runtime_safety`, so the ReleaseFast production JIT is not
-    // slowed. The verifier reasons over the final intervals (the originals plus the split children),
-    // flattened into one read-only slice.
+    // In a test or debug build, verify the completed allocation before lowering it. A firing assert
+    // here means the scan produced an UNSOUND allocation, a real bug, caught now instead of as a
+    // downstream miscompile. This check is gated on `runtime_safety`, so the ReleaseFast production
+    // JIT is not slowed. The verifier reasons over the final intervals, the originals plus the split
+    // children, flattened into one read-only slice.
     if (std.debug.runtime_safety) {
         const all = try allocator.alloc(Interval, intervals.len + children.items.len);
         defer allocator.free(all);
@@ -958,8 +974,8 @@ pub fn allocate(allocator: std.mem.Allocator, func: *const Function, desc: *cons
 
     var result = try buildAllocation(allocator, func, intervals, children.items, slots, desc);
     errdefer result.deinit(allocator);
-    // Task 7: RESOLVEDATAFLOW. Compute the control-flow-edge moves while the intervals (needed for
-    // liveness) are still alive, and order each edge's moves as a valid parallel move.
+    // RESOLVEDATAFLOW: compute the control-flow-edge moves while the intervals, needed for
+    // liveness, are still alive. Order each edge's moves as a valid parallel move.
     try resolveDataFlow(allocator, func, desc, intervals, children.items, &result);
     return result;
 }
@@ -1024,12 +1040,13 @@ fn insertSorted(allocator: std.mem.Allocator, list: *std.ArrayList(*Interval), i
     try list.insert(allocator, idx, iv);
 }
 
-/// SPLITINTERVAL (Wimmer & Franz): split `parent` at `pos` into a head the parent keeps (ranges and
-/// uses at positions `< pos`) and a freshly allocated CHILD carrying everything at positions `>= pos`
-/// (a range straddling `pos` is cut into `[from, pos)` for the head and `[pos, to)` for the child).
-/// Both reference the same `value`; the child's `location` is unset (the caller re-inserts it into
-/// the worklist or assigns it a slot). The child is appended to `children` so it is freed with the
-/// rest. Programmer error unless `parent.start() < pos < parent.end()` (both halves non-empty).
+/// SPLITINTERVAL (Wimmer & Franz): split `parent` at `pos` into a head the parent keeps, with
+/// ranges and uses at positions `< pos`, and a freshly allocated CHILD carrying everything at
+/// positions `>= pos`. A range straddling `pos` is cut into `[from, pos)` for the head and
+/// `[pos, to)` for the child. Both reference the same `value`. The child's `location` is unset,
+/// since the caller re-inserts it into the worklist or assigns it a slot. The child is appended
+/// to `children`, so it is freed with the rest. It is a programmer error unless
+/// `parent.start() < pos < parent.end()`, so both halves stay non-empty.
 fn splitInterval(allocator: std.mem.Allocator, parent: *Interval, pos: u32, children: *std.ArrayList(*Interval)) Error!*Interval {
     std.debug.assert(parent.fixed_reg == null);
     std.debug.assert(pos > parent.start());
@@ -1086,7 +1103,7 @@ fn splitInterval(allocator: std.mem.Allocator, parent: *Interval, pos: u32, chil
     };
     try children.append(allocator, child);
 
-    // Commit: the child now owns the tail; replace the parent's ranges/uses with the head.
+    // Commit: the child now owns the tail. Replace the parent's ranges and uses with the head.
     allocator.free(parent.ranges);
     parent.ranges = hr;
     allocator.free(parent.uses);
@@ -1094,13 +1111,14 @@ fn splitInterval(allocator: std.mem.Allocator, parent: *Interval, pos: u32, chil
     return child;
 }
 
-/// Spill `current`: it is the cheapest interval to move to memory (its own first use is further off
-/// than any evictable register's next use, or no register can be evicted here at all). A
-/// `must_have_register` use forces the spilled part to end at that use so the use lands back in a
-/// register (the head, which holds no must_have use, is safe in memory and the register-needing tail
-/// is re-queued). Otherwise the whole interval goes to a slot. Shared by both spill-current paths.
-/// Returns `error.Unsupported` when a same-position must-have demand exceeds the register pool (the
-/// unsatisfiable case the old allocator also rejects as "too many live params").
+/// Spill `current`. It is the cheapest interval to move to memory: its own first use is further
+/// off than any evictable register's next use, or no register can be evicted here at all. A
+/// `must_have_register` use forces the spilled part to end at that use, so the use lands back in
+/// a register. The head, which holds no must_have use, is safe in memory, and the register-needing
+/// tail is re-queued. Otherwise the whole interval goes to a slot. Both spill-current paths share
+/// this function. It returns `error.Unsupported` when a same-position must-have demand exceeds
+/// the register pool, the unsatisfiable case the old allocator also rejects as "too many live
+/// params".
 fn spillCurrent(
     allocator: std.mem.Allocator,
     current: *Interval,
@@ -1111,13 +1129,13 @@ fn spillCurrent(
 ) AllocateError!void {
     if (firstMustHaveUse(current)) |u| {
         // A must_have use AT `current.start()` means `current` needs a register the instant it
-        // becomes live, but it is the interval being spilled BECAUSE nothing here can be freed for
-        // it (Task 6b, a Task 2 finding): a same-position group (e.g. a loop header with more live
-        // params than the class has registers) can reach this exact split child through repeated
-        // re-eviction, where the only remaining must-have use coincides with the child's own start.
-        // That is more simultaneous must-have demand than the class can ever satisfy, the SAME
-        // "too many live params" limit the old allocator (aarch64 isel.zig `allocate`) rejects for
-        // this shape, so this bails to match rather than asserting a programmer error.
+        // becomes live. But it is the interval being spilled BECAUSE nothing here can be freed for
+        // it. A same-position group, for example a loop header with more live params than the
+        // class has registers, can reach this exact split child through repeated re-eviction,
+        // where the only remaining must-have use coincides with the child's own start. That is
+        // more simultaneous must-have demand than the class can ever satisfy. It is the SAME "too
+        // many live params" limit the old allocator (aarch64 isel.zig `allocate`) rejects for this
+        // shape. So this bails to match, rather than asserting a programmer error.
         if (u <= current.start()) return error.Unsupported;
         const tail = try splitInterval(allocator, current, u, children);
         current.location = .{ .slot = slots[class_idx] };
@@ -1129,15 +1147,16 @@ fn spillCurrent(
     }
 }
 
-/// ALLOCATEBLOCKEDREG (Wimmer & Franz Fig 7). `current` could not get a free register, so either it
-/// or an interval occupying a register must be split. Compute `nextUsePos[r]` for every allocatable
-/// register `r` of `current`'s class (the earliest future use of whatever holds `r`, or a hard block
-/// where a fixed interval clobbers `r`), pick the register whose next use is FURTHEST away, then:
-/// spill `current` if its own first use is even further off, otherwise take the register and split
-/// the intervals it displaces. A fixed clobber of the chosen register before `current` ends also
-/// splits `current` before the clobber. Honors `must_have_register`: a spilled head is cut before the
-/// first must_have use so that use lands back in a register. Propagates `error.Unsupported` from
-/// `spillCurrent` when a same-position must-have demand exceeds the register pool.
+/// ALLOCATEBLOCKEDREG (Wimmer & Franz Fig 7). `current` could not get a free register, so either
+/// it, or an interval occupying a register, must be split. Compute `nextUsePos[r]` for every
+/// allocatable register `r` of `current`'s class: the earliest future use of whatever holds `r`,
+/// or a hard block where a fixed interval clobbers `r`. Pick the register whose next use is
+/// FURTHEST away. Then spill `current` if its own first use is even further off. Otherwise take
+/// the register and split the intervals it displaces. A fixed clobber of the chosen register
+/// before `current` ends also splits `current` before the clobber. This honors
+/// `must_have_register`: a spilled head is cut before the first must_have use, so that use lands
+/// back in a register. It propagates `error.Unsupported` from `spillCurrent` when a same-position
+/// must-have demand exceeds the register pool.
 fn allocateBlockedReg(
     allocator: std.mem.Allocator,
     current: *Interval,
@@ -1155,18 +1174,20 @@ fn allocateBlockedReg(
     var next_use = [_]u32{infinity} ** max_phys_regs;
     var block_pos = [_]u32{infinity} ** max_phys_regs;
     var is_candidate = [_]bool{false} ** max_phys_regs;
-    // A register is EVICTABLE only if the active value interval occupying it can be legally split at
-    // `p`, i.e. that interval starts strictly before `p`. An occupant starting AT `p` (a same-start
-    // same-class value, e.g. one of a block's params when there are more of them than the pool) cannot
-    // be split there (`splitInterval` requires `pos > start`), so its register is not evictable here.
+    // A register is EVICTABLE only if the active value interval occupying it can be legally split
+    // at `p`. That is, that interval starts strictly before `p`. An occupant starting AT `p`, a
+    // same-start same-class value, for example one of a block's params when there are more of
+    // them than the pool, cannot be split there, since `splitInterval` requires `pos > start`. So
+    // its register is not evictable here.
     var evictable = [_]bool{true} ** max_phys_regs;
     for (class.allocatable) |r| {
         std.debug.assert(r < max_phys_regs);
         is_candidate[r] = true;
     }
 
-    // An active VALUE interval occupies its register from here; the register is wanted again at that
-    // interval's next use (`>= p`), or is spillable cheaply until its end if it has no further use.
+    // An active VALUE interval occupies its register from here. The register is wanted again at
+    // that interval's next use (`>= p`), or is spillable cheaply until its end if it has no
+    // further use.
     for (active.items) |it| {
         if (it.class != class_idx) continue;
         if (it.fixed_reg != null) continue;
@@ -1176,8 +1197,8 @@ fn allocateBlockedReg(
         if (u < next_use[r]) next_use[r] = u;
         if (it.start() == p) evictable[r] = false;
     }
-    // An inactive VALUE interval only reclaims its register where it next intersects `current`; its
-    // next use bounds how soon that register is genuinely wanted.
+    // An inactive VALUE interval only reclaims its register where it next intersects `current`.
+    // Its next use bounds how soon that register is genuinely wanted.
     for (inactive.items) |it| {
         if (it.class != class_idx) continue;
         if (it.fixed_reg != null) continue;
@@ -1253,8 +1274,8 @@ fn allocateBlockedReg(
         try insertSorted(allocator, unhandled, tail);
         break;
     }
-    // Each inactive value interval on `reg` that would reclaim it inside `current`'s life is split at
-    // that intersection; its tail is re-allocated elsewhere.
+    // Each inactive value interval on `reg` that would reclaim it inside `current`'s life is split
+    // at that intersection. Its tail is re-allocated elsewhere.
     for (inactive.items) |it| {
         if (it.class != class_idx) continue;
         if (it.fixed_reg != null) continue;
@@ -1269,13 +1290,14 @@ fn allocateBlockedReg(
     if (block_pos[reg] < current.end()) {
         const bp = block_pos[reg];
         // `bp <= p` means the clobber falls AT `current`'s very start, which is not a legal split
-        // point (`splitInterval` needs pos > start). This arises when `current` is a value used AT `p`
-        // and ALSO live past a clobber it cannot escape (e.g. an xmm value that is a call ARGUMENT and
-        // live across the call, in a class with no callee-saved register). It cannot bridge the clobber
-        // in `reg`, so it must live in a slot across it: spill `current` instead of splitting. The
-        // occupants evicted above are simply re-allocated (harmless). `spillCurrent` still bails
-        // `error.Unsupported` if `current` has a MUST_HAVE use at its start (a demand no slot can
-        // satisfy); a target whose uses may read from a slot (`should_have_register`) spills cleanly.
+        // point, since `splitInterval` needs pos > start. This arises when `current` is a value used
+        // AT `p` and ALSO live past a clobber it cannot escape, for example an xmm value that is a
+        // call ARGUMENT and live across the call, in a class with no callee-saved register. It
+        // cannot bridge the clobber in `reg`, so it must live in a slot across it. Spill `current`
+        // instead of splitting. The occupants evicted above are simply re-allocated, which is
+        // harmless. `spillCurrent` still bails `error.Unsupported` if `current` has a MUST_HAVE use
+        // at its start, a demand no slot can satisfy. A target whose uses may read from a slot
+        // (`should_have_register`) spills cleanly.
         if (bp <= p) {
             try spillCurrent(allocator, current, unhandled, children, slots, class_idx);
             return;
@@ -1324,20 +1346,22 @@ fn actionAtLessThan(_: void, a: Action, b: Action) bool {
     return a.at < b.at;
 }
 
-/// Order the intra-block actions so every same-position cluster drains hazard-free. Input is the
-/// actions already sorted ascending by `at`; for each maximal same-`at` run this treats the cluster
-/// as a parallel move (each action is one `(src -> dst)` transfer at that position) and runs it
-/// through `orderMoves` (the SAME routine, and scratch cycle-break, the control-flow edges use), then
-/// re-tags the ordered primitive moves as actions at that position. The result is still ascending by
-/// `at`, and within a cluster every source is read before it is overwritten. The caller owns the
-/// returned slice. Reusing the edge resolver is what lets the aarch64 bridge drop its ad-hoc
-/// same-position hazard detector: the ordering makes the fixed drain order always safe.
+/// Order the intra-block actions so every same-position cluster drains hazard-free. The input is
+/// the actions already sorted ascending by `at`. For each maximal same-`at` run, this treats the
+/// cluster as a parallel move, where each action is one `(src -> dst)` transfer at that position,
+/// and runs it through `orderMoves`, the SAME routine and scratch cycle-break the control-flow
+/// edges use. It then re-tags the ordered primitive moves as actions at that position. The result
+/// is still ascending by `at`, and within a cluster every source is read before it is overwritten.
+/// The caller owns the returned slice. Reusing the edge resolver is what lets the aarch64 bridge
+/// drop its ad-hoc same-position hazard detector: the ordering makes the fixed drain order always
+/// safe.
 ///
-/// The parallel-move invariants `orderClassMoves` relies on hold for an intra-block cluster exactly
-/// as for an edge: every spill slot names a distinct interval, so within one position a slot is never
-/// both a source and a destination (a store writes a fresh slot no other action reads; a reload reads
-/// a slot no other action writes). Therefore every register cycle is reg->reg and every slot->slot is
-/// independent, so the scratch routing is never nested inside a held cycle.
+/// The parallel-move invariants `orderClassMoves` relies on hold for an intra-block cluster
+/// exactly as for an edge. Every spill slot names a distinct interval, so within one position a
+/// slot is never both a source and a destination. A store writes a fresh slot no other action
+/// reads, and a reload reads a slot no other action writes. So every register cycle is reg-to-reg
+/// and every slot-to-slot move is independent, and the scratch routing is never nested inside a
+/// held cycle.
 fn orderIntraActions(allocator: std.mem.Allocator, sorted: []const Action, desc: *const RegDescription) Error![]Action {
     var out: std.ArrayList(Action) = .empty;
     errdefer out.deinit(allocator);
@@ -1378,7 +1402,7 @@ fn forEachPlacedValue(originals: []const Interval, children: []const *Interval, 
     for (originals) |*iv| {
         if (iv.fixed_reg != null) continue;
         if (iv.value == null) continue;
-        // The scan places every value interval it processes; a null here would silently drop a
+        // The scan places every value interval it processes. A null here would silently drop a
         // segment and miscompile, so it is a programmer error, not a skip.
         std.debug.assert(iv.location != null);
         try f(ctx, iv);
@@ -1404,9 +1428,10 @@ fn buildAllocation(allocator: std.mem.Allocator, func: *const Function, interval
     defer allocator.free(bounds.from);
     defer allocator.free(bounds.to);
 
-    // Intra-block data moves (spill/reload/reg-move) accumulated across every value, sorted ascending
-    // by `at` at the end. A cross-block transition is NOT an action here (Task 7 emits it as an edge
-    // move); it only flips `needs_resolution` so the backend bails instead of miscompiling.
+    // Intra-block data moves (spill, reload, reg-move) accumulated across every value, sorted
+    // ascending by `at` at the end. A cross-block transition is NOT an action here. Resolution
+    // emits it as an edge move instead, so this only flips `needs_resolution`, so the backend
+    // bails instead of miscompiling.
     var actions: std.ArrayList(Action) = .empty;
     errdefer actions.deinit(allocator);
 
@@ -1440,21 +1465,23 @@ fn buildAllocation(allocator: std.mem.Allocator, func: *const Function, interval
             if (segs.items.len > 0 and locEql(segs.items[segs.items.len - 1].loc, loc)) continue;
             try segs.append(allocator, .{ .from = iv.start(), .loc = loc });
         }
-        // Every consecutive segment pair is a location change the emitter must realize. An INTRA-block
-        // change (both sides in one block) becomes an `Action` at the later segment's `from`; a
-        // CROSS-block change is an edge move Task 7 owns, so it only records `needs_resolution`.
+        // Every consecutive segment pair is a location change the emitter must realize. An
+        // INTRA-block change, where both sides fall in one block, becomes an `Action` at the later
+        // segment's `from`. A CROSS-block change is an edge move resolution owns, so it only
+        // records `needs_resolution`.
         const class = list.items[0].class;
         var i: usize = 0;
         while (i + 1 < segs.items.len) : (i += 1) {
             const a = segs.items[i];
             const b = segs.items[i + 1];
             const at = b.from;
-            // A transition is cross-block (resolved on the edge by Task 7) ONLY when the later segment
-            // begins EXACTLY on a block-entry position. Any other transition happens mid-block and is an
-            // intra-block action, even when the earlier segment began in an earlier block: a value held
-            // in a register across a block boundary and evicted mid-block must be stored HERE, not on the
-            // edge (the edge sees the same register on both sides, so it emits no move). Classifying such
-            // a mid-block spill as cross-block drops the store, a silent miscompile.
+            // A transition is cross-block, resolved on the edge, ONLY when the later segment begins
+            // EXACTLY on a block-entry position. Any other transition happens mid-block and is an
+            // intra-block action, even when the earlier segment began in an earlier block. A value
+            // held in a register across a block boundary and evicted mid-block must be stored HERE,
+            // not on the edge, since the edge sees the same register on both sides, so it emits no
+            // move. Classifying such a mid-block spill as cross-block drops the store, a silent
+            // miscompile.
             const at_block = blockOfPos(bounds.from, bounds.to, at);
             const is_cross_block = at == bounds.from[at_block];
             if (is_cross_block) {
@@ -1470,10 +1497,11 @@ fn buildAllocation(allocator: std.mem.Allocator, func: *const Function, interval
     }
 
     // Actions land in ascending-`at` order for the emitter's single-cursor drain, and every
-    // same-position cluster is ordered into a hazard-free parallel-move sequence (Task 5): draining
-    // the result in order can never clobber a live value (a store's source read before a reload
-    // overwrites that register, a register cycle broken through the class scratch, a slot->slot
-    // shuffle expanded through it). Reuses `orderMoves` (the edge-move ordering), not a second resolver.
+    // same-position cluster is ordered into a hazard-free parallel-move sequence. Draining the
+    // result in order can never clobber a live value: a store's source is read before a reload
+    // overwrites that register, a register cycle is broken through the class scratch, and a
+    // slot-to-slot shuffle is expanded through it. This reuses `orderMoves`, the edge-move
+    // ordering, not a second resolver.
     std.mem.sort(Action, actions.items, {}, actionAtLessThan);
     const raw_actions = try actions.toOwnedSlice(allocator);
     defer allocator.free(raw_actions);
@@ -1512,26 +1540,26 @@ fn buildAllocation(allocator: std.mem.Allocator, func: *const Function, interval
 }
 
 // ===========================================================================
-// Task 7: RESOLVEDATAFLOW (Wimmer & Franz Fig 8) plus the standard parallel-move
+// RESOLVEDATAFLOW (Wimmer & Franz Fig 8) plus the standard parallel-move
 // ordering. After the scan, a value may live in DIFFERENT locations on the two
-// sides of a control-flow edge (the splitter placed it in a register in one
+// sides of a control-flow edge. The splitter placed it in a register in one
 // block and a slot in another, or a block parameter simply lands in a different
-// register than the argument that feeds it). Each such difference becomes a MOVE
-// on that edge. The raw move set of one edge may contain conflicts (one move's
-// destination is another's source) and cycles (a register swap), so each edge's
-// moves are ordered into a valid sequence: every source is read before it is
-// overwritten, cycles are broken through the class scratch register, and a
-// slot->slot shuffle is routed through the class scratch too (no target moves
-// memory to memory in one op). The backend (Task 8) emits the ordered list
-// op-by-op with no further reordering.
+// register than the argument that feeds it. Each such difference becomes a MOVE
+// on that edge. The raw move set of one edge may contain conflicts, where one
+// move's destination is another's source, and cycles, a register swap. So each
+// edge's moves are ordered into a valid sequence. Every source is read before
+// it is overwritten, cycles are broken through the class scratch register, and
+// a slot-to-slot shuffle is routed through the class scratch too, since no
+// target moves memory to memory in one op. The backend emits the ordered list
+// op by op with no further reordering.
 //
-// PRECONDITION: the function has NO critical edge. Resolution places moves at an
-// edge, and a critical edge (a multi-successor `if` block feeding a
-// multi-predecessor block) has no block that can host them without corrupting
-// the sibling edge. The Task-8 wiring calls `splitCriticalEdges` before building
-// the RegDescription, so numbering stays consistent; `assertNoCriticalEdges`
-// fails loudly on a wiring mistake. `allocate` never splits edges itself (that
-// would invalidate the already-built positions).
+// PRECONDITION: the function has NO critical edge. Resolution places moves at
+// an edge, and a critical edge, a multi-successor `if` block feeding a
+// multi-predecessor block, has no block that can host them without corrupting
+// the sibling edge. The driver calls `splitCriticalEdges` before building the
+// RegDescription, so numbering stays consistent. `assertNoCriticalEdges` fails
+// loudly on a wiring mistake. `allocate` never splits edges itself, since that
+// would invalidate the already-built positions.
 // ===========================================================================
 
 /// The location a value occupies at position `pos`, read from its ascending segment list: the
@@ -1547,8 +1575,9 @@ fn locationAt(segs: []const Segment, pos: u32) Location {
     return loc;
 }
 
-/// True iff some VALUE interval of `v` (an original or a split child, never a fixed interval) covers
-/// `pos`. A value's lifetime is the union of its intervals, so this is its true liveness at `pos`.
+/// True iff some VALUE interval of `v`, an original or a split child, never a fixed interval,
+/// covers `pos`. A value's lifetime is the union of its intervals, so this is its true liveness
+/// at `pos`.
 fn valueLiveAt(intervals: []const Interval, children: []const *Interval, v: Value, pos: u32) bool {
     for (intervals) |*iv| {
         if (iv.fixed_reg != null) continue;
@@ -1596,7 +1625,7 @@ fn resolveDataFlow(
     const nblocks = func.blockCount();
     for (0..nblocks) |bi| {
         const block: Block = @enumFromInt(bi);
-        // An `if` instruction contributes its two edges (then, else); each carries its own args.
+        // An `if` instruction contributes its two edges, then and else. Each carries its own args.
         for (func.blockInsts(block)) |inst| {
             if (func.opcode(inst) == .@"if") {
                 const cf = func.opcode(inst).@"if";
@@ -1604,7 +1633,7 @@ fn resolveDataFlow(
                 try addEdgeMoves(allocator, func, desc, intervals, children, result, bounds.from, bounds.to, &edges, block, cf.@"else");
             }
         }
-        // A `jump` terminator contributes one edge; a `ret` contributes none.
+        // A `jump` terminator contributes one edge. A `ret` contributes none.
         if (func.terminator(block)) |term| switch (term) {
             .jump => |j| try addEdgeMoves(allocator, func, desc, intervals, children, result, bounds.from, bounds.to, &edges, block, j),
             .ret => {},
@@ -1633,9 +1662,9 @@ fn addEdgeMoves(
     edge: Jump,
 ) Error!void {
     const succ = edge.target;
-    // The predecessor's branch executes at its last position; the successor is entered at its
-    // parameter row. A location looked up at `pt` is the value's placement as control leaves `pred`,
-    // and at `ss` its placement as control enters `succ`.
+    // The predecessor's branch executes at its last position. The successor is entered at its
+    // parameter row. A location looked up at `pt` is the value's placement as control leaves
+    // `pred`, and at `ss` its placement as control enters `succ`.
     const pt = block_to[@intFromEnum(pred)] - 1;
     const ss = block_from[@intFromEnum(succ)];
 
@@ -1867,8 +1896,8 @@ fn assertOrderingValid(
     }
 }
 
-/// Debug assertion that the function has NO critical edge (a `>1`-successor `if` block feeding a
-/// `>1`-predecessor block). Resolution assumes Task-8 wiring split them first; a violation is a
+/// Debug assertion that the function has NO critical edge: a `>1`-successor `if` block feeding a
+/// `>1`-predecessor block. Resolution assumes the driver split them first. A violation is a
 /// wiring bug, surfaced here rather than as a silent miscompile.
 fn assertNoCriticalEdges(allocator: std.mem.Allocator, func: *const Function) Error!void {
     const nblocks = func.blockCount();
@@ -1907,17 +1936,19 @@ fn assertNoCriticalEdges(allocator: std.mem.Allocator, func: *const Function) Er
 }
 
 // ===========================================================================
-// Task 9: the debug verifier (VERIFYINTERVALS).
+// The debug verifier (VERIFYINTERVALS).
 //
 // A white-box checker that validates a COMPLETED allocation and runs inside
-// `allocate` whenever `std.debug.runtime_safety` is on (every test and debug
-// build), so an allocation bug fails loudly at an assert instead of silently
-// miscompiling. It never runs under ReleaseFast, so the production JIT keeps
-// its speed. It operates on the final intervals (the originals AND the split
-// children flattened into one slice) and checks three soundness properties:
+// `allocate` whenever `std.debug.runtime_safety` is on, in every test and
+// debug build. So an allocation bug fails loudly at an assert instead of
+// silently miscompiling. It never runs under ReleaseFast, so the production
+// JIT keeps its speed. It operates on the final intervals, the originals AND
+// the split children flattened into one slice, and checks three soundness
+// properties:
 //
 //   1. REGISTER EXCLUSIVITY: no two same-class intervals in the same physical
-//      register have overlapping live ranges (the core soundness property).
+//      register have overlapping live ranges. This is the core soundness
+//      property.
 //   2. MUST_HAVE_REGISTER: every `must_have_register` use is covered by a
 //      register-located interval of its value, never only a spill slot.
 //   3. ASSIGNMENT: every value interval with a use was placed somewhere.
@@ -1927,7 +1958,7 @@ fn assertNoCriticalEdges(allocator: std.mem.Allocator, func: *const Function) Er
 // ===========================================================================
 
 /// One thing the allocation got wrong, found by `verifyIntervals`. `a` and `b` index the intervals
-/// slice passed to the verifier (`b == a` for the single-interval checks); `pos` is the program
+/// slice passed to the verifier, and `b == a` for the single-interval checks. `pos` is the program
 /// position the violation manifests at.
 pub const Violation = struct {
     kind: enum { reg_overlap, must_have_spilled, unassigned },
@@ -1936,9 +1967,10 @@ pub const Violation = struct {
     pos: u32,
 };
 
-/// The physical register an interval OCCUPIES, or null when it holds none (a spilled value interval,
-/// or a value interval the scan never placed). A fixed interval occupies its `fixed_reg`; a placed
-/// value interval occupies its assigned `.reg`. The nullable analogue of `assignedReg`.
+/// The physical register an interval OCCUPIES, or null when it holds none: a spilled value
+/// interval, or a value interval the scan never placed. A fixed interval occupies its
+/// `fixed_reg`. A placed value interval occupies its assigned `.reg`. This is the nullable
+/// analogue of `assignedReg`.
 fn occupiedReg(it: *const Interval) ?u16 {
     if (it.fixed_reg) |fr| return fr;
     const loc = it.location orelse return null;
@@ -1984,9 +2016,10 @@ fn valueInRegAt(intervals: []const Interval, v: Value, pos: u32) bool {
     return false;
 }
 
-/// Verify a completed allocation, returning every soundness `Violation` (empty slice = valid). The
-/// caller owns and frees the returned slice. See the section header for the three checks. The input is
-/// the flattened final intervals (originals plus split children); it is read-only and not freed here.
+/// Verify a completed allocation, returning every soundness `Violation`. An empty slice means the
+/// allocation is valid. The caller owns and frees the returned slice. See the section header for
+/// the three checks. The input is the flattened final intervals, originals plus split children.
+/// It is read-only and not freed here.
 pub fn verifyIntervals(allocator: std.mem.Allocator, intervals: []const Interval) Error![]Violation {
     var violations: std.ArrayList(Violation) = .empty;
     errdefer violations.deinit(allocator);
@@ -2007,9 +2040,9 @@ pub fn verifyIntervals(allocator: std.mem.Allocator, intervals: []const Interval
         }
     }
 
-    // CHECK 2: must_have_register satisfaction. Every `must_have_register` use of a value must fall in a
-    // `.reg`-located interval of that same value; a use covered ONLY by a `.slot` interval would read an
-    // operand from memory where the target forbids it.
+    // CHECK 2: must_have_register satisfaction. Every `must_have_register` use of a value must
+    // fall in a `.reg`-located interval of that same value. A use covered ONLY by a `.slot`
+    // interval would read an operand from memory where the target forbids it.
     for (intervals, 0..) |*ia, i| {
         if (ia.fixed_reg != null) continue;
         const va = ia.value orelse continue;

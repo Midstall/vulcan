@@ -53,7 +53,7 @@ fn buildSaxpy(func: *Function) !void {
     try func.appendStore(body, res, yaddr);
     const ni = try func.appendArithImm(body, i32_t, .add, bi, 1);
     try func.setJump(body, loop, &.{ni});
-    func.setTerminator(done, .{ .ret = null });
+    func.setTerminator(done, .{ .ret = ir.function.Ret.none() });
 }
 
 /// `for (i = 0; i < n; i += 1) y[i] = x[i] * x[i];` (a pure map, no read of the output).
@@ -85,7 +85,7 @@ fn buildSquare(func: *Function) !void {
     try func.appendStore(body, sq, yaddr);
     const ni = try func.appendArithImm(body, i32_t, .add, bi, 1);
     try func.setJump(body, loop, &.{ni});
-    func.setTerminator(done, .{ .ret = null });
+    func.setTerminator(done, .{ .ret = ir.function.Ret.none() });
 }
 
 /// `s = 0; for (i = 0; i < n; i += 1) s += a[i]; return s;` over f32. Marked fast_math so the FP
@@ -118,7 +118,7 @@ fn buildSumReduction(func: *Function) !void {
     const ni = try func.appendArithImm(body, i32_t, .add, bi, 1);
     try func.setJump(body, loop, &.{ ni, ns });
     const rs = try func.appendBlockParam(done, f32_t);
-    func.setTerminator(done, .{ .ret = rs });
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(rs) });
 }
 
 const Builder = *const fn (*Function) anyerror!void;

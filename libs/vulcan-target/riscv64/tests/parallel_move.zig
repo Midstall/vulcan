@@ -51,7 +51,7 @@ fn buildSwapLoop(allocator: std.mem.Allocator) !Function {
     const inext = try f.appendArithImm(header, t, .add, i, -1);
     const cmp = try f.appendInst(header, bool_t, .{ .icmp = .{ .op = .gt, .lhs = i, .rhs = zero } });
     try f.appendIf(header, cmp, .{ .target = header, .args = &.{ inext, vb, va } }, .{ .target = done, .args = &.{va} });
-    f.setTerminator(done, .{ .ret = ra });
+    f.setTerminator(done, .{ .ret = ir.function.Ret.one(ra) });
     return f;
 }
 
@@ -83,7 +83,7 @@ fn buildRotateLoop(allocator: std.mem.Allocator) !Function {
     const inext = try f.appendArithImm(header, t, .add, i, -1);
     const cmp = try f.appendInst(header, bool_t, .{ .icmp = .{ .op = .gt, .lhs = i, .rhs = zero } });
     try f.appendIf(header, cmp, .{ .target = header, .args = &.{ inext, vc, va, vb } }, .{ .target = done, .args = &.{va} });
-    f.setTerminator(done, .{ .ret = ra });
+    f.setTerminator(done, .{ .ret = ir.function.Ret.one(ra) });
     return f;
 }
 
@@ -121,7 +121,7 @@ fn buildFloatSwapLoop(allocator: std.mem.Allocator) !Function {
     const c2 = try f.appendInst(header, ft, .{ .arith = .{ .op = .sub, .lhs = c, .rhs = one } });
     const cmp = try f.appendInst(header, bool_t, .{ .icmp = .{ .op = .gt, .lhs = c, .rhs = zero } });
     try f.appendIf(header, cmp, .{ .target = header, .args = &.{ c2, vb, va, one, zero } }, .{ .target = done, .args = &.{va} });
-    f.setTerminator(done, .{ .ret = ra });
+    f.setTerminator(done, .{ .ret = ir.function.Ret.one(ra) });
     return f;
 }
 
@@ -164,7 +164,7 @@ fn buildVectorSwapLoop(allocator: std.mem.Allocator, n: i64, a: [4]f32, b: [4]f3
     try f.appendIf(header, cmp, .{ .target = header, .args = &.{ inext, hb, ha } }, .{ .target = done, .args = &.{ha} });
 
     const lane = try f.appendInst(done, ft, .{ .extract = .{ .aggregate = rv, .index = 0 } });
-    f.setTerminator(done, .{ .ret = lane });
+    f.setTerminator(done, .{ .ret = ir.function.Ret.one(lane) });
     return f;
 }
 

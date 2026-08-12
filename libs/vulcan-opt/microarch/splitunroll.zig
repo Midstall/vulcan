@@ -452,8 +452,8 @@ fn remapOp(func: *Function, op: Opcode, vmap: *const std.AutoHashMapUnmanaged(Va
         .convert => |c| .{ .convert = .{ .value = rv(vmap, c.value) } },
         .unary => |u| .{ .unary = .{ .op = u.op, .value = rv(vmap, u.value) } },
         .extract => |e| .{ .extract = .{ .aggregate = rv(vmap, e.aggregate), .index = e.index } },
-        .load => |l| .{ .load = .{ .ptr = rv(vmap, l.ptr) } },
-        .store => |s| .{ .store = .{ .value = rv(vmap, s.value), .ptr = rv(vmap, s.ptr) } },
+        .load => |l| .{ .load = .{ .ptr = rv(vmap, l.ptr), .@"volatile" = l.@"volatile" } },
+        .store => |s| .{ .store = .{ .value = rv(vmap, s.value), .ptr = rv(vmap, s.ptr), .@"volatile" = s.@"volatile" } },
         .prefetch => |p| .{ .prefetch = .{ .ptr = rv(vmap, p.ptr) } },
         .dot => |d| .{ .dot = .{ .acc = rv(vmap, d.acc), .a = rv(vmap, d.a), .b = rv(vmap, d.b) } },
         .struct_new => |sn| blk: {
@@ -474,7 +474,9 @@ fn remapOp(func: *Function, op: Opcode, vmap: *const std.AutoHashMapUnmanaged(Va
             for (func.valueList(c.args)) |v| try args.append(allocator, rv(vmap, v));
             break :blk .{ .call_indirect = .{ .target = rv(vmap, c.target), .args = try func.internValues(args.items) } };
         },
-        .@"if", .matmul => unreachable, // excluded by recognition
+        // SM12 T3: `va_start`/`va_arg`/`va_end` never appear in a loop body `recognize`
+        // accepts (a straight-line arithmetic nest), same as `if`/`matmul` above.
+        .@"if", .matmul, .va_start, .va_arg, .va_end => unreachable, // excluded by recognition
     };
 }
 
@@ -513,6 +515,9 @@ fn useCounts(allocator: std.mem.Allocator, func: *const Function) Error![]u32 {
                 bump(counts, x.ptr);
             },
             .prefetch => |x| bump(counts, x.ptr),
+            .va_start => |x| bump(counts, x.list),
+            .va_arg => |x| bump(counts, x.list),
+            .va_end => |x| bump(counts, x.list),
             .dot => |x| {
                 bump(counts, x.acc);
                 bump(counts, x.a);
@@ -538,7 +543,7 @@ fn useCounts(allocator: std.mem.Allocator, func: *const Function) Error![]u32 {
     }
     for (0..func.blockCount()) |bi| {
         if (func.terminator(@enumFromInt(bi))) |term| switch (term) {
-            .ret => |v| if (v) |vv| bump(counts, vv),
+            .ret => |r| for (r.slice()) |vv| bump(counts, vv),
             .jump => |jm| for (func.blockArgs(jm)) |v| bump(counts, v),
         };
     }

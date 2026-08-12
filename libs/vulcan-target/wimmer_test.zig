@@ -30,7 +30,7 @@ test "aarch64 description: leaf gpr pool, entry param pinning, no call sites" {
     const y = try func.appendBlockParam(b, t);
     const prod = try func.appendInst(b, t, .{ .arith = .{ .op = .mul, .lhs = x, .rhs = y } });
     const sum = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = prod, .rhs = x } });
-    func.setTerminator(b, .{ .ret = sum });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(sum) });
 
     var desc = try aarch64.aarch64RegDescription(allocator, &func);
     defer desc.deinit(allocator);
@@ -93,7 +93,7 @@ test "aarch64 description: fpr class pool and float param pinning" {
     const a = try func.appendBlockParam(b, f);
     const bp = try func.appendBlockParam(b, f);
     const sum = try func.appendInst(b, f, .{ .arith = .{ .op = .add, .lhs = a, .rhs = bp } });
-    func.setTerminator(b, .{ .ret = sum });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(sum) });
 
     var desc = try aarch64.aarch64RegDescription(allocator, &func);
     defer desc.deinit(allocator);
@@ -131,14 +131,18 @@ test "aarch64 description: a non-leaf function with a call records a call-clobbe
     // A call makes the function non-leaf and records a clobber site at the call position.
     const called = try func.appendCall(b, t, "callee", &.{x});
     const sum = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = called, .rhs = x } });
-    func.setTerminator(b, .{ .ret = sum });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(sum) });
 
     var desc = try aarch64.aarch64RegDescription(allocator, &func);
     defer desc.deinit(allocator);
 
-    // Non-leaf GPR pool is the callee-saved x19..x28.
-    try std.testing.expectEqual(@as(usize, 10), desc.classes[0].allocatable.len);
+    // Non-leaf GPR pool is the callee-saved x19..x28 PLUS the caller-saved temporaries x9..x12.
+    // These are clobbered at every call, so the allocator only uses them for values that do not
+    // live across a call, short-lived temporaries. This relieves the register pressure of a wide
+    // argument list. 10 + 4 = 14.
+    try std.testing.expectEqual(@as(usize, 14), desc.classes[0].allocatable.len);
     for (19..29) |idx| try std.testing.expect(contains(desc.classes[0].allocatable, @intCast(idx)));
+    for (9..13) |idx| try std.testing.expect(contains(desc.classes[0].allocatable, @intCast(idx)));
     // Non-leaf FPR pool is the callee-saved v8..v15.
     for (8..16) |idx| try std.testing.expect(contains(desc.classes[1].allocatable, @intCast(idx)));
 
@@ -193,7 +197,7 @@ test "riscv64 description: non-vpu int + float pools and entry param pinning" {
     const isum = try func.appendInst(b, i32t, .{ .arith = .{ .op = .add, .lhs = ip, .rhs = ip } });
     const fsum = try func.appendInst(b, f32t, .{ .arith = .{ .op = .add, .lhs = fp, .rhs = fp } });
     _ = fsum;
-    func.setTerminator(b, .{ .ret = isum });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(isum) });
 
     var desc = try riscv64.riscv64RegDescription(allocator, &func, false, false);
     defer desc.deinit(allocator);
@@ -266,7 +270,7 @@ test "riscv64 description: a call clobbers caller-saved of every class incl all 
     const x = try func.appendBlockParam(b, i32t);
     const called = try func.appendCall(b, i32t, "callee", &.{x});
     const sum = try func.appendInst(b, i32t, .{ .arith = .{ .op = .add, .lhs = called, .rhs = x } });
-    func.setTerminator(b, .{ .ret = sum });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(sum) });
 
     var desc = try riscv64.riscv64RegDescription(allocator, &func, false, false);
     defer desc.deinit(allocator);
@@ -274,13 +278,13 @@ test "riscv64 description: a call clobbers caller-saved of every class incl all 
     try std.testing.expect(desc.call_sites.len >= 1);
     const cs = desc.call_sites[0];
 
-    // Class 0 clobbers exactly the caller-saved int temps x5/x7/x28..x31; the callee-saved
+    // Class 0 clobbers exactly the caller-saved int temps x5/x7/x28..x31. The callee-saved
     // x9/x18..x27 survive a call and are NOT clobbered.
     const int_clob = clobberOf(cs, 0).?;
     for ([_]u16{ 5, 7, 28, 29, 30, 31 }) |idx| try std.testing.expect(contains(int_clob, idx));
     for ([_]u16{ 9, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27 }) |idx| try std.testing.expect(!contains(int_clob, idx));
 
-    // Class 1 clobbers the caller-saved float temps f0..f7/f28/f29; the callee-saved floats survive.
+    // Class 1 clobbers the caller-saved float temps f0..f7/f28/f29. The callee-saved floats survive.
     const float_clob = clobberOf(cs, 1).?;
     for ([_]u16{ 0, 1, 2, 3, 4, 5, 6, 7, 28, 29 }) |idx| try std.testing.expect(contains(float_clob, idx));
     for ([_]u16{ 8, 9, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27 }) |idx| try std.testing.expect(!contains(float_clob, idx));
@@ -298,10 +302,10 @@ test "riscv64 description: a call clobbers caller-saved of every class incl all 
 }
 
 test "riscv64 description: software-f16 shrinks class 0 to x5/x7 and drops x28..x31 from the clobber list" {
-    // SP3 Task 2, Gap B: `uses_f16 = true` mirrors the OLD `compileFunction`'s `reserve_f16_scratch`
-    // gate (x28..x31 are the software f16 convert scratch, unconditionally clobbered by
-    // `emitHalfToFloat`/`emitFloatToHalf` at every f16 boundary). Both the allocatable set and the
-    // per-call clobber list must exclude them, so the shared allocator never places a live value there.
+    // `uses_f16 = true` mirrors the OLD `compileFunction`'s `reserve_f16_scratch` gate. x28..x31 are
+    // the software f16 convert scratch, unconditionally clobbered by `emitHalfToFloat` and
+    // `emitFloatToHalf` at every f16 boundary. Both the allocatable set and the per-call clobber
+    // list must exclude them, so the shared allocator never places a live value there.
     const allocator = std.testing.allocator;
     var func = Function.init(allocator);
     defer func.deinit();
@@ -310,7 +314,7 @@ test "riscv64 description: software-f16 shrinks class 0 to x5/x7 and drops x28..
     const x = try func.appendBlockParam(b, i32t);
     const called = try func.appendCall(b, i32t, "callee", &.{x});
     const sum = try func.appendInst(b, i32t, .{ .arith = .{ .op = .add, .lhs = called, .rhs = x } });
-    func.setTerminator(b, .{ .ret = sum });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(sum) });
 
     var desc = try riscv64.riscv64RegDescription(allocator, &func, false, true);
     defer desc.deinit(allocator);
@@ -339,7 +343,7 @@ test "riscv64 description: vpu mode swaps the vector class and narrows the float
     const x = try func.appendBlockParam(b, i32t);
     const called = try func.appendCall(b, i32t, "callee", &.{x});
     const sum = try func.appendInst(b, i32t, .{ .arith = .{ .op = .add, .lhs = called, .rhs = x } });
-    func.setTerminator(b, .{ .ret = sum });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(sum) });
 
     var desc = try riscv64.riscv64RegDescription(allocator, &func, true, false);
     defer desc.deinit(allocator);
@@ -398,7 +402,7 @@ test "x86_64 description: gpr pool includes callee-saved, xmm pool, entry param 
     const isum = try func.appendInst(b, i32t, .{ .arith = .{ .op = .add, .lhs = ip, .rhs = ip } });
     const fsum = try func.appendInst(b, f32t, .{ .arith = .{ .op = .add, .lhs = fp, .rhs = fp } });
     _ = fsum;
-    func.setTerminator(b, .{ .ret = isum });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(isum) });
 
     var desc = try x86_64.x86_64RegDescription(allocator, &func);
     defer desc.deinit(allocator);
@@ -460,7 +464,7 @@ test "x86_64 description: a call clobbers caller-saved gpr but NOT callee-saved"
     const x = try func.appendBlockParam(b, i32t);
     const called = try func.appendCall(b, i32t, "callee", &.{x});
     const sum = try func.appendInst(b, i32t, .{ .arith = .{ .op = .add, .lhs = called, .rhs = x } });
-    func.setTerminator(b, .{ .ret = sum });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(sum) });
 
     var desc = try x86_64.x86_64RegDescription(allocator, &func);
     defer desc.deinit(allocator);
@@ -468,7 +472,7 @@ test "x86_64 description: a call clobbers caller-saved gpr but NOT callee-saved"
     try std.testing.expect(desc.call_sites.len >= 1);
     const cs = desc.call_sites[0];
 
-    // Class 0 clobbers exactly the caller-saved gpr set {rax,rcx,rdx,rsi,rdi,r8,r9}; the callee-saved
+    // Class 0 clobbers exactly the caller-saved gpr set {rax,rcx,rdx,rsi,rdi,r8,r9}. The callee-saved
     // {rbx,r12,r13,r14,r15} survive a call and are NOT clobbered.
     const gpr_clob = clobberOf(cs, 0).?;
     for ([_]u16{ 0, 1, 2, 6, 7, 8, 9 }) |idx| try std.testing.expect(contains(gpr_clob, idx));
@@ -492,7 +496,7 @@ test "x86_64 description: a div clobbers rax+rdx and a shift clobbers rcx at the
     // Position numbering: block-param row = 0, div = 1, shift = 2, terminator = 3.
     const quot = try func.appendInst(b, i32t, .{ .arith = .{ .op = .div, .lhs = x, .rhs = y } });
     const shifted = try func.appendInst(b, i32t, .{ .arith = .{ .op = .shl, .lhs = quot, .rhs = y } });
-    func.setTerminator(b, .{ .ret = shifted });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(shifted) });
 
     var desc = try x86_64.x86_64RegDescription(allocator, &func);
     defer desc.deinit(allocator);
@@ -514,7 +518,7 @@ test "x86_64 description: a div clobbers rax+rdx and a shift clobbers rcx at the
 }
 
 // ---------------------------------------------------------------------------
-// Task 2: interval builder (buildIntervals). These exercise range/hole/use and
+// The interval builder (buildIntervals). These exercise range, hole, use, and
 // fixed-interval construction, still driven through the aarch64 RegDescription.
 // ---------------------------------------------------------------------------
 
@@ -554,10 +558,10 @@ test "intervals: a value dead between two uses has a hole" {
     try func.appendIf(b0, cond, .{ .target = b2 }, .{ .target = b1 });
 
     const zero = try func.appendInst(b1, t, .{ .iconst = 0 });
-    func.setTerminator(b1, .{ .ret = zero });
+    func.setTerminator(b1, .{ .ret = ir.function.Ret.one(zero) });
 
     const use2 = try func.appendInst(b2, t, .{ .arith = .{ .op = .add, .lhs = v, .rhs = v } });
-    func.setTerminator(b2, .{ .ret = use2 });
+    func.setTerminator(b2, .{ .ret = ir.function.Ret.one(use2) });
 
     var desc = try aarch64.aarch64RegDescription(allocator, &func);
     defer desc.deinit(allocator);
@@ -587,10 +591,10 @@ test "intervals: a reachable def used only in an unreachable block degrades to a
     const b0 = try func.appendBlock();
     const b1 = try func.appendBlock();
     const v = try func.appendInst(b0, t, .{ .iconst = 5 });
-    func.setTerminator(b0, .{ .ret = null });
+    func.setTerminator(b0, .{ .ret = ir.function.Ret.none() });
 
     const w = try func.appendInst(b1, t, .{ .arith = .{ .op = .add, .lhs = v, .rhs = v } });
-    func.setTerminator(b1, .{ .ret = w });
+    func.setTerminator(b1, .{ .ret = ir.function.Ret.one(w) });
 
     var desc = try aarch64.aarch64RegDescription(allocator, &func);
     defer desc.deinit(allocator);
@@ -630,7 +634,7 @@ test "intervals: a loop-carried value stays live across the whole loop body" {
     const ni = try func.appendArithImm(body, t, .add, bi, 1);
     const nacc = try func.appendInst(body, t, .{ .arith = .{ .op = .add, .lhs = bacc, .rhs = bi } });
     try func.setJump(body, loop, &.{ ni, nacc });
-    func.setTerminator(done, .{ .ret = racc });
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(racc) });
 
     var desc = try aarch64.aarch64RegDescription(allocator, &func);
     defer desc.deinit(allocator);
@@ -658,7 +662,7 @@ test "intervals: a call clobbers every caller-saved gpr via a fixed interval at 
     const x = try func.appendBlockParam(b, t);
     const called = try func.appendCall(b, t, "callee", &.{x});
     const sum = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = called, .rhs = x } });
-    func.setTerminator(b, .{ .ret = sum });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(sum) });
 
     var desc = try aarch64.aarch64RegDescription(allocator, &func);
     defer desc.deinit(allocator);
@@ -685,7 +689,7 @@ test "intervals: use positions carry must_have_register on aarch64" {
     const y = try func.appendBlockParam(b, t);
     const prod = try func.appendInst(b, t, .{ .arith = .{ .op = .mul, .lhs = x, .rhs = y } });
     const sum = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = prod, .rhs = x } });
-    func.setTerminator(b, .{ .ret = sum });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(sum) });
 
     var desc = try aarch64.aarch64RegDescription(allocator, &func);
     defer desc.deinit(allocator);
@@ -699,8 +703,8 @@ test "intervals: use positions carry must_have_register on aarch64" {
 }
 
 // ---------------------------------------------------------------------------
-// Task 3: the linear scan skeleton + tryAllocateFreeReg (no splitting yet).
-// These run `allocate` end to end on aarch64 register descriptions.
+// The linear scan skeleton plus tryAllocateFreeReg (no splitting yet). These
+// run `allocate` end to end on aarch64 register descriptions.
 // ---------------------------------------------------------------------------
 
 /// The single segment reg index assigned to value `v`, or null if `v` has no register segment.
@@ -733,7 +737,7 @@ fn buildPressureKernel(func: *Function, t: ir.types.Type) !Value {
     for (&consts, 0..) |*c, idx| c.* = try func.appendInst(b, t, .{ .iconst = @intCast(idx) });
     var acc = consts[0];
     for (consts[1..]) |c| acc = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = c } });
-    func.setTerminator(b, .{ .ret = acc });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(acc) });
     return acc;
 }
 
@@ -747,7 +751,7 @@ test "scan: a low-pressure straight-line function assigns every value a register
     const y = try func.appendBlockParam(b, t);
     const prod = try func.appendInst(b, t, .{ .arith = .{ .op = .mul, .lhs = x, .rhs = y } });
     const sum = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = prod, .rhs = x } });
-    func.setTerminator(b, .{ .ret = sum });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(sum) });
 
     var desc = try aarch64.aarch64RegDescription(allocator, &func);
     defer desc.deinit(allocator);
@@ -775,7 +779,7 @@ test "scan: an entry parameter is assigned its ABI argument register via the hin
     const b = try func.appendBlock();
     const x = try func.appendBlockParam(b, t);
     const sum = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = x } });
-    func.setTerminator(b, .{ .ret = sum });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(sum) });
 
     var desc = try aarch64.aarch64RegDescription(allocator, &func);
     defer desc.deinit(allocator);
@@ -798,7 +802,7 @@ test "scan: a value live across a call gets a callee-saved register (not a calle
     const pre = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = x } });
     const called = try func.appendCall(b, t, "callee", &.{x});
     const after = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = pre, .rhs = called } });
-    func.setTerminator(b, .{ .ret = after });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(after) });
 
     var desc = try aarch64.aarch64RegDescription(allocator, &func);
     defer desc.deinit(allocator);
@@ -812,7 +816,7 @@ test "scan: a value live across a call gets a callee-saved register (not a calle
 }
 
 // ---------------------------------------------------------------------------
-// Task 4: register pressure handling (allocateBlockedReg + splitting + spill).
+// Register pressure handling (allocateBlockedReg plus splitting and spill).
 // These exercise `allocate` on functions whose pressure forces a split.
 // ---------------------------------------------------------------------------
 
@@ -899,14 +903,15 @@ test "scan: more same-class params than the register pool spills without crashin
 
     // Combine every param in REVERSE declaration order so the furthest-next-use victim the blocked
     // path picks is an EARLY-declared param whose interval starts at the block start. That is the
-    // degenerate split-at-own-start (pos == victim.start()) that Finding 1 must not crash on.
+    // degenerate split-at-own-start (pos == victim.start()) case the blocked-register path must
+    // not crash on.
     var acc = called;
     var idx: usize = nparams;
     while (idx > 0) {
         idx -= 1;
         acc = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = params[idx] } });
     }
-    func.setTerminator(b, .{ .ret = acc });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(acc) });
 
     var desc = try aarch64.aarch64RegDescription(allocator, &func);
     defer desc.deinit(allocator);
@@ -945,7 +950,7 @@ test "scan: a float value live across a call is split at the call (the vector-qu
     const pre = try func.appendInst(b, f, .{ .arith = .{ .op = .add, .lhs = x, .rhs = x } });
     const called = try func.appendCall(b, f, "callee", &.{x});
     const after = try func.appendInst(b, f, .{ .arith = .{ .op = .add, .lhs = pre, .rhs = called } });
-    func.setTerminator(b, .{ .ret = after });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(after) });
 
     var desc = try aarch64.aarch64RegDescription(allocator, &func);
     defer desc.deinit(allocator);
@@ -959,7 +964,7 @@ test "scan: a float value live across a call is split at the call (the vector-qu
     // `pre` was split around the call: it has more than one segment.
     try std.testing.expect(segs.len >= 2);
     // At the call it is NOT in a callee-saved fp register (v8..v15): the clobber forced it out. This
-    // proves the fixed call-clobber interval was VISIBLE when `pre` was allocated (CHANGE 1).
+    // proves the fixed call-clobber interval was VISIBLE when `pre` was allocated.
     const at_call = segmentAt(segs, call_pos);
     const in_fp_reg = switch (at_call.loc) {
         .reg => |r| r >= 8 and r <= 15,
@@ -969,9 +974,9 @@ test "scan: a float value live across a call is split at the call (the vector-qu
 }
 
 // ---------------------------------------------------------------------------
-// Task 7: RESOLVEDATAFLOW (edge_moves) + parallel-move ordering. The ordering is
-// unit-tested directly through `wimmer.orderMoves` (deterministic), and the edge
-// computation is tested end to end through `wimmer.allocate`.
+// RESOLVEDATAFLOW (edge_moves) plus parallel-move ordering. The ordering is
+// unit-tested directly through `wimmer.orderMoves`, which is deterministic. The
+// edge computation is tested end to end through `wimmer.allocate`.
 // ---------------------------------------------------------------------------
 
 const Move = wimmer.Move;
@@ -1029,7 +1034,7 @@ test "resolve: a two-register cycle is ordered via the class scratch and realize
     const t = try func.types.intern(i32k);
     const b = try func.appendBlock();
     const x = try func.appendBlockParam(b, t);
-    func.setTerminator(b, .{ .ret = x });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(x) });
 
     var desc = try aarch64.aarch64RegDescription(allocator, &func);
     defer desc.deinit(allocator);
@@ -1068,7 +1073,7 @@ test "resolve: a slot-to-slot move is routed through the class scratch" {
     const t = try func.types.intern(i32k);
     const b = try func.appendBlock();
     const x = try func.appendBlockParam(b, t);
-    func.setTerminator(b, .{ .ret = x });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(x) });
 
     var desc = try aarch64.aarch64RegDescription(allocator, &func);
     defer desc.deinit(allocator);
@@ -1097,7 +1102,7 @@ test "resolve: independent reg and slot moves pass through as single ops in a va
     const t = try func.types.intern(i32k);
     const b = try func.appendBlock();
     const x = try func.appendBlockParam(b, t);
-    func.setTerminator(b, .{ .ret = x });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(x) });
 
     var desc = try aarch64.aarch64RegDescription(allocator, &func);
     defer desc.deinit(allocator);
@@ -1126,7 +1131,7 @@ test "resolve: a store and a reload on the same register at one position order s
     const t = try func.types.intern(i32k);
     const b = try func.appendBlock();
     const x = try func.appendBlockParam(b, t);
-    func.setTerminator(b, .{ .ret = x });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(x) });
 
     var desc = try aarch64.aarch64RegDescription(allocator, &func);
     defer desc.deinit(allocator);
@@ -1159,7 +1164,7 @@ test "resolve: a block-param arg in a different register than the param becomes 
     defer func.deinit();
     const t = try func.types.intern(i32k);
 
-    // entry(x): jump next(x) ; next(p): ret p+p. `x` pins x0 (ABI arg reg). `p` is a fresh param, so
+    // entry(x): jump next(x). next(p): ret p+p. `x` pins x0 (ABI arg reg). `p` is a fresh param, so
     // it lands in a pool register other than x0. The entry->next edge must move x0 into p's register.
     const entry = try func.appendBlock();
     const x = try func.appendBlockParam(entry, t);
@@ -1167,7 +1172,7 @@ test "resolve: a block-param arg in a different register than the param becomes 
     const p = try func.appendBlockParam(next, t);
     try func.setJump(entry, next, &.{x});
     const sum = try func.appendInst(next, t, .{ .arith = .{ .op = .add, .lhs = p, .rhs = p } });
-    func.setTerminator(next, .{ .ret = sum });
+    func.setTerminator(next, .{ .ret = ir.function.Ret.one(sum) });
 
     var desc = try aarch64.aarch64RegDescription(allocator, &func);
     defer desc.deinit(allocator);
@@ -1214,7 +1219,7 @@ test "resolve: an argument feeding a spilled successor parameter becomes a reg-t
     const called = try func.appendCall(body, t, "callee", &.{params[0]});
     var acc = called;
     for (params) |p| acc = try func.appendInst(body, t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = p } });
-    func.setTerminator(body, .{ .ret = acc });
+    func.setTerminator(body, .{ .ret = ir.function.Ret.one(acc) });
 
     var desc = try aarch64.aarch64RegDescription(allocator, &func);
     defer desc.deinit(allocator);
@@ -1259,7 +1264,7 @@ test "buildAllocation: a value split mid-successor-block gets an intra-block act
     defer func.deinit();
     const t = try func.types.intern(i32k);
 
-    // entry(seed): v = seed + seed ; jump body. `v` is defined in entry, live-in to body, and used only
+    // entry(seed): v = seed + seed. jump body. `v` is defined in entry, live-in to body, and used only
     // at the VERY END of body. Twelve fresh constants in body create register pressure that exceeds the
     // leaf gpr pool, and `v`'s next use is the furthest, so the blocked-register path evicts `v` MID-body:
     // its register is stolen at a mid-block position `p` and `v` is stored to a slot there. That store is
@@ -1278,7 +1283,7 @@ test "buildAllocation: a value split mid-successor-block gets an intra-block act
     for (consts[1..]) |c| acc = try func.appendInst(body, t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = c } });
     // `v`'s single body use is last, giving it the furthest next use so the blocked path evicts it.
     acc = try func.appendInst(body, t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = v } });
-    func.setTerminator(body, .{ .ret = acc });
+    func.setTerminator(body, .{ .ret = ir.function.Ret.one(acc) });
 
     var desc = try aarch64.aarch64RegDescription(allocator, &func);
     defer desc.deinit(allocator);
@@ -1321,8 +1326,8 @@ test "resolve: a split CFG (diamond) allocates with consistent, valid edge moves
     const t = try func.types.intern(i32k);
     const bool_t = try func.types.intern(.bool);
 
-    // entry(x) -[if]-> a, b ; a -> m(x) ; b -> m(x+1) ; m(r): ret r. The two edges into m come from
-    // single-successor jumps, so no edge is critical; splitCriticalEdges leaves it unchanged. Both
+    // entry(x) -[if]-> a, b. a -> m(x). b -> m(x+1). m(r): ret r. The two edges into m come from
+    // single-successor jumps, so no edge is critical. splitCriticalEdges leaves it unchanged. Both
     // arms carry an argument into m, exercising cross-block param moves.
     const entry = try func.appendBlock();
     const x = try func.appendBlockParam(entry, t);
@@ -1335,9 +1340,9 @@ test "resolve: a split CFG (diamond) allocates with consistent, valid edge moves
     try func.setJump(a, m, &.{x});
     const xp1 = try func.appendArithImm(bb, t, .add, x, 1);
     try func.setJump(bb, m, &.{xp1});
-    func.setTerminator(m, .{ .ret = r });
+    func.setTerminator(m, .{ .ret = ir.function.Ret.one(r) });
 
-    // Task-8 wiring splits critical edges before allocation; here there are none, but run it anyway.
+    // The driver splits critical edges before allocation. Here there are none, but run it anyway.
     try ir.critical_edge.splitCriticalEdges(allocator, &func);
 
     var desc = try aarch64.aarch64RegDescription(allocator, &func);
@@ -1352,8 +1357,8 @@ test "resolve: a split CFG (diamond) allocates with consistent, valid edge moves
 }
 
 // ---------------------------------------------------------------------------
-// Task 9: the debug verifier (verifyIntervals). White-box tests build interval
-// sets directly (with owned ranges/uses) and check the three soundness
+// The debug verifier (verifyIntervals). White-box tests build interval sets
+// directly, with owned ranges and uses, and check the three soundness
 // properties: register exclusivity, must_have_register satisfaction, and
 // assignment. The verifier also runs inside every test-build `allocate`, so the
 // whole suite above exercises it on real allocations.

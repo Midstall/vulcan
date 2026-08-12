@@ -12,7 +12,7 @@ const builtin = @import("builtin");
 const ir = @import("vulcan-ir");
 const object = @import("object.zig");
 const link = @import("link.zig");
-const ld = @import("ld.zig");
+const ld = @import("vulcan-link");
 const platform = @import("../jit_platform.zig");
 
 pub const Error = std.mem.Allocator.Error || object.Error || ld.Error || platform.Error;
@@ -21,6 +21,11 @@ pub const Provider = platform.Provider;
 /// A W^X executable buffer that synchronizes the instruction cache (the memory comes
 /// from a pluggable `jit_platform.Provider`, posix by default, UEFI via `mapWith`).
 pub const CodeBuffer = platform.Buffer(syncICache);
+
+/// A W^X reservation carrying code, rodata, data, and bss sections for one module
+/// image (see `jit_platform.MappedImage`), synchronizing the instruction cache over
+/// the code span (via `fence.i` on RISC-V) once `finalize` flips it to read+execute.
+pub const MappedImage = platform.MappedImage(syncICache);
 
 /// Synchronize the instruction stream with freshly written code. RISC-V uses
 /// `fence.i` (mandatory before executing JIT output on real hardware). aarch64
@@ -122,7 +127,7 @@ test "JIT compiles a RISC-V module into executable memory" {
         const t = try callee.types.intern(i32k);
         const b = try callee.appendBlock();
         const x = try callee.appendBlockParam(b, t);
-        callee.setTerminator(b, .{ .ret = x });
+        callee.setTerminator(b, .{ .ret = ir.function.Ret.one(x) });
     }
     var caller = ir.function.Function.init(allocator);
     defer caller.deinit();
@@ -131,7 +136,7 @@ test "JIT compiles a RISC-V module into executable memory" {
         const b = try caller.appendBlock();
         const x = try caller.appendBlockParam(b, t);
         const r = try caller.appendCall(b, t, "callee", &.{x});
-        caller.setTerminator(b, .{ .ret = r });
+        caller.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
     }
     var module: link.Module = .{};
     defer module.deinit(allocator);
@@ -209,7 +214,7 @@ test "JIT binds an external call to a host address through a GOT stub" {
         const b = try entry.appendBlock();
         const x = try entry.appendBlockParam(b, t);
         const r = try entry.appendCall(b, t, "helper", &.{x});
-        entry.setTerminator(b, .{ .ret = r });
+        entry.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
     }
     var module: link.Module = .{};
     defer module.deinit(allocator);

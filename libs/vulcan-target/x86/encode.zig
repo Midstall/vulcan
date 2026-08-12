@@ -61,6 +61,20 @@ pub fn movReg(dst: Reg, src: Reg) Inst {
     return aluRR(0x89, src, dst);
 }
 
+/// `mov dst, dword [abs32]` (8B /r, mod=00 rm=101): LOAD from an ABSOLUTE 32-bit address.
+/// For a GOT-indirect `global_addr` (`via_got`): `abs32` is the symbol's GOT slot vaddr (the
+/// linker patches it), and this reads the symbol's ADDRESS the loader wrote there via
+/// `R_386_GLOB_DAT`. Distinct from `movImm` (B8+r, `mov dst, imm32`, where imm32 IS the value):
+/// here the `8B` opcode with a disp32 ModRM makes it a memory LOAD. In 32-bit mode mod=00 rm=101
+/// is a plain absolute disp32 (no SIB, no base register); i386 has no rip-relative form, so the
+/// address is absolute (correct for a non-PIE exe at a fixed base). The abs32 field is the 4
+/// bytes after the ModRM byte.
+pub fn movFromAbs32(dst: Reg, abs: u32) Inst {
+    const b = imm32(@bitCast(abs));
+    const modrm_byte: u8 = 0x05 | (n(dst) << 3); // mod=00, reg=dst, rm=101 (disp32 absolute)
+    return Inst.of(&.{ 0x8B, modrm_byte, b[0], b[1], b[2], b[3] });
+}
+
 /// `mov dst, [esp + disp8]` (8B /r with a SIB byte, since the ESP base requires SIB):
 /// load a stack slot. Used to read cdecl stack arguments.
 pub fn movFromStack(dst: Reg, disp8: u8) Inst {
@@ -246,6 +260,26 @@ pub fn movzxByte(dst: Reg, src: Reg) Inst {
     return Inst.of(&.{ 0x0F, 0xB6, modrm(dst, src) });
 }
 
+/// `movsx dst, src8` (0F BE /r): sign-extend `src`'s low byte. `src` must be 0..3.
+pub fn movsxByte(dst: Reg, src: Reg) Inst {
+    // Byte-addressability invariant: `src`'s low byte is read directly (al/cl/dl/bl),
+    // so without a REX prefix `src` MUST be eax/ecx/edx/ebx (enum indices 0..3).
+    std.debug.assert(@intFromEnum(src) < 4);
+    return Inst.of(&.{ 0x0F, 0xBE, modrm(dst, src) });
+}
+
+/// `movzx dst, src16` (0F B7 /r): zero-extend `src`'s low 16 bits. Every register has a
+/// 16-bit form (ax/cx/dx/bx/sp/bp/si/di), so unlike the byte forms `src` is unrestricted.
+pub fn movzxWord(dst: Reg, src: Reg) Inst {
+    return Inst.of(&.{ 0x0F, 0xB7, modrm(dst, src) });
+}
+
+/// `movsx dst, src16` (0F BF /r): sign-extend `src`'s low 16 bits. Every register has a
+/// 16-bit form (ax/cx/dx/bx/sp/bp/si/di), so unlike the byte forms `src` is unrestricted.
+pub fn movsxWord(dst: Reg, src: Reg) Inst {
+    return Inst.of(&.{ 0x0F, 0xBF, modrm(dst, src) });
+}
+
 /// `jcc rel32` (0F 80+cc cd).
 pub fn jcc(cond: Cond, rel: i32) Inst {
     const b = imm32(rel);
@@ -263,6 +297,34 @@ pub fn jmp(rel: i32) Inst {
 pub fn aluImm(digit: u3, dst: Reg, imm: i32) Inst {
     const b = imm32(imm);
     return Inst.of(&.{ 0x81, 0xC0 | (@as(u8, digit) << 3) | n(dst), b[0], b[1], b[2], b[3] });
+}
+
+/// An ALU op against a MEMORY operand and an 8-bit sign-extended immediate (83 /digit ib):
+/// ADD=/0. `[base + disp32]` (mod=10, with an SIB byte when `base` is esp, mirroring `memOp`
+/// in the data-move encoders). Bumps a value directly in memory (e.g. a `va_list` pointer
+/// field) without needing a spare register to hold the new value.
+pub fn aluMemImm8(digit: u3, base: Reg, disp: i32, imm8: i8) Inst {
+    const d = imm32(disp);
+    const modrm_byte: u8 = 0x80 | (@as(u8, digit) << 3) | (n(base) & 7);
+    const sib = (n(base) & 7) == 4;
+    var buf: [8]u8 = undefined;
+    var i: usize = 0;
+    buf[i] = 0x83;
+    i += 1;
+    buf[i] = modrm_byte;
+    i += 1;
+    if (sib) {
+        buf[i] = 0x24;
+        i += 1;
+    }
+    buf[i] = d[0];
+    buf[i + 1] = d[1];
+    buf[i + 2] = d[2];
+    buf[i + 3] = d[3];
+    i += 4;
+    buf[i] = @bitCast(imm8);
+    i += 1;
+    return Inst.of(buf[0..i]);
 }
 
 /// `imul dst, src, imm32` (69 /r id): dst = src * imm.
@@ -315,6 +377,12 @@ pub fn callRel(rel: i32) Inst {
     return Inst.of(&.{ 0xE8, b[0], b[1], b[2], b[3] });
 }
 
+/// `call r32` (FF /2): an indirect call through a register (register-direct ModRM, mod=11,
+/// reg field=/2). No REX/extension bits to worry about (i386 has only 8 registers).
+pub fn callReg(reg: Reg) Inst {
+    return Inst.of(&.{ 0xFF, 0xD0 | n(reg) }); // mod=11, reg=/2 (010), rm=reg
+}
+
 /// `int 0x80`: the i386 Linux system-call gate.
 pub fn int80() Inst {
     return Inst.of(&.{ 0xCD, 0x80 });
@@ -329,6 +397,7 @@ test "known i386 encodings" {
     try std.testing.expectEqualSlices(u8, &.{ 0x8B, 0x44, 0x24, 0x04 }, movFromStack(.eax, 4).slice()); // mov eax, [esp+4]
     try std.testing.expectEqualSlices(u8, &.{0xC3}, ret().slice());
     try std.testing.expectEqualSlices(u8, &.{ 0xCD, 0x80 }, int80().slice());
+    try std.testing.expectEqualSlices(u8, &.{ 0xFF, 0xD7 }, callReg(.edi).slice()); // call edi
 }
 
 test "x86-32 reg+disp32 load and store encoders match known bytes" {

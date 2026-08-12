@@ -33,6 +33,8 @@ fn hoistable(opcode: ir.function.Opcode) bool {
         .arith => |a| nonTrapping(a.op),
         .arith_imm => |a| nonTrapping(a.op),
         .alloca, .struct_new, .load, .store, .prefetch, .matmul, .call, .call_indirect, .@"if" => false,
+        // SM12 T3: mutate/read the `va_list` object at `list`, like `load`/`store` above.
+        .va_start, .va_arg, .va_end => false,
     };
 }
 
@@ -164,7 +166,7 @@ test "hoists a loop-invariant product to the preheader" {
     _ = inv;
     const next = try func.appendArithImm(body, i32_t, .add, bi, 1);
     try func.setJump(body, loop, &.{next});
-    func.setTerminator(done, .{ .ret = n });
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(n) });
 
     const entry_before = func.blockInsts(entry).len;
     const body_before = func.blockInsts(body).len;
@@ -201,7 +203,7 @@ test "does not hoist a loop-variant value" {
     _ = try func.appendInst(body, i32_t, .{ .arith = .{ .op = .mul, .lhs = bi, .rhs = bi } });
     const next = try func.appendArithImm(body, i32_t, .add, bi, 1);
     try func.setJump(body, loop, &.{next});
-    func.setTerminator(done, .{ .ret = n });
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(n) });
 
     var analyses = pass.Analyses{ .allocator = allocator, .func = &func };
     defer analyses.deinit();

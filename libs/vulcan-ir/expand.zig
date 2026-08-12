@@ -217,11 +217,11 @@ fn expectMulhExpands(bits: u16, signedness: std.builtin.Signedness, a: i64, b: i
     const av = try func.appendInst(e, t, .{ .iconst = a });
     const bv = try func.appendInst(e, t, .{ .iconst = b });
     const r = try func.appendInst(e, t, .{ .arith = .{ .op = .mulh, .lhs = av, .rhs = bv } });
-    func.setTerminator(e, .{ .ret = r });
+    func.setTerminator(e, .{ .ret = function.Ret.one(r) });
 
     try testing.expect(try expandMulh(allocator, &func));
     for (func.blockInsts(e)) |inst| try testing.expect(!isMulh(&func, inst)); // no mulh survives
-    const got = evalConst(&func, func.terminator(e).?.ret.?);
+    const got = evalConst(&func, func.terminator(e).?.ret.values[0]);
     try testing.expectEqual(oracleHigh(a, b, bits, signedness), got);
 }
 

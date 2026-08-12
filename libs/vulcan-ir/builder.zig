@@ -88,7 +88,14 @@ pub const Builder = struct {
 
     /// Return from the function, optionally with a value.
     pub fn ret(self: *Builder, value: ?Value) void {
-        self.func.setTerminator(self.block, .{ .ret = value });
+        const r: function.Ret = if (value) |v| function.Ret.one(v) else function.Ret.none();
+        self.func.setTerminator(self.block, .{ .ret = r });
+    }
+
+    /// Return from the function with multiple values (up to 4). Used for a
+    /// register-pair or HFA struct return once a backend lowers one.
+    pub fn retValues(self: *Builder, vals: []const Value) void {
+        self.func.setTerminator(self.block, .{ .ret = function.Ret.many(vals) });
     }
 
     /// Jump unconditionally to `target`, passing `args` to its parameters.
@@ -231,6 +238,10 @@ test "builder builds a branching function" {
 
     const if_inst = func.blockInsts(entry)[func.blockInsts(entry).len - 1];
     try std.testing.expectEqual(cond, func.opcode(if_inst).@"if".cond);
-    try std.testing.expectEqual(function.Terminator{ .ret = a }, func.terminator(then_b).?);
-    try std.testing.expectEqual(function.Terminator{ .ret = b }, func.terminator(else_b).?);
+    const then_ret = func.terminator(then_b).?.ret;
+    try std.testing.expectEqual(@as(u8, 1), then_ret.count);
+    try std.testing.expectEqual(a, then_ret.values[0]);
+    const else_ret = func.terminator(else_b).?.ret;
+    try std.testing.expectEqual(@as(u8, 1), else_ret.count);
+    try std.testing.expectEqual(b, else_ret.values[0]);
 }

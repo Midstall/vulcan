@@ -10,6 +10,7 @@
 const std = @import("std");
 const function = @import("function.zig");
 const types = @import("types.zig");
+const parser = @import("parser.zig");
 
 const Function = function.Function;
 const Value = function.Value;
@@ -43,6 +44,9 @@ const op_call_indirect: u8 = 16;
 const op_prefetch: u8 = 17;
 const op_dot: u8 = 18;
 const op_matmul: u8 = 19;
+const op_va_start: u8 = 20;
+const op_va_arg: u8 = 21;
+const op_va_end: u8 = 22;
 
 const Writer = struct {
     bytes: std.ArrayList(u8) = .empty,
@@ -232,6 +236,8 @@ fn writeInst(w: *Writer, func: *const Function, inst: Inst, serial: []const u32,
             try w.u8v(op_alloca);
             try w.u32v(@intFromEnum(al.elem));
         },
+        // TODO: is_variadic/num_fixed do not round-trip here yet. Fix this before any
+        // variadic call is serialized, in bitcode, LTO, or text IR.
         .call => |c| {
             try w.u8v(op_call);
             try w.u32v(c.symbol);
@@ -258,6 +264,21 @@ fn writeInst(w: *Writer, func: *const Function, inst: Inst, serial: []const u32,
         .prefetch => |pf| {
             try w.u8v(op_prefetch);
             try w.u32v(sv(serial, pf.ptr));
+        },
+        // `VaArg.ty` is not written separately. It always equals the result type
+        // already written generically above (`if (result) |r| ... valueType(r)`), so the
+        // decoder recovers it from `rty` with nothing extra on the wire.
+        .va_start => |vs| {
+            try w.u8v(op_va_start);
+            try w.u32v(sv(serial, vs.list));
+        },
+        .va_arg => |va| {
+            try w.u8v(op_va_arg);
+            try w.u32v(sv(serial, va.list));
+        },
+        .va_end => |ve| {
+            try w.u8v(op_va_end);
+            try w.u32v(sv(serial, ve.list));
         },
         .dot => |d| {
             try w.u8v(op_dot);
@@ -319,6 +340,7 @@ fn writeInst(w: *Writer, func: *const Function, inst: Inst, serial: []const u32,
         .global_addr => |ga| {
             try w.u8v(op_global_addr);
             try w.u32v(ga.symbol);
+            try w.u8v(@intFromBool(ga.via_got));
         },
     }
 }
@@ -336,10 +358,10 @@ fn writeTerm(w: *Writer, func: *const Function, block: Block, serial: []const u3
         return;
     };
     switch (term) {
-        .ret => |v| {
+        .ret => |r| {
             try w.u8v(1);
-            try w.u8v(if (v != null) 1 else 0);
-            if (v) |vv| try w.u32v(sv(serial, vv));
+            try w.u8v(r.count);
+            for (r.slice()) |vv| try w.u32v(sv(serial, vv));
         },
         .jump => |j| {
             try w.u8v(2);
@@ -539,6 +561,9 @@ const Fixup = struct {
                         st.ptr = next(&i, self.slots, serial);
                     },
                     .prefetch => |*pf| pf.ptr = next(&i, self.slots, serial),
+                    .va_start => |*vs| vs.list = next(&i, self.slots, serial),
+                    .va_arg => |*va| va.list = next(&i, self.slots, serial),
+                    .va_end => |*ve| ve.list = next(&i, self.slots, serial),
                     .dot => |*d| {
                         d.acc = next(&i, self.slots, serial);
                         d.a = next(&i, self.slots, serial);
@@ -570,8 +595,8 @@ const Fixup = struct {
                 const tptr = func.terminatorPtr(block);
                 if (tptr.* == null) return;
                 switch (tptr.*.?) {
-                    .ret => |v| {
-                        if (v != null) tptr.* = .{ .ret = next(&i, self.slots, serial) };
+                    .ret => |*r| {
+                        for (r.values[0..r.count]) |*vv| vv.* = next(&i, self.slots, serial);
                     },
                     .jump => |j| for (func.valueListMut(j.args)) |*a| {
                         a.* = next(&i, self.slots, serial);
@@ -639,6 +664,8 @@ fn readInst(r: *Reader, func: *Function, block: Block, type_map: []const Type, b
             break :blk try appendRes(func, block, serial, rty, .{ .unary = .{ .op = uop, .value = dummy } });
         },
         op_alloca => try appendRes(func, block, serial, rty, .{ .alloca = .{ .elem = try mapType(type_map, type_map.len, try r.take(u32)) } }),
+        // TODO: is_variadic/num_fixed do not round-trip here yet. Fix this before any
+        // variadic call is serialized, in bitcode, LTO, or text IR.
         op_call => blk: {
             const symbol = try r.take(u32);
             const n = try r.take(u32);
@@ -675,6 +702,20 @@ fn readInst(r: *Reader, func: *Function, block: Block, type_map: []const Type, b
         op_prefetch => blk: {
             try slots.append(allocator, try r.take(u32));
             break :blk try appendStmtOp(func, block, .{ .prefetch = .{ .ptr = dummy } });
+        },
+        op_va_start => blk: {
+            try slots.append(allocator, try r.take(u32));
+            break :blk try appendStmtOp(func, block, .{ .va_start = .{ .list = dummy } });
+        },
+        // `rty` was already decoded above (`has_result` is true for `va_arg`), so `VaArg.ty`
+        // recovers straight from it - see `writeInst`'s matching comment.
+        op_va_arg => blk: {
+            try slots.append(allocator, try r.take(u32));
+            break :blk try appendRes(func, block, serial, rty, .{ .va_arg = .{ .list = dummy, .ty = rty } });
+        },
+        op_va_end => blk: {
+            try slots.append(allocator, try r.take(u32));
+            break :blk try appendStmtOp(func, block, .{ .va_end = .{ .list = dummy } });
         },
         op_dot => blk: {
             try slots.append(allocator, try r.take(u32));
@@ -733,7 +774,11 @@ fn readInst(r: *Reader, func: *Function, block: Block, type_map: []const Type, b
             const else_j = try readJumpDummy(r, func, block_count, &slots, dummy, allocator);
             break :blk try appendStmtOp(func, block, .{ .@"if" = .{ .cond = dummy, .then = then_j, .@"else" = else_j } });
         },
-        op_global_addr => try appendRes(func, block, serial, rty, .{ .global_addr = .{ .symbol = try r.take(u32) } }),
+        op_global_addr => blk: {
+            const symbol = try r.take(u32);
+            const via_got = (try r.take(u8)) != 0;
+            break :blk try appendRes(func, block, serial, rty, .{ .global_addr = .{ .symbol = symbol, .via_got = via_got } });
+        },
         else => return error.MalformedBitcode,
     };
 
@@ -757,13 +802,14 @@ fn readTerm(r: *Reader, func: *Function, block: Block, block_count: u32, dummy: 
     switch (try r.take(u8)) {
         0 => {}, // no terminator
         1 => {
-            const has_value = (try r.take(u8)) != 0;
-            if (has_value) {
+            const count = try r.take(u8);
+            if (count > 4) return error.MalformedBitcode;
+            var dummies: [4]Value = undefined;
+            for (0..count) |i| {
                 try slots.append(allocator, try r.take(u32));
-                func.setTerminator(block, .{ .ret = dummy });
-            } else {
-                func.setTerminator(block, .{ .ret = null });
+                dummies[i] = dummy;
             }
+            func.setTerminator(block, .{ .ret = function.Ret.many(dummies[0..count]) });
         },
         2 => {
             const target = try checkBlock(try r.take(u32), block_count);
@@ -820,7 +866,7 @@ test "round-trips a function through bitcode" {
     const sum = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = y } });
     try func.appendIf(entry, c, .{ .target = merge, .args = &.{prod} }, .{ .target = merge, .args = &.{sum} });
     const r = try func.appendArithImm(merge, i32_t, .add, z, 1);
-    func.setTerminator(merge, .{ .ret = r });
+    func.setTerminator(merge, .{ .ret = function.Ret.one(r) });
 
     const bytes = try encode(allocator, &func);
     defer allocator.free(bytes);
@@ -845,7 +891,7 @@ test "round-trips a prefetch through bitcode" {
     const entry = try func.appendBlock();
     const p = try func.appendBlockParam(entry, ptr_t);
     try func.appendPrefetch(entry, p);
-    func.setTerminator(entry, .{ .ret = null });
+    func.setTerminator(entry, .{ .ret = function.Ret.none() });
 
     const bytes = try encode(allocator, &func);
     defer allocator.free(bytes);
@@ -857,6 +903,73 @@ test "round-trips a prefetch through bitcode" {
     const op = decoded.opcode(insts[insts.len - 1]);
     try std.testing.expect(op == .prefetch);
     try std.testing.expectEqual(p, op.prefetch.ptr);
+
+    const a = try std.fmt.allocPrint(allocator, "{f}", .{func});
+    defer allocator.free(a);
+    const b = try std.fmt.allocPrint(allocator, "{f}", .{decoded});
+    defer allocator.free(b);
+    try std.testing.expectEqualStrings(a, b);
+}
+
+test "round-trips va_start/va_arg/va_end through bitcode" {
+    const allocator = std.testing.allocator;
+
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr_t = try func.types.intern(.ptr);
+    const entry = try func.appendBlock();
+    const list = try func.appendBlockParam(entry, ptr_t);
+    try func.appendVaStart(entry, list);
+    const v = try func.appendVaArg(entry, list, i32_t);
+    try func.appendVaEnd(entry, list);
+    func.setTerminator(entry, .{ .ret = function.Ret.one(v) });
+
+    const bytes = try encode(allocator, &func);
+    defer allocator.free(bytes);
+
+    var decoded = try decode(allocator, bytes);
+    defer decoded.deinit();
+
+    const insts = decoded.blockInsts(entry);
+    try std.testing.expectEqual(list, decoded.opcode(insts[0]).va_start.list);
+    try std.testing.expectEqual(list, decoded.opcode(insts[1]).va_arg.list);
+    try std.testing.expectEqual(i32_t, decoded.opcode(insts[1]).va_arg.ty);
+    try std.testing.expectEqual(list, decoded.opcode(insts[2]).va_end.list);
+
+    const a = try std.fmt.allocPrint(allocator, "{f}", .{func});
+    defer allocator.free(a);
+    const b = try std.fmt.allocPrint(allocator, "{f}", .{decoded});
+    defer allocator.free(b);
+    try std.testing.expectEqualStrings(a, b);
+}
+
+test "round-trips a global_addr's via_got flag through bitcode (both directions)" {
+    const allocator = std.testing.allocator;
+
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ptr_t = try func.types.intern(.ptr);
+    const entry = try func.appendBlock();
+    const direct = try func.appendGlobalAddr(entry, ptr_t, "D");
+    const got = try func.appendGlobalAddrGot(entry, ptr_t, "G");
+    _ = direct;
+    _ = got;
+    func.setTerminator(entry, .{ .ret = function.Ret.none() });
+
+    const bytes = try encode(allocator, &func);
+    defer allocator.free(bytes);
+
+    var decoded = try decode(allocator, bytes);
+    defer decoded.deinit();
+
+    const insts = decoded.blockInsts(entry);
+    const d_op = decoded.opcode(insts[0]);
+    const g_op = decoded.opcode(insts[1]);
+    try std.testing.expect(d_op == .global_addr);
+    try std.testing.expect(g_op == .global_addr);
+    try std.testing.expectEqual(false, d_op.global_addr.via_got);
+    try std.testing.expectEqual(true, g_op.global_addr.via_got);
 
     const a = try std.fmt.allocPrint(allocator, "{f}", .{func});
     defer allocator.free(a);
@@ -879,7 +992,7 @@ test "round-trips a dot through bitcode" {
     const a_val = try func.appendBlockParam(entry, v16i8);
     const b_val = try func.appendBlockParam(entry, v16i8);
     const result = try func.appendDot(entry, acc, a_val, b_val);
-    func.setTerminator(entry, .{ .ret = result });
+    func.setTerminator(entry, .{ .ret = function.Ret.one(result) });
 
     const bytes = try encode(allocator, &func);
     defer allocator.free(bytes);
@@ -912,7 +1025,7 @@ test "round-trips a matmul through bitcode" {
     const b_val = try func.appendBlockParam(entry, ptr_t);
     const c_val = try func.appendBlockParam(entry, ptr_t);
     try func.appendMatmul(entry, a_val, b_val, c_val, 8, 12, 4, .uint8, true);
-    func.setTerminator(entry, .{ .ret = null });
+    func.setTerminator(entry, .{ .ret = function.Ret.none() });
 
     const bytes = try encode(allocator, &func);
     defer allocator.free(bytes);
@@ -952,7 +1065,7 @@ test "round-trips a matmul with a mixed-signedness input_signs override through 
     const b_val = try func.appendBlockParam(entry, ptr_t);
     const c_val = try func.appendBlockParam(entry, ptr_t);
     try func.appendMatmulSigned(entry, a_val, b_val, c_val, 8, 12, 4, .int8, true, .{ .a_unsigned = true, .b_unsigned = false });
-    func.setTerminator(entry, .{ .ret = null });
+    func.setTerminator(entry, .{ .ret = function.Ret.none() });
 
     const bytes = try encode(allocator, &func);
     defer allocator.free(bytes);
@@ -986,7 +1099,7 @@ test "round-trips a matmul quant epilogue through bitcode" {
     const b_val = try func.appendBlockParam(entry, ptr_t);
     const c_val = try func.appendBlockParam(entry, ptr_t);
     try func.appendMatmulQuant(entry, a_val, b_val, c_val, 8, 12, 4, .int8, true, .{ .scale = .{ .scalar = 0x3F000000 }, .relu = true });
-    func.setTerminator(entry, .{ .ret = null });
+    func.setTerminator(entry, .{ .ret = function.Ret.none() });
 
     const bytes = try encode(allocator, &func);
     defer allocator.free(bytes);
@@ -1026,7 +1139,7 @@ test "round-trips a matmul per-column quant epilogue through bitcode" {
     // Exercises .u8 here (the scalar round-trip test above already covers the default .i8), so
     // the new `out` byte's encode/decode order is proven for both enum values across the suite.
     try func.appendMatmulQuantPerColumn(entry, a_val, b_val, c_val, 8, 4, 4, .int8, true, true, .u8, scales);
-    func.setTerminator(entry, .{ .ret = null });
+    func.setTerminator(entry, .{ .ret = function.Ret.none() });
 
     const bytes = try encode(allocator, &func);
     defer allocator.free(bytes);
@@ -1069,7 +1182,7 @@ test "round-trips an asymmetric-uint8 matmul quant epilogue (bias + zero_point) 
         .relu = false,
         .out = .u8,
     });
-    func.setTerminator(entry, .{ .ret = null });
+    func.setTerminator(entry, .{ .ret = function.Ret.none() });
 
     const bytes = try encode(allocator, &func);
     defer allocator.free(bytes);
@@ -1167,7 +1280,7 @@ test "round-trips f16 alongside f32 and f64 through bitcode" {
     const doubled = try func.appendInst(entry, f64_t, .{ .convert = .{ .value = p64 } }); // f64 -> f64 (identity, keeps p64 live)
     _ = narrowed;
     _ = doubled;
-    func.setTerminator(entry, .{ .ret = widened });
+    func.setTerminator(entry, .{ .ret = function.Ret.one(widened) });
 
     const bytes = try encode(allocator, &func);
     defer allocator.free(bytes);
@@ -1201,4 +1314,48 @@ test "regression: rejects an unknown float-kind byte instead of silently aliasin
         "\x02" ++ // type 0: float
         "\x03"; // float-kind byte = 3 (no such FloatKind)
     try std.testing.expectError(error.MalformedBitcode, decode(allocator, bad_float));
+}
+
+test "a 2-value ret round-trips through bitcode and text-IR" {
+    // `Terminator.ret` was widened from a single optional value to an inline
+    // list of up to 4 values. A count of 0 or 1 must stay byte-identical to before,
+    // as proven by every other test in this file. This test proves only the new
+    // count-2 shape: it serializes and parses correctly. No backend lowers a count
+    // above 1 yet, so this never touches codegen.
+    const allocator = std.testing.allocator;
+
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const entry = try func.appendBlock();
+    const a = try func.appendBlockParam(entry, i32_t);
+    const b = try func.appendBlockParam(entry, i32_t);
+    func.setTerminator(entry, .{ .ret = function.Ret.many(&.{ a, b }) });
+
+    // Bitcode round-trip: write then read back.
+    const bytes = try encode(allocator, &func);
+    defer allocator.free(bytes);
+    var decoded = try decode(allocator, bytes);
+    defer decoded.deinit();
+
+    const decoded_ret = decoded.terminator(entry).?.ret;
+    try std.testing.expectEqual(@as(u8, 2), decoded_ret.count);
+    try std.testing.expectEqual(decoded.blockParams(entry)[0], decoded_ret.values[0]);
+    try std.testing.expectEqual(decoded.blockParams(entry)[1], decoded_ret.values[1]);
+
+    // Text-IR round-trip: print then parse, byte-identical text (`ret v0, v1`).
+    const text = try std.fmt.allocPrint(allocator, "{f}", .{func});
+    defer allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "ret v0, v1") != null);
+
+    var reparsed = try parser.parse(allocator, text);
+    defer reparsed.deinit();
+    const reparsed_ret = reparsed.terminator(entry).?.ret;
+    try std.testing.expectEqual(@as(u8, 2), reparsed_ret.count);
+    try std.testing.expectEqual(reparsed.blockParams(entry)[0], reparsed_ret.values[0]);
+    try std.testing.expectEqual(reparsed.blockParams(entry)[1], reparsed_ret.values[1]);
+
+    const reprinted = try std.fmt.allocPrint(allocator, "{f}", .{reparsed});
+    defer allocator.free(reprinted);
+    try std.testing.expectEqualStrings(text, reprinted);
 }

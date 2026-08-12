@@ -208,7 +208,7 @@ test "instrumentation adds a transparent counter to every block" {
     const b = try func.appendBlock();
     const x = try func.appendBlockParam(b, t);
     const r = try func.appendInst(b, t, .{ .arith = .{ .op = .mul, .lhs = x, .rhs = x } });
-    func.setTerminator(b, .{ .ret = r });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
 
     const before = func.blockInsts(b).len;
     const counters = try instrument(allocator, &func, "prof_counters");
@@ -217,7 +217,7 @@ test "instrumentation adds a transparent counter to every block" {
     // Five counter instructions were prepended. The original body still follows,
     // and the result (the mul) is unchanged.
     try std.testing.expectEqual(before + 5, func.blockInsts(b).len);
-    try std.testing.expectEqual(r, func.terminator(b).?.ret.?);
+    try std.testing.expectEqual(r, func.terminator(b).?.ret.values[0]);
     var has_store = false;
     for (func.blockInsts(b)) |inst| {
         if (func.opcode(inst) == .store) has_store = true;
@@ -237,7 +237,7 @@ test "guided inlining inlines hot calls and skips cold ones" {
         const b = try f.appendBlock();
         const a = try f.appendBlockParam(b, t);
         const s = try f.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = a, .rhs = a } });
-        f.setTerminator(b, .{ .ret = s });
+        f.setTerminator(b, .{ .ret = ir.function.Ret.one(s) });
         try module.add("helper", f);
     }
     // caller(x): block0 if x>0 -> hot else cold, hot: r=helper(x) jump done(r)
@@ -259,7 +259,7 @@ test "guided inlining inlines hot calls and skips cold ones" {
         try f.setJump(hot, done, &.{r});
         const r2 = try f.appendCall(cold, t, "helper", &.{x});
         try f.setJump(cold, done, &.{r2});
-        f.setTerminator(done, .{ .ret = z });
+        f.setTerminator(done, .{ .ret = ir.function.Ret.one(z) });
         try module.add("caller", f);
     }
 

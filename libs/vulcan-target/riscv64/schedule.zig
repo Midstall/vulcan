@@ -33,7 +33,7 @@ test "a dependent chain keeps its order and stays verifiable" {
     const v2 = try func.appendInst(block, i32_t, .{ .arith = .{ .op = .add, .lhs = v0, .rhs = v1 } });
     const v3 = try func.appendInst(block, i32_t, .{ .arith = .{ .op = .add, .lhs = v2, .rhs = v0 } });
     const v4 = try func.appendInst(block, i32_t, .{ .arith = .{ .op = .add, .lhs = v3, .rhs = v0 } });
-    func.setTerminator(block, .{ .ret = v4 });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(v4) });
 
     try scheduleFunction(std.testing.allocator, &func);
 
@@ -61,7 +61,7 @@ test "a later load never reorders ahead of an earlier store" {
     try func.appendStore(block, x, p);
     const v = try func.appendInst(block, i32_t, .{ .load = .{ .ptr = p } }); // higher latency than the store
     _ = try func.appendInst(block, i32_t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = x } });
-    func.setTerminator(block, .{ .ret = v });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(v) });
 
     const before = func.blockInsts(block);
     const i_store = before[0];
@@ -89,7 +89,7 @@ test "fills the load-use gap with independent work, keeping the load pinned" {
     const v4 = try func.appendInst(block, i32_t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = x } }); // independent
     const v5 = try func.appendInst(block, i32_t, .{ .arith = .{ .op = .add, .lhs = v4, .rhs = x } });
     const v6 = try func.appendInst(block, i32_t, .{ .arith = .{ .op = .add, .lhs = v3, .rhs = v5 } });
-    func.setTerminator(block, .{ .ret = v6 });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(v6) });
 
     try scheduleFunction(std.testing.allocator, &func);
 
@@ -117,7 +117,7 @@ test "schedules independent high-latency ops early to hide latency" {
     const v4 = try func.appendInst(block, i32_t, .{ .arith = .{ .op = .mul, .lhs = v0, .rhs = v0 } });
     const v5 = try func.appendInst(block, i32_t, .{ .arith = .{ .op = .add, .lhs = v4, .rhs = v1 } });
     const v6 = try func.appendInst(block, i32_t, .{ .arith = .{ .op = .add, .lhs = v3, .rhs = v5 } });
-    func.setTerminator(block, .{ .ret = v6 });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(v6) });
 
     try scheduleFunction(std.testing.allocator, &func);
 

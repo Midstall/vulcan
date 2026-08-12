@@ -36,17 +36,25 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
         for (func.blockInsts(@enumFromInt(bi))) |inst| {
             switch (func.opcode(inst)) {
                 .load => |ld| {
-                    const result = func.instResult(inst).?;
-                    if (find(avail.items, func, ld.ptr)) |v| {
-                        func.replaceAllUses(result, v);
-                        block_changed = true;
-                        continue; // drop the now-redundant load
+                    // A `volatile` load (SM9 Plan 2 Task 4) must observably re-read memory every
+                    // time: it is never satisfied from a prior availability entry, and it is never
+                    // itself recorded as one (so no later load can be forwarded from it either).
+                    if (!ld.@"volatile") {
+                        const result = func.instResult(inst).?;
+                        if (find(avail.items, func, ld.ptr, func.valueType(result))) |v| {
+                            func.replaceAllUses(result, v);
+                            block_changed = true;
+                            continue; // drop the now-redundant load
+                        }
+                        try avail.append(allocator, .{ .ptr = ld.ptr, .value = result });
                     }
-                    try avail.append(allocator, .{ .ptr = ld.ptr, .value = result });
                 },
                 .store => |st| {
+                    // A `volatile` store is still a barrier to aliasing loads (invalidate as usual),
+                    // but its value must not be handed out to satisfy a later load - so it is not
+                    // recorded as an availability entry.
                     invalidateAliasing(&avail, func, st.ptr);
-                    try avail.append(allocator, .{ .ptr = st.ptr, .value = st.value });
+                    if (!st.@"volatile") try avail.append(allocator, .{ .ptr = st.ptr, .value = st.value });
                 },
                 // A call or matmul may write any memory; a prefetch is a pure hint. Everything else is
                 // pure (no memory effect) and leaves availability intact.
@@ -63,10 +71,19 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
     return changed;
 }
 
-/// The available value for `ptr`, if some entry holds exactly that address.
-fn find(items: []const Avail, func: *const Function, ptr: Value) ?Value {
+/// The available value for `ptr`, if some entry holds exactly that address AND was recorded
+/// at the same IR type as the load being satisfied. The type check matters because Vulcan
+/// pointers are untyped (no pointee type carried at the IR level): the same address can
+/// legitimately be stored/loaded at DIFFERENT widths at different points in a function - e.g.
+/// a struct field access at offset 0 (its own narrower scalar type) versus a whole-struct
+/// blob copy through that same base address (a wider word type covering the whole struct).
+/// Forwarding a value of one type to satisfy a load of another would hand a mistyped operand
+/// to every use of the load's result, which the IR verifier (rightly) rejects afterward - so
+/// a type mismatch here is treated as "not available", not a match, falling through to a
+/// fresh load exactly as if no prior access exists.
+fn find(items: []const Avail, func: *const Function, ptr: Value, want_ty: ir.types.Type) ?Value {
     for (items) |a| {
-        if (sameAddress(func, a.ptr, ptr)) return a.value;
+        if (sameAddress(func, a.ptr, ptr) and func.valueType(a.value) == want_ty) return a.value;
     }
     return null;
 }
@@ -166,10 +183,10 @@ test "a store forwards its value to a later load of the same address" {
     const v = try func.appendBlockParam(b, t);
     try func.appendStore(b, v, p);
     const y = try func.appendInst(b, t, .{ .load = .{ .ptr = p } });
-    func.setTerminator(b, .{ .ret = y });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(y) });
 
     try testing.expect(try runOnce(allocator, &func));
-    try testing.expectEqual(v, func.terminator(b).?.ret.?); // load forwarded the stored value
+    try testing.expectEqual(v, func.terminator(b).?.ret.values[0]); // load forwarded the stored value
 }
 
 test "a second load of an address reuses the first" {
@@ -183,7 +200,7 @@ test "a second load of an address reuses the first" {
     const y1 = try func.appendInst(b, t, .{ .load = .{ .ptr = p } });
     const y2 = try func.appendInst(b, t, .{ .load = .{ .ptr = p } });
     const sum = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = y1, .rhs = y2 } });
-    func.setTerminator(b, .{ .ret = sum });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(sum) });
 
     try testing.expect(try runOnce(allocator, &func));
     const add = func.opcode(func.definingInst(sum).?).arith;
@@ -205,7 +222,7 @@ test "a store to a distinct alloca does not kill an available load" {
     try func.appendStore(b, v, a); // store to a distinct alloca
     const second = try func.appendInst(b, t, .{ .load = .{ .ptr = c } });
     const sum = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = first, .rhs = second } });
-    func.setTerminator(b, .{ .ret = sum });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(sum) });
 
     try testing.expect(try runOnce(allocator, &func));
     const add = func.opcode(func.definingInst(sum).?).arith;
@@ -226,7 +243,32 @@ test "a store to a possibly-aliasing pointer forces a reload" {
     try func.appendStore(b, v, q);
     const second = try func.appendInst(b, t, .{ .load = .{ .ptr = p } });
     const sum = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = first, .rhs = second } });
-    func.setTerminator(b, .{ .ret = sum });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(sum) });
 
     try testing.expect(!try runOnce(allocator, &func)); // second load cannot be forwarded
+}
+
+// SM6 Task 2 (vcc struct copy) surfaced this: a struct's whole-blob copy stores/loads a WIDE
+// word directly through the same base pointer a narrower scalar field also loads/stores
+// through (a field at offset 0 shares the struct's own base address, no arithmetic in
+// between) - two different widths, same address, same block. Forwarding the wide store's
+// value to satisfy the narrow load (or vice versa) would hand a mistyped operand to every use
+// of the narrow load's result.
+test "a store and a load of different widths at the same address do not forward" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t32 = try i32Ty(&func);
+    const t64 = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
+    const ptr_t = try func.types.intern(.ptr);
+    const b = try func.appendBlock();
+    const p = try func.appendBlockParam(b, ptr_t);
+    const wide = try func.appendBlockParam(b, t64);
+    try func.appendStore(b, wide, p); // a wide (64-bit) store to p
+    const narrow = try func.appendInst(b, t32, .{ .load = .{ .ptr = p } }); // a narrower (32-bit) load of the SAME address
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(narrow) });
+
+    _ = try runOnce(allocator, &func); // may still run (nothing else to fold), but must not forward
+    const term = func.terminator(b).?;
+    try testing.expectEqual(narrow, term.ret.values[0]); // the narrow load must survive, not be replaced by `wide`
 }

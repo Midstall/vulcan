@@ -27,7 +27,7 @@ fn arithmetic(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !voi
         const y = try f.appendBlockParam(b, t);
         const p = try f.appendInst(b, t, .{ .arith = .{ .op = .mul, .lhs = x, .rhs = y } });
         const s = try f.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = p, .rhs = x } });
-        f.setTerminator(b, .{ .ret = s });
+        f.setTerminator(b, .{ .ret = ir.function.Ret.one(s) });
         try expectRun(io, allocator, &f, &.{ 3, 4 }, 15, backend);
     }
     inline for (.{ .{ .op = .div, .want = 6 }, .{ .op = .rem, .want = 2 } }) |c| {
@@ -38,7 +38,7 @@ fn arithmetic(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !voi
         const x = try f.appendBlockParam(b, t);
         const y = try f.appendBlockParam(b, t);
         const r = try f.appendInst(b, t, .{ .arith = .{ .op = c.op, .lhs = x, .rhs = y } });
-        f.setTerminator(b, .{ .ret = r });
+        f.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
         try expectRun(io, allocator, &f, &.{ 20, 3 }, c.want, backend);
     }
     { // shift by a register count: x << k
@@ -49,7 +49,7 @@ fn arithmetic(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !voi
         const x = try f.appendBlockParam(b, t);
         const k = try f.appendBlockParam(b, t);
         const s = try f.appendInst(b, t, .{ .arith = .{ .op = .shl, .lhs = x, .rhs = k } });
-        f.setTerminator(b, .{ .ret = s });
+        f.setTerminator(b, .{ .ret = ir.function.Ret.one(s) });
         try expectRun(io, allocator, &f, &.{ 3, 4 }, 48, backend);
     }
     { // 3 args with division: (a + b) / c. The EAX/EDX reservation leaves only a
@@ -63,7 +63,7 @@ fn arithmetic(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !voi
         const c = try f.appendBlockParam(b, t);
         const s = try f.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = a, .rhs = bb } });
         const r = try f.appendInst(b, t, .{ .arith = .{ .op = .div, .lhs = s, .rhs = c } });
-        f.setTerminator(b, .{ .ret = r });
+        f.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
         try expectRun(io, allocator, &f, &.{ 20, 1, 3 }, 7, backend); // 21 / 3
     }
 }
@@ -82,7 +82,7 @@ fn immediates(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !voi
         const b = try f.appendBlock();
         const x = try f.appendBlockParam(b, t);
         const r = try f.appendArithImm(b, t, c.op, x, c.imm);
-        f.setTerminator(b, .{ .ret = r });
+        f.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
         try expectRun(io, allocator, &f, &.{10}, c.want, backend);
     }
 }
@@ -100,7 +100,7 @@ fn controlFlow(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !vo
         const r = try f.appendBlockParam(merge, t);
         const c = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .gt, .lhs = a, .rhs = b } });
         try f.appendIf(entry, c, .{ .target = merge, .args = &.{a} }, .{ .target = merge, .args = &.{b} });
-        f.setTerminator(merge, .{ .ret = r });
+        f.setTerminator(merge, .{ .ret = ir.function.Ret.one(r) });
         try expectRun(io, allocator, &f, &.{ 3, 4 }, 4, backend);
         try expectRun(io, allocator, &f, &.{ 7, 2 }, 7, backend);
     }
@@ -126,7 +126,7 @@ fn controlFlow(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !vo
         const ob = try f.appendInst(body, t, .{ .iconst = 1 });
         const inext = try f.appendInst(body, t, .{ .arith = .{ .op = .add, .lhs = i, .rhs = ob } });
         try f.setJump(body, header, &.{ sum2, inext });
-        f.setTerminator(exit, .{ .ret = r });
+        f.setTerminator(exit, .{ .ret = ir.function.Ret.one(r) });
         try expectRun(io, allocator, &f, &.{5}, 15, backend);
         try expectRun(io, allocator, &f, &.{10}, 55, backend);
     }
@@ -143,7 +143,7 @@ fn spilling(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void 
     for (0..6) |k| temps[k] = try f.appendArithImm(b, t, .add, a, @intCast(k + 1));
     var acc = temps[0];
     for (1..6) |k| acc = try f.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = temps[k] } });
-    f.setTerminator(b, .{ .ret = acc });
+    f.setTerminator(b, .{ .ret = ir.function.Ret.one(acc) });
     try expectRun(io, allocator, &f, &.{10}, 81, backend); // 6a + 21
 }
 
@@ -158,7 +158,7 @@ fn calls(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {
         const x = try helper.appendBlockParam(b, t);
         const d = try helper.appendInst(b, t, .{ .arith = .{ .op = .mul, .lhs = x, .rhs = x } });
         const r = try helper.appendArithImm(b, t, .add, d, 1);
-        helper.setTerminator(b, .{ .ret = r });
+        helper.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
     }
     var main = Function.init(allocator);
     defer main.deinit();
@@ -167,7 +167,7 @@ fn calls(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {
         const b = try main.appendBlock();
         const x = try main.appendBlockParam(b, t);
         const r = try main.appendCall(b, t, "helper", &.{x});
-        main.setTerminator(b, .{ .ret = r });
+        main.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
     }
     var module: link.Module = .{};
     defer module.deinit(allocator);
@@ -185,7 +185,7 @@ fn calls(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {
         const x = try helper2.appendBlockParam(b, t);
         const d = try helper2.appendInst(b, t, .{ .arith = .{ .op = .mul, .lhs = x, .rhs = x } });
         const r = try helper2.appendArithImm(b, t, .add, d, 1);
-        helper2.setTerminator(b, .{ .ret = r });
+        helper2.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
     }
     var main2 = Function.init(allocator);
     defer main2.deinit();
@@ -195,7 +195,7 @@ fn calls(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {
         const x = try main2.appendBlockParam(b, t);
         const called = try main2.appendCall(b, t, "helper", &.{x});
         const r = try main2.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = called, .rhs = x } });
-        main2.setTerminator(b, .{ .ret = r });
+        main2.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
     }
     var module2: link.Module = .{};
     defer module2.deinit(allocator);
@@ -219,7 +219,7 @@ fn memory(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {
             const v = try f.appendInst(b, t, .{ .iconst = c });
             try f.appendStore(b, v, slot);
             const r = try f.appendInst(b, t, .{ .load = .{ .ptr = slot } });
-            f.setTerminator(b, .{ .ret = r });
+            f.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
             try expectRun(io, allocator, &f, &.{}, c, backend);
         }
     }
@@ -245,7 +245,7 @@ fn memory(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {
         const v = try f.appendInst(b, t, .{ .load = .{ .ptr = slot0 } });
         try f.appendStore(b, v, slot1);
         const r = try f.appendInst(b, t, .{ .load = .{ .ptr = slot1 } });
-        f.setTerminator(b, .{ .ret = r });
+        f.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
         try expectRun(io, allocator, &f, &.{77}, 77, backend);
     }
 }
@@ -263,7 +263,7 @@ fn memorySubWord(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !
         try f.appendStore(b, c, slot);
         const v = try f.appendInst(b, i8_t, .{ .load = .{ .ptr = slot } });
         const r = try f.appendArithImm(b, i8_t, .shr, v, 24);
-        f.setTerminator(b, .{ .ret = r });
+        f.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
         try expectRun(io, allocator, &f, &.{}, -1, backend);
     }
     { // unsigned u8 load: the same 0x81 pattern zero-extends, so shr(v, 24) leaves 0.
@@ -277,7 +277,7 @@ fn memorySubWord(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !
         try f.appendStore(b, c, slot);
         const v = try f.appendInst(b, u8_t, .{ .load = .{ .ptr = slot } });
         const r = try f.appendArithImm(b, u8_t, .shr, v, 24);
-        f.setTerminator(b, .{ .ret = r });
+        f.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
         try expectRun(io, allocator, &f, &.{}, 0, backend);
     }
     { // signed i16 load: 0x8001 sign-extends, so shr(v, 16) leaves the extension fill (-1).
@@ -291,7 +291,7 @@ fn memorySubWord(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !
         try f.appendStore(b, c, slot);
         const v = try f.appendInst(b, i16_t, .{ .load = .{ .ptr = slot } });
         const r = try f.appendArithImm(b, i16_t, .shr, v, 16);
-        f.setTerminator(b, .{ .ret = r });
+        f.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
         try expectRun(io, allocator, &f, &.{}, -1, backend);
     }
     { // unsigned u16 load: the same 0x8001 pattern zero-extends, so shr(v, 16) leaves 0.
@@ -305,7 +305,7 @@ fn memorySubWord(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !
         try f.appendStore(b, c, slot);
         const v = try f.appendInst(b, u16_t, .{ .load = .{ .ptr = slot } });
         const r = try f.appendArithImm(b, u16_t, .shr, v, 16);
-        f.setTerminator(b, .{ .ret = r });
+        f.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
         try expectRun(io, allocator, &f, &.{}, 0, backend);
     }
 }

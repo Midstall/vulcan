@@ -99,8 +99,15 @@ fn keyOf(func: *const Function, canon: []const Value, inst: Inst, result: Value)
         }
     }.of;
     return switch (func.opcode(inst)) {
-        .iconst => |v| .{ .kind = .iconst, .a = @bitCast(v) },
-        .fconst => |v| .{ .kind = .fconst, .a = @bitCast(v) },
+        // The result TYPE must be part of the key, not just the bit pattern: an `iconst 0`
+        // typed unsigned-i32 and one typed signed-i32 have the same `a` but are NOT
+        // interchangeable (a later pass may build a signed vs. unsigned `icmp`/`arith` on
+        // top of it) - merging them would silently swap in the wrong-typed operand.
+        // Previously every `iconst`/`fconst` this frontend emitted shared one `Type` handle
+        // (e.g. plain `int`), so the omission was latent; SM4 Task 5 (typed integer-literal
+        // suffixes) is the first place a same-valued constant can carry a different type.
+        .iconst => |v| .{ .kind = .iconst, .a = @bitCast(v), .sub = @intFromEnum(func.valueType(result)) },
+        .fconst => |v| .{ .kind = .fconst, .a = @bitCast(v), .sub = @intFromEnum(func.valueType(result)) },
         .arith => |x| blk: {
             var a = vn(canon, x.lhs);
             var b = vn(canon, x.rhs);
@@ -118,13 +125,19 @@ fn keyOf(func: *const Function, canon: []const Value, inst: Inst, result: Value)
         .convert => |x| .{ .kind = .convert, .sub = @intFromEnum(func.valueType(result)), .a = vn(canon, x.value) },
         .unary => |x| .{ .kind = .unary, .sub = @intFromEnum(func.valueType(result)), .a = vn(canon, x.value), .b = @intFromEnum(x.op) },
         .extract => |x| .{ .kind = .extract, .sub = x.index, .a = vn(canon, x.aggregate) },
-        .global_addr => |x| .{ .kind = .global_addr, .a = x.symbol },
+        // `via_got` must be part of the key, not just `symbol`: a direct global_addr and a
+        // GOT-indirect global_addr of the same symbol are different addressing modes, not
+        // interchangeable values (the same discipline as the result-type fold-in above for
+        // `iconst`/`fconst`) - merging them would silently swap GOT-indirect for direct.
+        .global_addr => |x| .{ .kind = .global_addr, .a = x.symbol, .sub = @intFromBool(x.via_got) },
         // dot is pure, like arith, and keyed on all three operands (not commutative:
         // acc is the accumulator, distinct from a/b).
         .dot => |x| .{ .kind = .dot, .a = vn(canon, x.acc), .b = vn(canon, x.a), .c = vn(canon, x.b) },
         // alloca (distinct addresses), struct_new (variadic), and the impure
         // load/store/prefetch/matmul/call/if are not numbered.
         .alloca, .struct_new, .load, .store, .prefetch, .matmul, .call, .call_indirect, .@"if" => null,
+        // SM12 T3: mutate/read the `va_list` object at `list`, like `load`/`store` above - not numbered.
+        .va_start, .va_arg, .va_end => null,
     };
 }
 
@@ -162,6 +175,9 @@ fn rewriteOperands(func: *Function, canon: []const Value) void {
                 st.ptr = sub(canon, st.ptr);
             },
             .prefetch => |*pf| pf.ptr = sub(canon, pf.ptr),
+            .va_start => |*vs| vs.list = sub(canon, vs.list),
+            .va_arg => |*va| va.list = sub(canon, va.list),
+            .va_end => |*ve| ve.list = sub(canon, ve.list),
             .dot => |*d| {
                 d.acc = sub(canon, d.acc);
                 d.a = sub(canon, d.a);
@@ -175,12 +191,14 @@ fn rewriteOperands(func: *Function, canon: []const Value) void {
             .struct_new => |sn| for (func.valueListMut(sn.fields)) |*f| {
                 f.* = sub(canon, f.*);
             },
-            .call => |c| for (func.valueListMut(c.args)) |*arg| {
-                arg.* = sub(canon, arg.*);
+            .call => |*c| {
+                for (func.valueListMut(c.args)) |*arg| arg.* = sub(canon, arg.*);
+                if (c.ret_dest) |d| c.ret_dest = sub(canon, d); // SM14 M4d-c: the struct-return destination is a call operand
             },
             .call_indirect => |*c| {
                 c.target = sub(canon, c.target);
                 for (func.valueListMut(c.args)) |*arg| arg.* = sub(canon, arg.*);
+                if (c.ret_dest) |d| c.ret_dest = sub(canon, d); // SM14 M4d-c
             },
             .@"if" => |*cf| {
                 cf.cond = sub(canon, cf.cond);
@@ -192,8 +210,8 @@ fn rewriteOperands(func: *Function, canon: []const Value) void {
     for (0..func.blockCount()) |bi| {
         const term = func.terminatorPtr(@enumFromInt(bi));
         if (term.*) |*t| switch (t.*) {
-            .ret => |*v| if (v.*) |vv| {
-                v.* = sub(canon, vv);
+            .ret => |*r| for (r.values[0..r.count]) |*vv| {
+                vv.* = sub(canon, vv.*);
             },
             .jump => |*j| for (func.valueListMut(j.args)) |*arg| {
                 arg.* = sub(canon, arg.*);
@@ -215,7 +233,7 @@ test "cse reuses a redundant arithmetic expression" {
     const e1 = try func.appendInst(b, i32_t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = y } });
     const e2 = try func.appendInst(b, i32_t, .{ .arith = .{ .op = .add, .lhs = y, .rhs = x } });
     const r = try func.appendInst(b, i32_t, .{ .arith = .{ .op = .add, .lhs = e1, .rhs = e2 } });
-    func.setTerminator(b, .{ .ret = r });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
 
     var analyses = pass.Analyses{ .allocator = allocator, .func = &func };
     defer analyses.deinit();
@@ -242,13 +260,46 @@ test "cse does not reuse across a non-dominating block" {
     // b0: if cnd -> b1 else b2, b1: e1 = x+x -> ret e1, b2: e2 = x+x -> ret e2
     try func.appendIf(b0, cnd, .{ .target = b1 }, .{ .target = b2 });
     const e1 = try func.appendInst(b1, i32_t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = x } });
-    func.setTerminator(b1, .{ .ret = e1 });
+    func.setTerminator(b1, .{ .ret = ir.function.Ret.one(e1) });
     const e2 = try func.appendInst(b2, i32_t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = x } });
-    func.setTerminator(b2, .{ .ret = e2 });
+    func.setTerminator(b2, .{ .ret = ir.function.Ret.one(e2) });
 
     var analyses = pass.Analyses{ .allocator = allocator, .func = &func };
     defer analyses.deinit();
     // b1 does not dominate b2, so e2 cannot reuse e1: nothing changes.
     try std.testing.expect(!try run(allocator, &func, &analyses));
-    try std.testing.expectEqual(e2, func.terminator(b2).?.ret.?);
+    try std.testing.expectEqual(e2, func.terminator(b2).?.ret.values[0]);
+}
+
+test "gvn does not merge a direct and a via_got global_addr of the same symbol" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+
+    const ptr_t = try func.types.intern(.ptr);
+    const i64_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
+    const b = try func.appendBlock();
+    // direct = &G, got = &G (via GOT). Same symbol, different addressing mode:
+    // these must stay two distinct values, never CSE'd together (that would
+    // silently swap a GOT-indirect load for a direct one, or vice versa).
+    const direct = try func.appendGlobalAddr(b, ptr_t, "G");
+    const got = try func.appendGlobalAddrGot(b, ptr_t, "G");
+    const d_int = try func.appendInst(b, i64_t, .{ .convert = .{ .value = direct } });
+    const g_int = try func.appendInst(b, i64_t, .{ .convert = .{ .value = got } });
+    const r = try func.appendInst(b, i64_t, .{ .arith = .{ .op = .add, .lhs = d_int, .rhs = g_int } });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
+
+    var analyses = pass.Analyses{ .allocator = allocator, .func = &func };
+    defer analyses.deinit();
+    // The direct/via_got pair must not be recognized as congruent: gvn makes no change.
+    try std.testing.expect(!try run(allocator, &func, &analyses));
+
+    // Both converts still source their own, distinct global_addr: neither was
+    // replaced by the other.
+    const d_conv = func.definingInst(d_int).?;
+    const g_conv = func.definingInst(g_int).?;
+    try std.testing.expectEqual(direct, func.opcode(d_conv).convert.value);
+    try std.testing.expectEqual(got, func.opcode(g_conv).convert.value);
+    try std.testing.expectEqual(false, func.opcode(func.definingInst(direct).?).global_addr.via_got);
+    try std.testing.expectEqual(true, func.opcode(func.definingInst(got).?).global_addr.via_got);
 }

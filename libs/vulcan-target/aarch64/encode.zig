@@ -389,6 +389,19 @@ pub fn subImm64Shift(rd: Reg, rn: Reg, imm: u12) u32 {
     return 0xD1400000 | (@as(u32, imm) << 10) | (n(rn) << 5) | n(rd);
 }
 
+/// `adrp xd, #imm` (the page address of a PC-relative symbol; `imm` is the already
+/// page-shifted 21-bit delta `(target_page - PC_page) >> 12`, split into a 2-bit low
+/// part (bits [30:29]) and a 19-bit high part (bits [23:5]) per the ADR/ADRP encoding,
+/// op=1 selecting the page (vs byte) form. A `global_addr`'s page component is emitted
+/// with `imm = 0` plus a relocation; a later task patches these bits once the symbol's
+/// runtime address is known.
+pub fn adrp(rd: Reg, imm: i21) u32 {
+    const u: u21 = @bitCast(imm);
+    const immlo: u32 = u & 0x3;
+    const immhi: u32 = u >> 2;
+    return 0x90000000 | (immlo << 29) | (immhi << 5) | n(rd);
+}
+
 /// `str wt, [xn, #off]` (32-bit store, `off` a multiple of 4).
 pub fn strW(rt: Reg, rn: Reg, off: u14) u32 {
     return 0xB9000000 | ((@as(u32, off) >> 2) << 10) | (n(rn) << 5) | n(rt);
@@ -397,6 +410,13 @@ pub fn strW(rt: Reg, rn: Reg, off: u14) u32 {
 /// `ldr wt, [xn, #off]` (32-bit load).
 pub fn ldrW(rt: Reg, rn: Reg, off: u14) u32 {
     return 0xB9400000 | ((@as(u32, off) >> 2) << 10) | (n(rn) << 5) | n(rt);
+}
+
+/// `ldrsw xt, [xn, #off]` (load a 32-bit word, sign-extended into the 64-bit register). `off`
+/// is a byte offset, scaled by 4 (a multiple of 4). Used to read a signed `va_list` field
+/// (`__gr_offs`/`__vr_offs`) whole into an X register so the negative value adds to a pointer.
+pub fn ldrsw(rt: Reg, rn: Reg, off: u14) u32 {
+    return 0xB9800000 | ((@as(u32, off) >> 2) << 10) | (n(rn) << 5) | n(rt);
 }
 
 /// `strb wt, [xn]` (store the low byte).

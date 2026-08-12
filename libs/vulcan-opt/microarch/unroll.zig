@@ -133,15 +133,19 @@ pub fn cloneBlocks(
                         .args = try func.internValues(args_buf.items),
                     } };
                 },
-                .global_addr => |g| .{ .global_addr = .{ .symbol = g.symbol } },
-                .load => |l| .{ .load = .{ .ptr = remapValue(value_map, l.ptr) } },
+                .global_addr => |g| .{ .global_addr = .{ .symbol = g.symbol, .via_got = g.via_got } },
+                .load => |l| .{ .load = .{ .ptr = remapValue(value_map, l.ptr), .@"volatile" = l.@"volatile" } },
                 .store => |st| .{ .store = .{
                     .value = remapValue(value_map, st.value),
                     .ptr = remapValue(value_map, st.ptr),
+                    .@"volatile" = st.@"volatile",
                 } },
                 .prefetch => |pf| .{ .prefetch = .{
                     .ptr = remapValue(value_map, pf.ptr),
                 } },
+                .va_start => |vs| .{ .va_start = .{ .list = remapValue(value_map, vs.list) } },
+                .va_arg => |va| .{ .va_arg = .{ .list = remapValue(value_map, va.list), .ty = va.ty } },
+                .va_end => |ve| .{ .va_end = .{ .list = remapValue(value_map, ve.list) } },
                 .dot => |d| .{ .dot = .{
                     .acc = remapValue(value_map, d.acc),
                     .a = remapValue(value_map, d.a),
@@ -189,7 +193,9 @@ pub fn cloneBlocks(
             };
 
             switch (rebuilt) {
-                .store, .prefetch, .matmul, .@"if" => _ = try func.appendStmtRaw(cloned, rebuilt),
+                // `va_arg` has a result (like `load`), so it stays out of this result-less
+                // list and falls to the `else` (appendInst) branch below (SM12 T3).
+                .store, .prefetch, .matmul, .@"if", .va_start, .va_end => _ = try func.appendStmtRaw(cloned, rebuilt),
                 else => {
                     const result = func.instResult(inst) orelse unreachable;
                     const cloned_result = try func.appendInst(cloned, func.valueType(result), rebuilt);
@@ -200,7 +206,11 @@ pub fn cloneBlocks(
 
         if (func.terminator(b)) |term| {
             const rebuilt_term: Terminator = switch (term) {
-                .ret => |maybe_v| .{ .ret = if (maybe_v) |v| remapValue(value_map, v) else null },
+                .ret => |r| blk: {
+                    var nr = r;
+                    for (nr.values[0..nr.count]) |*vv| vv.* = remapValue(value_map, vv.*);
+                    break :blk .{ .ret = nr };
+                },
                 .jump => |j| blk: {
                     args_buf.clearRetainingCapacity();
                     for (func.valueList(j.args)) |v| {
@@ -350,7 +360,7 @@ fn eligible(
     // The header's control is the `if`; any explicit terminator other than an
     // implicit/void return means a shape we do not model.
     if (func.terminator(header)) |term| switch (term) {
-        .ret => |v| if (v != null) return null,
+        .ret => |r| if (r.count != 0) return null,
         .jump => return null,
     };
 
@@ -676,6 +686,9 @@ fn collectOperands(
                 try set.put(a, x.ptr, {});
             },
             .prefetch => |x| try set.put(a, x.ptr, {}),
+            .va_start => |x| try set.put(a, x.list, {}),
+            .va_arg => |x| try set.put(a, x.list, {}),
+            .va_end => |x| try set.put(a, x.list, {}),
             .dot => |x| {
                 try set.put(a, x.acc, {});
                 try set.put(a, x.a, {});
@@ -700,7 +713,7 @@ fn collectOperands(
         }
     }
     if (func.terminator(block)) |term| switch (term) {
-        .ret => |v| if (v) |vv| try set.put(a, vv, {}),
+        .ret => |r| for (r.slice()) |vv| try set.put(a, vv, {}),
         .jump => |j| for (func.valueList(j.args)) |v| try set.put(a, v, {}),
     };
 }
@@ -740,6 +753,9 @@ fn replaceInBlock(func: *Function, block: Block, from: Value, to: Value) void {
                 x.ptr = rep(from, to, x.ptr);
             },
             .prefetch => |*x| x.ptr = rep(from, to, x.ptr),
+            .va_start => |*x| x.list = rep(from, to, x.list),
+            .va_arg => |*x| x.list = rep(from, to, x.list),
+            .va_end => |*x| x.list = rep(from, to, x.list),
             .dot => |*x| {
                 x.acc = rep(from, to, x.acc);
                 x.a = rep(from, to, x.a);
@@ -768,8 +784,8 @@ fn replaceInBlock(func: *Function, block: Block, from: Value, to: Value) void {
         }
     }
     if (func.terminatorPtr(block).*) |*t| switch (t.*) {
-        .ret => |*v| if (v.*) |vv| {
-            v.* = rep(from, to, vv);
+        .ret => |*r| for (r.values[0..r.count]) |*vv| {
+            vv.* = rep(from, to, vv.*);
         },
         .jump => |*j| for (func.valueListMut(j.args)) |*arg| {
             arg.* = rep(from, to, arg.*);
@@ -798,7 +814,7 @@ fn buildCountedLoop(func: *Function, impure_header: bool) Error!void {
     try func.appendIf(loop, cmp, .{ .target = body, .args = &.{i} }, .{ .target = done });
     const next = try func.appendArithImm(body, i32_t, .add, bi, 1);
     try func.setJump(body, loop, &.{next});
-    func.setTerminator(done, .{ .ret = i });
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(i) });
 }
 
 test "run leaves an ineligible loop (impure header) unchanged" {
@@ -848,7 +864,7 @@ test "cloneBlocks duplicates a region with remapped values and independent block
     const b0 = try func.appendBlock();
     const p = try func.appendBlockParam(b0, i32_t);
     const d = try func.appendArithImm(b0, i32_t, .mul, p, 2);
-    func.setTerminator(b0, .{ .ret = d });
+    func.setTerminator(b0, .{ .ret = ir.function.Ret.one(d) });
 
     var vmap: ValueMap = .empty;
     defer vmap.deinit(allocator);
@@ -864,4 +880,33 @@ test "cloneBlocks duplicates a region with remapped values and independent block
     var diags = try ir.verify.verify(allocator, &func, .low);
     defer diags.deinit();
     try std.testing.expect(diags.ok());
+}
+
+test "cloneBlocks keeps via_got=true on a cloned global_addr (loop-unroll body copy)" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ptr_t = try func.types.intern(.ptr);
+    const b0 = try func.appendBlock();
+    const g = try func.appendGlobalAddrGot(b0, ptr_t, "G");
+    func.setTerminator(b0, .{ .ret = ir.function.Ret.one(g) });
+
+    var vmap: ValueMap = .empty;
+    defer vmap.deinit(allocator);
+    var bmap: BlockMap = .empty;
+    defer bmap.deinit(allocator);
+    const clones = try cloneBlocks(allocator, &func, &.{b0}, &vmap, &bmap);
+    defer allocator.free(clones);
+
+    // The unrolled body's global_addr copy must still be via_got=true: the
+    // per-instruction remap must forward the flag, not rebuild the op from just
+    // `.symbol` (which would silently default it false).
+    var found = false;
+    for (func.blockInsts(clones[0])) |inst| {
+        if (func.opcode(inst) == .global_addr) {
+            found = true;
+            try std.testing.expect(func.opcode(inst).global_addr.via_got);
+        }
+    }
+    try std.testing.expect(found);
 }

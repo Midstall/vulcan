@@ -1,9 +1,9 @@
-//! Differential JIT oracle for the IR `prefetch` hint. We build two identical
-//! functions that load through a pointer parameter and do arithmetic; ONE copy
-//! gets a hand-inserted `prefetch` of that same pointer right after it becomes
-//! available. JIT both on the host and require bit-identical results for every
-//! input, proving the PRFM (aarch64) / dropped-hint (every other backend)
-//! lowering has no observable effect on the function's result.
+//! Differential JIT oracle for the IR `prefetch` hint. This test builds two identical
+//! functions that load through a pointer parameter and do arithmetic. ONE copy gets a
+//! hand-inserted `prefetch` of that same pointer, right after the pointer becomes
+//! available. The test JITs both on the host and requires bit-identical results for
+//! every input. This proves the PRFM (aarch64) lowering, and the dropped-hint lowering
+//! on every other backend, has no observable effect on the function's result.
 //!
 //! This runs only where the native JIT has a backend (aarch64/x86_64/riscv64/x86).
 
@@ -26,16 +26,15 @@ fn buildLoadAdd(func: *Function, with_prefetch: bool) anyerror!void {
     if (with_prefetch) try func.appendPrefetch(entry, p);
     const val = try func.appendInst(entry, i64_t, .{ .load = .{ .ptr = p } });
     const sum = try func.appendArithImm(entry, i64_t, .add, val, 10);
-    func.setTerminator(entry, .{ .ret = sum });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(sum) });
 }
 
 /// `fn(p: *i64) i64 { *p = *p * 2; return *p + *p; }`. A second shape that also
 /// stores back through the pointer, so the prefetched build and the plain build
-/// exercise both a load and a store on the same address, with the prefetch
-/// (of a distinct, harmlessly-computed address `p+8`) sitting between them.
-/// `p+8` is never dereferenced, only prefetched, so it is fine that it may
-/// point one i64 past the caller's real cell: a prefetch never reads memory
-/// architecturally, it's a hint only.
+/// exercise both a load and a store on the same address. The prefetch, of a distinct,
+/// harmlessly-computed address `p+8`, sits between them. `p+8` is never dereferenced,
+/// only prefetched, so it is fine that it may point one i64 past the caller's real
+/// cell. A prefetch never reads memory architecturally. It is a hint only.
 fn buildStoreDouble(func: *Function, with_prefetch: bool) anyerror!void {
     const i64_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
     const ptr_t = try func.types.intern(.ptr);
@@ -50,14 +49,14 @@ fn buildStoreDouble(func: *Function, with_prefetch: bool) anyerror!void {
     }
     const reloaded = try func.appendInst(entry, i64_t, .{ .load = .{ .ptr = p } });
     const sum = try func.appendInst(entry, i64_t, .{ .arith = .{ .op = .add, .lhs = reloaded, .rhs = reloaded } });
-    func.setTerminator(entry, .{ .ret = sum });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(sum) });
 }
 
 const Builder = *const fn (*Function, bool) anyerror!void;
 
 /// Build a plain copy and a prefetch-hinted copy of `build`, JIT both, and
-/// require identical results (both the returned value AND the pointee left
-/// behind in the caller's cell) across a spread of inputs.
+/// require identical results, both the returned value AND the pointee left
+/// behind in the caller's cell, across a spread of inputs.
 fn expectPrefetchIsNoOp(build: Builder) !void {
     const allocator = std.testing.allocator;
     const inputs = [_]i64{ 0, 1, -1, 7, 42, -100, 1 << 40 };
@@ -132,12 +131,13 @@ fn ampere() *const opt.microarch.Model {
     return opt.microarch.modelFor(.@"ampere-altra");
 }
 
-/// `fn(n: i32, arr: *i64) i64`: `s = 0; p = arr; for (i = 0; i < n; i += 1) { s += *p; p += 8; }
-/// return s`. `p` is a pointer-typed loop-carried value that steps by a constant 8-byte stride each
-/// iteration and is dereferenced directly each time: exactly the affine-strided-load shape
-/// `microarch.prefetch.run` looks for. This is the real oracle for Task 3: the pass reads real
-/// loop/load structure (not a hand-inserted prefetch like the tests above), so it proves both that
-/// eligibility fires on a genuine strided loop AND that the inserted hint changes nothing.
+/// `fn(n: i32, arr: *i64) i64`. It sets s to 0 and p to arr, then for i from 0 up to n, adds the
+/// value at p to s and advances p by 8 each iteration, then returns s. `p` is a pointer-typed
+/// loop-carried value that steps by a constant 8-byte stride each iteration and is dereferenced
+/// directly each time. This is exactly the affine-strided-load shape that `microarch.prefetch.run`
+/// looks for. It is the real oracle for the pass: the pass reads real loop and load structure, not
+/// a hand-inserted prefetch like the tests above. So it proves both that eligibility fires on a
+/// genuine strided loop, and that the inserted hint changes nothing.
 fn buildStridedSum(func: *Function) anyerror!void {
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const i64_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
@@ -171,7 +171,7 @@ fn buildStridedSum(func: *Function) anyerror!void {
     const ni = try func.appendArithImm(body, i32_t, .add, bi, 1);
     try func.setJump(body, loop, &.{ ni, np, ns });
 
-    func.setTerminator(done, .{ .ret = ds });
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(ds) });
 }
 
 test "prefetch differential: strided-reduction loop over a real array (sum a[i] for i in 0..n)" {
@@ -217,10 +217,10 @@ test "prefetch differential: strided-reduction loop over a real array (sum a[i] 
     }
 }
 
-/// Whether `code` (host machine bytes) contains a `PRFM (immediate)` word. The
-/// encoding is `0xF9800000 | (Rn << 5)`; every bit outside the 5-bit Rn field
-/// (bits [9:5]) is fixed, so masking those bits out and comparing the rest
-/// finds the instruction regardless of which register the allocator chose.
+/// Whether `code`, host machine bytes, contains a `PRFM (immediate)` word. The
+/// encoding is `0xF9800000 | (Rn << 5)`. Every bit outside the 5-bit Rn field,
+/// bits [9:5], is fixed. So masking those bits out and comparing the rest
+/// finds the instruction, regardless of which register the allocator chose.
 fn containsPrfm(code: []const u8) bool {
     const rn_field_mask: u32 = 0x1F << 5;
     var i: usize = 0;

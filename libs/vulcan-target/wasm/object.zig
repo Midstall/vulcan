@@ -65,7 +65,7 @@ test "object: compiles a simple add function to Wasm" {
     const b = try func.appendBlockParam(b0, t_i32);
 
     const sum = try func.appendInst(b0, t_i32, .{ .arith = .{ .op = .add, .lhs = a, .rhs = b } });
-    func.setTerminator(b0, .{ .ret = sum });
+    func.setTerminator(b0, .{ .ret = ir.function.Ret.one(sum) });
 
     // Compile to Wasm.
     var m = link.Module.init(allocator);
@@ -90,7 +90,7 @@ test "object: compiles a function with no params and no result" {
     defer func.deinit();
 
     const b0 = try func.appendBlock();
-    func.setTerminator(b0, .{ .ret = null });
+    func.setTerminator(b0, .{ .ret = ir.function.Ret.none() });
 
     var m = link.Module.init(allocator);
     defer m.deinit();
@@ -113,7 +113,7 @@ test "object: compiles a call_indirect module (table + element sections)" {
         const b = try f_double.appendBlock();
         const x = try f_double.appendBlockParam(b, t);
         const r = try f_double.appendInst(b, t, .{ .arith_imm = .{ .op = .mul, .lhs = x, .imm = 2 } });
-        f_double.setTerminator(b, .{ .ret = r });
+        f_double.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
     }
 
     var f_disp = Function.init(allocator);
@@ -124,7 +124,7 @@ test "object: compiles a call_indirect module (table + element sections)" {
         const sel = try f_disp.appendBlockParam(b, t);
         const x = try f_disp.appendBlockParam(b, t);
         const r = try f_disp.appendCallIndirect(b, t, sel, &.{x});
-        f_disp.setTerminator(b, .{ .ret = r });
+        f_disp.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
     }
 
     var m = link.Module.init(allocator);
@@ -178,7 +178,7 @@ test "object: compiles two functions sharing a signature" {
     const a1 = try func1.appendBlockParam(b1, t_i32);
     const b1_val = try func1.appendBlockParam(b1, t_i32);
     const s1 = try func1.appendInst(b1, t_i32, .{ .arith = .{ .op = .add, .lhs = a1, .rhs = b1_val } });
-    func1.setTerminator(b1, .{ .ret = s1 });
+    func1.setTerminator(b1, .{ .ret = ir.function.Ret.one(s1) });
 
     // Second function: fn sub(i32, i32) -> i32 (same signature)
     var func2 = Function.init(allocator);
@@ -188,7 +188,7 @@ test "object: compiles two functions sharing a signature" {
     const a2 = try func2.appendBlockParam(b2, t_i32_2);
     const b2_val = try func2.appendBlockParam(b2, t_i32_2);
     const s2 = try func2.appendInst(b2, t_i32_2, .{ .arith = .{ .op = .sub, .lhs = a2, .rhs = b2_val } });
-    func2.setTerminator(b2, .{ .ret = s2 });
+    func2.setTerminator(b2, .{ .ret = ir.function.Ret.one(s2) });
 
     var m = link.Module.init(allocator);
     defer m.deinit();

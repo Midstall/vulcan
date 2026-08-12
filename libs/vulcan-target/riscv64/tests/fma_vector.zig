@@ -28,7 +28,7 @@ const ir = @import("vulcan-ir");
 const isel = @import("../isel.zig");
 const disasm = @import("../disasm.zig");
 const emit = @import("../emit.zig");
-const ld = @import("../ld.zig");
+const ld = @import("vulcan-link");
 const harness = @import("harness.zig");
 
 const Function = ir.function.Function;
@@ -70,7 +70,7 @@ fn buildVecFmaFunc(allocator: std.mem.Allocator, shape: FmaShape, a: [4]f32, b: 
         .csub => try func.appendInst(blk, v4, .{ .arith = .{ .op = .sub, .lhs = vc, .rhs = prod } }),
     };
     const lane = try func.appendInst(blk, ft, .{ .extract = .{ .aggregate = r, .index = ret_lane } });
-    func.setTerminator(blk, .{ .ret = lane });
+    func.setTerminator(blk, .{ .ret = ir.function.Ret.one(lane) });
     return func;
 }
 
@@ -90,7 +90,7 @@ fn runSelectedFloat(io: std.Io, allocator: std.mem.Allocator, func: *Function) !
     const bytes = try emit.emitBytes(allocator, program);
     defer allocator.free(bytes);
     const user_base: u64 = 0x10000;
-    const elf = try ld.writeElfExec(allocator, bytes, bytes.len, user_base, user_base);
+    const elf = try ld.writeElfExec(.riscv64, allocator, bytes, bytes.len, user_base, user_base);
     defer allocator.free(elf);
 
     var tmp = std.testing.tmpDir(.{});
@@ -216,7 +216,7 @@ test "vfma: a multi-use vector mul does NOT fuse (separate vfmul+vfadd, correct 
             const s = try func.appendInst(blk, v4, .{ .arith = .{ .op = .add, .lhs = prod, .rhs = vc } }); // a*b+c, fusible shape...
             const r = try func.appendInst(blk, v4, .{ .arith = .{ .op = .add, .lhs = s, .rhs = prod } }); // ...but prod is reused here
             const lane = try func.appendInst(blk, ft, .{ .extract = .{ .aggregate = r, .index = ret_lane } });
-            func.setTerminator(blk, .{ .ret = lane });
+            func.setTerminator(blk, .{ .ret = ir.function.Ret.one(lane) });
             return func;
         }
     }.f;

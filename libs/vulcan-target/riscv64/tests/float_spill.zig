@@ -54,7 +54,7 @@ fn buildSumFunc(allocator: std.mem.Allocator, dbl: bool) !Function {
     }
     var acc = vals[0];
     for (vals[1..]) |v| acc = try func.appendInst(b, ft, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = v } });
-    func.setTerminator(b, .{ .ret = acc });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(acc) });
     return func;
 }
 
@@ -123,7 +123,7 @@ fn buildFmaSumFunc(allocator: std.mem.Allocator, dbl: bool) !Function {
     }
     var acc = vals[0];
     for (vals[1..]) |v| acc = try func.appendInst(b, ft, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = v } });
-    func.setTerminator(b, .{ .ret = acc });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(acc) });
     return func;
 }
 
@@ -184,7 +184,7 @@ fn buildMulAddSelfKernel(func: *Function) !void {
         const addr_out = try func.appendArithImm(b, ptr_t, .add, ptr_out, @intCast(i * 4));
         try func.appendStore(b, addv[i], addr_out);
     }
-    func.setTerminator(b, .{ .ret = null });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
 }
 
 test "float-spill: et-soc VPU a[i]*b[i]+a[i] now compiles (previously error.Unsupported), runs on sw-sysemu when present" {

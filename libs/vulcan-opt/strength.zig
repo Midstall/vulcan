@@ -392,12 +392,12 @@ fn foldMagic(allocator: std.mem.Allocator, x: i64, d: i64, signedness: std.built
     const xc = try func.appendInst(b, t, .{ .iconst = x });
     const dc = try func.appendInst(b, t, .{ .iconst = d });
     const r = try func.appendInst(b, t, .{ .arith = .{ .op = if (is_rem) .rem else .div, .lhs = xc, .rhs = dc } });
-    func.setTerminator(b, .{ .ret = r });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
 
     const pipeline = [_]pass.Pass{ pass_def, constfold.pass_def, dce.pass_def };
     _ = try pass.runToFixpoint(allocator, &func, &pipeline, 16);
 
-    const ret = func.terminator(b).?.ret.?;
+    const ret = func.terminator(b).?.ret.values[0];
     const inst = func.definingInst(ret) orelse return error.NotFolded;
     return switch (func.opcode(inst)) {
         .iconst => |c| c,
@@ -500,9 +500,9 @@ fn magicAtWidth(allocator: std.mem.Allocator, x: i64, d: i64, bits: u16, signedn
     const xc = try func.appendInst(b, t, .{ .iconst = x });
     const dc = try func.appendInst(b, t, .{ .iconst = d });
     const r = try func.appendInst(b, t, .{ .arith = .{ .op = if (is_rem) .rem else .div, .lhs = xc, .rhs = dc } });
-    func.setTerminator(b, .{ .ret = r });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
     try testing.expect(try runOnce(allocator, &func));
-    return evalMagic(&func, func.terminator(b).?.ret.?);
+    return evalMagic(&func, func.terminator(b).?.ret.values[0]);
 }
 
 test "unsigned 32-bit magic division matches real division across divisors and dividends" {
@@ -541,7 +541,7 @@ test "x * 8 becomes x << 3" {
     const b = try func.appendBlock();
     const x = try func.appendBlockParam(b, t);
     const y = try func.appendArithImm(b, t, .mul, x, 8);
-    func.setTerminator(b, .{ .ret = y });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(y) });
 
     try testing.expect(try runOnce(allocator, &func));
     const a = func.opcode(func.definingInst(y).?).arith_imm;
@@ -559,7 +559,7 @@ test "unsigned x / 4 becomes x >> 2, x % 4 becomes x & 3" {
     const q = try func.appendArithImm(b, t, .div, x, 4);
     const r = try func.appendArithImm(b, t, .rem, x, 4);
     const s = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = q, .rhs = r } });
-    func.setTerminator(b, .{ .ret = s });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(s) });
 
     try testing.expect(try runOnce(allocator, &func));
     const qi = func.opcode(func.definingInst(q).?).arith_imm;
@@ -578,7 +578,7 @@ test "signed division by a power of two is left alone (rounding differs)" {
     const b = try func.appendBlock();
     const x = try func.appendBlockParam(b, t);
     const q = try func.appendArithImm(b, t, .div, x, 4);
-    func.setTerminator(b, .{ .ret = q });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(q) });
     try testing.expect(!try runOnce(allocator, &func));
     try testing.expectEqual(BinOp.div, func.opcode(func.definingInst(q).?).arith_imm.op);
 }
@@ -591,7 +591,7 @@ test "non-power-of-two multiply is left alone" {
     const b = try func.appendBlock();
     const x = try func.appendBlockParam(b, t);
     const y = try func.appendArithImm(b, t, .mul, x, 3);
-    func.setTerminator(b, .{ .ret = y });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(y) });
     try testing.expect(!try runOnce(allocator, &func));
 }
 
@@ -604,7 +604,7 @@ test "arith form: x * (iconst 16) reduces via the constant operand" {
     const x = try func.appendBlockParam(b, t);
     const c16 = try func.appendInst(b, t, .{ .iconst = 16 });
     const y = try func.appendInst(b, t, .{ .arith = .{ .op = .mul, .lhs = x, .rhs = c16 } });
-    func.setTerminator(b, .{ .ret = y });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(y) });
 
     try testing.expect(try runOnce(allocator, &func));
     const a = func.opcode(func.definingInst(y).?).arith_imm; // rewritten to arith_imm shl

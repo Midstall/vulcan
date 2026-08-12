@@ -20,7 +20,7 @@ const riscv64 = @import("../../riscv64.zig");
 const encode = riscv64.encode;
 const isel = riscv64.isel;
 const schedule = riscv64.schedule;
-const ld = riscv64.ld;
+const ld = @import("vulcan-link");
 const link = riscv64.link;
 const object = riscv64.object;
 
@@ -65,7 +65,7 @@ fn runWords(allocator: std.mem.Allocator, code: []const u32, args: []const i64, 
 
     const bytes = try riscv64.emitImage(allocator, program.items, features);
     defer allocator.free(bytes);
-    const elf = try ld.writeElfExec(allocator, bytes, bytes.len, 0x10000, 0x10000);
+    const elf = try ld.writeElfExec(.riscv64, allocator, bytes, bytes.len, 0x10000, 0x10000);
     defer allocator.free(elf);
 
     var tmp = std.testing.tmpDir(.{});
@@ -120,7 +120,7 @@ fn runLinkedImage(allocator: std.mem.Allocator, image_code: []const u8) !u8 {
         try final.appendSlice(allocator, &buf);
     }
     try final.appendSlice(allocator, image_code);
-    const elf = try ld.writeElfExec(allocator, final.items, final.items.len, 0x10000, 0x10000);
+    const elf = try ld.writeElfExec(.riscv64, allocator, final.items, final.items.len, 0x10000, 0x10000);
     defer allocator.free(elf);
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -154,7 +154,7 @@ test "qemu-riscv: linkObjectsCompressed resolves a global auipc pair against the
             const b = try entry.appendBlock();
             const p = try entry.appendGlobalAddr(b, ptr_t, "K");
             const v = try entry.appendInst(b, t, .{ .load = .{ .ptr = p } });
-            entry.setTerminator(b, .{ .ret = v });
+            entry.setTerminator(b, .{ .ret = ir.function.Ret.one(v) });
             const k_bytes = [_]u8{ 42, 0, 0, 0 };
             var module: link.Module = .{};
             defer module.deinit(a);
@@ -209,7 +209,7 @@ test "qemu-riscv: compressPinned + a linker-style call patch runs correctly" {
     const disp: i64 = @as(i64, @intCast(offs[callee_idx])) - @as(i64, @intCast(offs[call_idx]));
     std.mem.writeInt(u32, image[offs[call_idx]..][0..4], encode.jal(.x1, @intCast(disp)), .little);
 
-    const elf = try ld.writeElfExec(allocator, image, image.len, 0x10000, 0x10000);
+    const elf = try ld.writeElfExec(.riscv64, allocator, image, image.len, 0x10000, 0x10000);
     defer allocator.free(elf);
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -263,7 +263,7 @@ fn runPcrelProgram(allocator: std.mem.Allocator, comptime compress: bool) !u8 {
     }
     try blob.appendSlice(allocator, &data); // data begins right after the (possibly shrunk) code
 
-    const elf = try ld.writeElfExec(allocator, blob.items, blob.items.len, 0x10000, 0x10000);
+    const elf = try ld.writeElfExec(.riscv64, allocator, blob.items, blob.items.len, 0x10000, 0x10000);
     defer allocator.free(elf);
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -302,7 +302,7 @@ fn addFunc(allocator: std.mem.Allocator) !*Function {
     const x = try func.appendBlockParam(b, t);
     const y = try func.appendBlockParam(b, t);
     const s = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = y } });
-    func.setTerminator(b, .{ .ret = s });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(s) });
     return func;
 }
 
@@ -330,7 +330,7 @@ fn sumLoopFunc(allocator: std.mem.Allocator) !*Function {
     const ni = try func.appendArithImm(body, t, .add, bi, 1);
     const nacc = try func.appendInst(body, t, .{ .arith = .{ .op = .add, .lhs = bacc, .rhs = bi } });
     try func.setJump(body, loop, &.{ ni, nacc });
-    func.setTerminator(done, .{ .ret = racc });
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(racc) });
     return func;
 }
 
@@ -365,7 +365,7 @@ fn fnArithChain(allocator: std.mem.Allocator) !*Function {
     const y = try f.appendBlockParam(b, t);
     const s = try f.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = y } });
     const p = try f.appendInst(b, t, .{ .arith = .{ .op = .mul, .lhs = s, .rhs = x } });
-    f.setTerminator(b, .{ .ret = p });
+    f.setTerminator(b, .{ .ret = ir.function.Ret.one(p) });
     return f;
 }
 
@@ -379,7 +379,7 @@ fn fnMaxSelect(allocator: std.mem.Allocator) !*Function {
     const y = try f.appendBlockParam(b, t);
     const c = try f.appendInst(b, bool_t, .{ .icmp = .{ .op = .gt, .lhs = x, .rhs = y } });
     const m = try f.appendInst(b, t, .{ .select = .{ .cond = c, .then = x, .@"else" = y } });
-    f.setTerminator(b, .{ .ret = m });
+    f.setTerminator(b, .{ .ret = ir.function.Ret.one(m) });
     return f;
 }
 
@@ -395,7 +395,7 @@ fn fnMaxBranch(allocator: std.mem.Allocator) !*Function {
     const racc = try f.appendBlockParam(exit, t);
     const c = try f.appendInst(e, bool_t, .{ .icmp = .{ .op = .gt, .lhs = x, .rhs = y } });
     try f.appendIf(e, c, .{ .target = exit, .args = &.{x} }, .{ .target = exit, .args = &.{y} });
-    f.setTerminator(exit, .{ .ret = racc });
+    f.setTerminator(exit, .{ .ret = ir.function.Ret.one(racc) });
     return f;
 }
 
@@ -409,7 +409,7 @@ fn fnDivRem(allocator: std.mem.Allocator) !*Function {
     const q = try f.appendInst(b, t, .{ .arith = .{ .op = .div, .lhs = x, .rhs = y } });
     const r = try f.appendInst(b, t, .{ .arith = .{ .op = .rem, .lhs = x, .rhs = y } });
     const s = try f.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = q, .rhs = r } });
-    f.setTerminator(b, .{ .ret = s });
+    f.setTerminator(b, .{ .ret = ir.function.Ret.one(s) });
     return f;
 }
 
@@ -425,7 +425,7 @@ fn fnAllocaRoundtrip(allocator: std.mem.Allocator) !*Function {
     try f.appendStore(b, x, slot);
     const v = try f.appendInst(b, t, .{ .load = .{ .ptr = slot } });
     const s = try f.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = v, .rhs = y } });
-    f.setTerminator(b, .{ .ret = s });
+    f.setTerminator(b, .{ .ret = ir.function.Ret.one(s) });
     return f;
 }
 
@@ -455,7 +455,7 @@ fn fnLoopWithSelect(allocator: std.mem.Allocator) !*Function {
     const nacc = try f.appendInst(body, t, .{ .arith = .{ .op = .add, .lhs = bacc, .rhs = contrib } });
     const ni = try f.appendArithImm(body, t, .add, bi, 1);
     try f.setJump(body, loop, &.{ ni, nacc });
-    f.setTerminator(done, .{ .ret = racc });
+    f.setTerminator(done, .{ .ret = ir.function.Ret.one(racc) });
     return f;
 }
 
@@ -476,7 +476,7 @@ fn fnDoubleRoundtrip(allocator: std.mem.Allocator) !*Function {
     try f.appendStore(b, xd, slot); // fsd
     const v = try f.appendInst(b, dt, .{ .load = .{ .ptr = slot } }); // fld
     const r = try f.appendInst(b, it, .{ .convert = .{ .value = v } }); // f64 -> i32
-    f.setTerminator(b, .{ .ret = r });
+    f.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
     return f;
 }
 
@@ -497,7 +497,7 @@ test "qemu-riscv: a linked two-function module runs compressed (intra-module cal
                 const x = try callee.appendBlockParam(b, t);
                 const y = try callee.appendBlockParam(b, t);
                 const s = try callee.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = y } });
-                callee.setTerminator(b, .{ .ret = s });
+                callee.setTerminator(b, .{ .ret = ir.function.Ret.one(s) });
             }
             const ct = try caller.types.intern(.{ .int = .{ .bits = 32, .signedness = .signed } });
             {
@@ -505,7 +505,7 @@ test "qemu-riscv: a linked two-function module runs compressed (intra-module cal
                 const x = try caller.appendBlockParam(b, ct);
                 const y = try caller.appendBlockParam(b, ct);
                 const r = try caller.appendCall(b, ct, "callee", &.{ x, y });
-                caller.setTerminator(b, .{ .ret = r });
+                caller.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
             }
             var module: link.Module = .{};
             defer module.deinit(a);

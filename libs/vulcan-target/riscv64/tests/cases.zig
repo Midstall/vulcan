@@ -8,7 +8,7 @@ const ir = @import("vulcan-ir");
 const opt = @import("vulcan-opt");
 const link = @import("../link.zig");
 const object = @import("../object.zig");
-const ld = @import("../ld.zig");
+const ld = @import("vulcan-link");
 const h = @import("harness.zig");
 
 const Function = ir.function.Function;
@@ -38,7 +38,7 @@ fn arithmetic(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !voi
         const b = try f.appendBlockParam(e, t);
         const p = try f.appendInst(e, t, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = b } });
         const s = try f.appendInst(e, t, .{ .arith = .{ .op = .add, .lhs = p, .rhs = a } });
-        f.setTerminator(e, .{ .ret = s });
+        f.setTerminator(e, .{ .ret = ir.function.Ret.one(s) });
         try h.expectRun(io, allocator, &f, &.{ 3, 4 }, 15, backend);
     }
     { // subtraction (negative result)
@@ -49,7 +49,7 @@ fn arithmetic(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !voi
         const a = try f.appendBlockParam(e, t);
         const b = try f.appendBlockParam(e, t);
         const d = try f.appendInst(e, t, .{ .arith = .{ .op = .sub, .lhs = a, .rhs = b } });
-        f.setTerminator(e, .{ .ret = d });
+        f.setTerminator(e, .{ .ret = ir.function.Ret.one(d) });
         try h.expectRun(io, allocator, &f, &.{ 3, 10 }, -7, backend);
     }
     { // signed division
@@ -60,7 +60,7 @@ fn arithmetic(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !voi
         const a = try f.appendBlockParam(e, t);
         const b = try f.appendBlockParam(e, t);
         const q = try f.appendInst(e, t, .{ .arith = .{ .op = .div, .lhs = a, .rhs = b } });
-        f.setTerminator(e, .{ .ret = q });
+        f.setTerminator(e, .{ .ret = ir.function.Ret.one(q) });
         try h.expectRun(io, allocator, &f, &.{ 20, 3 }, 6, backend);
     }
     { // strength-reduced multiply (a * 8 -> a << 3)
@@ -71,7 +71,7 @@ fn arithmetic(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !voi
         const a = try f.appendBlockParam(e, t);
         const eight = try f.appendInst(e, t, .{ .iconst = 8 });
         const p = try f.appendInst(e, t, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = eight } });
-        f.setTerminator(e, .{ .ret = p });
+        f.setTerminator(e, .{ .ret = ir.function.Ret.one(p) });
         try h.expectRun(io, allocator, &f, &.{5}, 40, backend);
     }
     { // immediate arithmetic (a + 100)
@@ -81,7 +81,7 @@ fn arithmetic(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !voi
         const e = try f.appendBlock();
         const a = try f.appendBlockParam(e, t);
         const r = try f.appendArithImm(e, t, .add, a, 100);
-        f.setTerminator(e, .{ .ret = r });
+        f.setTerminator(e, .{ .ret = ir.function.Ret.one(r) });
         try h.expectRun(io, allocator, &f, &.{5}, 105, backend);
     }
     { // comparison returns a boolean
@@ -93,7 +93,7 @@ fn arithmetic(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !voi
         const a = try f.appendBlockParam(e, t);
         const b = try f.appendBlockParam(e, t);
         const c = try f.appendInst(e, bool_t, .{ .icmp = .{ .op = .lt, .lhs = a, .rhs = b } });
-        f.setTerminator(e, .{ .ret = c });
+        f.setTerminator(e, .{ .ret = ir.function.Ret.one(c) });
         try h.expectRun(io, allocator, &f, &.{ 3, 7 }, 1, backend);
     }
 }
@@ -110,7 +110,7 @@ fn conversions(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !vo
         const e = try f.appendBlock();
         const x = try f.appendBlockParam(e, src);
         const w = try f.appendInst(e, dst, .{ .convert = .{ .value = x } });
-        f.setTerminator(e, .{ .ret = w });
+        f.setTerminator(e, .{ .ret = ir.function.Ret.one(w) });
         try h.expectRun(io, allocator, &f, &.{0xFFFFFFFB}, -5, backend); // sign fill, not 0x00000000FFFFFFFB
     }
     { // widen an unsigned u32 to u64: zero-extend
@@ -121,7 +121,7 @@ fn conversions(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !vo
         const e = try f.appendBlock();
         const x = try f.appendBlockParam(e, src);
         const w = try f.appendInst(e, dst, .{ .convert = .{ .value = x } });
-        f.setTerminator(e, .{ .ret = w });
+        f.setTerminator(e, .{ .ret = ir.function.Ret.one(w) });
         try h.expectRun(io, allocator, &f, &.{0xFFFFFFFB}, 0xFFFFFFFB, backend); // zero fill
     }
 }
@@ -137,7 +137,7 @@ fn controlFlow(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !vo
         const b = try f.appendBlockParam(e, t);
         const c = try f.appendInst(e, bool_t, .{ .icmp = .{ .op = .lt, .lhs = a, .rhs = b } });
         const m = try f.appendInst(e, t, .{ .select = .{ .cond = c, .then = a, .@"else" = b } });
-        f.setTerminator(e, .{ .ret = m });
+        f.setTerminator(e, .{ .ret = ir.function.Ret.one(m) });
         try h.expectRun(io, allocator, &f, &.{ 7, 3 }, 3, backend);
     }
     { // if computes a max via a merge block
@@ -152,7 +152,7 @@ fn controlFlow(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !vo
         const r = try f.appendBlockParam(exit, t);
         const c = try f.appendInst(e, bool_t, .{ .icmp = .{ .op = .gt, .lhs = a, .rhs = b } });
         try f.appendIf(e, c, .{ .target = exit, .args = &.{a} }, .{ .target = exit, .args = &.{b} });
-        f.setTerminator(exit, .{ .ret = r });
+        f.setTerminator(exit, .{ .ret = ir.function.Ret.one(r) });
         try h.expectRun(io, allocator, &f, &.{ 4, 9 }, 9, backend);
     }
     { // counted loop summing 0..n
@@ -177,7 +177,7 @@ fn controlFlow(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !vo
         const ni = try f.appendArithImm(body, t, .add, bi, 1);
         const nacc = try f.appendInst(body, t, .{ .arith = .{ .op = .add, .lhs = bacc, .rhs = bi } });
         try f.setJump(body, loop, &.{ ni, nacc });
-        f.setTerminator(done, .{ .ret = racc });
+        f.setTerminator(done, .{ .ret = ir.function.Ret.one(racc) });
         try h.expectRun(io, allocator, &f, &.{5}, 10, backend);
     }
 }
@@ -193,7 +193,7 @@ fn memory(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {
         const slot = try f.appendInst(e, ptr_t, .{ .alloca = .{ .elem = t } });
         try f.appendStore(e, x, slot);
         const v = try f.appendInst(e, t, .{ .load = .{ .ptr = slot } });
-        f.setTerminator(e, .{ .ret = v });
+        f.setTerminator(e, .{ .ret = ir.function.Ret.one(v) });
         try h.expectRun(io, allocator, &f, &.{42}, 42, backend);
     }
     { // sub-word store + sign-extending load (i8): 200 -> 0xC8 -> -56
@@ -206,7 +206,7 @@ fn memory(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {
         const slot = try f.appendInst(e, ptr_t, .{ .alloca = .{ .elem = i8_t } });
         try f.appendStore(e, a, slot);
         const v = try f.appendInst(e, i8_t, .{ .load = .{ .ptr = slot } });
-        f.setTerminator(e, .{ .ret = v });
+        f.setTerminator(e, .{ .ret = ir.function.Ret.one(v) });
         try h.expectRun(io, allocator, &f, &.{200}, -56, backend);
     }
 }
@@ -221,7 +221,7 @@ fn calls(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {
         for (&ps) |*p| p.* = try callee.appendBlockParam(cb, t);
         var sum = ps[0];
         for (ps[1..]) |p| sum = try callee.appendInst(cb, t, .{ .arith = .{ .op = .add, .lhs = sum, .rhs = p } });
-        callee.setTerminator(cb, .{ .ret = sum });
+        callee.setTerminator(cb, .{ .ret = ir.function.Ret.one(sum) });
 
         var caller = Function.init(allocator);
         defer caller.deinit();
@@ -230,7 +230,7 @@ fn calls(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {
         var args: [10]Value = undefined;
         for (&args, 0..) |*a, i| a.* = try caller.appendInst(cb2, ct, .{ .iconst = @intCast(i + 1) });
         const r = try caller.appendCall(cb2, ct, "callee", &args);
-        caller.setTerminator(cb2, .{ .ret = r });
+        caller.setTerminator(cb2, .{ .ret = ir.function.Ret.one(r) });
 
         var module: link.Module = .{};
         defer module.deinit(allocator);
@@ -246,7 +246,7 @@ fn calls(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {
         const a = try callee.appendBlockParam(cb, t);
         const bb = try callee.appendBlockParam(cb, t);
         const d = try callee.appendInst(cb, t, .{ .arith = .{ .op = .sub, .lhs = a, .rhs = bb } });
-        callee.setTerminator(cb, .{ .ret = d });
+        callee.setTerminator(cb, .{ .ret = ir.function.Ret.one(d) });
 
         var caller = Function.init(allocator);
         defer caller.deinit();
@@ -255,7 +255,7 @@ fn calls(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {
         const x = try caller.appendBlockParam(cb2, ct);
         const y = try caller.appendBlockParam(cb2, ct);
         const r = try caller.appendCall(cb2, ct, "callee", &.{ y, x });
-        caller.setTerminator(cb2, .{ .ret = r });
+        caller.setTerminator(cb2, .{ .ret = ir.function.Ret.one(r) });
 
         var module: link.Module = .{};
         defer module.deinit(allocator);
@@ -276,7 +276,7 @@ fn spilling(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void 
     for (&vals) |*v| v.* = try f.appendInst(e, t, .{ .arith = .{ .op = .add, .lhs = p0, .rhs = p1 } });
     var acc = vals[0];
     for (vals[1..]) |v| acc = try f.appendInst(e, t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = v } });
-    f.setTerminator(e, .{ .ret = acc });
+    f.setTerminator(e, .{ .ret = ir.function.Ret.one(acc) });
     try h.expectRun(io, allocator, &f, &.{ 1, 1 }, 40, backend);
 }
 
@@ -294,7 +294,7 @@ fn optimized(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void
         const prod = try f.appendInst(b, t, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = c4 } });
         _ = try f.appendInst(b, t, .{ .arith = .{ .op = .mul, .lhs = x, .rhs = x } });
         const r = try f.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = prod, .rhs = x } });
-        f.setTerminator(b, .{ .ret = r });
+        f.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
         try std.testing.expect(try opt.optimize(allocator, &f));
         try h.expectRun(io, allocator, &f, &.{22}, 42, backend);
     }
@@ -314,8 +314,8 @@ fn optimized(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void
         try f.appendIf(entry, cond, .{ .target = then_b }, .{ .target = else_b });
         const d = try f.appendInst(then_b, t, .{ .arith = .{ .op = .mul, .lhs = x, .rhs = y } });
         const r = try f.appendInst(then_b, t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = d } });
-        f.setTerminator(then_b, .{ .ret = r });
-        f.setTerminator(else_b, .{ .ret = base });
+        f.setTerminator(then_b, .{ .ret = ir.function.Ret.one(r) });
+        f.setTerminator(else_b, .{ .ret = ir.function.Ret.one(base) });
         try std.testing.expect(try opt.optimize(allocator, &f));
         try h.expectRun(io, allocator, &f, &.{ 3, 4 }, 24, backend);
     }
@@ -344,7 +344,7 @@ fn optimized(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void
         const nacc = try f.appendInst(body, t, .{ .arith = .{ .op = .add, .lhs = bacc, .rhs = p } });
         const ni = try f.appendArithImm(body, t, .add, bi, 1);
         try f.setJump(body, loop, &.{ ni, nacc });
-        f.setTerminator(done, .{ .ret = racc });
+        f.setTerminator(done, .{ .ret = ir.function.Ret.one(racc) });
         try std.testing.expect(try opt.optimize(allocator, &f));
         try h.expectRun(io, allocator, &f, &.{ 2, 3, 4 }, 24, backend);
     }
@@ -356,7 +356,7 @@ fn optimized(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void
         const x = try f.appendBlockParam(b, t);
         const ten = try f.appendInst(b, t, .{ .iconst = 10 });
         const q = try f.appendInst(b, t, .{ .arith = .{ .op = .div, .lhs = x, .rhs = ten } });
-        f.setTerminator(b, .{ .ret = q });
+        f.setTerminator(b, .{ .ret = ir.function.Ret.one(q) });
         try std.testing.expect(try opt.optimize(allocator, &f));
         try h.expectRun(io, allocator, &f, &.{1234567}, 123456, backend);
     }
@@ -368,7 +368,7 @@ fn optimized(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void
         const x = try f.appendBlockParam(b, t);
         const ten = try f.appendInst(b, t, .{ .iconst = 10 });
         const r = try f.appendInst(b, t, .{ .arith = .{ .op = .rem, .lhs = x, .rhs = ten } });
-        f.setTerminator(b, .{ .ret = r });
+        f.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
         try std.testing.expect(try opt.optimize(allocator, &f));
         try h.expectRun(io, allocator, &f, &.{1234567}, 7, backend);
     }
@@ -380,7 +380,7 @@ fn optimized(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void
         const x = try f.appendBlockParam(b, t);
         const seven = try f.appendInst(b, t, .{ .iconst = 7 });
         const q = try f.appendInst(b, t, .{ .arith = .{ .op = .div, .lhs = x, .rhs = seven } });
-        f.setTerminator(b, .{ .ret = q });
+        f.setTerminator(b, .{ .ret = ir.function.Ret.one(q) });
         try std.testing.expect(try opt.optimize(allocator, &f));
         try h.expectRun(io, allocator, &f, &.{-100}, -14, backend); // trunc toward zero
     }
@@ -392,7 +392,7 @@ fn optimized(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void
         const x = try f.appendBlockParam(b, t);
         const seven = try f.appendInst(b, t, .{ .iconst = 7 });
         const r = try f.appendInst(b, t, .{ .arith = .{ .op = .rem, .lhs = x, .rhs = seven } });
-        f.setTerminator(b, .{ .ret = r });
+        f.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
         try std.testing.expect(try opt.optimize(allocator, &f));
         try h.expectRun(io, allocator, &f, &.{-100}, -2, backend); // -100 = -14*7 - 2
     }
@@ -405,7 +405,7 @@ fn optimized(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void
         const x = try f.appendBlockParam(b, t);
         const ten = try f.appendInst(b, t, .{ .iconst = 10 });
         const q = try f.appendInst(b, t, .{ .arith = .{ .op = .div, .lhs = x, .rhs = ten } });
-        f.setTerminator(b, .{ .ret = q });
+        f.setTerminator(b, .{ .ret = ir.function.Ret.one(q) });
         try std.testing.expect(try opt.optimize(allocator, &f));
         try h.expectRun(io, allocator, &f, &.{123456789}, 12345678, backend);
     }
@@ -418,7 +418,7 @@ fn optimized(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void
         const x = try f.appendBlockParam(b, t);
         const ten = try f.appendInst(b, t, .{ .iconst = 10 });
         const r = try f.appendInst(b, t, .{ .arith = .{ .op = .rem, .lhs = x, .rhs = ten } });
-        f.setTerminator(b, .{ .ret = r });
+        f.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
         try std.testing.expect(try opt.optimize(allocator, &f));
         try h.expectRun(io, allocator, &f, &.{123456789}, 9, backend);
     }
@@ -430,7 +430,7 @@ fn optimized(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void
         const x = try f.appendBlockParam(b, t);
         const seven = try f.appendInst(b, t, .{ .iconst = 7 });
         const q = try f.appendInst(b, t, .{ .arith = .{ .op = .div, .lhs = x, .rhs = seven } });
-        f.setTerminator(b, .{ .ret = q });
+        f.setTerminator(b, .{ .ret = ir.function.Ret.one(q) });
         try std.testing.expect(try opt.optimize(allocator, &f));
         try h.expectRun(io, allocator, &f, &.{-100}, -14, backend);
     }
@@ -442,7 +442,7 @@ fn optimized(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void
         const x = try f.appendBlockParam(b, t);
         const seven = try f.appendInst(b, t, .{ .iconst = 7 });
         const r = try f.appendInst(b, t, .{ .arith = .{ .op = .rem, .lhs = x, .rhs = seven } });
-        f.setTerminator(b, .{ .ret = r });
+        f.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
         try std.testing.expect(try opt.optimize(allocator, &f));
         try h.expectRun(io, allocator, &f, &.{-100}, -2, backend);
     }
@@ -463,7 +463,7 @@ fn bitcodeAndLto(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !
         const prod = try f.appendInst(entry, t, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = b } });
         try f.appendIf(entry, c, .{ .target = merge, .args = &.{prod} }, .{ .target = merge, .args = &.{b} });
         const r = try f.appendArithImm(merge, t, .add, z, 1);
-        f.setTerminator(merge, .{ .ret = r });
+        f.setTerminator(merge, .{ .ret = ir.function.Ret.one(r) });
         const bytes = try ir.bitcode.encode(allocator, &f);
         defer allocator.free(bytes);
         var decoded = try ir.bitcode.decode(allocator, bytes);
@@ -480,7 +480,7 @@ fn bitcodeAndLto(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !
             const bb = try f.appendBlockParam(b, t);
             const prod = try f.appendInst(b, t, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = bb } });
             const sum = try f.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = prod, .rhs = a } });
-            f.setTerminator(b, .{ .ret = sum });
+            f.setTerminator(b, .{ .ret = ir.function.Ret.one(sum) });
             try src.add("helper", f);
             var g = Function.init(allocator);
             const gt = try g.types.intern(i32k);
@@ -488,7 +488,7 @@ fn bitcodeAndLto(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !
             const x = try g.appendBlockParam(gb, gt);
             const call = try g.appendCall(gb, gt, "helper", &.{ x, x });
             const r = try g.appendArithImm(gb, gt, .add, call, 1);
-            g.setTerminator(gb, .{ .ret = r });
+            g.setTerminator(gb, .{ .ret = ir.function.Ret.one(r) });
             try src.add("entry", g);
         }
         const blob = try opt.lto.encode(allocator, &src);
@@ -510,7 +510,7 @@ fn pgo(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {
         const b = try f.appendBlock();
         const x = try f.appendBlockParam(b, t);
         const r = try f.appendInst(b, t, .{ .arith = .{ .op = .mul, .lhs = x, .rhs = x } });
-        f.setTerminator(b, .{ .ret = r });
+        f.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
         const nblocks = try opt.pgo.instrument(allocator, &f, "pgo_counters");
 
         var module: link.Module = .{};
@@ -535,14 +535,14 @@ fn pgo(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {
             const b = try f.appendBlock();
             const a = try f.appendBlockParam(b, t);
             const s = try f.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = a, .rhs = a } });
-            f.setTerminator(b, .{ .ret = s });
+            f.setTerminator(b, .{ .ret = ir.function.Ret.one(s) });
             try module.add("helper", f);
             var g = Function.init(allocator);
             const gt = try g.types.intern(i32k);
             const gb = try g.appendBlock();
             const x = try g.appendBlockParam(gb, gt);
             const call = try g.appendCall(gb, gt, "helper", &.{x});
-            g.setTerminator(gb, .{ .ret = call });
+            g.setTerminator(gb, .{ .ret = ir.function.Ret.one(call) });
             try module.add("caller", g);
         }
         var profile = opt.pgo.Profile.init(allocator);

@@ -10,7 +10,6 @@ pub const emit = @import("riscv64/emit.zig");
 pub const schedule = @import("riscv64/schedule.zig");
 pub const link = @import("riscv64/link.zig");
 pub const object = @import("riscv64/object.zig");
-pub const ld = @import("riscv64/ld.zig");
 pub const jit = @import("riscv64/jit.zig");
 pub const compress = @import("riscv64/compress.zig");
 
@@ -94,6 +93,8 @@ const tests = struct {
     pub const f16_native = @import("riscv64/tests/f16_native.zig");
     pub const shift_add = @import("riscv64/tests/shift_add.zig");
     pub const addr_hi_lo = @import("riscv64/tests/addr_hi_lo.zig");
+    pub const link_shared = @import("riscv64/tests/link_shared.zig");
+    pub const dynamic = @import("riscv64/tests/dynamic.zig");
 };
 
 test {

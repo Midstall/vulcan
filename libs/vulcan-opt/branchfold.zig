@@ -85,8 +85,8 @@ test "branchfold: a constant condition becomes an unconditional jump to the take
         const bv = try func.appendBlockParam(b, t);
         const cond = try func.appendInst(entry, bool_t, .{ .iconst = case[0] });
         try func.appendIf(entry, cond, .{ .target = a, .args = &.{x} }, .{ .target = b, .args = &.{x} });
-        func.setTerminator(a, .{ .ret = av });
-        func.setTerminator(b, .{ .ret = bv });
+        func.setTerminator(a, .{ .ret = ir.function.Ret.one(av) });
+        func.setTerminator(b, .{ .ret = ir.function.Ret.one(bv) });
 
         var analyses = pass.Analyses{ .allocator = allocator, .func = &func };
         defer analyses.deinit();
@@ -111,7 +111,7 @@ test "branchfold: a runtime branch whose arms are the same edge collapses to a j
     const x = try func.appendInst(entry, t, .{ .iconst = 5 });
     // if cond -> target(x) else target(x): both arms identical.
     try func.appendIf(entry, cond, .{ .target = target, .args = &.{x} }, .{ .target = target, .args = &.{x} });
-    func.setTerminator(target, .{ .ret = tv });
+    func.setTerminator(target, .{ .ret = ir.function.Ret.one(tv) });
 
     var analyses = pass.Analyses{ .allocator = allocator, .func = &func };
     defer analyses.deinit();
@@ -136,8 +136,8 @@ test "branchfold: a runtime condition is left alone" {
     const bv = try func.appendBlockParam(b, t);
     const x = try func.appendInst(entry, t, .{ .iconst = 5 });
     try func.appendIf(entry, cond, .{ .target = a, .args = &.{x} }, .{ .target = b, .args = &.{x} });
-    func.setTerminator(a, .{ .ret = av });
-    func.setTerminator(b, .{ .ret = bv });
+    func.setTerminator(a, .{ .ret = ir.function.Ret.one(av) });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(bv) });
 
     var analyses = pass.Analyses{ .allocator = allocator, .func = &func };
     defer analyses.deinit();
