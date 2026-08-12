@@ -545,7 +545,7 @@ fn isTrivialVoidExit(func: *const Function, exit: Block, exit_args: []const Valu
     if (exit_args.len != 0) return false; // live values threaded out: surrounded
     if (func.blockInsts(exit).len != 0) return false; // the continuation does real work: surrounded
     return switch (func.terminator(exit) orelse return false) {
-        .ret => |v| v == null, // exactly `ret void`
+        .ret => |r| r.count == 0, // exactly `ret void`
         // A jump means more code follows the exit: surrounded, not a bare terminal return.
         .jump => false,
     };
@@ -590,7 +590,7 @@ fn matchLoop(func: *const Function, loop: *const loops.Loop, def_block: []const 
     if (cmp.op != .lt) return null;
     if (func.terminator(header)) |t| switch (t) {
         // A value-returning header is not the loop-test idiom.
-        .ret => |v| if (v != null) return null,
+        .ret => |r| if (r.count != 0) return null,
         // An explicit jump terminator would make the header more than a pure test.
         .jump => return null,
     };
@@ -1727,7 +1727,7 @@ pub fn buildMatmulNest(func: *Function, spec: NestSpec) Error!void {
     const nc_ptr_i = if (spec.c_resets) try func.appendArithImm(j_exit, ptr_t, .add, ib_c_ptr, c_row) else jx_c_ptr;
     try func.setJump(j_exit, i_header, &.{ ni, na_row, nc_ptr_i });
 
-    func.setTerminator(ret_block, .{ .ret = null });
+    func.setTerminator(ret_block, .{ .ret = ir.function.Ret.none() });
 }
 
 /// Build a 2-deep (i, j) loop nest, verify-clean, for the "not exactly three loops" negative.
@@ -1783,7 +1783,7 @@ fn buildTwoDeepNest(func: *Function) Error!void {
     const na_row = try func.appendArithImm(j_exit, ptr_t, .add, ib_a_row, 16);
     try func.setJump(j_exit, i_header, &.{ ni, na_row, jx_c_ptr });
 
-    func.setTerminator(ret_block, .{ .ret = null });
+    func.setTerminator(ret_block, .{ .ret = ir.function.Ret.none() });
 }
 
 /// Run recognizeNest end to end (analyze + def-blocks + match), returning the Plan or null.

@@ -52,7 +52,7 @@ fn buildExtendFn(func: *Function) !void {
     const f = try func.appendInst(b, f32_t, .{ .convert = .{ .value = h } });
     try func.appendStore(b, f, slot);
     const bits = try func.appendInst(b, i32_t, .{ .load = .{ .ptr = slot } });
-    func.setTerminator(b, .{ .ret = bits });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(bits) });
 }
 
 /// `f(in: i64) -> i64`: reinterpret the low 32 bits of `in` as an f32, round it to f16 (software
@@ -72,7 +72,7 @@ fn buildTruncFn(func: *Function) !void {
     const f = try func.appendInst(b, f32_t, .{ .convert = .{ .value = h } });
     try func.appendStore(b, f, slot);
     const bits = try func.appendInst(b, i32_t, .{ .load = .{ .ptr = slot } });
-    func.setTerminator(b, .{ .ret = bits });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(bits) });
 }
 
 fn runIntFn(comptime buildFn: fn (*Function) anyerror!void, in: u32) !?u32 {
@@ -142,7 +142,7 @@ fn buildExtendSweepFn(func: *Function) !void {
     const inext = try func.appendArithImm(body, i32_t, .add, bi, 1);
     try func.setJump(body, loop, &.{ inext, acc2, slot });
 
-    func.setTerminator(done, .{ .ret = racc });
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(racc) });
 }
 
 /// `f() -> i64`: loop i over 0..(1<<20), form the f32 pattern `i << 12` (sweeping all exponents,
@@ -195,7 +195,7 @@ fn buildTruncSweepFn(func: *Function) !void {
     const inext = try func.appendArithImm(body, i32_t, .add, bi, 1);
     try func.setJump(body, loop, &.{ inext, acc2, slot });
 
-    func.setTerminator(done, .{ .ret = racc });
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(racc) });
 }
 
 test "f16 extend: all 65536 half patterns widen to f32 bit-exact vs @as(f32, @as(f16, x)) (qemu-riscv64)" {
@@ -311,7 +311,7 @@ fn buildBinaryFn(func: *Function, op: ir.function.BinOp) !void {
     const a = try func.appendBlockParam(b, f16_t);
     const c = try func.appendBlockParam(b, f16_t);
     const r = try func.appendInst(b, f16_t, .{ .arith = .{ .op = op, .lhs = a, .rhs = c } });
-    func.setTerminator(b, .{ .ret = r });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
 }
 
 fn runBinary(op: ir.function.BinOp, a: f16, b: f16) !?f16 {
@@ -372,7 +372,7 @@ fn buildSpillSumFn(func: *Function) !void {
     }
     var acc = vals[0];
     for (vals[1..]) |v| acc = try func.appendInst(b, f16_t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = v } });
-    func.setTerminator(b, .{ .ret = acc });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(acc) });
 }
 
 test "f16 survives register spilling bit-exact (qemu-riscv64)" {
@@ -414,7 +414,7 @@ fn buildIntToHalfFn(func: *Function) !void {
     const f = try func.appendInst(b, f32_t, .{ .convert = .{ .value = h } });
     try func.appendStore(b, f, slot);
     const bits = try func.appendInst(b, i32_t, .{ .load = .{ .ptr = slot } });
-    func.setTerminator(b, .{ .ret = bits });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(bits) });
 }
 
 /// `f(in: i64) -> i64`: take a half bit pattern in the low 16 bits of `in`, load it as an f16 (lhu +
@@ -429,7 +429,7 @@ fn buildHalfToIntFn(func: *Function) !void {
     try func.appendStore(b, in, slot);
     const h = try func.appendInst(b, f16_t, .{ .load = .{ .ptr = slot } });
     const r = try func.appendInst(b, i32_t, .{ .convert = .{ .value = h } });
-    func.setTerminator(b, .{ .ret = r });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
 }
 
 test "int <-> f16 conversions match Zig, bit-exact (qemu-riscv64)" {

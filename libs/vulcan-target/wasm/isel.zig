@@ -1,6 +1,6 @@
-//! Wasm instruction selection: lowers a Vulcan IR function to Wasm (MVP) bytecode.
-//! Wasm is a stack machine with locals. Each IR value is assigned a Wasm local
-//! variable, and instructions emit local.get/local.set sequences.
+//! Wasm instruction selection. This file lowers a Vulcan IR function to Wasm (MVP) bytecode.
+//! Wasm is a stack machine with locals. Each IR value gets its own Wasm local variable.
+//! Instructions emit local.get and local.set sequences.
 
 const std = @import("std");
 const ir = @import("vulcan-ir");
@@ -15,6 +15,7 @@ const Opcode = ir.function.Opcode;
 const BinOp = ir.function.BinOp;
 const CmpOp = ir.function.CmpOp;
 const Terminator = ir.function.Terminator;
+const Ret = ir.function.Ret;
 
 pub const Error = std.mem.Allocator.Error || error{Unsupported};
 
@@ -33,16 +34,17 @@ pub const Signature = struct {
     results: []const encode.ValType,
 };
 
-/// Module-level information the linker owns and isel needs: the deduplicated type
-/// section (so `call_indirect` can name a type index) and the function names in
-/// module order (so a direct `call` resolves a symbol name to a function index,
-/// rather than trusting the caller's interning order to match the module layout).
+/// Module-level information that the linker owns and isel needs.
+/// It holds the deduplicated type section, so `call_indirect` can name a type index.
+/// It also holds the function names in module order, so a direct `call` resolves a
+/// symbol name to a function index. This does not trust the caller's interning order
+/// to match the module layout.
 pub const ModuleResolver = struct {
     sigs: []const Signature,
     func_names: []const []const u8,
-    /// The index of the mutable i32 stack-pointer global, if the module declares one
-    /// (it does when any function allocates). alloca-heavy functions carve their frame
-    /// from this descending stack so allocas never alias across calls.
+    /// The index of the mutable i32 stack-pointer global. The module declares one only
+    /// when a function allocates. Functions with many allocas carve their frame from
+    /// this descending stack, so allocas never alias across calls.
     sp_global: ?u32 = null,
 
     pub fn indexOf(self: *const ModuleResolver, params: []const encode.ValType, results: []const encode.ValType) ?u32 {
@@ -61,12 +63,13 @@ pub const ModuleResolver = struct {
     }
 };
 
-/// A function's stack frame carved from the shared descending stack: which global
-/// holds the pointer, the local that saves the caller's value, and the frame size.
+/// A function's stack frame, carved from the shared descending stack. It names the
+/// global that holds the pointer, the local that saves the caller's value, and the
+/// frame size.
 const FrameCtx = struct { sp_global: u32, saved_sp_local: u32, size: u32 };
 
-/// Restore the caller's stack pointer, emitted before every return of a framed
-/// function. A no-op when the function has no frame.
+/// Restore the caller's stack pointer. This code runs before every return of a
+/// framed function. It does nothing when the function has no frame.
 fn emitEpilogue(code: *std.ArrayList(u8), allocator: std.mem.Allocator, frame: ?FrameCtx) Error!void {
     const fr = frame orelse return;
     try code.append(allocator, encode.LocalOp.local_get);
@@ -76,15 +79,17 @@ fn emitEpilogue(code: *std.ArrayList(u8), allocator: std.mem.Allocator, frame: ?
 }
 
 /// Compile a single IR function to Wasm bytecode. `resolver` supplies type indices
-/// for `call_indirect`. Pass null when compiling standalone (indirect calls then
-/// return error.Unsupported).
+/// for `call_indirect`. Pass null when you compile standalone. Indirect calls then
+/// return error.Unsupported.
 pub fn selectFunction(allocator: std.mem.Allocator, func: *const Function, resolver: ?*const ModuleResolver) Error!Compiled {
-    // f16 is emulated in software: wasm has no f16 value type nor f16 arithmetic, so an f16
-    // SSA value is held as its f32 widening in an f32 local and every memory/round boundary
-    // converts in software (see `emitHalfExtend` / `emitHalfTruncate` / `emitRoundToHalf`).
-    // This mirrors the riscv64/aarch64 held-as-f32 model, so no f16 rejection gate remains.
-    // Only SCALAR f16 is handled; f16 nested in a vector/aggregate would fall through to the
-    // raw path and miscompile the half lanes, so reject that composite case cleanly.
+    // Wasm emulates f16 in software. Wasm has no f16 value type and no f16 arithmetic.
+    // An f16 SSA value is held as its f32 widening in an f32 local. Every memory boundary
+    // and every round converts in software (see `emitHalfExtend`, `emitHalfTruncate`, and
+    // `emitRoundToHalf`). This matches the riscv64 and aarch64 held-as-f32 model, so this
+    // code no longer rejects f16.
+    // This code handles only SCALAR f16. An f16 value nested in a vector or an aggregate
+    // would fall through to the raw path and miscompile the half lanes. Reject that
+    // composite case cleanly instead.
     if (ir.function.functionUsesCompositeF16(func)) return error.Unsupported;
     var code = std.ArrayList(u8).empty;
     errdefer code.deinit(allocator);
@@ -94,14 +99,15 @@ pub fn selectFunction(allocator: std.mem.Allocator, func: *const Function, resol
     return .{ .code = try code.toOwnedSlice(allocator) };
 }
 
-/// The Wasm value type occupied by each scalar leaf of `ty`. Wasm has no pointer
-/// type, so pointers (and any unmapped scalar) become an i32 address.
+/// The Wasm value type for each scalar leaf of `ty`. Wasm has no pointer type.
+/// Pointers, and any unmapped scalar, become an i32 address.
 fn scalarValtype(types: *const ir.types.TypeTable, ty: ir.types.Type) encode.ValType {
     return encode.irTypeToWasm(types, ty) orelse .i32;
 }
 
-/// How many contiguous wasm locals `ty` occupies: one per scalar, or one per field
-/// of a struct or vector (aggregates are scalarized into consecutive locals).
+/// The number of contiguous wasm locals `ty` occupies. This is one per scalar, or
+/// one per field of a struct or vector. isel scalarizes aggregates into consecutive
+/// locals.
 fn leafCount(types: *const ir.types.TypeTable, ty: ir.types.Type) u32 {
     return switch (types.type_kind(ty)) {
         .@"struct" => |fields| @intCast(fields.len),
@@ -116,8 +122,9 @@ fn typeSize(types: *const ir.types.TypeTable, ty: ir.types.Type) u32 {
         .bool => 1,
         .int => |i| (@as(u32, i.bits) + 7) / 8,
         .ptr => 4,
-        // An f16 in memory is a 2-byte IEEE half (loaded/stored via load16_u/store16); the
-        // f32 widening lives only in the local, never in memory. Matches riscv64's typeSize.
+        // An f16 in memory is a 2-byte IEEE half. isel loads and stores it with
+        // load16_u/store16. The f32 widening lives only in the local, never in memory.
+        // This matches riscv64's typeSize.
         .float => |f| switch (f) {
             .f16 => 2,
             .f32 => 4,
@@ -139,8 +146,9 @@ fn typeAlign(types: *const ir.types.TypeTable, ty: ir.types.Type) u32 {
     return if (sz <= 1) 1 else if (sz <= 2) 2 else if (sz <= 4) 4 else 8;
 }
 
-/// How a scalar type participates in a `convert`: whether it is a float, a double,
-/// a 64-bit width, and (for ints) unsigned. Bools count as unsigned i32.
+/// How a scalar type participates in a `convert`. This says whether it is a float,
+/// a double, and a 64-bit width, and for ints, whether it is unsigned. Bools count
+/// as unsigned i32.
 const ConvClass = struct { float: bool, dbl: bool, bits64: bool, unsigned: bool };
 
 fn convClass(types: *const ir.types.TypeTable, ty: ir.types.Type) ?ConvClass {
@@ -152,8 +160,9 @@ fn convClass(types: *const ir.types.TypeTable, ty: ir.types.Type) ?ConvClass {
     };
 }
 
-/// The single valtype a value's locals share, or null if it has no wasm
-/// representation or is a non-uniform aggregate (which isel cannot lower).
+/// The single valtype shared by a value's locals. This is null when the value has
+/// no wasm representation, or when it is a non-uniform aggregate that isel cannot
+/// lower.
 fn valueValtype(types: *const ir.types.TypeTable, ty: ir.types.Type) ?encode.ValType {
     return switch (types.type_kind(ty)) {
         .@"struct" => |fields| {
@@ -169,9 +178,9 @@ fn valueValtype(types: *const ir.types.TypeTable, ty: ir.types.Type) ?encode.Val
     };
 }
 
-/// Whether `ty` is the half-precision float `f16`. Wasm has no f16, so an f16 value is
-/// emulated as its f32 widening held in an f32 local, with software convert at every
-/// boundary (mirrors the riscv64/aarch64 model).
+/// Whether `ty` is the half-precision float `f16`. Wasm has no f16. isel emulates an
+/// f16 value as its f32 widening, held in an f32 local, with a software convert at
+/// every boundary. This matches the riscv64 and aarch64 model.
 fn isF16(types: *const ir.types.TypeTable, ty: ir.types.Type) bool {
     return switch (types.type_kind(ty)) {
         .float => |f| f == .f16,
@@ -179,15 +188,16 @@ fn isF16(types: *const ir.types.TypeTable, ty: ir.types.Type) bool {
     };
 }
 
-/// The wasm locals reserved for the software f16 convert routines when a function uses f16.
-/// Three scratch i32 locals and one scratch f32 local are enough for both the extend and
-/// truncate sequences (they never run concurrently, so the two sequences reuse `i0`/`i1`).
-/// Locals are cheap in wasm, so reserving a fixed handful is simpler than juggling the
-/// operand stack alone. Absent (null) in every non-f16 function, so those stay byte-identical.
+/// The wasm locals reserved for the software f16 convert routines, when a function uses f16.
+/// Three scratch i32 locals and one scratch f32 local are enough for both the extend
+/// sequence and the truncate sequence. The two sequences never run at the same time, so
+/// they reuse `i0` and `i1`. Locals are cheap in wasm, so reserving a fixed handful is
+/// simpler than juggling the operand stack alone. This value is null in every non-f16
+/// function, so those functions stay byte-identical.
 const HalfScratch = struct { i0: u32, i1: u32, i2: u32, f0: u32 };
 
-/// Append an `i32.const` carrying the raw 32-bit pattern `bits` (as a signed LEB, so a
-/// pattern with the top bit set still encodes as the correct i32).
+/// Append an `i32.const` that carries the raw 32-bit pattern `bits`. It encodes as a
+/// signed LEB, so a pattern with the top bit set still encodes as the correct i32.
 fn emitI32ConstBits(code: *std.ArrayList(u8), allocator: std.mem.Allocator, bits: u32) Error!void {
     var leb: [10]u8 = undefined;
     try code.append(allocator, encode.ConstOp.i32_const);
@@ -195,13 +205,15 @@ fn emitI32ConstBits(code: *std.ArrayList(u8), allocator: std.mem.Allocator, bits
     try code.appendSlice(allocator, leb[0..n]);
 }
 
-/// Software EXTEND f16 -> f32 (exact, no rounding). Consumes the raw 16-bit half pattern
-/// (an i32, zero-extended, e.g. straight from `i32.load16_u`) from the top of the operand
-/// stack and leaves the f32 widening of the same value on the stack. Fabian Giesen's
-/// magic-multiply half->float: shift the 15 exponent+mantissa bits into an f32 whose
-/// exponent is biased low, multiply by the exact power of two 2^112 (0x77800000) to rebias
-/// (renormalizing subnormals for free), patch the inf/NaN exponent, then OR in the sign.
-/// This is the byte-for-byte port of riscv64's `emitHalfToFloat`, proven bit-exact.
+/// Software EXTEND from f16 to f32 (exact, no rounding). This routine consumes the raw
+/// 16-bit half pattern from the top of the operand stack. The pattern is an i32, zero
+/// extended, for example straight from `i32.load16_u`. It leaves the f32 widening of the
+/// same value on the stack. This uses Fabian Giesen's magic-multiply half-to-float method.
+/// It shifts the 15 exponent and mantissa bits into an f32 whose exponent is biased low.
+/// It multiplies by the exact power of two 2^112 (0x77800000) to rebias the value. This
+/// also renormalizes subnormals for free. It then patches the inf/NaN exponent, and ORs
+/// in the sign. This is a byte-for-byte port of riscv64's `emitHalfToFloat`, proven
+/// bit-exact.
 fn emitHalfExtend(code: *std.ArrayList(u8), allocator: std.mem.Allocator, sc: HalfScratch) Error!void {
     const h = sc.i0; // raw 16-bit half pattern
     const of = sc.f0; // o.f (the low-biased f32 before the exponent patch)
@@ -210,8 +222,8 @@ fn emitHalfExtend(code: *std.ArrayList(u8), allocator: std.mem.Allocator, sc: Ha
     try code.append(allocator, encode.LocalOp.local_set);
     try code.append(allocator, @as(u8, @intCast(h)));
 
-    // o.f = reinterpret((h & 0x7fff) << 13) * 2^112. The mask drops the sign, the shift
-    // places the 15 bits at f32 bit 13, and the pure-power-of-two multiply is exact in any
+    // o.f = reinterpret((h & 0x7fff) << 13) * 2^112. The mask drops the sign. The shift
+    // places the 15 bits at f32 bit 13. The pure-power-of-two multiply is exact in any
     // rounding mode.
     try code.append(allocator, encode.LocalOp.local_get);
     try code.append(allocator, @as(u8, @intCast(h)));
@@ -229,9 +241,10 @@ fn emitHalfExtend(code: *std.ArrayList(u8), allocator: std.mem.Allocator, sc: Ha
     try code.append(allocator, encode.LocalOp.local_set);
     try code.append(allocator, @as(u8, @intCast(ou)));
 
-    // inf/NaN: a half with exponent 31 lands at >= 2^16 = 65536.0 (0x47800000) after the
-    // multiply, so OR in the f32 all-ones exponent 0x7f800000 whenever o.f >= 65536.0.
-    // `f32.ge` yields 0/1, and `* 0x7f800000` selects the exponent mask branchlessly.
+    // inf/NaN case: a half with exponent 31 lands at >= 2^16 = 65536.0 (0x47800000) after
+    // the multiply. So this code ORs in the f32 all-ones exponent 0x7f800000 whenever
+    // o.f >= 65536.0. `f32.ge` yields 0 or 1. `* 0x7f800000` selects the exponent mask
+    // without a branch.
     try code.append(allocator, encode.LocalOp.local_get);
     try code.append(allocator, @as(u8, @intCast(of)));
     try emitI32ConstBits(code, allocator, 0x47800000);
@@ -245,7 +258,8 @@ fn emitHalfExtend(code: *std.ArrayList(u8), allocator: std.mem.Allocator, sc: Ha
     try code.append(allocator, encode.LocalOp.local_set);
     try code.append(allocator, @as(u8, @intCast(ou)));
 
-    // sign: bit 15 of the half -> bit 31 of the f32, then reinterpret the assembled bits.
+    // Sign: bit 15 of the half moves to bit 31 of the f32. Then this code reinterprets the
+    // assembled bits.
     try code.append(allocator, encode.LocalOp.local_get);
     try code.append(allocator, @as(u8, @intCast(h)));
     try emitI32ConstBits(code, allocator, 15);
@@ -258,14 +272,14 @@ fn emitHalfExtend(code: *std.ArrayList(u8), allocator: std.mem.Allocator, sc: Ha
     try code.append(allocator, encode.F32Op.reinterpret_i32);
 }
 
-/// Software TRUNCATE f32 -> f16 with round-to-nearest-EVEN. Consumes the held f32 from the
-/// top of the operand stack and leaves the 16-bit half pattern (in the low 16 bits of an
-/// i32, sign already merged) on the stack. Branchless port of Fabian Giesen's
-/// `float_to_half_fast3_rtne`: it computes the normal, subnormal, and inf/NaN candidates and
-/// blends them with `select` on masks derived from the input's exponent range. Handles RNE
-/// ties (the mant-odd bias), overflow to inf, gradual underflow into f16 subnormals or
-/// signed zero, and NaN (mapped to a quiet NaN). This is the port of riscv64's
-/// `emitFloatToHalf`, proven bit-exact.
+/// Software TRUNCATE from f32 to f16, with round-to-nearest-even. This routine consumes
+/// the held f32 from the top of the operand stack. It leaves the 16-bit half pattern on
+/// the stack, in the low 16 bits of an i32, with the sign already merged in. This is a
+/// branchless port of Fabian Giesen's `float_to_half_fast3_rtne`. It computes the normal,
+/// subnormal, and inf/NaN candidates, then blends them with `select` on masks derived
+/// from the input's exponent range. It handles RNE ties with the mant-odd bias, overflow
+/// to inf, gradual underflow into f16 subnormals or signed zero, and NaN, which it maps
+/// to a quiet NaN. This is a port of riscv64's `emitFloatToHalf`, proven bit-exact.
 fn emitHalfTruncate(code: *std.ArrayList(u8), allocator: std.mem.Allocator, sc: HalfScratch) Error!void {
     const inbits = sc.i0; // the f32 bit pattern
     const abs = sc.i1; // |f| bits, kept live for the whole routine
@@ -283,9 +297,9 @@ fn emitHalfTruncate(code: *std.ArrayList(u8), allocator: std.mem.Allocator, sc: 
     try code.append(allocator, encode.LocalOp.local_set);
     try code.append(allocator, @as(u8, @intCast(abs)));
 
-    // NORMAL candidate: out = (abs + ((15-127)<<23) + 0xfff + mant_odd) >>_u 13, where
-    // mant_odd = (abs >> 13) & 1 is the RNE bias. ((15-127)<<23)+0xfff = 0xC8000FFF. The
-    // add wraps mod 2^32 (like the riscv 32-bit low word), and the >>_u 13 realigns.
+    // NORMAL candidate: out = (abs + ((15-127)<<23) + 0xfff + mant_odd) >>_u 13.
+    // mant_odd = (abs >> 13) & 1 is the RNE bias. ((15-127)<<23)+0xfff = 0xC8000FFF.
+    // The add wraps mod 2^32, like the riscv 32-bit low word. The >>_u 13 realigns it.
     try code.append(allocator, encode.LocalOp.local_get);
     try code.append(allocator, @as(u8, @intCast(abs)));
     try emitI32ConstBits(code, allocator, 0xC8000FFF);
@@ -303,8 +317,8 @@ fn emitHalfTruncate(code: *std.ArrayList(u8), allocator: std.mem.Allocator, sc: 
     try code.append(allocator, @as(u8, @intCast(out)));
 
     // SUBNORMAL candidate, chosen when abs < (113<<23) = 0x38800000. Adding the magic 0.5
-    // (0x3f000000) to |f| as an f32 aligns the 10 mantissa bits at the bottom under RNE;
-    // the integer subtract of the bias yields the half. `select(o_sub, out, flag_sub)`.
+    // (0x3f000000) to |f| as an f32 aligns the 10 mantissa bits at the bottom under RNE.
+    // The integer subtract of the bias yields the half. `select(o_sub, out, flag_sub)`.
     try code.append(allocator, encode.LocalOp.local_get);
     try code.append(allocator, @as(u8, @intCast(abs)));
     try code.append(allocator, encode.F32Op.reinterpret_i32);
@@ -325,7 +339,7 @@ fn emitHalfTruncate(code: *std.ArrayList(u8), allocator: std.mem.Allocator, sc: 
     try code.append(allocator, @as(u8, @intCast(out)));
 
     // INF/NaN candidate, chosen when abs >= (143<<23) = f16max = 0x47800000. o_inf =
-    // 0x7c00 | (abs > 0x7f800000 ? 0x200 : 0): Inf stays Inf, any NaN becomes a quiet NaN.
+    // 0x7c00 | (abs > 0x7f800000 ? 0x200 : 0). Inf stays Inf. Any NaN becomes a quiet NaN.
     try emitI32ConstBits(code, allocator, 0x7C00);
     try code.append(allocator, encode.LocalOp.local_get);
     try code.append(allocator, @as(u8, @intCast(abs)));
@@ -344,7 +358,7 @@ fn emitHalfTruncate(code: *std.ArrayList(u8), allocator: std.mem.Allocator, sc: 
     try code.append(allocator, encode.LocalOp.local_set);
     try code.append(allocator, @as(u8, @intCast(out)));
 
-    // Mask to 16 bits, then OR in the sign (bit 31 of the input -> bit 15 of the half).
+    // Mask to 16 bits. Then OR in the sign: bit 31 of the input moves to bit 15 of the half.
     try code.append(allocator, encode.LocalOp.local_get);
     try code.append(allocator, @as(u8, @intCast(out)));
     try emitI32ConstBits(code, allocator, 0xFFFF);
@@ -358,11 +372,12 @@ fn emitHalfTruncate(code: *std.ArrayList(u8), allocator: std.mem.Allocator, sc: 
     try code.append(allocator, encode.I32Op.bit_or);
 }
 
-/// Round the held f32-widening f16 value on the top of the operand stack to nearest-even
-/// half and re-widen it, leaving the rounded f32 on the stack. This is the per-op rounding
-/// an f16 arithmetic result (or an f32/f64/int -> f16 convert) needs: truncate to half then
-/// extend back, both in software. The truncate leaves the 16-bit half on the stack, which
-/// the extend consumes; the two sequences reuse the scratch locals since they run in turn.
+/// Round the held f32-widening f16 value, on top of the operand stack, to nearest-even
+/// half, then re-widen it. This leaves the rounded f32 on the stack. Every f16 arithmetic
+/// result needs this per-op rounding. So does an f32, f64, or int to f16 convert. The
+/// routine truncates to half, then extends back, both in software. The truncate leaves
+/// the 16-bit half on the stack, and the extend consumes it. The two sequences reuse the
+/// scratch locals, because they run one after the other.
 fn emitRoundToHalf(code: *std.ArrayList(u8), allocator: std.mem.Allocator, sc: HalfScratch) Error!void {
     try emitHalfTruncate(code, allocator, sc);
     try emitHalfExtend(code, allocator, sc);
@@ -379,12 +394,12 @@ fn emitFunction(
     const types = &func.types;
     const val_count = func.valueCount();
 
-    // Assign each IR value a contiguous run of wasm locals. Entry-block params are
-    // the wasm function parameters, positional at indices 0..n_params-1. Every other
-    // value (non-entry block params and instruction results) becomes a declared
-    // local. Wasm requires the locals vector grouped by type, so declared locals are
-    // laid out grouped by valtype and the index assignment mirrors that order.
-    // Aggregates scalarize into `leafCount` consecutive locals of one valtype.
+    // Assign each IR value a contiguous run of wasm locals. Entry-block params are the
+    // wasm function parameters, at positional indices 0 to n_params-1. Every other value,
+    // meaning non-entry block params and instruction results, becomes a declared local.
+    // Wasm requires the locals vector grouped by type. So declared locals are laid out
+    // grouped by valtype, and the index assignment follows that same order.
+    // isel scalarizes aggregates into `leafCount` consecutive locals of one valtype.
     const leb_order = [_]encode.ValType{ .i32, .i64, .f32, .f64 };
 
     var value_local = try func.allocator.alloc(u32, val_count);
@@ -433,10 +448,10 @@ fn emitFunction(
         }
     }
 
-    // When the function allocates and the linker provided a stack-pointer global,
-    // carve the frame from the shared descending stack (allocas then never alias
-    // across calls). The frame adds one i32 local to hold the caller's sp. Without a
-    // resolver (standalone compile) fall back to static offsets from memory base 0.
+    // When the function allocates, and the linker provided a stack-pointer global,
+    // carve the frame from the shared descending stack. Allocas then never alias across
+    // calls. The frame adds one i32 local to hold the caller's sp. Without a resolver,
+    // in a standalone compile, this falls back to static offsets from memory base 0.
     const sp_global: ?u32 = if (frame_size > 0) (if (resolver) |r| r.sp_global else null) else null;
     const frame: ?FrameCtx = if (sp_global) |g| blk: {
         const saved = next_local;
@@ -444,10 +459,11 @@ fn emitFunction(
         break :blk .{ .sp_global = g, .saved_sp_local = saved, .size = frame_size };
     } else null;
 
-    // When the function uses f16, reserve the software-convert scratch locals (three i32
-    // and one f32) as trailing groups after the saved-sp local. Their indices come last, so
-    // they never shift the grouped value-local indices, and a non-f16 function reserves
-    // nothing (byte-identical codegen). See `HalfScratch` / `emitHalfExtend` / `emitHalfTruncate`.
+    // When the function uses f16, reserve the software-convert scratch locals, three i32
+    // locals and one f32 local, as trailing groups after the saved-sp local. Their indices
+    // come last, so they never shift the grouped value-local indices. A non-f16 function
+    // reserves nothing, so its codegen stays byte-identical. See `HalfScratch`,
+    // `emitHalfExtend`, and `emitHalfTruncate`.
     const uses_f16 = ir.function.functionUsesF16(func);
     const half: ?HalfScratch = if (uses_f16) blk: {
         const base = next_local;
@@ -455,9 +471,9 @@ fn emitFunction(
         break :blk .{ .i0 = base, .i1 = base + 1, .i2 = base + 2, .f0 = base + 3 };
     } else null;
 
-    // Emit the locals vector: group count, then (count, valtype) per present group.
-    // The saved-sp local is appended as its own trailing i32 group so it does not
-    // shift the grouped value-local indices.
+    // Emit the locals vector: the group count, then a (count, valtype) pair per group.
+    // The saved-sp local is appended as its own trailing i32 group, so it does not shift
+    // the grouped value-local indices.
     var group_counts = [_]u32{0} ** leb_order.len;
     var n_groups: u32 = 0;
     for (leb_order, 0..) |vt, gi| {
@@ -489,8 +505,8 @@ fn emitFunction(
         try code.append(allocator, 0x01); // one saved-sp local
         try code.append(allocator, encode.ValType.i32.toByte());
     }
-    // The f16 scratch groups, emitted in index order (i0,i1,i2 then f0) so the declaration
-    // order matches the indices assigned in `half` above.
+    // The f16 scratch groups are emitted in index order, i0, i1, i2, then f0, so the
+    // declaration order matches the indices assigned in `half` above.
     if (half != null) {
         try code.append(allocator, 0x03); // three i32 scratch locals (i0, i1, i2)
         try code.append(allocator, encode.ValType.i32.toByte());
@@ -514,9 +530,9 @@ fn emitFunction(
         try code.append(allocator, @as(u8, @intCast(fr.sp_global)));
     }
 
-    // A single-block function needs no explicit block wrapper: the function body is
-    // already an implicit block, so its instructions and the returned value sit at
-    // function scope where the final `end` returns them.
+    // A single-block function needs no explicit block wrapper. The function body is
+    // already an implicit block. So its instructions and the returned value sit at
+    // function scope, where the final `end` returns them.
     if (func.blockCount() == 1) {
         const block: Block = @enumFromInt(0);
         for (func.blockInsts(block)) |inst| {
@@ -525,9 +541,13 @@ fn emitFunction(
         try emitEpilogue(code, allocator, frame); // restore sp before the value is returned
         if (func.terminator(block)) |term| {
             switch (term) {
-                .ret => |rv| if (rv) |v| {
-                    try code.append(allocator, encode.LocalOp.local_get);
-                    try code.append(allocator, @as(u8, @intCast(value_local[@intFromEnum(v)])));
+                .ret => |r| switch (r.count) {
+                    0 => {},
+                    1 => {
+                        try code.append(allocator, encode.LocalOp.local_get);
+                        try code.append(allocator, @as(u8, @intCast(value_local[@intFromEnum(r.values[0])])));
+                    },
+                    else => return error.Unsupported, // multi-value struct return not yet lowered
                 },
                 .jump => return error.Unsupported,
             }
@@ -536,9 +556,9 @@ fn emitFunction(
         return;
     }
 
-    // Multi-block: emit structured Wasm control flow. IR `if` instructions become
-    // wasm if/else (selection) or block+loop (when the head carries a cf.continue
-    // attribute), and block-parameter phis become edge moves into param locals.
+    // Multi-block: emit structured Wasm control flow. IR `if` instructions become a wasm
+    // if/else for a selection, or a block+loop when the head carries a cf.continue
+    // attribute. Block-parameter phis become edge moves into param locals.
     const visited = try func.allocator.alloc(bool, func.blockCount());
     defer func.allocator.free(visited);
     @memset(visited, false);
@@ -580,7 +600,7 @@ const EmitCtx = struct {
     leb_buf: *[10]u8,
     allocator: std.mem.Allocator,
     resolver: ?*const ModuleResolver,
-    /// IR blocks that an enclosing wasm block/loop targets, innermost last. A `br` to
+    /// IR blocks that an enclosing wasm block or loop targets, innermost last. A `br` to
     /// one of these uses its relative depth.
     control: *std.ArrayList(usize),
     /// Selection merge blocks of enclosing `if`s. A jump to one of these falls through
@@ -600,8 +620,8 @@ fn blockIf(func: *const Function, block: Block) ?ir.function.If {
     return null;
 }
 
-/// Read an integer `cf.<key>` block attribute (a structured-control-flow target the
-/// frontend records on a selection or loop head).
+/// Read an integer `cf.<key>` block attribute. This is a structured-control-flow target
+/// that the frontend records on a selection or loop head.
 fn cfAttrInt(func: *const Function, block: Block, key: []const u8) ?usize {
     var it = func.attributesOf(.{ .block = block });
     while (it.next()) |attr| switch (attr) {
@@ -618,8 +638,9 @@ fn cfAttrInt(func: *const Function, block: Block, key: []const u8) ?usize {
     return null;
 }
 
-/// The merge (continuation) block of a block's `if`: the shared target when both arms
-/// jump to one block, else the recorded `cf.merge`, else a simple diamond's join.
+/// The merge, or continuation, block of a block's `if`. This is the shared target when
+/// both arms jump to one block. Otherwise it is the recorded `cf.merge`. Otherwise it is
+/// a simple diamond's join.
 fn mergeOf(func: *const Function, block: Block) ?usize {
     const iff = blockIf(func, block) orelse return null;
     if (iff.then.target == iff.@"else".target) return @intFromEnum(iff.then.target);
@@ -635,9 +656,9 @@ fn isLoopHeader(func: *const Function, block: Block) bool {
     return blockIf(func, block) != null and cfAttrInt(func, block, "continue") != null;
 }
 
-/// A `control` entry standing for an enclosing wasm `if` scope. It occupies a nesting
-/// level (so `scopeDepth` counts it) but is never a real branch target: no IR block has
-/// this index, so `scopeDepth(real_block)` never matches it.
+/// A `control` entry that stands for an enclosing wasm `if` scope. It occupies a nesting
+/// level, so `scopeDepth` counts it. It is never a real branch target, because no IR
+/// block has this index. So `scopeDepth(real_block)` never matches it.
 const IF_SCOPE_SENTINEL: usize = std.math.maxInt(usize);
 
 /// The relative wasm depth of the innermost control scope targeting `block_idx`.
@@ -655,9 +676,10 @@ fn isStop(ctx: *const EmitCtx, block_idx: usize) bool {
     return false;
 }
 
-/// Move edge `args` into the parameter locals of `target`. All sources are pushed
-/// first, then popped into the destinations, so the move is a correct parallel move
-/// even when a source aliases a destination (e.g. a loop back-edge that swaps).
+/// Move edge `args` into the parameter locals of `target`. This pushes all sources
+/// first, then pops them into the destinations. So the move is a correct parallel move,
+/// even when a source aliases a destination, for example a loop back-edge that swaps
+/// values.
 fn emitEdgeMoves(ctx: *const EmitCtx, args: ir.function.ValueList, target: Block) Error!void {
     const arg_vals = ctx.func.valueList(args);
     const params = ctx.func.blockParams(target);
@@ -687,11 +709,15 @@ fn emitEdge(ctx: *const EmitCtx, target: Block, args: ir.function.ValueList) Err
     }
 }
 
-fn emitRet(ctx: *const EmitCtx, v: ?Value) Error!void {
+fn emitRet(ctx: *const EmitCtx, r: Ret) Error!void {
     try emitEpilogue(ctx.code, ctx.allocator, ctx.frame);
-    if (v) |val| {
-        try ctx.code.append(ctx.allocator, encode.LocalOp.local_get);
-        try ctx.code.append(ctx.allocator, @as(u8, @intCast(ctx.value_local[@intFromEnum(val)])));
+    switch (r.count) {
+        0 => {},
+        1 => {
+            try ctx.code.append(ctx.allocator, encode.LocalOp.local_get);
+            try ctx.code.append(ctx.allocator, @as(u8, @intCast(ctx.value_local[@intFromEnum(r.values[0])])));
+        },
+        else => return error.Unsupported, // multi-value struct return not yet lowered
     }
     try ctx.code.append(ctx.allocator, encode.ControlOp.return_);
 }
@@ -723,10 +749,10 @@ fn emitRegion(ctx: *const EmitCtx, block_idx: usize) Error!void {
     } else if (ctx.func.terminator(block)) |term| {
         switch (term) {
             .jump => |j| try emitEdge(ctx, j.target, j.args),
-            .ret => |v| try emitRet(ctx, v),
+            .ret => |r| try emitRet(ctx, r),
         }
     } else {
-        try emitRet(ctx, null);
+        try emitRet(ctx, Ret.none());
     }
 }
 
@@ -740,10 +766,10 @@ fn emitSelection(ctx: *const EmitCtx, block_idx: usize, iff: ir.function.If) Err
     try ctx.code.append(ctx.allocator, encode.ControlOp.if_);
     try ctx.code.append(ctx.allocator, encode.BlockType.empty.toByte());
 
-    // The wasm `if` is a real nesting level: push a sentinel onto `control` so that a
-    // `br` to an OUTER scope (a break/continue reaching an enclosing loop) counts this
-    // `if` in its relative depth. The merge stays on `stops` (a jump to it falls through
-    // the if/else); the sentinel is never itself a branch target.
+    // The wasm `if` is a real nesting level. Push a sentinel onto `control`, so that a
+    // `br` to an OUTER scope, for example a break or continue reaching an enclosing
+    // loop, counts this `if` in its relative depth. The merge stays on `stops`, so a jump
+    // to it falls through the if/else. The sentinel itself is never a branch target.
     try ctx.stops.append(ctx.allocator, merge);
     try ctx.control.append(ctx.allocator, IF_SCOPE_SENTINEL);
     try emitEdge(ctx, iff.then.target, iff.then.args);
@@ -758,9 +784,9 @@ fn emitSelection(ctx: *const EmitCtx, block_idx: usize, iff: ir.function.If) Err
     if (!isStop(ctx, merge) and scopeDepth(ctx, merge) == null) try emitRegion(ctx, merge);
 }
 
-/// Emit a loop head as `block { loop { <cond> break-if-done <body> br } }`. The head's
-/// condition is re-evaluated each iteration, one arm continues the loop and the other
-/// (the merge) exits it.
+/// Emit a loop head as `block { loop { <cond> break-if-done <body> br } }`. The head
+/// re-evaluates its condition each iteration. One arm continues the loop, and the other
+/// arm, the merge, exits it.
 fn emitLoop(ctx: *const EmitCtx, header_idx: usize) Error!void {
     const header: Block = @enumFromInt(header_idx);
     const iff = blockIf(ctx.func, header).?;
@@ -800,12 +826,13 @@ fn emitLoop(ctx: *const EmitCtx, header_idx: usize) Error!void {
     try ctx.code.append(ctx.allocator, encode.ControlOp.br_if);
     try ctx.code.append(ctx.allocator, @as(u8, @intCast(scopeDepth(ctx, exit).?)));
 
-    // The loop's continue block (increment + back-edge) must be a real branch target, not
-    // inlined at its first use: with a `continue` in one arm of an `if` and the fall-through
-    // in the other, two paths reach it, and inlining emits it once (in the first path),
-    // leaving the second with no increment/back-edge. Wrap the body in an inner `block`
-    // labeled with the continue block so every path `br`s to it, then emit its code once
-    // after the inner block closes.
+    // The loop's continue block, which holds the increment and the back-edge, must be a
+    // real branch target. It must not be inlined at its first use. A `continue` in one
+    // arm of an `if`, and the fall-through in the other, means two paths reach it.
+    // Inlining would emit it once, in the first path, and leave the second path with no
+    // increment and no back-edge. Instead, wrap the body in an inner `block` labeled with
+    // the continue block, so every path `br`s to it. Then emit its code once, after the
+    // inner block closes.
     const cont_b = cfAttrInt(ctx.func, header, "continue");
     if (cont_b != null and cont_b.? != @intFromEnum(body_target)) {
         const cb = cont_b.?;
@@ -821,10 +848,11 @@ fn emitLoop(ctx: *const EmitCtx, header_idx: usize) Error!void {
         try emitBlockBody(ctx, @enumFromInt(cb));
         if (ctx.func.terminator(@enumFromInt(cb))) |term| switch (term) {
             .jump => |j| try emitEdge(ctx, j.target, j.args),
-            .ret => |v| try emitRet(ctx, v),
-        } else try emitRet(ctx, null);
+            .ret => |r| try emitRet(ctx, r),
+        } else try emitRet(ctx, Ret.none());
     } else {
-        // No distinct continue block: fall through into the body (back-edge branches home).
+        // No distinct continue block. Fall through into the body. The back-edge branches
+        // home.
         try emitEdge(ctx, body_target, body_args);
     }
 
@@ -861,8 +889,8 @@ fn emitInst(
             switch (vt) {
                 .i32 => {
                     try code.append(allocator, encode.ConstOp.i32_const);
-                    // Take the low 32 bits as the i32 bit pattern: a uint constant like
-                    // 0xFFFFFFFF is a valid i32 (-1) that `@intCast` would reject.
+                    // Take the low 32 bits as the i32 bit pattern. A uint constant like
+                    // 0xFFFFFFFF is a valid i32, meaning -1, that `@intCast` would reject.
                     const n = encode.encodeS32leb(leb_buf, @as(i32, @truncate(val)));
                     try code.appendSlice(allocator, leb_buf[0..n]);
                 },
@@ -884,10 +912,11 @@ fn emitInst(
             switch (vt) {
                 .f32 => {
                     try code.append(allocator, encode.ConstOp.f32_const);
-                    // wasm encodes float immediates little-endian; write in that order
-                    // explicitly so the output is correct on a big-endian host too. An f16
-                    // constant is pre-rounded to half (`@as(f16, val)`) then widened back to
-                    // f32, so the materialized value already satisfies the held-as-f32 invariant.
+                    // wasm encodes float immediates little-endian. Write in that order
+                    // explicitly, so the output is correct on a big-endian host too. isel
+                    // pre-rounds an f16 constant to half, with `@as(f16, val)`, then widens
+                    // it back to f32. So the materialized value already satisfies the
+                    // held-as-f32 invariant.
                     const f32_val: f32 = if (isF16(types, res_ty))
                         @as(f32, @as(f16, @floatCast(fval)))
                     else
@@ -952,8 +981,8 @@ fn emitInst(
                             .div => encode.F64Op.div,
                             else => return error.Unsupported,
                         },
-                        // f16 has no native wasm arith op; wasm f16 lowering is a
-                        // later task, not this IR-only change.
+                        // f16 has no native wasm arith op. Wasm f16 lowering here is a later
+                        // task, not part of this IR-only change.
                         .f16 => return error.Unsupported,
                     };
                     try code.append(allocator, op_byte);
@@ -968,8 +997,8 @@ fn emitInst(
             }
         },
         .icmp => |c| {
-            // The comparison op is chosen from the operand type (the result is always
-            // bool, so keying off it would always pick eq).
+            // The comparison op is chosen from the operand type. The result type is
+            // always bool, so keying off the result would always pick eq.
             const ty = func.valueType(c.lhs);
             const lhs_local = value_local[@intFromEnum(c.lhs)];
             const rhs_local = value_local[@intFromEnum(c.rhs)];
@@ -988,11 +1017,11 @@ fn emitInst(
                     try code.append(allocator, op_byte);
                 },
                 .bool => {
-                    // Bools are i32 (0/1), compare with the actual op, not always eq.
+                    // Bools are i32 (0/1). Compare with the actual op, not always eq.
                     try code.append(allocator, cmpI32(c.op, .unsigned));
                 },
                 .float => |f| {
-                    // The IR uses `icmp` for float comparisons too (keyed off operands).
+                    // The IR uses `icmp` for float comparisons too, keyed off the operand type.
                     try code.append(allocator, cmpFloat(c.op, f == .f64));
                 },
                 else => return error.Unsupported,
@@ -1004,8 +1033,8 @@ fn emitInst(
             }
         },
         .select => |s| {
-            // Wasm `select` is [v1, v2, cond] -> cond ? v1 : v2, so push `then` first
-            // (v1) and `else` second (v2), matching the IR `cond ? then : else`.
+            // Wasm `select` is [v1, v2, cond] -> cond ? v1 : v2. So push `then` first, as
+            // v1, and `else` second, as v2. This matches the IR `cond ? then : else`.
             const else_local = value_local[@intFromEnum(s.@"else")];
             const then_local = value_local[@intFromEnum(s.then)];
             const cond_local = value_local[@intFromEnum(s.cond)];
@@ -1051,10 +1080,10 @@ fn emitInst(
                 else
                     (if (s.dbl) (if (d.unsigned) encode.I32Op.trunc_f64_u else encode.I32Op.trunc_f64_s) else (if (d.unsigned) encode.I32Op.trunc_f32_u else encode.I32Op.trunc_f32_s)));
             } else {
-                // float -> float: promote, demote, or same no-op. An f16 is held as its f32
-                // widening, so f16<->f32 is a no-op here (the round below handles f32->f16),
-                // f16->f64 is the plain promote (the exact half widens), and f64->f16 first
-                // demotes to f32 then rounds below.
+                // float -> float: promote, demote, or a no-op when the type is the same. An
+                // f16 is held as its f32 widening, so f16 to f32 is a no-op here (the round
+                // below handles f32 to f16). f16 to f64 is the plain promote, because the
+                // exact half widens. f64 to f16 first demotes to f32, then rounds below.
                 if (!s.dbl and d.dbl) {
                     try code.append(allocator, encode.F64Op.promote_f32);
                 } else if (s.dbl and !d.dbl) {
@@ -1063,8 +1092,9 @@ fn emitInst(
             }
 
             // Any conversion whose destination is f16 rounds the produced f32 to nearest-even
-            // half (int->f16, f32->f16, f64->f16), keeping the held-as-f32 invariant. A
-            // destination of f32/f64/int needs no rounding. f16->int already truncated above.
+            // half. This covers int to f16, f32 to f16, and f64 to f16, and it keeps the
+            // held-as-f32 invariant. A destination of f32, f64, or int needs no rounding.
+            // f16 to int already truncated above.
             if (isF16(types, dst_ty)) {
                 const sc = half orelse return error.Unsupported;
                 try emitRoundToHalf(code, allocator, sc);
@@ -1090,8 +1120,8 @@ fn emitInst(
                         64 => try code.append(allocator, encode.I64Op.reinterpret_i64),
                         else => return error.Unsupported,
                     },
-                    // f16 has no native wasm reinterpret op; wasm f16 lowering
-                    // is a later task, not this IR-only change.
+                    // f16 has no native wasm reinterpret op. Wasm f16 lowering here is a
+                    // later task, not part of this IR-only change.
                     .float => |f| switch (f) {
                         .f32 => try code.append(allocator, encode.F32Op.reinterpret_i32),
                         .f64 => try code.append(allocator, encode.F64Op.reinterpret_i64),
@@ -1147,8 +1177,9 @@ fn emitInst(
             try code.append(allocator, try encode.irLoadOp(types, ty));
             try code.append(allocator, 0x00); // align
             try code.append(allocator, 0x00); // offset
-            // f16 loads read the raw 2-byte half (via load16_u above); widen those bits to
-            // the held f32 in software before the value lands in its f32 local.
+            // f16 loads read the raw 2-byte half, using load16_u above. This code widens
+            // those bits to the held f32 in software, before the value lands in its f32
+            // local.
             if (isF16(types, ty)) {
                 const sc = half orelse return error.Unsupported;
                 try emitHalfExtend(code, allocator, sc);
@@ -1162,15 +1193,15 @@ fn emitInst(
             const val_local = value_local[@intFromEnum(st.value)];
             const ptr_local = value_local[@intFromEnum(st.ptr)];
             const val_ty = func.valueType(st.value);
-            // Wasm store pops the value (top of stack) then the address, so push the
-            // address first.
+            // Wasm store pops the value from the top of the stack, then the address. So
+            // push the address first.
             try code.append(allocator, encode.LocalOp.local_get);
             try code.append(allocator, @as(u8, @intCast(ptr_local)));
             try code.append(allocator, encode.LocalOp.local_get);
             try code.append(allocator, @as(u8, @intCast(val_local)));
-            // f16 stores truncate the held f32 (now on the stack, above the address) to the
-            // 2-byte half in software, then store16 those low 16 bits. The address pushed
-            // first stays untouched underneath the truncate's stack work.
+            // f16 stores truncate the held f32, now on the stack above the address, to the
+            // 2-byte half in software. Then store16 writes those low 16 bits. The address
+            // pushed first stays untouched underneath the truncate's stack work.
             if (isF16(types, val_ty)) {
                 const sc = half orelse return error.Unsupported;
                 try emitHalfTruncate(code, allocator, sc);
@@ -1179,15 +1210,18 @@ fn emitInst(
             try code.append(allocator, 0x00); // align
             try code.append(allocator, 0x00); // offset
         },
-        .prefetch => {}, // a hint, Wasm has no prefetch, dropped
-        // dot is aarch64+dotprod-only in practice; Wasm has no lowering for it.
+        .prefetch => {}, // This is a hint. Wasm has no prefetch, so isel drops it.
+        // dot is aarch64 dotprod-only in practice. Wasm has no lowering for it.
         .dot => return error.Unsupported,
-        // matmul is et-soc-only (a later task); Wasm has no lowering for it.
+        // matmul is et-soc only, a later task. Wasm has no lowering for it.
         .matmul => return error.Unsupported,
+        // These IR ops exist for frontend and IR construction only. Wasm has no lowering
+        // for them yet, a later task, mirroring `dot` and `matmul` above.
+        .va_start, .va_arg, .va_end => return error.Unsupported,
         .call => |c| {
-            // Resolve the callee by NAME to its module function index. `c.symbol` is a
-            // per-function interned id whose ordering need not match the module layout,
-            // so using it as the index directly would call the wrong function.
+            // Resolve the callee by NAME, to its module function index. `c.symbol` is a
+            // per-function interned id. Its ordering need not match the module layout, so
+            // using it directly as the index would call the wrong function.
             const res = resolver orelse return error.Unsupported;
             const callee = res.funcIndex(func.symbolName(c.symbol)) orelse return error.Unsupported;
             for (func.valueList(c.args)) |arg| {
@@ -1203,9 +1237,9 @@ fn emitInst(
             }
         },
         .call_indirect => |ci| {
-            // Push the args, then the table index (`ci.target`), then call_indirect
-            // naming the callee signature's type index and table 0. The linker owns
-            // the type section, so it supplies the resolver.
+            // Push the args, then the table index (`ci.target`), then emit call_indirect
+            // naming the callee signature's type index and table 0. The linker owns the
+            // type section, so it supplies the resolver.
             const res = resolver orelse return error.Unsupported;
             const args = func.valueList(ci.args);
 
@@ -1263,8 +1297,8 @@ fn emitInst(
             try code.append(allocator, @as(u8, @intCast(value_local[@intFromEnum(rv)])));
         },
         .global_addr => {
-            // Named globals need a data/global layout the wasm target does not lay out
-            // yet. Fail loudly rather than returning a bogus address.
+            // Named globals need a data and global layout that the wasm target does not lay
+            // out yet. Fail loudly, rather than return a bogus address.
             return error.Unsupported;
         },
         .struct_new => |sn| {
@@ -1291,8 +1325,8 @@ fn emitInst(
             try code.append(allocator, @as(u8, @intCast(value_local[@intFromEnum(rv)])));
         },
         .@"if" => {
-            // The structured emitter handles `if` at the block level and never emits
-            // it as an instruction, so reaching here is a bug.
+            // The structured emitter handles `if` at the block level. It never emits `if`
+            // as an instruction, so reaching here is a bug.
             return error.Unsupported;
         },
     }
@@ -1306,8 +1340,9 @@ fn emitIconst(
     val: i64,
 ) Error!void {
     try code.append(func.allocator, encode.ConstOp.i32_const);
-    // Low 32 bits as the i32 bit pattern (see the .iconst case): a full-range uint immediate
-    // is a valid i32 that a range-checked `@intCast` would reject.
+    // Take the low 32 bits as the i32 bit pattern, as in the .iconst case above. A
+    // full-range uint immediate is a valid i32 that a range-checked `@intCast` would
+    // reject.
     const n = encode.encodeS32leb(leb_buf, @as(i32, @truncate(val)));
     try code.appendSlice(func.allocator, leb_buf[0..n]);
 }
@@ -1326,8 +1361,8 @@ fn arithI32(op: BinOp, signed: std.builtin.Signedness) u8 {
         .bit_xor => encode.I32Op.bit_xor,
         .shl => encode.I32Op.shl,
         .shr => if (signed == .signed) encode.I32Op.shr_s else encode.I32Op.shr_u,
-        // wasm has no high-multiply; `expandMulh` rewrites `mulh` into plain multiplies/shifts
-        // before this backend's isel, so it never reaches here.
+        // wasm has no high-multiply op. `expandMulh` rewrites `mulh` into plain multiplies
+        // and shifts before this backend's isel runs, so it never reaches here.
         .mulh => unreachable,
     };
 }
@@ -1344,8 +1379,8 @@ fn arithI64(op: BinOp, signed: std.builtin.Signedness) u8 {
         .bit_xor => encode.I64Op.bit_xor,
         .shl => encode.I64Op.shl,
         .shr => if (signed == .signed) encode.I64Op.shr_s else encode.I64Op.shr_u,
-        // wasm has no high-multiply; `expandMulh` rewrites `mulh` into plain multiplies/shifts
-        // before this backend's isel, so it never reaches here.
+        // wasm has no high-multiply op. `expandMulh` rewrites `mulh` into plain multiplies
+        // and shifts before this backend's isel runs, so it never reaches here.
         .mulh => unreachable,
     };
 }
@@ -1401,8 +1436,9 @@ fn emitArith(
     result: ?Value,
     code: *std.ArrayList(u8),
 ) Error!void {
-    // wasm has no high-multiply and this backend runs no `expandMulh`; reject cleanly rather than
-    // reach the `unreachable` in arithI32/arithI64. Only the 64-bit magic-divide lowering emits it.
+    // wasm has no high-multiply op, and this backend runs no `expandMulh`. Reject cleanly,
+    // rather than reach the `unreachable` in arithI32 or arithI64. Only the 64-bit
+    // magic-divide lowering emits mulh.
     if (op == .mulh) return error.Unsupported;
     const ty = if (result) |r| func.valueType(r) else func.valueType(lhs);
     const lhs_local = value_local[@intFromEnum(lhs)];
@@ -1439,9 +1475,9 @@ fn emitArith(
                     .div => encode.F64Op.div,
                     else => return error.Unsupported,
                 },
-                // f16 is emulated as its f32 widening: the operands are already the f32
-                // widenings held in f32 locals, so the op runs in f32 and the result is
-                // rounded back to half below (per-op rounding = correct IEEE f16 semantics).
+                // f16 is emulated as its f32 widening. The operands are already the f32
+                // widenings held in f32 locals, so the op runs in f32. The result is rounded
+                // back to half below. This per-op rounding gives correct IEEE f16 semantics.
                 .f16 => switch (op) {
                     .add => encode.F32Op.add,
                     .sub => encode.F32Op.sub,
@@ -1451,8 +1487,9 @@ fn emitArith(
                 },
             };
             try code.append(func.allocator, op_byte);
-            // Round the f32 result back to nearest-even half, preserving the held-as-f32
-            // widening invariant. The truncate+extend consumes and re-produces the stack top.
+            // Round the f32 result back to nearest-even half. This keeps the held-as-f32
+            // widening invariant. The truncate and extend sequence consumes and
+            // re-produces the stack top.
             if (f == .f16) {
                 const sc = half orelse return error.Unsupported;
                 try emitRoundToHalf(code, func.allocator, sc);
@@ -1468,8 +1505,9 @@ fn emitArith(
 }
 
 test "codegen+disasm round-trip: integer add" {
-    // Lower an IR add to Wasm bytecode and assert the disassembled function body: the locals
-    // header plus the stack-machine expression. No execution, so it runs on any host.
+    // Lower an IR add to Wasm bytecode. Assert the disassembled function body: the locals
+    // header, plus the stack-machine expression. This test does not execute the code, so
+    // it runs on any host.
     const a = std.testing.allocator;
     var func = Function.init(a);
     defer func.deinit();
@@ -1478,7 +1516,7 @@ test "codegen+disasm round-trip: integer add" {
     const x = try func.appendBlockParam(e, i32_t);
     const y = try func.appendBlockParam(e, i32_t);
     const s = try func.appendInst(e, i32_t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = y } });
-    func.setTerminator(e, .{ .ret = s });
+    func.setTerminator(e, .{ .ret = ir.function.Ret.one(s) });
 
     var compiled = try selectFunction(a, &func, null);
     defer compiled.deinit(a);
@@ -1497,9 +1535,9 @@ test "codegen+disasm round-trip: integer add" {
 }
 
 test "an f16 function lowers: held as f32, with reserved software-convert scratch locals" {
-    // f16 is emulated as its f32 widening (no wasm f16 type), so an f16 add now lowers rather
-    // than being rejected. The function must declare the reserved f16 scratch locals (three
-    // i32 and one f32) and round the f32 add result back to half.
+    // f16 is emulated as its f32 widening, because wasm has no f16 type. So an f16 add now
+    // lowers, rather than being rejected. The function must declare the reserved f16 scratch
+    // locals, three i32 and one f32, and round the f32 add result back to half.
     const a = std.testing.allocator;
     var func = Function.init(a);
     defer func.deinit();
@@ -1508,14 +1546,14 @@ test "an f16 function lowers: held as f32, with reserved software-convert scratc
     const x = try func.appendBlockParam(e, f16_t);
     const y = try func.appendBlockParam(e, f16_t);
     const s = try func.appendInst(e, f16_t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = y } });
-    func.setTerminator(e, .{ .ret = s });
+    func.setTerminator(e, .{ .ret = ir.function.Ret.one(s) });
 
     var compiled = try selectFunction(a, &func, null);
     defer compiled.deinit(a);
     const text = try disasm.formatBody(a, compiled.code);
     defer a.free(text);
-    // The result f32 local plus the four reserved f16 scratch locals (3 i32, 1 f32); the
-    // body starts by adding the two f32-widening params, then rounds to half.
+    // The result f32 local, plus the four reserved f16 scratch locals, 3 i32 and 1 f32.
+    // The body starts by adding the two f32-widening params, then rounds to half.
     try std.testing.expect(std.mem.indexOf(u8, text, "1 x f32") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "3 x i32") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "f32.add") != null);

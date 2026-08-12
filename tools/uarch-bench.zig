@@ -156,7 +156,7 @@ fn buildMulChain(allocator: std.mem.Allocator) anyerror!Function {
     var r = x;
     var k: usize = 0;
     while (k < 5) : (k += 1) r = try func.appendInst(entry, i64_t, .{ .arith = .{ .op = .mul, .lhs = r, .rhs = x } });
-    func.setTerminator(entry, .{ .ret = r });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(r) });
     return func;
 }
 
@@ -183,7 +183,7 @@ fn buildPressureKernel(allocator: std.mem.Allocator) anyerror!Function {
     while (j < terms.len) : (j += 1) {
         acc = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = terms[j] } });
     }
-    func.setTerminator(entry, .{ .ret = acc });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(acc) });
     return func;
 }
 
@@ -210,7 +210,7 @@ fn buildSumLoop(allocator: std.mem.Allocator) anyerror!Function {
     const ns = try func.appendInst(body, i64_t, .{ .arith = .{ .op = .add, .lhs = bs, .rhs = bi } });
     const ni = try func.appendArithImm(body, i64_t, .add, bi, 1);
     try func.setJump(body, loop, &.{ ni, ns });
-    func.setTerminator(done, .{ .ret = s });
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(s) });
     return func;
 }
 
@@ -252,7 +252,7 @@ fn buildSaxpyLoop(allocator: std.mem.Allocator) anyerror!Function {
     const ni = try func.appendArithImm(body, i32_t, .add, bi, 1);
     try func.setJump(body, loop, &.{ni});
     const r = try func.appendInst(done, f32_t, .{ .load = .{ .ptr = out } }); // out[0], data-dependent
-    func.setTerminator(done, .{ .ret = r });
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(r) });
     return func;
 }
 
@@ -289,7 +289,7 @@ fn buildFsumLoop(allocator: std.mem.Allocator) anyerror!Function {
     const ni = try func.appendArithImm(body, i32_t, .add, bi, 1);
     try func.setJump(body, loop, &.{ ni, ns });
     const rs = try func.appendBlockParam(done, f32_t);
-    func.setTerminator(done, .{ .ret = rs });
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(rs) });
     return func;
 }
 
@@ -328,7 +328,7 @@ fn buildStridedSum(allocator: std.mem.Allocator) anyerror!Function {
     const ni = try func.appendArithImm(body, i64_t, .add, bi, 1);
     try func.setJump(body, loop, &.{ ni, np, ns });
 
-    func.setTerminator(done, .{ .ret = s });
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(s) });
     return func;
 }
 
@@ -350,7 +350,7 @@ fn buildFmaChain(allocator: std.mem.Allocator) anyerror!Function {
         const t = try func.appendInst(entry, f32_t, .{ .arith = .{ .op = .mul, .lhs = r, .rhs = b } });
         r = try func.appendInst(entry, f32_t, .{ .arith = .{ .op = .add, .lhs = t, .rhs = c } });
     }
-    func.setTerminator(entry, .{ .ret = r });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(r) });
     return func;
 }
 
@@ -370,7 +370,7 @@ fn buildSlpAdds(allocator: std.mem.Allocator) anyerror!Function {
     for (0..4) |lane| b[lane] = try func.appendBlockParam(entry, f32_t);
     var r: [4]Value = undefined;
     for (0..4) |lane| r[lane] = try func.appendInst(entry, f32_t, .{ .arith = .{ .op = .add, .lhs = a[lane], .rhs = b[lane] } });
-    func.setTerminator(entry, .{ .ret = r[0] });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(r[0]) });
     return func;
 }
 
@@ -410,7 +410,7 @@ fn buildMemAdd(allocator: std.mem.Allocator) anyerror!Function {
         const addr = try func.appendArithImm(entry, ptr_t, .add, pout, @intCast(i * 4));
         try func.appendStore(entry, cv[i], addr);
     }
-    func.setTerminator(entry, .{ .ret = cv[0] });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(cv[0]) });
     return func;
 }
 
@@ -454,7 +454,7 @@ fn buildMemMulAdd(allocator: std.mem.Allocator) anyerror!Function {
         const addr = try func.appendArithImm(entry, ptr_t, .add, pout, @intCast(i * 4));
         try func.appendStore(entry, cv[i], addr);
     }
-    func.setTerminator(entry, .{ .ret = cv[0] });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(cv[0]) });
     return func;
 }
 
@@ -491,7 +491,7 @@ fn buildMemPair(allocator: std.mem.Allocator) anyerror!Function {
     const back0 = try func.appendInst(entry, i64_t, .{ .load = .{ .ptr = out_addrs[0] } });
     const backN = try func.appendInst(entry, i64_t, .{ .load = .{ .ptr = out_addrs[words - 1] } });
     const sum = try func.appendInst(entry, i64_t, .{ .arith = .{ .op = .add, .lhs = back0, .rhs = backN } });
-    func.setTerminator(entry, .{ .ret = sum });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(sum) });
     return func;
 }
 
@@ -514,6 +514,8 @@ fn customLatency(op: ir.function.Opcode) u32 {
         // This fictional part carries no tensor unit; a placeholder in case one is added.
         .matmul => 64,
         .iconst, .fconst, .icmp, .select, .struct_new, .extract, .alloca, .call, .call_indirect, .global_addr, .store, .prefetch, .@"if" => 1,
+        // SM12 T3: no backend expands these yet, priced like any other cheap bookkeeping op.
+        .va_start, .va_arg, .va_end => 1,
     };
 }
 
@@ -539,6 +541,8 @@ fn customThroughput(op: ir.function.Opcode, elem_float: bool) u32 {
         .dot => 3,
         .matmul => 64, // no tensor unit here; non-pipelined placeholder
         .iconst, .fconst, .icmp, .select, .struct_new, .extract, .alloca, .call, .call_indirect, .global_addr, .store, .prefetch, .@"if" => 1,
+        // SM12 T3: no backend expands these yet, priced like any other cheap bookkeeping op.
+        .va_start, .va_arg, .va_end => 1,
     };
 }
 
@@ -560,6 +564,10 @@ fn customUnit(op: ir.function.Opcode) opt.microarch.UnitClass {
         .dot => .fpsimd,
         // matmul runs on the tensor/VPU unit, modeled as fpsimd like dot.
         .matmul => .fpsimd,
+        // SM12 T3: `va_arg` reads through `list` (a memory access, like `load`); `va_start`/
+        // `va_end` are pure bookkeeping, like `struct_new`/`extract` above.
+        .va_arg => .mem,
+        .va_start, .va_end => .none,
     };
 }
 

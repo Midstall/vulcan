@@ -31,7 +31,7 @@ const code_offset: usize = 0x1000;
 /// Write an ET-SoC-loadable ELF wrapping `image` (loaded at, and entered at, `base`).
 /// sw-sysemu's loader walks each PT_LOAD segment's *sections* and copies each section's
 /// bytes to memory. The production flat-image ELF writer emits no section headers, so it
-/// would load nothing here; the image must instead be exposed as a `.text` section inside
+/// would load nothing here. The image must instead be exposed as a `.text` section inside
 /// the segment.
 /// One PT_LOAD (R|W|X, so the kernel can store its result vector back), one `.text`
 /// PROGBITS section spanning the whole image, and a `.shstrtab`. Caller owns the result.
@@ -107,7 +107,7 @@ const load_base: u64 = 0x8000800000;
 /// dump. encode.zig has no `wfi`, so it is spelled out as its fixed word here.
 const wfi_word: u32 = 0x10500073;
 /// A generous per-frame scratch stack reserved at the top of the image. The test kernel's
-/// frame is a handful of words; 4 KiB is far more than any single frame needs.
+/// frame is a handful of words. 4 KiB is far more than any single frame needs.
 const stack_reserve: u64 = 4096;
 
 fn roundUp(x: u64, comptime n: u64) u64 {
@@ -128,7 +128,7 @@ fn appendPcRel(allocator: std.mem.Allocator, w: *std.ArrayList(u32), rd: encode.
 }
 
 /// The full baremetal image for one VPU run: the entry stub, the compiled function, and
-/// the input/output buffers. `data_off` is the byte offset of the first input buffer;
+/// the input/output buffers. `data_off` is the byte offset of the first input buffer.
 /// `out_off` is the byte offset of the output buffer. Caller owns `bytes`.
 const Image = struct {
     bytes: []u8,
@@ -140,7 +140,7 @@ const Image = struct {
 };
 
 /// Lay out and assemble the image from raw 32-bit lane words. `code` is the compiled
-/// function (entry at word 0); `in_a` and `in_b` are the two 8-lane input vectors (as raw
+/// function (entry at word 0). `in_a` and `in_b` are the two 8-lane input vectors (as raw
 /// little-endian u32 lanes, so this serves both f32 bit patterns and i32 values) the kernel
 /// reads through its first two pointer arguments, writing 8 result words through its third.
 fn buildImageWords(allocator: std.mem.Allocator, code: []const u32, in_a: [8]u32, in_b: [8]u32) std.mem.Allocator.Error!Image {
@@ -216,7 +216,7 @@ fn runVpuImage(io: std.Io, allocator: std.mem.Allocator, image: Image) ![32]u8 {
     const reset_pc = try std.fmt.allocPrint(allocator, "0x{x}", .{load_base});
     defer allocator.free(reset_pc);
 
-    // Like the river/spike runners, the emulator is found by name on `PATH`; a custom
+    // Like the river/spike runners, the emulator is found by name on `PATH`. A custom
     // build is used by putting its directory on `PATH`. Absent, `process.run` returns
     // `error.FileNotFound` and the test skips.
     const argv = [_][]const u8{
@@ -321,7 +321,7 @@ fn buildAddKernel(func: *Function) !void {
         const addr_out = try func.appendArithImm(b, ptr_t, .add, ptr_out, @intCast(i * 4));
         try func.appendStore(b, c, addr_out);
     }
-    func.setTerminator(b, .{ .ret = null });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
 }
 
 /// Build a SCALAR 8-lane elementwise f32 kernel, `out[i] = a[i] * a[i] + b[i]` for i in 0..8:
@@ -375,7 +375,7 @@ fn buildSquareAddKernel(func: *Function) !void {
         const addr_out = try func.appendArithImm(b, ptr_t, .add, ptr_out, @intCast(i * 4));
         try func.appendStore(b, addv[i], addr_out);
     }
-    func.setTerminator(b, .{ .ret = null });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
 }
 
 test "et-soc SLP: sw-sysemu executes an SLP-vectorized 8-lane f32 square-add and matches the scalar reference" {
@@ -394,7 +394,7 @@ test "et-soc SLP: sw-sysemu executes an SLP-vectorized 8-lane f32 square-add and
     try std.testing.expect(changed);
     // Memory coalescing must have fired: the scalar loads of `a`/`b` became wide `flw.ps` vector
     // loads and the scalar stores became one `fsw.ps` vector store. This is what makes the kernel
-    // profitable without a scalar-float pack/unpack round trip; sw-sysemu executes those wide ops
+    // profitable without a scalar-float pack/unpack round trip. sw-sysemu executes those wide ops
     // below and the result must still match the scalar reference lane for lane.
     try std.testing.expect(hasVectorLoad(&func));
     try std.testing.expect(hasVectorStore(&func));
@@ -490,7 +490,7 @@ fn buildVectorMulAddKernel(func: *Function, second_op: ir.function.BinOp) !void 
         const addr_out = try func.appendArithImm(b, ptr_t, .add, ptr_out, @intCast(i * 4));
         try func.appendStore(b, c, addr_out);
     }
-    func.setTerminator(b, .{ .ret = null });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
 }
 
 /// Count `fmadd.ps` words in `code`: opcode 0x5B (0b1011011) is the whole PS fused-multiply-add
@@ -582,7 +582,7 @@ test "et-soc VPU differential: an UNFUSED 8-lane f32 a*a-b keeps fmul.ps+fsub.ps
 /// packed into one `<8 x i32>`, 8 scalar i32 loads of `b` packed likewise, one vector `arith`
 /// lowered to the matching packed-integer (`pi`) op, then 8 extracts and 8 scalar i32 stores.
 /// Mirrors `buildAddKernel` but every lane is an i32, so the pack/unpack rides the INT register
-/// file (which spills freely), not the tight scalar-float pool - hence no register-pressure caveat.
+/// file (which spills freely), not the tight scalar-float pool, so there is no register-pressure caveat.
 fn buildIntKernel(func: *Function, op: ir.function.BinOp) !void {
     const V = ir.function.Value;
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
@@ -611,7 +611,7 @@ fn buildIntKernel(func: *Function, op: ir.function.BinOp) !void {
         const addr_out = try func.appendArithImm(b, ptr_t, .add, ptr_out, @intCast(i * 4));
         try func.appendStore(b, c, addr_out);
     }
-    func.setTerminator(b, .{ .ret = null });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
 }
 
 test "et-soc VPU differential: sw-sysemu executes 8-lane <8 x i32> pi ops and matches the scalar i32 reference" {
@@ -700,14 +700,14 @@ fn buildIntMulAddKernel(func: *Function) !void {
         const addr_out = try func.appendArithImm(b, ptr_t, .add, ptr_out, @intCast(i * 4));
         try func.appendStore(b, addv[i], addr_out);
     }
-    func.setTerminator(b, .{ .ret = null });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
 }
 
 /// Build a SCALAR i32 xor-then-shift kernel, `out[i] = (a[i] ^ b[i]) << 2` for i in 0..8: 8 scalar
 /// i32 loads of each of `a` and `b`, 8 contiguous `a[i] ^ b[i]` xors, one shift-amount constant,
 /// then 8 contiguous `xor[i] << 2` shifts, then 8 stores. Exercises the bitwise (`fxor.pi`) and the
 /// left-shift (`fsll.pi`) pi lowerings that the SLP integer path produces. The shift amount is a
-/// shared `iconst` (a non-arith op, so it does not break the contiguous shl run); the vectorizer
+/// shared `iconst` (a non-arith op, so it does not break the contiguous shl run). The vectorizer
 /// packs eight copies of it into the shift-amount vector.
 fn buildIntXorShiftKernel(func: *Function) !void {
     const V = ir.function.Value;
@@ -741,7 +741,7 @@ fn buildIntXorShiftKernel(func: *Function) !void {
         const addr_out = try func.appendArithImm(b, ptr_t, .add, ptr_out, @intCast(i * 4));
         try func.appendStore(b, shv[i], addr_out);
     }
-    func.setTerminator(b, .{ .ret = null });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
 }
 
 test "et-soc SLP: sw-sysemu executes SLP-vectorized 8-lane <8 x i32> pi kernels and matches the scalar i32 reference" {
@@ -814,7 +814,7 @@ test "buildImage lays out the entry stub, function, and buffers" {
     const image = try buildImage(allocator, &code, in_a, in_b);
     defer image.deinit(allocator);
 
-    // Entry stub is 13 words; the function follows; buffers are 32-byte aligned after.
+    // Entry stub is 13 words. The function follows. Buffers are 32-byte aligned after.
     const data_off = roundUp((13 + code.len) * 4, 32);
     try std.testing.expectEqual(data_off + 64, image.out_off);
     // The first word is the FP-enable `lui x6, 0x6`, and the stub's call site is a jal
@@ -829,8 +829,8 @@ test "buildImage lays out the entry stub, function, and buffers" {
 // The matmul lowering (isel.zig `.matmul`) emits the tensor CSR-write protocol proven on
 // sw-sysemu by /tmp/etsoc-build/matmul/mm.s, generalized to arbitrary m/n/k via a compile-time
 // tile grid. A, B, and C are REAL row-major f32 matrices (A: m x k stride k*4, B: k x n stride
-// n*4, C: m x n stride n*4 - no cache-line padding). Each buffer base is 64-byte aligned so the
-// tensor_load unit (which addresses 64-byte lines) can reach the sub-tiles; rows whose real pitch
+// n*4, C: m x n stride n*4, no cache-line padding). Each buffer base is 64-byte aligned so the
+// tensor_load unit (which addresses 64-byte lines) can reach the sub-tiles. Rows whose real pitch
 // is not a multiple of 64 are staged into a stack scratch by the lowering itself. This needs its
 // own image layout (three pointer args at a0/a1/a2, three real row-major matrices) distinct from
 // the two-8-lane-vector layout `buildImageWords` uses.
@@ -862,7 +862,7 @@ fn mmElemBytes(dtype: MMType) usize {
 
 /// Encode the integer value `v` as one A/B element of `dtype` into `dst` (little-endian). All the
 /// differential tests use integer-valued inputs so the products/sums are EXACT for every dtype:
-/// int8/uint8 are integers by nature; small integers are exactly representable in f16/f32.
+/// int8/uint8 are integers by nature. Small integers are exactly representable in f16/f32.
 fn writeMatmulElem(dst: []u8, dtype: MMType, v: i32) void {
     switch (dtype) {
         .fp32 => std.mem.writeInt(u32, dst[0..4], @bitCast(@as(f32, @floatFromInt(v))), .little),
@@ -978,12 +978,12 @@ fn buildMatmulKernel(func: *Function, m: u16, n: u16, k: u16, dtype: MMType, acc
     const pb = try func.appendBlockParam(blk, ptr_t);
     const pc = try func.appendBlockParam(blk, ptr_t);
     try func.appendMatmul(blk, pa, pb, pc, m, n, k, dtype, accumulate);
-    func.setTerminator(blk, .{ .ret = null });
+    func.setTerminator(blk, .{ .ret = ir.function.Ret.none() });
 }
 
 /// Build an EMBEDDED matmul kernel: a value V is loaded into a float register BEFORE the matmul and
 /// stored back AFTER it, so V is live ACROSS the matmul. The V slot lives just past C in memory (at
-/// C + m*n*4, pre-initialized by the image); a >= 4-row matmul clobbers every scalar float temp
+/// C + m*n*4, pre-initialized by the image). A >= 4-row matmul clobbers every scalar float temp
 /// f0..f7 (TenC is f0..f(2*min(16,m)-1)), so V's register is definitely clobbered. Only the embedded
 /// save/restore keeps V intact, so a mis-lowered (or non-self-contained) matmul makes the stored V
 /// observably wrong while C stays correct. a0=&A, a1=&B, a2=&C, exactly like `buildMatmulKernel`.
@@ -998,7 +998,7 @@ fn buildEmbeddedMatmulKernel(func: *Function, m: u16, n: u16, k: u16, dtype: MMT
     const vf = try func.appendInst(blk, f32_t, .{ .load = .{ .ptr = vptr } });
     try func.appendMatmulEmbedded(blk, pa, pb, pc, m, n, k, dtype, false, null);
     try func.appendStore(blk, vf, vptr);
-    func.setTerminator(blk, .{ .ret = null });
+    func.setTerminator(blk, .{ .ret = ir.function.Ret.none() });
 }
 
 /// The distinctive live-across value V the embedded differential checks survives the matmul: f32
@@ -1088,7 +1088,7 @@ test "et-soc matmul: structural CSR sequence, fsw.ps store, and first_pass toggl
     try std.testing.expect(std.mem.indexOfScalar(u32, code, encode.mov_m_x(0, .x0, 0xFF)) != null);
     var fsw_ps_count: usize = 0;
     for (code) |word| {
-        // fsw.ps opcode 0x0B, funct3 110; mask out the register/immediate fields.
+        // fsw.ps opcode 0x0B, funct3 110. Mask out the register/immediate fields.
         if ((word & 0x707F) == (encode.fsw_ps(.f0, .x0, 0) & 0x707F)) fsw_ps_count += 1;
     }
     try std.testing.expect(fsw_ps_count >= 2);
@@ -1120,12 +1120,12 @@ test "et-soc matmul differential: sw-sysemu computes correct fp32 matrix product
     try std.testing.expect(model.vpu());
 
     // Shapes exercising every axis of the compile-time tile grid, all real row-major:
-    //   2x4x2   - the original single tile (degenerate 1x1x1 grid), staged loads (k,n < 16).
-    //   4x4x3   - single tile, K=3 staged.
-    //   4x4x32  - two K slices (k=32) accumulated into one output tile; A aligned, B staged (n=4).
-    //   8x32x8  - two N tiles (n=32); B aligned, A staged (k=8).
-    //   32x8x8  - two M tiles (m=32); both A and B staged (k,n=8).
-    //   32x32x32 - full 2x2 output grid, 2 K slices each; fully aligned (k,n mult of 16, no staging).
+    //   2x4x2:    the original single tile (degenerate 1x1x1 grid), staged loads (k,n < 16).
+    //   4x4x3:    single tile, K=3 staged.
+    //   4x4x32:   two K slices (k=32) accumulated into one output tile. A aligned, B staged (n=4).
+    //   8x32x8:   two N tiles (n=32). B aligned, A staged (k=8).
+    //   32x8x8:   two M tiles (m=32). Both A and B staged (k,n=8).
+    //   32x32x32: full 2x2 output grid, 2 K slices each, fully aligned (k,n mult of 16, no staging).
     // Integer-valued f32 inputs so the softfloat products/sums are exact and the scalar reference is
     // bit-identical to sw-sysemu.
     const Case = struct { m: u16, n: u16, k: u16 };
@@ -1192,9 +1192,9 @@ test "et-soc matmul differential: accumulate=true adds A*B onto a nonzero preloa
     // before the fma passes, so the (first_pass=0) fma computes `C_initial + A*B`. Seeding C with
     // NONZERO values before the run is the non-vacuity guard: an overwrite (accumulate=false) lowering
     // would drop the seed and produce plain A*B, FAILING the seed+A*B assert below. Shapes:
-    //   4x4x32  - pure 4-col REMAINDER tile (cols=4, the staged-remainder preload path), two K slices.
-    //   4x8x8   - one FULL 8-col group (cols=8, the direct flw.ps preload path), a single K slice.
-    //   8x12x32 - one full group + one 4-col remainder (cols=12, BOTH preload paths), two K slices, m=8.
+    //   4x4x32:  pure 4-col REMAINDER tile (cols=4, the staged-remainder preload path), two K slices.
+    //   4x8x8:   one FULL 8-col group (cols=8, the direct flw.ps preload path), a single K slice.
+    //   8x12x32: one full group plus one 4-col remainder (cols=12, BOTH preload paths), two K slices, m=8.
     // Integer-valued inputs and a 1..9 integer seed keep every f32 sum exact (well under 2^24), so the
     // scalar reference is bit-identical to sw-sysemu regardless of accumulation order.
     const Case = struct { m: u16, n: u16, k: u16 };
@@ -1324,7 +1324,7 @@ test "et-soc matmul differential: an EMBEDDED matmul preserves a live-across val
             }
         }
         // (b) The live-across value V survived the matmul's full register clobber (the save/restore
-        // is what makes this hold; without it V would read back as a TenC accumulator).
+        // is what makes this hold. Without it V would read back as a TenC accumulator).
         const v_got = std.mem.readInt(u32, dump[@as(usize, m) * n * 4 ..][0..4], .little);
         try std.testing.expectEqual(embedded_v_bits, v_got);
     }
@@ -1368,7 +1368,7 @@ test "et-soc matmul differential: sw-sysemu computes correct int8->int32 and uin
         defer allocator.free(a);
         const b = try allocator.alloc(i32, @as(usize, k) * n);
         defer allocator.free(b);
-        // Signed int8 data spans negatives (exercises sign-extension); uint8 data spans 0..255.
+        // Signed int8 data spans negatives (exercises sign-extension). uint8 data spans 0..255.
         for (0..a.len) |idx| a[idx] = if (dtype == .uint8) @intCast((idx * 3) % 200) else @as(i32, @intCast(idx % 15)) - 7;
         for (0..b.len) |idx| b[idx] = if (dtype == .uint8) @intCast((idx * 5) % 200) else @as(i32, @intCast(idx % 13)) - 6;
 
@@ -1403,8 +1403,8 @@ test "et-soc matmul differential: sw-sysemu computes correct fp16->fp32 products
     const model = mm.modelFor(.@"et-soc");
     try std.testing.expect(model.vpu());
 
-    // fp16 K-tile is 32 (one 64-byte SCP line holds 32 f16). 4x4x4 is a sub-K tile; 4x4x32 is one
-    // full K pass; 8x16x32 exercises two output rows and a full-width column tile. Small integers are
+    // fp16 K-tile is 32 (one 64-byte SCP line holds 32 f16). 4x4x4 is a sub-K tile. 4x4x32 is one
+    // full K pass. 8x16x32 exercises two output rows and a full-width column tile. Small integers are
     // exactly representable in f16 and their sums exact in the f32 accumulator, so the fp32 reference
     // is bit-identical to sw-sysemu's tensor_fma16a32 path.
     const Case = struct { m: u16, n: u16, k: u16 };
@@ -1456,7 +1456,7 @@ test "et-soc matmul: fma type field and unsigned bits per dtype" {
     const model = mm.modelFor(.@"et-soc");
     try std.testing.expect(model.vpu());
 
-    // The fma descriptor's type field is bits 3:1 (fp32=0, fp16=1, int8=3); tena/tenb_unsigned are
+    // The fma descriptor's type field is bits 3:1 (fp32=0, fp16=1, int8=3). tena/tenb_unsigned are
     // bits 22/21, set only for uint8. Verify structurally for each dtype (no sysemu needed).
     const Case = struct { dtype: MMType, want_type: u64, want_unsigned: bool };
     const cases = [_]Case{
@@ -1515,7 +1515,7 @@ fn buildMatmulMixedKernel(func: *Function, m: u16, n: u16, k: u16, accumulate: b
     const pb = try func.appendBlockParam(blk, ptr_t);
     const pc = try func.appendBlockParam(blk, ptr_t);
     try func.appendMatmulSigned(blk, pa, pb, pc, m, n, k, .int8, accumulate, input_signs);
-    func.setTerminator(blk, .{ .ret = null });
+    func.setTerminator(blk, .{ .ret = ir.function.Ret.none() });
 }
 
 /// Lay out and assemble a mixed-signedness matmul image: same layout as `buildMatmulImage` (A/B
@@ -1652,8 +1652,8 @@ const MMQuantSpec = Function.MatMulQuantSpec;
 
 /// Build a function containing exactly one requantizing `matmul c = quant(a @ b)` over three
 /// pointer parameters (a0=&A, a1=&B, a2=&C). Sibling of `buildMatmulKernel`. `dtype` is the A/B
-/// input dtype (verify rejects any dtype other than `.int8`/`.uint8` paired with a quant; the
-/// symmetric plan-12/13 differentials all pass `.int8`, the asymmetric ones `.uint8`).
+/// input dtype. Verify rejects any dtype other than `.int8`/`.uint8` paired with a quant. The
+/// symmetric differentials all pass `.int8`, the asymmetric ones `.uint8`.
 fn buildMatmulQuantKernel(func: *Function, m: u16, n: u16, k: u16, dtype: MMType, accumulate: bool, quant: MMQuant) !void {
     const ptr_t = try func.types.intern(.ptr);
     const blk = try func.appendBlock();
@@ -1661,13 +1661,13 @@ fn buildMatmulQuantKernel(func: *Function, m: u16, n: u16, k: u16, dtype: MMType
     const pb = try func.appendBlockParam(blk, ptr_t);
     const pc = try func.appendBlockParam(blk, ptr_t);
     try func.appendMatmulQuant(blk, pa, pb, pc, m, n, k, dtype, accumulate, quant);
-    func.setTerminator(blk, .{ .ret = null });
+    func.setTerminator(blk, .{ .ret = ir.function.Ret.none() });
 }
 
 /// Build a function containing exactly one requantizing `matmul c = quant(a @ b)` from a full
 /// `MatMulQuantSpec` (bias + zero_point + scale + relu + out). Sibling of `buildMatmulQuantKernel`
 /// / `buildMatmulQuantPerColumnKernel`, which only cover the symmetric (no-bias, zero_point == 0)
-/// subset those two builders' call sites need; the asymmetric-uint8 differentials need bias and a
+/// subset those two builders' call sites need. The asymmetric-uint8 differentials need bias and a
 /// nonzero zero_point, so they go through `appendMatmulQuantSpec` directly.
 fn buildMatmulQuantSpecKernel(func: *Function, m: u16, n: u16, k: u16, dtype: MMType, accumulate: bool, spec: MMQuantSpec) !void {
     const ptr_t = try func.types.intern(.ptr);
@@ -1676,7 +1676,7 @@ fn buildMatmulQuantSpecKernel(func: *Function, m: u16, n: u16, k: u16, dtype: MM
     const pb = try func.appendBlockParam(blk, ptr_t);
     const pc = try func.appendBlockParam(blk, ptr_t);
     try func.appendMatmulQuantSpec(blk, pa, pb, pc, m, n, k, dtype, accumulate, spec);
-    func.setTerminator(blk, .{ .ret = null });
+    func.setTerminator(blk, .{ .ret = ir.function.Ret.none() });
 }
 
 /// Lay out and assemble a requantizing matmul image for `dtype` (`.int8` or `.uint8`, the only
@@ -1784,7 +1784,7 @@ test "et-soc matmul quant differential: sw-sysemu computes bit-exact requantized
             .b = &[_]i32{ 30, -30, 6, -2, 30, -30, 6, -2, 30, -30, 6, -2, 30, -30, 6, -2 },
             .expected = &[_]i8{ 127, -128, 60, -20, 127, -128, 84, -28 },
         },
-        // relu at scale 1.0: A's rows sum to +10 and -10; B's columns (constant across k) are
+        // relu at scale 1.0: A's rows sum to +10 and -10. B's columns (constant across k) are
         // 5/-5/20/-3. Row0 accs are 50/-50/200/-30 -> relu keeps 50 and 200 (200 then saturates to
         // 127), zeroes -50 and -30. Row1 accs are -50/50/-200/30 -> relu keeps 50 and 30, zeroes
         // -50 and -200.
@@ -1910,7 +1910,7 @@ test "et-soc matmul quant: structural CSR sequence has tensor_quant, non-quant p
         try std.testing.expect(std.mem.indexOfScalar(u64, waits, encode.TENSOR_WAIT_QUANT) != null);
     }
 
-    // The plain int8 matmul (no quant) must NOT emit csrw 0x806 - guards against always-emitting
+    // The plain int8 matmul (no quant) must NOT emit csrw 0x806. This guards against always-emitting
     // the epilogue regardless of whether a quant is actually attached.
     {
         var func = Function.init(allocator);
@@ -1925,7 +1925,7 @@ test "et-soc matmul quant: structural CSR sequence has tensor_quant, non-quant p
 
 // `per_column` bakes one fp32 scale per output column as compile-time constant data (`func.
 // scaleList`), not a guest-memory buffer, so the image layout is identical to the scalar quant
-// harness above (`buildMatmulQuantImage`); only the kernel builder differs (it calls
+// harness above (`buildMatmulQuantImage`). Only the kernel builder differs (it calls
 // `appendMatmulQuantPerColumn` instead of `appendMatmulQuant`).
 
 /// Build a function containing exactly one requantizing `matmul c = quant(a @ b)` with a
@@ -1938,7 +1938,7 @@ fn buildMatmulQuantPerColumnKernel(func: *Function, m: u16, n: u16, k: u16, accu
     const pb = try func.appendBlockParam(blk, ptr_t);
     const pc = try func.appendBlockParam(blk, ptr_t);
     try func.appendMatmulQuantPerColumn(blk, pa, pb, pc, m, n, k, .int8, accumulate, relu, out, scales);
-    func.setTerminator(blk, .{ .ret = null });
+    func.setTerminator(blk, .{ .ret = ir.function.Ret.none() });
 }
 
 test "et-soc matmul quant differential: per_column scale, single tile computes bit-exact requantized int8 output" {
@@ -1946,10 +1946,10 @@ test "et-soc matmul quant differential: per_column scale, single tile computes b
     const model = mm.modelFor(.@"et-soc");
     try std.testing.expect(model.vpu());
 
-    // B's columns (constant across k) are 6/3/2/50; A's rows sum to 10 and 26 (same A as the
+    // B's columns (constant across k) are 6/3/2/50. A's rows sum to 10 and 26 (same A as the
     // scalar GOLDEN case), so acc(i,j) = col_j * rowsum(i). Scales are powers of two so every
     // acc*scale is an exact integer: col1 (scale 0.5) needs an even acc (rowsum is even, any
-    // col1 works); col2 (scale 0.25) needs acc%4==0 (col2=2 is even, and rowsum%4==2, so
+    // col1 works). col2 (scale 0.25) needs acc%4==0 (col2=2 is even, and rowsum%4==2, so
     // col2*rowsum%4==0). col3=50 with scale 2.0 saturates both rows, proving saturation still
     // works per-column.
     const scales = [_]u32{ 0x3F800000, 0x3F000000, 0x3E800000, 0x40000000 }; // 1.0, 0.5, 0.25, 2.0
@@ -2007,7 +2007,7 @@ test "et-soc matmul quant differential: per_column scale, multi-tile proves scal
     // ni=0 tile ((16+g)%5 != g%5 in general, since 16%5=1). A `ni`-blind bug that always read
     // `scales[g]` instead of `scales[ni*TILE+g]` would therefore apply ni=0's column-g scale to
     // ni=1's column (16+g), which is a numerically different value here (unlike a cycle length
-    // that divides 16, where the two would coincidentally agree) - so this test's PASS is by
+    // that divides 16, where the two would coincidentally agree). So this test's PASS is by
     // itself proof the tile-relative-to-absolute column mapping is correct, not just a
     // by-inspection argument about the isel code.
     const m: u16 = 20;
@@ -2018,11 +2018,11 @@ test "et-soc matmul quant differential: per_column scale, multi-tile proves scal
     for (0..n) |j| scales[j] = cycle[j % cycle.len];
 
     // A cycles every row through a permutation of {0,1,2,3} over the k=4 window, so
-    // sum_k A[i][k] is always exactly 6 regardless of i; with B constant across k, acc(i,j) is
+    // sum_k A[i][k] is always exactly 6 regardless of i. With B constant across k, acc(i,j) is
     // always B[j]*6. B here is 2*((j%3)-1) (doubled vs the scalar multi-tile test) so acc is
     // always a multiple of 12 (-12, 0, or 12): that divides evenly by every scale in `cycle`
-    // (including 0.25, giving -3/0/3; 4.0 only ever multiplies, so it can never introduce a
-    // fraction), so no acc*scale is ever an exact `.5` tie - the hardware's round-to-nearest-even
+    // (including 0.25, giving -3/0/3. 4.0 only ever multiplies, so it can never introduce a
+    // fraction), so no acc*scale is ever an exact `.5` tie. The hardware's round-to-nearest-even
     // and the host truncation in `refQuantElem` would disagree on a tie, and this test's job is
     // proving column indexing, not rounding mode. |acc*scale| stays well under 128 (48 at
     // worst), so nothing saturates either (the single-tile case above covers saturation).
@@ -2070,7 +2070,7 @@ test "et-soc matmul quant differential: per_column scale with relu" {
     const model = mm.modelFor(.@"et-soc");
     try std.testing.expect(model.vpu());
 
-    // A's rows sum to +10 and -10 (mirrors the scalar relu case); B's columns (constant across
+    // A's rows sum to +10 and -10 (mirrors the scalar relu case). B's columns (constant across
     // k) are 5/-5/20/-4, giving acc(i,j) = col_j * rowsum(i) = col_j * (+-10). col3 is even (-4,
     // not the scalar test's -3) so col3*10 is a multiple of 20, and after the 0.25 scale (the
     // one fractional scale in the cycle) the result is still an exact integer, never a `.5` tie
@@ -2111,9 +2111,9 @@ test "et-soc matmul quant differential: per_column scale with relu" {
 }
 
 // `MatMulQuant.out` picks the requantize chain's saturating transform: `.i8` (the default, all
-// tests above) emits `.satint8` and clamps to `-128..127`; `.u8` emits `.satuint8` and clamps to
+// tests above) emits `.satint8` and clamps to `-128..127`. `.u8` emits `.satuint8` and clamps to
 // `0..255`. The packed-byte store (isel.zig, the `has_quant` store loop) is byte-for-byte
-// identical either way, so `buildMatmulQuantImage`/`buildMatmulQuantKernel` need no changes: only
+// identical either way, so `buildMatmulQuantImage`/`buildMatmulQuantKernel` need no changes. Only
 // the kernel's `quant.out` (or `buildMatmulQuantPerColumnKernel`'s new `out` param) and the
 // reference (`refQuantElemU8` instead of `refQuantElem`) differ.
 
@@ -2124,9 +2124,9 @@ test "et-soc matmul quant differential: sw-sysemu computes bit-exact requantized
 
     // Same row-sum shape as the i8 "saturation both ways" case (A rows sum to 10 and 14), but B's
     // columns are chosen against the uint8 range 0..255: col0=30 pushes both rows' acc (300, 420)
-    // above 255 (clamp to 255), col1=-30 pushes both rows negative (-300, -420; clamp to 0), col2=6
+    // above 255 (clamp to 255), col1=-30 pushes both rows negative (-300, -420, clamp to 0), col2=6
     // stays in range both rows (60, 84, proving no premature clamp), col3=-2 goes negative again
-    // (-20, -28; clamp to 0). Scale 1.0 keeps every acc*scale an exact integer.
+    // (-20, -28, clamp to 0). Scale 1.0 keeps every acc*scale an exact integer.
     const m: u16 = 2;
     const n: u16 = 4;
     const k: u16 = 4;
@@ -2169,7 +2169,7 @@ test "et-soc matmul quant differential: per_column scale, uint8 output with a sa
     const model = mm.modelFor(.@"et-soc");
     try std.testing.expect(model.vpu());
 
-    // Same A/B/scales as the i8 per_column single-tile case (rowsums 10/26; columns 6/3/2/50 at
+    // Same A/B/scales as the i8 per_column single-tile case (rowsums 10/26, columns 6/3/2/50 at
     // scales 1.0/0.5/0.25/2.0), but read back as uint8: col3 (2.0 * 50 * rowsum) saturates to 255
     // on BOTH rows (500 and 1300, both far above 255) instead of i8's 127, while col0..col2 stay
     // in range and prove the per-column scale still composes correctly under the u8 clamp.
@@ -2218,7 +2218,7 @@ test "et-soc matmul quant differential: per_column scale, uint8 output with a sa
 // `.matmul` `has_quant` block), reading three consecutive SCP lines in that same order (bias,
 // then scale, then zero_point). The reference below folds bias in BEFORE relu and zero_point in
 // AFTER rounding, matching that exactly. `buildMatmulQuantSpecKernel`/`buildMatmulQuantImage`
-// (both now dtype-parametrized) build the `.uint8`-input kernels these tests need; neither
+// (both now dtype-parametrized) build the `.uint8`-input kernels these tests need. Neither
 // `buildMatmulQuantKernel` (fixed `MatMulQuant`, no bias knob reachable without a spec) nor
 // `buildMatmulQuantPerColumnKernel` (no bias/zero_point knob at all) can express bias or
 // zero_point, so these go through `appendMatmulQuantSpec` via `buildMatmulQuantSpecKernel`.
@@ -2248,12 +2248,12 @@ test "et-soc matmul quant differential: asymmetric uint8, multi-tile, per-column
     // so this exercises `bias[ni*TILE+g]` AND `scale[ni*TILE+g]` indexing at ni>0, plus the
     // 3-line SCP load order (bias@40, scale@41, zero_point@42) end to end. A cycles a
     // permutation of {0,1,2,3} per row (uint8-safe, unsigned) so every row's K-sum is exactly 6
-    // regardless of i; B is constant across k, one of 5 unsigned values per 5-column cycle
+    // regardless of i. B is constant across k, one of 5 unsigned values per 5-column cycle
     // (0/5/10/15/20), so acc(i,j) = 6 * Bcol[j%5] is independent of i. The bias/scale cycles
     // (length 5, which does NOT divide TILE=16) put column (16+g) of the ni=1 tile on a
     // different cycle phase than column g of the ni=0 tile (16%5=1, so (16+g)%5 != g%5 in
     // general), so a `[g]`-instead-of-`[ni*TILE+g]` indexing bug would read the wrong bias/scale
-    // for the second tile and produce numerically different (wrong) results - this test's pass
+    // for the second tile and produce numerically different (wrong) results. This test's pass
     // is proof of correct indexing, not just inspection. The chosen bias/scale/zero_point values
     // also drive some columns' `acc+bias` above the range that survives `*scale + zero_point`
     // (saturates to 255) and others below zero (clamps to 0 after the zero_point add), alongside
@@ -2367,13 +2367,13 @@ test "et-soc matmul quant differential: asymmetric uint8, per-column bias + zero
     const model = mm.modelFor(.@"et-soc");
     try std.testing.expect(model.vpu());
 
-    // A's rows sum to 10 and 14 (uint8-safe, unsigned); B is a uniform 5 across every column and
+    // A's rows sum to 10 and 14 (uint8-safe, unsigned). B is a uniform 5 across every column and
     // every k, so acc(i,j) = 50 / 70 for every column regardless of j. Bias then differentiates
     // the columns: bias[0]=-100 drives acc+bias negative on BOTH rows (-50 / -30), which relu
-    // (applied AFTER bias, per the oracle chain order) zeroes; bias[2]=60 keeps both rows well
+    // (applied AFTER bias, per the oracle chain order) zeroes. bias[2]=60 keeps both rows well
     // positive (110 / 130), which relu leaves untouched. If relu were (incorrectly) applied
     // BEFORE bias instead, row0 col0 would compute relu(50)=50, then +bias=-50 (never re-relu'd),
-    // giving a different final byte than the correct order's zeroed 0 - so this test's pass is
+    // giving a different final byte than the correct order's zeroed 0. So this test's pass is
     // proof of the chain ORDER, not just that bias and relu individually work.
     const m: u16 = 2;
     const n: u16 = 4;
@@ -2415,8 +2415,8 @@ test "et-soc matmul quant differential: asymmetric uint8, per-column bias + zero
 }
 
 // The showcase: `input_signs` (unsigned uint8 activations x signed int8 weights) COMPOSED with the
-// plan-15 asymmetric quant epilogue (per-column bias + per-column scale + nonzero output
-// zero-point, unsigned uint8 output) - a real quantized MLP layer's inner loop end to end.
+// asymmetric quant epilogue (per-column bias + per-column scale + nonzero output zero-point,
+// unsigned uint8 output). This is a real quantized MLP layer's inner loop end to end.
 
 /// Sibling of `buildMatmulMixedImage` for a requantizing mixed-signedness matmul: same
 /// per-operand-signed A/B encoding (`writeElemSigned`), but C is `m*n` BYTES (the quant epilogue's
@@ -2471,8 +2471,8 @@ test "et-soc matmul quant differential: mixed-signedness asymmetric inference, u
     try std.testing.expect(model.vpu());
 
     // The full asymmetric-inference shape: UNSIGNED uint8 activations (A) times SIGNED int8
-    // weights (B), requantized through the plan-15 quant epilogue (per-column bias + per-column
-    // scale + nonzero output zero-point) to an unsigned uint8 output - a real quantized MLP
+    // weights (B), requantized through the quant epilogue (per-column bias + per-column
+    // scale + nonzero output zero-point) to an unsigned uint8 output. This is a real quantized MLP
     // layer. Same 20x20 output over K=4 (2x2 output-tile grid, mi/ni both > 0 on one tile) as the
     // symmetric asymmetric-uint8 showcase above, so this ALSO proves bias[ni*TILE+g] /
     // scale[ni*TILE+g] indexing at ni>0, now under a MIXED dtype. A's cycle includes 200 and 255
@@ -2573,7 +2573,7 @@ test "matmul_recog: both the raw nest and the recognized function compile, and r
     // They stay in registers, no spilled base ever reaches emission, and the raw nest now compiles to
     // correct code (the values that DO spill are whole-interval spills emission reloads at every use).
     // The recognized path remains the intended fast path (`apply` orphans the nest, reachability-aware
-    // isel lowers only the preheader + `matmul` + `ret`); it is exercised end to end, with sysemu
+    // isel lowers only the preheader + `matmul` + `ret`). It is exercised end to end, with sysemu
     // execution, by "matmul_recog differential" below.
     const allocator = std.testing.allocator;
     const model = mm.modelFor(.@"et-soc");
@@ -2621,8 +2621,8 @@ test "matmul_recog differential: recognized matmul matches the host reference on
 
         // raises exactly one `matmul`, and that the matmul's operands are EXACTLY the function's own
         // A/B/C params (entry block params 0/1/2, in that order) with the exact input tile
-        // dimensions, fp32, no accumulate - i.e. semantically identical to `matmul(a, b, c, m, n, k,
-        // .fp32, false)` over a standalone 3-pointer-param function. ---
+        // dimensions, fp32, no accumulate. That is, it is semantically identical to `matmul(a, b, c,
+        // m, n, k, .fp32, false)` over a standalone 3-pointer-param function. ---
         var func_recog = Function.init(allocator);
         defer func_recog.deinit();
         try mm.matmul_recog.buildMatmulNest(&func_recog, .{ .m = m, .n = n, .k = k });
@@ -2653,20 +2653,20 @@ test "matmul_recog differential: recognized matmul matches the host reference on
         try std.testing.expectEqual(ir.function.MatMulType.fp32, raised_mm.dtype);
         try std.testing.expectEqual(false, raised_mm.accumulate);
 
-        // preheader block still physically carries the now-orphaned loop nest's dead invariants
-        // (zero/m_c/n_c/k_c/facc0, appended before `apply` overwrote the terminator - the IR has no
-        // instruction- or block-deletion primitive, per `matmul_recog.zig`'s `apply` doc comment) and
+        // The preheader block still physically carries the now-orphaned loop nest's dead invariants
+        // (zero/m_c/n_c/k_c/facc0, appended before `apply` overwrote the terminator. The IR has no
+        // instruction- or block-deletion primitive, per `matmul_recog.zig`'s `apply` doc comment), and
         // the whole loop nest hangs off it, unreachable. `splitCriticalEdges` is the same caller step
         // every other loop-executing harness in this file runs before compiling (harness.zig:287,
-        // compressed.zig:95, zicbop_differential.zig:100); this function's reachable entry ends in
+        // compressed.zig:95, zicbop_differential.zig:100). This function's reachable entry ends in
         // `matmul` + `ret`, not an `if`, so it is a no-op here, kept only for parity with those
         // harnesses and in case a future recognized shape reintroduces a block-arg edge.
-        // `selectFunctionForModel` is reachability-aware (Task 1: riscv64/isel.zig skips blocks
-        // unreachable from the entry), so it lowers only the reachable preheader + matmul + ret; the
-        // orphaned nest contributes neither register pressure nor code. This is the direct proof that
+        // `selectFunctionForModel` is reachability-aware (riscv64/isel.zig skips blocks unreachable
+        // from the entry), so it lowers only the reachable preheader + matmul + ret. The orphaned
+        // nest contributes neither register pressure nor code. This is the direct proof that
         // recognition's OWN output runs, not evidence-by-analogy from a separately built kernel. The
         // compile runs unconditionally, before the sys_emu availability check, so a broken matmul-op
-        // lowering (or a regression in Task 1's reachability fix) fails this test even when sw-sysemu
+        // lowering (or a regression in this reachability behavior) fails this test even when sw-sysemu
         // is not on PATH.
         try isel.splitCriticalEdges(allocator, &func_recog);
         const code = try isel.selectFunctionForModel(allocator, &func_recog, model);
@@ -2711,9 +2711,9 @@ test "matmul_recog differential: a MEMORY-accumulator nest raises to accumulate=
     const model = mm.modelFor(.@"et-soc");
     try std.testing.expect(model.vpu());
 
-    // Task 2 (memory accumulator): the canonical nest, but the k-loop accumulator is seeded with
+    // Memory accumulator: the canonical nest, but the k-loop accumulator is seeded with
     // `load(C[i][j])` (the SAME j-level C pointer the k_exit store writes back), so the nest computes
-    // `C += A*B`. Recognition must raise it to matmul(accumulate=true), NOT accumulate=false: the
+    // `C += A*B`. Recognition must raise it to matmul(accumulate=true), NOT accumulate=false. The
     // difference is observable ONLY when C starts nonzero, which is exactly the non-vacuity guard below.
     // Same shapes as the fresh-accumulator recognition differential (N a multiple of 4 throughout).
     const Case = struct { m: u16, n: u16, k: u16 };
@@ -2759,7 +2759,7 @@ test "matmul_recog differential: a MEMORY-accumulator nest raises to accumulate=
         try std.testing.expectEqual(ir.function.MatMulType.fp32, raised_mm.dtype);
         try std.testing.expectEqual(true, raised_mm.accumulate); // memory accumulator: C += A*B
 
-        // differential above; see its comment for why the orphaned nest costs nothing). ---
+        // differential above. See its comment for why the orphaned nest costs nothing). ---
         try isel.splitCriticalEdges(allocator, &func_recog);
         const code = try isel.selectFunctionForModel(allocator, &func_recog, model);
         defer allocator.free(code);
@@ -2808,16 +2808,17 @@ test "matmul_recog differential: a MEMORY-accumulator nest raises to accumulate=
     }
 }
 
-/// Build a SURROUNDED fp32 matmul nest (`fn(A, B, C) void`) that is NOT the whole function: loop-free
-/// setup runs before the nest and a live-value continuation runs after it, the shape Task 2 recognition
+/// Build a SURROUNDED fp32 matmul nest (`fn(A, B, C) void`) that is NOT the whole function. Loop-free
+/// setup runs before the nest, and a live-value continuation runs after it, the shape recognition
 /// raises as an EMBEDDED matmul. A sentinel f32 V is loaded from `C + m*n*4` in the setup block (BEFORE
 /// the preheader), threaded through the outer loop as a LOOP-INVARIANT header param, and stored back in
 /// the continuation AFTER the nest, so V is live ACROSS the matmul (only the embedded save/restore keeps
 /// it intact). The outer loop also threads its induction variable out, so the continuation exercises BOTH
 /// exit-arg reconstruction paths: the iv (reconstructed to `iconst(m)`) and the invariant V (reconstructed
 /// to the preheader's initial arg). The continuation stores V back (survival proof) and the reconstructed
-/// final `i` (== m) to `C + m*n*4 + 4` (reconstruction proof). Row-major A(m x k)/B(k x n)/C(m x n), unit-
-/// stepped element pointers: exactly the layout `buildMatmulImage` writes, so the plain fp32 image runs it.
+/// final `i` (== m) to `C + m*n*4 + 4` (reconstruction proof). Row-major A(m x k)/B(k x n)/C(m x n), with
+/// unit-stepped element pointers, is exactly the layout `buildMatmulImage` writes, so the plain fp32
+/// image runs it.
 fn buildSurroundedMatmulNest(func: *Function, m: u16, n: u16, k: u16, mem_accumulate: bool) !void {
     const ptr_t = try func.types.intern(.ptr);
     const bool_t = try func.types.intern(.bool);
@@ -2932,7 +2933,7 @@ fn buildSurroundedMatmulNest(func: *Function, m: u16, n: u16, k: u16, mem_accumu
     try func.appendStore(cont, fv, vptr); // V survived the matmul's clobber (the embedded save/restore)
     const fiptr = try func.appendArithImm(cont, ptr_t, .add, vptr, 4);
     try func.appendStore(cont, fi, fiptr); // the reconstructed outer induction variable, which must equal m
-    func.setTerminator(cont, .{ .ret = null });
+    func.setTerminator(cont, .{ .ret = ir.function.Ret.none() });
 }
 
 test "matmul_recog differential: a SURROUNDED nest is raised to an embedded matmul, computes C, and preserves a live-across value" {
@@ -2940,8 +2941,8 @@ test "matmul_recog differential: a SURROUNDED nest is raised to an embedded matm
     const model = mm.modelFor(.@"et-soc");
     try std.testing.expect(model.vpu());
 
-    // m >= 4 so TenC (f0..f(2*min(16,m)-1)) covers f0..f7 and V's float register is definitely clobbered;
-    // only the embedded save/restore keeps it intact. 4x4x4 is a single output tile (cap 1*1*1 <= 64),
+    // m >= 4 so TenC (f0..f(2*min(16,m)-1)) covers f0..f7 and V's float register is definitely clobbered.
+    // Only the embedded save/restore keeps it intact. 4x4x4 is a single output tile (cap 1*1*1 <= 64),
     // N % 4 == 0, K % 1 == 0, so recognition's own gates accept it.
     const m: u16 = 4;
     const n: u16 = 4;
@@ -2992,8 +2993,8 @@ test "matmul_recog differential: a SURROUNDED nest is raised to an embedded matm
 
     var image = try buildMatmulImage(allocator, .fp32, code, a, b, m, n, k);
     defer image.deinit(allocator);
-    // The live-across sentinel V sits at C + m*n*4 (the slot the kernel loads and stores back); the
-    // reconstructed final i (== m) lands at C + m*n*4 + 4. Pre-seed V; widen the dump to cover both.
+    // The live-across sentinel V sits at C + m*n*4 (the slot the kernel loads and stores back). The
+    // reconstructed final i (== m) lands at C + m*n*4 + 4. Pre-seed V, and widen the dump to cover both.
     const v_slot: usize = @intCast(image.c_off + @as(u64, m) * n * 4);
     std.mem.writeInt(u32, image.bytes[v_slot..][0..4], embedded_v_bits, .little);
     image.c_size = @as(u64, m) * n * 4 + 8; // C, then V, then the reconstructed i
@@ -3023,10 +3024,10 @@ test "matmul_recog differential: a SURROUNDED nest is raised to an embedded matm
 }
 
 test "matmul_recog differential: a SURROUNDED memory-accumulator nest raises an embedded accumulate=true matmul (C += A*B) and preserves a live-across value" {
-    // Combines the two Plan-20 + non-whole-function paths that were only tested apart: a nest that is
-    // BOTH surrounded (live V across it -> embedded lowering) AND a memory accumulator (acc seeded from
-    // load(C) -> accumulate=true). This exercises the C-tile preload running INSIDE the embedded
-    // save/restore, the one interaction the two separate differentials did not cover end-to-end.
+    // Combines the memory-accumulator and non-whole-function paths that were only tested apart: a nest
+    // that is BOTH surrounded (live V across it -> embedded lowering) AND a memory accumulator (acc
+    // seeded from load(C) -> accumulate=true). This exercises the C-tile preload running INSIDE the
+    // embedded save/restore, the one interaction the two separate differentials did not cover end-to-end.
     const allocator = std.testing.allocator;
     const model = mm.modelFor(.@"et-soc");
     try std.testing.expect(model.vpu());
@@ -3112,13 +3113,13 @@ test "matmul_recog differential: a SURROUNDED memory-accumulator nest raises an 
 }
 
 test "matmul_recog differential: recognized int8/uint8/mixed matmul matches the host reference on sysemu" {
-    // Sibling of the fp32 differential above, for the int8-family dtypes plan 19 Task A taught
-    // `buildMatmulNest`/recognition to raise: `.int8` (both operands signed), `.uint8` (both
-    // unsigned), and `.mixed` (A unsigned x B signed, raised as `.int8` plus the `input_signs`
-    // override). Every int8-family case shares ONE image layout regardless of which of the three this
-    // is: A/B are 1-byte elements, each operand's OWN signedness (not the nest's nominal dtype) drives
-    // its encoding/reference, exactly what `buildMatmulMixedImage`/`refElemSigned` already do for the
-    // OP-level mixed differential - so it is reused here unchanged for all three cases.
+    // Sibling of the fp32 differential above, for the int8-family dtypes `buildMatmulNest`/
+    // recognition also knows to raise: `.int8` (both operands signed), `.uint8` (both unsigned), and
+    // `.mixed` (A unsigned x B signed, raised as `.int8` plus the `input_signs` override). Every
+    // int8-family case shares ONE image layout regardless of which of the three this is. A/B are
+    // 1-byte elements, and each operand's OWN signedness (not the nest's nominal dtype) drives its
+    // encoding/reference, exactly what `buildMatmulMixedImage`/`refElemSigned` already do for the
+    // OP-level mixed differential, so it is reused here unchanged for all three cases.
     const allocator = std.testing.allocator;
     const model = mm.modelFor(.@"et-soc");
     try std.testing.expect(model.vpu());
@@ -3136,7 +3137,7 @@ test "matmul_recog differential: recognized int8/uint8/mixed matmul matches the 
     };
     const cases = [_]Case{
         // int8 (both signed): a sub-K-tile shape, then K=68 spans two 64-int8 SCP lines
-        // (k_tiles = ceil(68/64) = 2), per Task A's own K-tiling concern.
+        // (k_tiles = ceil(68/64) = 2), the K-tiling concern for int8.
         .{ .elem = .int8, .m = 2, .n = 4, .k = 4, .want_dtype = .int8, .want_signs = null, .a_unsigned = false, .b_unsigned = false },
         .{ .elem = .int8, .m = 4, .n = 8, .k = 68, .want_dtype = .int8, .want_signs = null, .a_unsigned = false, .b_unsigned = false },
         // uint8 (both unsigned).
@@ -3151,7 +3152,7 @@ test "matmul_recog differential: recognized int8/uint8/mixed matmul matches the 
         const k = cse.k;
 
         // raised op carries the right dtype/input_signs BEFORE compiling. This runs unconditionally
-        // (no sys_emu dependency), so a dtype/input_signs regression in Task A fails here even without
+        // (no sys_emu dependency), so a dtype/input_signs regression fails here even without
         // the emulator. ---
         var func_recog = Function.init(allocator);
         defer func_recog.deinit();
@@ -3185,7 +3186,7 @@ test "matmul_recog differential: recognized int8/uint8/mixed matmul matches the 
         try std.testing.expectEqual(false, raised_mm.accumulate);
 
         // hand-built stand-in), exactly as the fp32 differential above. `splitCriticalEdges` is a no-op
-        // here (the reachable entry ends in `matmul` + `ret`, not an `if`) but kept for parity; the
+        // here (the reachable entry ends in `matmul` + `ret`, not an `if`) but kept for parity. The
         // orphaned dead nest below it lowers to nothing (unreachable from the entry). ---
         try isel.splitCriticalEdges(allocator, &func_recog);
         const code = try isel.selectFunctionForModel(allocator, &func_recog, model);
@@ -3301,8 +3302,8 @@ test "matmul_recog differential: recognized fp16 matmul matches the host referen
         try std.testing.expectEqual(false, raised_mm.accumulate);
 
         // hand-built stand-in), exactly as the fp32/int8 differentials above. `splitCriticalEdges` is a
-        // no-op here (the reachable entry ends in `matmul` + `ret`, not an `if`) but kept for parity;
-        // the orphaned dead nest below it lowers to nothing (unreachable from the entry). ---
+        // no-op here (the reachable entry ends in `matmul` + `ret`, not an `if`) but kept for parity.
+        // The orphaned dead nest below it lowers to nothing (unreachable from the entry). ---
         try isel.splitCriticalEdges(allocator, &func_recog);
         const code = try isel.selectFunctionForModel(allocator, &func_recog, model);
         defer allocator.free(code);
@@ -3339,8 +3340,8 @@ test "matmul_recog differential: recognized fp16 matmul matches the host referen
 
 test "matmul_recog non-vacuity: a rejected nest is left as loops, unmutated and verify-clean" {
     // `no_product`: the k-loop accumulates a bare A load (`acc += A[i][kk]`), never multiplying by
-    // B, so this is NOT a matmul (Task 2's "the accumulate's other operand is a product" gate must
-    // reject it). It is otherwise the exact canonical scaffolding, so the rejection proves
+    // B, so this is NOT a matmul (recognition's "the accumulate's other operand is a product" gate
+    // must reject it). It is otherwise the exact canonical scaffolding, so the rejection proves
     // recognition does not false-accept a same-shaped-but-differently-bodied nest.
     //
     // This does NOT additionally run the rejected nest on sw-sysemu: like the raw matmul nest, ANY
@@ -3374,7 +3375,7 @@ test "matmul_recog non-vacuity: a rejected nest is left as loops, unmutated and 
 }
 
 // ===========================================================================
-// riscv64 adoption RV-T4: the et-soc VPU vector class (class 3) through the SHARED Wimmer-Franz
+// riscv64 adoption: the et-soc VPU vector class (class 3) through the SHARED Wimmer-Franz
 // allocator (`isel.compileFunctionWimmerRiscv(func, vpu = true)`) instead of the backend's own
 // `allocateRegisters`, driving the SAME battle-tested VPU emission. The sw-sysemu oracle above is the
 // execution check: each kernel is a 3-pointer 8-lane VPU function (a0=&in_a, a1=&in_b, a2=&out) that
@@ -3382,7 +3383,7 @@ test "matmul_recog non-vacuity: a rejected nest is left as loops, unmutated and 
 // the mathematically-correct reference lane for lane, exactly like the native VPU tests above.
 //
 // The compile step runs UNCONDITIONALLY, before the sys_emu availability check, so a broken class-3
-// translation / spill / edge-move path fails these tests even where sw-sysemu is not on PATH (the
+// translation, spill, or edge-move path fails these tests even where sw-sysemu is not on PATH (the
 // shared allocator additionally self-checks its result with `wimmer.verifyIntervals`). The structural
 // assertions (the VPU mask preamble is emitted, a spill emits `fsw.ps`) prove the VPU allocation
 // engaged without depending on the emulator. Where sw-sysemu IS present the lanes are executed too.
@@ -3390,7 +3391,7 @@ test "matmul_recog non-vacuity: a rejected nest is left as loops, unmutated and 
 
 /// The one-time VPU mask preamble word (`mov.m.x m0, x0, 0xFF`) the emission fires for any function
 /// that touches a VPU vector register or slot. Its presence proves the shared Wimmer path built a
-/// vpu-mode `RegDescription` and emitted the vpu preamble (RV-T4 change 4).
+/// vpu-mode `RegDescription` and emitted the vpu preamble.
 const vpu_mask_preamble: u32 = encode.mov_m_x(0, .x0, 0xFF);
 
 /// Count `fsw.ps` words (8-lane VPU store): opcode 0x0B (0b0001011), funct3 = 0b110. A VPU vector
@@ -3412,8 +3413,8 @@ fn hasVpuMaskPreamble(code: []const u32) bool {
     return false;
 }
 
-/// Compile `func` through the SHARED Wimmer-Franz allocator in VPU mode (`vpu = true`), the RV-T4
-/// path. Mutates `func` (splits critical edges). Caller owns the returned `Compiled`. NOT legalized,
+/// Compile `func` through the SHARED Wimmer-Franz allocator in VPU mode (`vpu = true`).
+/// Mutates `func` (splits critical edges). Caller owns the returned `Compiled`. NOT legalized,
 /// so the IR stays byte-identical to what the native `selectFunctionForModel` reference compiles.
 fn compileVpuWimmer(allocator: std.mem.Allocator, func: *Function) !isel.Compiled {
     return isel.compileFunctionWimmerRiscv(allocator, func, true);
@@ -3433,7 +3434,7 @@ test "wimmer-vpu: an 8-lane f32 add compiles through the shared allocator and ex
 
     // Wimmer kernel: same IR, compiled through the SHARED allocator in vpu mode. This MUST succeed
     // (a class-3 bail would be `error.Unsupported`) and runs unconditionally, so it fails everywhere
-    // if the RV-T4 translation regresses.
+    // if the class-3 translation regresses.
     var wim_func = Function.init(allocator);
     defer wim_func.deinit();
     try buildAddKernel(&wim_func);
@@ -3504,7 +3505,7 @@ fn buildVpuPressureKernel(func: *Function) !void {
         const addr_out = try func.appendArithImm(b, ptr_t, .add, ptr_out, @intCast(i * 4));
         try func.appendStore(b, c, addr_out);
     }
-    func.setTerminator(b, .{ .ret = null });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
 }
 
 test "wimmer-vpu: register pressure spills a vpu vector to a 32-byte slot and reloads it" {
@@ -3545,7 +3546,7 @@ fn buildVpuScalarCallee(func: *Function) !void {
     const x = try func.appendBlockParam(blk, f32_t);
     const one = try func.appendInst(blk, f32_t, .{ .fconst = 1.0 });
     const r = try func.appendInst(blk, f32_t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = one } });
-    func.setTerminator(blk, .{ .ret = r });
+    func.setTerminator(blk, .{ .ret = ir.function.Ret.one(r) });
 }
 
 /// Build the VPU across-call caller `f(a, b, out)`: pack `va` from 8 scalar loads of `a` BEFORE
@@ -3553,7 +3554,7 @@ fn buildVpuScalarCallee(func: *Function) !void {
 /// `<8 x f32>`) is defined before the call and used after it, hence LIVE ACROSS the call. Every vpu
 /// vector register (f16..f27) is caller-saved, so the shared allocator cannot keep `va` in a register
 /// across the call: it must spill/split it to a 32-byte slot and reload it afterward. The NATIVE VPU
-/// allocator bails `error.Unsupported` on exactly this shape (a vector live across a call); the shared
+/// allocator bails `error.Unsupported` on exactly this shape (a vector live across a call). The shared
 /// Wimmer path GENERALIZES that into a spill. `b` is unused.
 fn buildVpuAcrossCallCaller(func: *Function) !void {
     const V = ir.function.Value;
@@ -3580,7 +3581,7 @@ fn buildVpuAcrossCallCaller(func: *Function) !void {
         const addr_out = try func.appendArithImm(b, ptr_t, .add, ptr_out, @intCast(i * 4));
         try func.appendStore(b, c, addr_out);
     }
-    func.setTerminator(b, .{ .ret = null });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
 }
 
 /// Concatenate `caller` and `callee` code, resolve every `call` reloc in the caller (all target
@@ -3606,11 +3607,11 @@ test "wimmer-vpu: a vpu vector live across a call spills across the call (not an
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    // A vpu vector live across a call has NO native reference to diff against (the retired native
-    // allocator bailed `error.Unsupported` on it - every f16..f27 is caller-saved and it had no vpu
-    // vector split - and `selectFunctionForModel` is now itself the shared Wimmer path, so it no longer
-    // bails). That limitation is exactly what the shared Wimmer path removes here, so the oracle is the
-    // host reference computed below.
+    // A vpu vector live across a call has NO native reference to diff against. The retired native
+    // allocator bailed with `error.Unsupported` on it, because every f16..f27 is caller-saved and it
+    // had no vpu vector split, and `selectFunctionForModel` is now itself the shared Wimmer path, so
+    // it no longer bails. That limitation is exactly what the shared Wimmer path removes here, so the
+    // oracle is the host reference computed below.
     const model = mm.modelFor(.@"et-soc");
 
     // Wimmer: caller through the SHARED allocator (this MUST succeed), callee through the native
@@ -3629,7 +3630,7 @@ test "wimmer-vpu: a vpu vector live across a call spills across the call (not an
     defer callee_f.deinit();
     try buildVpuScalarCallee(&callee_f);
     const callee_c = try isel.selectFunctionForModel(allocator, &callee_f, model);
-    // selectFunctionForModel returns just code; wrap it as a Compiled with no relocs for linkRunVpu.
+    // selectFunctionForModel returns just code. Wrap it as a Compiled with no relocs for linkRunVpu.
     const callee_wrapped: isel.Compiled = .{ .code = callee_c, .relocs = &.{} };
     defer allocator.free(callee_c);
 
@@ -3707,7 +3708,7 @@ fn buildVpuEdgeKernel(func: *Function) !void {
         const addr_out = try func.appendArithImm(merge, ptr_t, .add, ptr_out, @intCast(i * 4));
         try func.appendStore(merge, cc, addr_out);
     }
-    func.setTerminator(merge, .{ .ret = null });
+    func.setTerminator(merge, .{ .ret = ir.function.Ret.none() });
 }
 
 test "wimmer-vpu: a vpu vector carried across a cross-block edge matches (class-3 edge move)" {
@@ -3716,7 +3717,7 @@ test "wimmer-vpu: a vpu vector carried across a cross-block edge matches (class-
     const model = mm.modelFor(.@"et-soc");
     try std.testing.expect(model.vpu());
 
-    // Two input sets: in_b[0] positive (bits > 0 as i32) takes arm A (a + b); in_b[0] negative (sign
+    // Two input sets: in_b[0] positive (bits > 0 as i32) takes arm A (a + b). in_b[0] negative (sign
     // bit set, a negative i32) takes arm B (2 * b). Both drive a vpu vector through an edge move.
     const Case = struct { b0: f32, arm_a: bool };
     const cases = [_]Case{ .{ .b0 = 2.0, .arm_a = true }, .{ .b0 = -1.0, .arm_a = false } };
@@ -3724,10 +3725,11 @@ test "wimmer-vpu: a vpu vector carried across a cross-block edge matches (class-
         const in_a = [8]f32{ 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0 };
         const in_b = [8]f32{ case.b0, 20.0, -3.0, 0.0, 100.0, -0.5, 42.0, 1000.0 };
 
-        // A vpu vector carried across a block edge has no native reference to diff against (the retired
-        // native path bailed `error.Unsupported` on it - there is no whole-vector VPU move instruction,
-        // so it refused to guess a move sequence - and `selectFunctionForModel` is now itself the shared
-        // Wimmer path, which resolves it with class-3 edge moves). The oracle is the host ground truth.
+        // A vpu vector carried across a block edge has no native reference to diff against. The retired
+        // native path bailed with `error.Unsupported` on it, because there is no whole-vector VPU move
+        // instruction, so it refused to guess a move sequence, and `selectFunctionForModel` is now
+        // itself the shared Wimmer path, which resolves it with class-3 edge moves. The oracle is the
+        // host ground truth.
 
         // Wimmer: the diamond through the SHARED allocator in vpu mode. The merge block param is a
         // `<8 x f32>` fed from both arms, so class-3 edge moves resolve it. This MUST compile (a

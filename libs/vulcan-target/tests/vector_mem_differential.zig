@@ -71,7 +71,7 @@ fn buildMemKernel(func: *Function, kind: Kind, store_between: bool) anyerror!voi
         const addr = try func.appendArithImm(block, ptr_t, .add, pout, @intCast(i * 4));
         try func.appendStore(block, cv[i], addr);
     }
-    func.setTerminator(block, .{ .ret = null });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.none() });
 }
 
 const KernelFn = *const fn ([*]f32, [*]f32, [*]f32, [*]f32) callconv(.c) void;

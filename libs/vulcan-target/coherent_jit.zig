@@ -18,6 +18,11 @@ fn noSync(_: []const u8) void {}
 /// A page of executable memory holding generated machine code (no icache sync needed).
 pub const CodeBuffer = platform.Buffer(noSync);
 
+/// A W^X reservation carrying code, rodata, data, and bss sections for one module
+/// image (see `jit_platform.MappedImage`). No icache sync is needed on these
+/// cache-coherent ISAs, so `finalize`'s sync hook is a no-op.
+pub const MappedImage = platform.MappedImage(noSync);
+
 test "maps code into an executable buffer (W^X)" {
     // x86-64 `mov eax, 42` then `ret` (the bytes are not run here - host may differ).
     const code = [_]u8{ 0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3 };

@@ -75,8 +75,10 @@ const Builder = struct {
     writes: []bool = &.{},
     /// The value flowing into a block for a slot (a fresh block param or a forwarded value), memoized.
     entry_memo: []?Value = &.{},
-    /// Guards `readEntry` against re-entering a block whose entry is still being computed (a cycle
-    /// of single-predecessor blocks, only reachable on malformed input): recover as an undef zero.
+    /// A defensive backstop only. `readEntry` now memoizes a block parameter for every block with a
+    /// predecessor before it recurses, so a control-flow cycle re-entering a block always finds that
+    /// memoized parameter rather than this guard. It can therefore only fire on a truly pathological
+    /// input (a block reached before its own memo is installed), where it recovers as an undef zero.
     computing: []bool = &.{},
     undef_zero: []?Value = &.{},
 
@@ -97,6 +99,9 @@ const Builder = struct {
     fn buildTables(self: *Builder) pass.Error!void {
         const n = self.num_slots * self.cfg.blockCount();
         self.local_end = try self.allocator.alloc(Value, n);
+        // Cells without a store are never read (gated on `writes`), but `repointCaches` scans the
+        // whole array, so initialize to a valid Value to avoid reading uninitialized memory.
+        @memset(self.local_end, @enumFromInt(0));
         self.writes = try self.allocator.alloc(bool, n);
         @memset(self.writes, false);
         self.entry_memo = try self.allocator.alloc(?Value, n);
@@ -127,6 +132,14 @@ const Builder = struct {
 
     /// The slot's value on entry to `block`: a forwarded single-predecessor value, or a fresh block
     /// parameter merging the predecessors (the block-param analog of phi insertion). Memoized.
+    ///
+    /// Every block with at least one predecessor introduces its block parameter and memoizes it
+    /// *before* reading the predecessors. This is the Braun et al. cycle break: a control-flow cycle
+    /// re-entering this block (a single-predecessor chain around a loop, not only a diamond join)
+    /// then resolves to this parameter instead of hitting the `computing` guard and fabricating an
+    /// undef zero. After every incoming edge carries its argument, `removeTrivialPhi` collapses the
+    /// parameter when it has a single distinct incoming value, which restores plain single-pred
+    /// forwarding for acyclic code and leaves only genuine merges (and loop-carried parameters).
     fn readEntry(self: *Builder, slot: usize, block: usize) pass.Error!Value {
         if (self.entry_memo[self.idx(slot, block)]) |v| return v;
         if (self.computing[self.idx(slot, block)]) return self.undefZero(slot);
@@ -134,22 +147,148 @@ const Builder = struct {
         defer self.computing[self.idx(slot, block)] = false;
 
         const preds = self.cfg.predecessors(block);
-        var result: Value = undefined;
         if (preds.len == 0) {
-            result = try self.undefZero(slot);
-            self.entry_memo[self.idx(slot, block)] = result;
-        } else if (preds.len == 1) {
-            result = try self.readEndOfBlock(slot, preds[0]);
-            self.entry_memo[self.idx(slot, block)] = result;
-        } else {
-            // A join: introduce a block parameter, break cycles by memoizing it before reading the
-            // predecessors, then thread the slot's exit value onto every incoming edge.
-            const phi = try self.func.appendBlockParam(@enumFromInt(block), self.slot_elem[slot]);
-            self.entry_memo[self.idx(slot, block)] = phi;
-            try self.addEdgeArgs(slot, @enumFromInt(block));
-            result = phi;
+            const z = try self.undefZero(slot);
+            self.entry_memo[self.idx(slot, block)] = z;
+            return z;
         }
-        return result;
+        const phi = try self.func.appendBlockParam(@enumFromInt(block), self.slot_elem[slot]);
+        self.entry_memo[self.idx(slot, block)] = phi;
+        try self.addEdgeArgs(slot, @enumFromInt(block));
+        const resolved = try self.removeTrivialPhi(slot, block, phi);
+        self.entry_memo[self.idx(slot, block)] = resolved;
+        return resolved;
+    }
+
+    /// Braun et al. trivial-phi elimination. The block parameter `phi` on `block` is trivial when,
+    /// across its incoming edge arguments, it has at most one distinct value other than itself (a
+    /// self-reference is a back edge feeding the parameter its own value and does not count). A
+    /// trivial phi equals that unique value `v` (or an undef zero when it had no non-self operand at
+    /// all, e.g. an unreachable self-cycle): every use is forwarded to `v`, the parameter is deleted
+    /// and its now-orphaned argument dropped from every incoming edge, and `v` is returned. Two or
+    /// more distinct non-self operands make it a genuine merge, returned unchanged.
+    ///
+    /// Only phis found trivial at construction time are collapsed. A loop-carried parameter that is
+    /// only *retroactively* self-trivial (its back-edge argument became a self-reference after an
+    /// inner single-pred phi collapsed onto it) is intentionally kept: it is the identity phi that
+    /// threads a loop-invariant slot around the back edge, still valid SSA. No later pass eliminates
+    /// it (gvn numbers instruction results, not block params, and simplify does not fold identity
+    /// block params either); it is left for the backend register allocator, whose live-range
+    /// coalescing merges the parameter with the self-fed argument at negligible cost.
+    fn removeTrivialPhi(self: *Builder, slot: usize, block: usize, phi: Value) pass.Error!Value {
+        const blk: Block = @enumFromInt(block);
+        const params = self.func.blockParams(blk);
+        const pidx = for (params, 0..) |p, i| {
+            if (p == phi) break i;
+        } else return phi; // no longer a parameter (already collapsed): nothing to do
+
+        // Gather the operand at position `pidx` on every edge into `block`, tracking the single
+        // distinct value other than `phi` itself. The edge scan mirrors `addEdgeArgs` exactly so the
+        // argument positions line up with the parameter positions.
+        var same: ?Value = null;
+        var distinct_two = false;
+        const cls = struct {
+            fn consider(op: Value, self_phi: Value, s: *?Value, two: *bool) void {
+                if (op == self_phi) return; // self-reference: does not count toward triviality
+                if (s.*) |prev| {
+                    if (prev != op) two.* = true;
+                } else s.* = op;
+            }
+        };
+        for (0..self.cfg.blockCount()) |si| {
+            const source: Block = @enumFromInt(si);
+            for (self.func.blockInsts(source)) |inst| {
+                switch (self.func.opcode(inst)) {
+                    .@"if" => |cf| {
+                        if (cf.then.target == blk) cls.consider(self.func.blockArgs(cf.then)[pidx], phi, &same, &distinct_two);
+                        if (cf.@"else".target == blk) cls.consider(self.func.blockArgs(cf.@"else")[pidx], phi, &same, &distinct_two);
+                    },
+                    else => {},
+                }
+            }
+            if (self.func.terminator(source)) |term| switch (term) {
+                .jump => |j| if (j.target == blk) cls.consider(self.func.blockArgs(j)[pidx], phi, &same, &distinct_two),
+                .ret => {},
+            };
+        }
+
+        if (distinct_two) return phi; // a genuine merge of >=2 values: keep the block parameter
+
+        const v: Value = same orelse try self.undefZero(slot);
+        self.func.replaceAllUses(phi, v);
+        self.repointCaches(phi, v);
+        try self.dropParamAndEdgeArgs(blk, pidx);
+        return v;
+    }
+
+    /// Repoint every cached reference to `from` (a value just folded into `to`, its defining
+    /// instruction dropped and every use existing *at this moment* already fixed by
+    /// `replaceAllUses`) across both of `Builder`'s value caches: `entry_memo` (a block's resolved
+    /// entry value, which `removeTrivialPhi` can collapse straight to a raw predecessor value) and
+    /// `local_end` (Phase 1's snapshot of each block's last store, which can itself be a promotable
+    /// load's result). Neither cache is part of the IR, so `replaceAllUses` cannot see into it - a
+    /// cache entry equal to `from` is only patched here. This matters because both caches are read
+    /// lazily and repeatedly as `rewrite` walks blocks in index order: `readEntry`/`readEndOfBlock`
+    /// can hand a cached value back out to build a *new* edge argument or replacement long after
+    /// `from`'s own promotion, and that new reference must land on the live `to`, not the now-dead
+    /// `from`, regardless of which block order exposed the read. Called both when `removeTrivialPhi`
+    /// collapses a block parameter and when `rewrite` promotes a load.
+    fn repointCaches(self: *Builder, from: Value, to: Value) void {
+        for (self.entry_memo) |*m| {
+            if (m.*) |mv| {
+                if (mv == from) m.* = to;
+            }
+        }
+        for (self.local_end) |*m| {
+            if (m.* == from) m.* = to;
+        }
+    }
+
+    /// Delete parameter `pidx` from `block` and drop the argument at that same position from every
+    /// incoming edge, keeping every edge's arity matched to the block's parameter count. The edge
+    /// scan mirrors `addEdgeArgs`/`appendArg` so positions stay consistent.
+    fn dropParamAndEdgeArgs(self: *Builder, block: Block, pidx: usize) pass.Error!void {
+        const params = self.func.blockParams(block);
+        var np: std.ArrayList(Value) = .empty;
+        defer np.deinit(self.allocator);
+        for (params, 0..) |p, i| if (i != pidx) try np.append(self.allocator, p);
+        try self.func.setBlockParams(block, np.items);
+
+        for (0..self.cfg.blockCount()) |si| {
+            const source: Block = @enumFromInt(si);
+            for (self.func.blockInsts(source)) |inst| {
+                switch (self.func.opcode(inst)) {
+                    .@"if" => |cf| {
+                        if (cf.then.target == block) try self.dropEdgeArg(.{ .if_then = inst }, pidx);
+                        if (cf.@"else".target == block) try self.dropEdgeArg(.{ .if_else = inst }, pidx);
+                    },
+                    else => {},
+                }
+            }
+            if (self.func.terminator(source)) |term| switch (term) {
+                .jump => |j| if (j.target == block) try self.dropEdgeArg(.{ .term = source }, pidx),
+                .ret => {},
+            };
+        }
+    }
+
+    /// Remove the argument at position `pidx` from a single edge's argument list, mirroring the
+    /// per-edge write in `appendArg`.
+    fn dropEdgeArg(self: *Builder, edge: EdgeRef, pidx: usize) pass.Error!void {
+        const old = switch (edge) {
+            .term => self.func.blockArgs(self.func.terminator(edge.term).?.jump),
+            .if_then => self.func.blockArgs(self.func.opcode(edge.if_then).@"if".then),
+            .if_else => self.func.blockArgs(self.func.opcode(edge.if_else).@"if".@"else"),
+        };
+        var buf: std.ArrayList(Value) = .empty;
+        defer buf.deinit(self.allocator);
+        for (old, 0..) |a, i| if (i != pidx) try buf.append(self.allocator, a);
+        const list = try self.func.internValues(buf.items);
+        switch (edge) {
+            .term => self.func.terminatorPtr(edge.term).*.?.jump.args = list,
+            .if_then => self.func.opcodeMut(edge.if_then).@"if".then.args = list,
+            .if_else => self.func.opcodeMut(edge.if_else).@"if".@"else".args = list,
+        }
     }
 
     /// Append, to every control-flow edge targeting `block`, the source block's exit value for the
@@ -233,7 +372,14 @@ const Builder = struct {
                             current[s] = v;
                             break :blk v;
                         };
-                        self.func.replaceAllUses(self.func.instResult(inst).?, val);
+                        const result = self.func.instResult(inst).?;
+                        self.func.replaceAllUses(result, val);
+                        // `local_end`/`entry_memo` may have snapshotted this very load's result
+                        // (e.g. `store (load a_slot), r_slot`, Phase 1's `local_end[r_slot, block]`)
+                        // before this promotion dropped it. Repoint so a later cache read (an
+                        // `addEdgeArgs` for a merge block visited after this one) sources the
+                        // resolved value instead of a now-dead load, independent of block order.
+                        self.repointCaches(result, val);
                     } else try kept.append(self.allocator, inst),
                     else => try kept.append(self.allocator, inst),
                 }
@@ -277,8 +423,15 @@ fn markEscapes(func: *const Function, promotable: []bool) void {
     }.hit;
     for (0..func.instCount()) |i| {
         switch (func.opcode(@enumFromInt(i))) {
-            .load => {}, // ld.ptr is the sanctioned use
-            .store => |st| esc(promotable, st.value), // ptr is fine, value escapes
+            // ld.ptr is the sanctioned use - UNLESS the load is `volatile` (SM9 Plan 2 Task 4):
+            // a volatile access must observably hit memory, so its alloca cannot be promoted
+            // to an SSA value and the load must stay in the IR.
+            .load => |ld| if (ld.@"volatile") esc(promotable, ld.ptr),
+            // ptr is fine, value escapes; a `volatile` store likewise pins its alloca unpromotable.
+            .store => |st| {
+                esc(promotable, st.value);
+                if (st.@"volatile") esc(promotable, st.ptr);
+            },
             .alloca, .iconst, .fconst, .global_addr => {},
             .arith => |a| {
                 esc(promotable, a.lhs);
@@ -298,6 +451,14 @@ fn markEscapes(func: *const Function, promotable: []bool) void {
             .convert => |cv| esc(promotable, cv.value),
             .unary => |u| esc(promotable, u.value),
             .prefetch => |pf| esc(promotable, pf.ptr),
+            // SM12 T3: unlike `load`/`store`'s `ptr` (a sanctioned dereference), `list` is the
+            // `va_list` OBJECT's raw address, captured for a later backend expansion to do its
+            // own pointer arithmetic on (e.g. writing the next-argument pointer into it) - the
+            // same reason `.addrof`-taking uses always escape. An alloca feeding one of these
+            // must keep its real stack storage, never be promoted away as a bare SSA value.
+            .va_start => |vs| esc(promotable, vs.list),
+            .va_arg => |va| esc(promotable, va.list),
+            .va_end => |ve| esc(promotable, ve.list),
             .dot => |d| {
                 esc(promotable, d.acc);
                 esc(promotable, d.a);
@@ -309,10 +470,14 @@ fn markEscapes(func: *const Function, promotable: []bool) void {
                 esc(promotable, mm.c);
             },
             .struct_new => |sn| for (func.valueList(sn.fields)) |f| esc(promotable, f),
-            .call => |c| for (func.valueList(c.args)) |arg| esc(promotable, arg),
+            .call => |c| {
+                for (func.valueList(c.args)) |arg| esc(promotable, arg);
+                if (c.ret_dest) |rd| esc(promotable, rd); // SM14 M4d-c T1: the call writes memory through the dest
+            },
             .call_indirect => |c| {
                 esc(promotable, c.target);
                 for (func.valueList(c.args)) |arg| esc(promotable, arg);
+                if (c.ret_dest) |rd| esc(promotable, rd); // SM14 M4d-c T1: the call writes memory through the dest
             },
             .@"if" => |cf| {
                 esc(promotable, cf.cond);
@@ -323,7 +488,7 @@ fn markEscapes(func: *const Function, promotable: []bool) void {
     }
     for (0..func.blockCount()) |bi| {
         if (func.terminator(@enumFromInt(bi))) |term| switch (term) {
-            .ret => |v| if (v) |vv| esc(promotable, vv),
+            .ret => |r| for (r.slice()) |vv| esc(promotable, vv),
             .jump => |j| for (func.blockArgs(j)) |arg| esc(promotable, arg),
         };
     }
@@ -378,10 +543,10 @@ test "single-block store then load forwards the stored value" {
     const slot = try func.appendInst(b, ptr_t, .{ .alloca = .{ .elem = t } });
     try func.appendStore(b, x, slot);
     const y = try func.appendInst(b, t, .{ .load = .{ .ptr = slot } });
-    func.setTerminator(b, .{ .ret = y });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(y) });
 
     try testing.expect(try runOnce(allocator, &func));
-    try testing.expectEqual(x, func.terminator(b).?.ret.?); // load became x
+    try testing.expectEqual(x, func.terminator(b).?.ret.values[0]); // load became x
     try expectNoMemoryInsts(&func, b);
 }
 
@@ -398,10 +563,10 @@ test "store in entry forwards across a jump to its single successor" {
     try func.appendStore(b0, x, slot);
     try func.setJump(b0, b1, &.{});
     const y = try func.appendInst(b1, t, .{ .load = .{ .ptr = slot } });
-    func.setTerminator(b1, .{ .ret = y });
+    func.setTerminator(b1, .{ .ret = ir.function.Ret.one(y) });
 
     try testing.expect(try runOnce(allocator, &func));
-    try testing.expectEqual(x, func.terminator(b1).?.ret.?); // load forwarded across the edge
+    try testing.expectEqual(x, func.terminator(b1).?.ret.values[0]); // load forwarded across the edge
     try expectNoMemoryInsts(&func, b0);
     try expectNoMemoryInsts(&func, b1);
 }
@@ -427,13 +592,13 @@ test "diamond store on each arm merges into a block parameter at the join" {
     try func.appendStore(b2, bb, slot);
     try func.setJump(b2, b3, &.{});
     const y = try func.appendInst(b3, t, .{ .load = .{ .ptr = slot } });
-    func.setTerminator(b3, .{ .ret = y });
+    func.setTerminator(b3, .{ .ret = ir.function.Ret.one(y) });
 
     try testing.expect(try runOnce(allocator, &func));
     // A single new parameter on the join carries the merged value, and the ret returns it.
     const params = func.blockParams(b3);
     try testing.expectEqual(@as(usize, 1), params.len);
-    try testing.expectEqual(params[0], func.terminator(b3).?.ret.?);
+    try testing.expectEqual(params[0], func.terminator(b3).?.ret.values[0]);
     // Each arm passes its stored constant along its edge to the join.
     try testing.expectEqual(a, func.blockArgs(func.terminator(b1).?.jump)[0]);
     try testing.expectEqual(bb, func.blockArgs(func.terminator(b2).?.jump)[0]);
@@ -469,7 +634,7 @@ test "loop-carried slot becomes a header parameter threaded around the back edge
     try func.setJump(body, header, &.{});
     // exit: r = load slot; ret r
     const r = try func.appendInst(exit, t, .{ .load = .{ .ptr = slot } });
-    func.setTerminator(exit, .{ .ret = r });
+    func.setTerminator(exit, .{ .ret = ir.function.Ret.one(r) });
 
     try testing.expect(try runOnce(allocator, &func));
     // The header carries the loop value as its one parameter.
@@ -482,7 +647,7 @@ test "loop-carried slot becomes a header parameter threaded around the back edge
     // entry seeds it with 0, the back edge threads the incremented value, exit returns it.
     try testing.expectEqual(zero, func.blockArgs(func.terminator(entry).?.jump)[0]);
     try testing.expectEqual(iv2, func.blockArgs(func.terminator(body).?.jump)[0]);
-    try testing.expectEqual(p, func.terminator(exit).?.ret.?);
+    try testing.expectEqual(p, func.terminator(exit).?.ret.values[0]);
     for ([_]Block{ entry, header, body, exit }) |blk| try expectNoMemoryInsts(&func, blk);
     try expectVerifies(allocator, &func);
 }
@@ -499,7 +664,7 @@ test "a slot whose address escapes to a call is left in memory" {
     try func.appendStore(b, x, slot);
     try func.appendVoidCall(b, "escape", &.{slot}); // address leaves the function
     const y = try func.appendInst(b, t, .{ .load = .{ .ptr = slot } });
-    func.setTerminator(b, .{ .ret = y });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(y) });
 
     try testing.expect(!try runOnce(allocator, &func)); // not promotable, nothing changes
     var loads: usize = 0;
@@ -519,9 +684,186 @@ test "a slot with an aggregate element is not promoted" {
     const b = try func.appendBlock();
     const slot = try func.appendInst(b, ptr_t, .{ .alloca = .{ .elem = arr_t } });
     _ = try func.appendInst(b, arr_t, .{ .load = .{ .ptr = slot } });
-    func.setTerminator(b, .{ .ret = null });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
 
     try testing.expect(!try runOnce(allocator, &func)); // aggregate slot stays in memory
+}
+
+test "loop-invariant slot through a single-pred chain re-entering the header is not corrupted to zero" {
+    // int f(int n) { int i = 0; while (1) { if (i >= n) break; i += 1; } return i; }
+    //
+    // header has two predecessors (entry, cont) so mem2reg makes it a join and memoizes the
+    // new block param for a slot BEFORE recursing into its predecessors. But `n` is read only
+    // through the single-pred chain body -> cont (neither writes n_slot), so resolving n's
+    // value on the cont->header back edge walks cont (single-pred: body) -> body (single-pred:
+    // header) -> header again. That inner revisit of body re-enters readEntry(n_slot, body)
+    // while the outer call for the very same (slot, block) is still marked `computing`, so it
+    // hits the cycle guard and fabricates a fresh `iconst 0` instead of resolving to header's
+    // own n parameter. That spurious zero then gets threaded onto the back edge, corrupting the
+    // invariant slot.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try intTy(&func, 32, .signed);
+    const bool_t = try func.types.intern(.bool);
+    const ptr_t = try func.types.intern(.ptr);
+    const entry = try func.appendBlock();
+    const header = try func.appendBlock();
+    const body = try func.appendBlock();
+    const cont = try func.appendBlock();
+    const exit = try func.appendBlock();
+    const n = try func.appendBlockParam(entry, t);
+
+    // entry: i_slot = alloca; n_slot = alloca; store 0 -> i_slot; store n -> n_slot; jump header
+    const i_slot = try func.appendInst(entry, ptr_t, .{ .alloca = .{ .elem = t } });
+    const n_slot = try func.appendInst(entry, ptr_t, .{ .alloca = .{ .elem = t } });
+    const zero = try func.appendInst(entry, t, .{ .iconst = 0 });
+    try func.appendStore(entry, zero, i_slot);
+    try func.appendStore(entry, n, n_slot);
+    try func.setJump(entry, header, &.{});
+
+    // header: while (1) -> body, else exit (the else edge is never taken at runtime, but it is
+    // a real CFG edge so header has exactly one join-worthy predecessor pair: entry and cont).
+    const one_h = try func.appendInst(header, t, .{ .iconst = 1 });
+    try func.appendIf(header, one_h, .{ .target = body }, .{ .target = exit });
+
+    // body: iv = load i_slot; nv = load n_slot; if (iv >= nv) exit else cont
+    const iv = try func.appendInst(body, t, .{ .load = .{ .ptr = i_slot } });
+    const nv = try func.appendInst(body, t, .{ .load = .{ .ptr = n_slot } });
+    const ge = try func.appendInst(body, bool_t, .{ .icmp = .{ .op = .ge, .lhs = iv, .rhs = nv } });
+    try func.appendIf(body, ge, .{ .target = exit }, .{ .target = cont });
+
+    // cont: iv2 = load i_slot; inc = iv2 + 1; store inc -> i_slot; jump header (the back edge)
+    const iv2 = try func.appendInst(cont, t, .{ .load = .{ .ptr = i_slot } });
+    const inc = try func.appendInst(cont, t, .{ .arith_imm = .{ .op = .add, .lhs = iv2, .imm = 1 } });
+    try func.appendStore(cont, inc, i_slot);
+    try func.setJump(cont, header, &.{});
+
+    // exit: r = load i_slot; ret r
+    const r = try func.appendInst(exit, t, .{ .load = .{ .ptr = i_slot } });
+    func.setTerminator(exit, .{ .ret = ir.function.Ret.one(r) });
+
+    try testing.expect(try runOnce(allocator, &func));
+
+    // `nv`'s use in the comparison always resolves correctly to header's own parameter for n
+    // (this leg of the resolution never re-enters a `computing` block), so it is a stable,
+    // bug-independent handle on which header parameter carries the invariant slot.
+    const n_param = func.opcode(func.definingInst(ge).?).icmp.rhs;
+    const header_params = func.blockParams(header);
+    const n_index = for (header_params, 0..) |p, idx2| {
+        if (p == n_param) break idx2;
+    } else return error.InvariantParamNotFound;
+
+    // The crux: the back edge from `cont` must thread that same parameter around unchanged
+    // (the invariant slot never changes), not some other value entirely - and definitely not a
+    // freshly materialized zero constant fabricated by the cycle-guard bug.
+    const back_edge_arg = func.blockArgs(func.terminator(cont).?.jump)[n_index];
+    try testing.expectEqual(n_param, back_edge_arg);
+    try expectVerifies(allocator, &func);
+}
+
+/// Every argument on every control-flow edge (`.jump` and `.@"if"` then/else) must reference a
+/// value that is still *live*: a surviving instruction result (its defining instruction is still
+/// in some block's instruction list) or a parameter still present on its block. A promotion that
+/// drops an instruction but leaves an edge argument pointing at its now-orphaned result produces a
+/// dangling SSA edge, which this catches directly (independent of the full verifier).
+fn assertNoDanglingEdgeArgs(allocator: std.mem.Allocator, func: *const Function) !void {
+    var live = try allocator.alloc(bool, func.valueCount());
+    defer allocator.free(live);
+    @memset(live, false);
+    for (0..func.blockCount()) |bi| {
+        const blk: Block = @enumFromInt(bi);
+        for (func.blockParams(blk)) |p| live[@intFromEnum(p)] = true;
+        for (func.blockInsts(blk)) |inst| {
+            if (func.instResult(inst)) |r| live[@intFromEnum(r)] = true;
+        }
+    }
+    for (0..func.blockCount()) |bi| {
+        const blk: Block = @enumFromInt(bi);
+        for (func.blockInsts(blk)) |inst| {
+            if (func.opcode(inst) == .@"if") {
+                const cf = func.opcode(inst).@"if";
+                for (func.blockArgs(cf.then)) |a| if (!live[@intFromEnum(a)]) return error.DanglingEdgeArg;
+                for (func.blockArgs(cf.@"else")) |a| if (!live[@intFromEnum(a)]) return error.DanglingEdgeArg;
+            }
+        }
+        if (func.terminator(blk)) |term| switch (term) {
+            .jump => |j| for (func.blockArgs(j)) |a| if (!live[@intFromEnum(a)]) return error.DanglingEdgeArg,
+            .ret => {},
+        };
+    }
+}
+
+test "diamond storing a promoted load into a slot then reading it after the merge does not dangle" {
+    // int f(int a) { int r = 0; if (a > 0) { r = a; } else { r = -a; } return r; }
+    //
+    // The then arm's `r = a` is `t = load a_slot; store t -> r_slot`, i.e. it stores the RESULT
+    // of a promotable load. mem2reg's Phase 1 records local_end[r_slot, then] = t (the load
+    // result). Because the then block has a LOWER block index than the merge block, Phase 2
+    // promotes and drops the load `t` (running replaceAllUses(t -> a's value)) BEFORE the merge
+    // block's join parameter and its incoming edge arguments are ever materialized. When the
+    // merge param is finally built, addEdgeArgs sources the then->merge argument straight from the
+    // stale local_end[r_slot, then] = t, a value that is by now dead (its load was dropped and the
+    // covering replaceAllUses already ran and cannot reach this not-yet-created argument). The
+    // else arm is unaffected: it stores `nt = 0 - a`, a surviving sub, not a promoted-away load.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try intTy(&func, 32, .signed);
+    const bool_t = try func.types.intern(.bool);
+    const ptr_t = try func.types.intern(.ptr);
+
+    // Creation order is load-bearing: then (block 1) MUST precede merge (block 3) so Phase 2
+    // visits and promotes the then-arm load before the merge join parameter is constructed.
+    const entry = try func.appendBlock();
+    const then_b = try func.appendBlock();
+    const else_b = try func.appendBlock();
+    const merge = try func.appendBlock();
+
+    // entry: store a -> a_slot; store 0 -> r_slot; if a > 0 then->then_b else->else_b
+    const a = try func.appendBlockParam(entry, t);
+    const a_slot = try func.appendInst(entry, ptr_t, .{ .alloca = .{ .elem = t } });
+    const r_slot = try func.appendInst(entry, ptr_t, .{ .alloca = .{ .elem = t } });
+    try func.appendStore(entry, a, a_slot);
+    const zero0 = try func.appendInst(entry, t, .{ .iconst = 0 });
+    try func.appendStore(entry, zero0, r_slot);
+    const zero_c = try func.appendInst(entry, t, .{ .iconst = 0 });
+    const cond = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .gt, .lhs = a, .rhs = zero_c } });
+    try func.appendIf(entry, cond, .{ .target = then_b }, .{ .target = else_b });
+
+    // then: t = load a_slot; store t -> r_slot; jump merge
+    const tl = try func.appendInst(then_b, t, .{ .load = .{ .ptr = a_slot } });
+    try func.appendStore(then_b, tl, r_slot);
+    try func.setJump(then_b, merge, &.{});
+
+    // else: t2 = load a_slot; nt = 0 - t2; store nt -> r_slot; jump merge
+    const t2 = try func.appendInst(else_b, t, .{ .load = .{ .ptr = a_slot } });
+    const z2 = try func.appendInst(else_b, t, .{ .iconst = 0 });
+    const nt = try func.appendInst(else_b, t, .{ .arith = .{ .op = .sub, .lhs = z2, .rhs = t2 } });
+    try func.appendStore(else_b, nt, r_slot);
+    try func.setJump(else_b, merge, &.{});
+
+    // merge: r = load r_slot; ret r
+    const r = try func.appendInst(merge, t, .{ .load = .{ .ptr = r_slot } });
+    func.setTerminator(merge, .{ .ret = ir.function.Ret.one(r) });
+
+    try testing.expect(try runOnce(allocator, &func));
+
+    // The crux: no edge argument may reference a dropped (promoted-away) value. This catches the
+    // dangling then->merge argument directly.
+    try assertNoDanglingEdgeArgs(allocator, &func);
+    try expectVerifies(allocator, &func);
+
+    // The merge join carries one parameter; the ret returns it.
+    const params = func.blockParams(merge);
+    try testing.expectEqual(@as(usize, 1), params.len);
+    try testing.expectEqual(params[0], func.terminator(merge).?.ret.values[0]);
+    // The then->merge edge must forward `a` (the promoted load's resolved value), not a dead value.
+    try testing.expectEqual(a, func.blockArgs(func.terminator(then_b).?.jump)[0]);
+    // The else->merge edge forwards the surviving negation.
+    const else_arg = func.blockArgs(func.terminator(else_b).?.jump)[0];
+    try testing.expect(std.meta.activeTag(func.opcode(func.definingInst(else_arg).?)) == .arith);
+    for ([_]Block{ entry, then_b, else_b, merge }) |blk| try expectNoMemoryInsts(&func, blk);
 }
 
 test "two independent scalar slots both promote" {
@@ -540,7 +882,7 @@ test "two independent scalar slots both promote" {
     const la = try func.appendInst(b, t, .{ .load = .{ .ptr = sa } });
     const lb = try func.appendInst(b, t, .{ .load = .{ .ptr = sb } });
     const sum = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = la, .rhs = lb } });
-    func.setTerminator(b, .{ .ret = sum });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(sum) });
 
     try testing.expect(try runOnce(allocator, &func));
     // sum now adds the two stored values directly.

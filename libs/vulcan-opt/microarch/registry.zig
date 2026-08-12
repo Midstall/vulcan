@@ -38,6 +38,10 @@ fn altraLatency(op: ir.function.Opcode) u32 {
         // scalar mul/dot: not native to this arch, a placeholder pending real timing.
         .matmul => 64,
         .iconst, .fconst, .icmp, .select, .struct_new, .extract, .alloca, .call, .call_indirect, .global_addr, .store, .prefetch, .@"if" => 1,
+        // SM12 T3: no backend expands these yet (Tasks 4a-d), so the microarch optimizer
+        // never actually schedules one today - priced like any other cheap bookkeeping op
+        // (`iconst`/`store`/...) so a future backend expansion doesn't silently under-model.
+        .va_start, .va_arg, .va_end => 1,
     };
 }
 
@@ -78,6 +82,10 @@ fn altraThroughput(op: ir.function.Opcode, elem_float: bool) u32 {
         // A matmul is not native here; a placeholder, non-pipelined (== latency).
         .matmul => 64,
         .iconst, .fconst, .icmp, .select, .struct_new, .extract, .alloca, .call, .call_indirect, .global_addr, .store, .prefetch, .@"if" => 1,
+        // SM12 T3: no backend expands these yet (Tasks 4a-d), so the microarch optimizer
+        // never actually schedules one today - priced like any other cheap bookkeeping op
+        // (`iconst`/`store`/...) so a future backend expansion doesn't silently under-model.
+        .va_start, .va_arg, .va_end => 1,
     };
 }
 
@@ -98,6 +106,10 @@ fn cascadelakeLatency(op: ir.function.Opcode) u32 {
         .dot => 3, // mul-class
         .matmul => 64, // non-native placeholder
         .iconst, .fconst, .icmp, .select, .struct_new, .extract, .alloca, .call, .call_indirect, .global_addr, .store, .prefetch, .@"if" => 1,
+        // SM12 T3: no backend expands these yet (Tasks 4a-d), so the microarch optimizer
+        // never actually schedules one today - priced like any other cheap bookkeeping op
+        // (`iconst`/`store`/...) so a future backend expansion doesn't silently under-model.
+        .va_start, .va_arg, .va_end => 1,
     };
 }
 
@@ -123,6 +135,10 @@ fn cascadelakeThroughput(op: ir.function.Opcode, elem_float: bool) u32 {
         .dot => 1,
         .matmul => 64,
         .iconst, .fconst, .icmp, .select, .struct_new, .extract, .alloca, .call, .call_indirect, .global_addr, .store, .prefetch, .@"if" => 1,
+        // SM12 T3: no backend expands these yet (Tasks 4a-d), so the microarch optimizer
+        // never actually schedules one today - priced like any other cheap bookkeeping op
+        // (`iconst`/`store`/...) so a future backend expansion doesn't silently under-model.
+        .va_start, .va_arg, .va_end => 1,
     };
 }
 
@@ -147,6 +163,10 @@ fn etsocLatency(op: ir.function.Opcode) u32 {
         // a cycle-accurate model of the CSR protocol (isel lowering is a later task).
         .matmul => 64,
         .iconst, .fconst, .icmp, .select, .struct_new, .extract, .alloca, .call, .call_indirect, .global_addr, .store, .prefetch, .@"if" => 1,
+        // SM12 T3: no backend expands these yet (Tasks 4a-d), so the microarch optimizer
+        // never actually schedules one today - priced like any other cheap bookkeeping op
+        // (`iconst`/`store`/...) so a future backend expansion doesn't silently under-model.
+        .va_start, .va_arg, .va_end => 1,
     };
 }
 
@@ -184,6 +204,10 @@ fn etsocThroughput(op: ir.function.Opcode, elem_float: bool) u32 {
         // Matmul is the async CSR-write tensor sequence: non-pipelined, throughput == latency.
         .matmul => 64,
         .iconst, .fconst, .icmp, .select, .struct_new, .extract, .alloca, .call, .call_indirect, .global_addr, .store, .prefetch, .@"if" => 1,
+        // SM12 T3: no backend expands these yet (Tasks 4a-d), so the microarch optimizer
+        // never actually schedules one today - priced like any other cheap bookkeeping op
+        // (`iconst`/`store`/...) so a future backend expansion doesn't silently under-model.
+        .va_start, .va_arg, .va_end => 1,
     };
 }
 
@@ -209,6 +233,10 @@ fn riverInorderLatency(op: ir.function.Opcode) u32 {
         // River carries no tensor unit; a placeholder in case one is added.
         .matmul => 64,
         .iconst, .fconst, .icmp, .select, .struct_new, .extract, .alloca, .call, .call_indirect, .global_addr, .store, .prefetch, .@"if" => 1,
+        // SM12 T3: no backend expands these yet (Tasks 4a-d), so the microarch optimizer
+        // never actually schedules one today - priced like any other cheap bookkeeping op
+        // (`iconst`/`store`/...) so a future backend expansion doesn't silently under-model.
+        .va_start, .va_arg, .va_end => 1,
     };
 }
 
@@ -236,6 +264,10 @@ fn riverMacroLatency(op: ir.function.Opcode) u32 {
         // River carries no tensor unit; a placeholder in case one is added.
         .matmul => 64,
         .iconst, .fconst, .icmp, .select, .struct_new, .extract, .alloca, .call, .call_indirect, .global_addr, .store, .prefetch, .@"if" => 1,
+        // SM12 T3: no backend expands these yet (Tasks 4a-d), so the microarch optimizer
+        // never actually schedules one today - priced like any other cheap bookkeeping op
+        // (`iconst`/`store`/...) so a future backend expansion doesn't silently under-model.
+        .va_start, .va_arg, .va_end => 1,
     };
 }
 
@@ -263,6 +295,10 @@ fn riverInorderThroughput(op: ir.function.Opcode, elem_float: bool) u32 {
         .dot => 3, // mul-class placeholder, non-pipelined here
         .matmul => 64, // no tensor unit here; non-pipelined placeholder
         .iconst, .fconst, .icmp, .select, .struct_new, .extract, .alloca, .call, .call_indirect, .global_addr, .store, .prefetch, .@"if" => 1,
+        // SM12 T3: no backend expands these yet (Tasks 4a-d), so the microarch optimizer
+        // never actually schedules one today - priced like any other cheap bookkeeping op
+        // (`iconst`/`store`/...) so a future backend expansion doesn't silently under-model.
+        .va_start, .va_arg, .va_end => 1,
     };
 }
 
@@ -291,6 +327,10 @@ fn riverPipelinedThroughput(op: ir.function.Opcode, elem_float: bool) u32 {
         .dot => 1, // pipelined mul-accumulate on the wider profile
         .matmul => 64, // no tensor unit here; non-pipelined placeholder
         .iconst, .fconst, .icmp, .select, .struct_new, .extract, .alloca, .call, .call_indirect, .global_addr, .store, .prefetch, .@"if" => 1,
+        // SM12 T3: no backend expands these yet (Tasks 4a-d), so the microarch optimizer
+        // never actually schedules one today - priced like any other cheap bookkeeping op
+        // (`iconst`/`store`/...) so a future backend expansion doesn't silently under-model.
+        .va_start, .va_arg, .va_end => 1,
     };
 }
 
@@ -320,6 +360,11 @@ fn unitOfShared(op: ir.function.Opcode) UnitClass {
         .dot => .fpsimd,
         // matmul runs on the tensor/VPU unit, modeled as fpsimd like dot.
         .matmul => .fpsimd,
+        // SM12 T3: no backend expands these yet. `va_arg` reads through `list` (a memory
+        // access, like `load`); `va_start`/`va_end` are pure bookkeeping, like `struct_new`/
+        // `extract` above.
+        .va_arg => .mem,
+        .va_start, .va_end => .none,
     };
 }
 

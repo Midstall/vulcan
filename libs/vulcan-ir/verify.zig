@@ -114,6 +114,18 @@ fn checkOperandTypes(func: *const Function, diags: *Diagnostics) std.mem.Allocat
                 .matmul => |mm| if (matmulOperandsMismatch(func, mm)) {
                     try diags.add(.{ .operand_type_mismatch = mm.c });
                 },
+                // `list` (the `va_list` object's address) must be a `ptr` in every
+                // one of the three ops. `va_start`/`va_end` have no result value, so, like
+                // `matmul` above, a mismatch is reported against the operand itself.
+                .va_start => |vs| if (!isPtrValue(func, vs.list)) {
+                    try diags.add(.{ .operand_type_mismatch = vs.list });
+                },
+                .va_arg => |va| if (!isPtrValue(func, va.list)) {
+                    if (func.instResult(inst)) |result| try diags.add(.{ .operand_type_mismatch = result });
+                },
+                .va_end => |ve| if (!isPtrValue(func, ve.list)) {
+                    try diags.add(.{ .operand_type_mismatch = ve.list });
+                },
                 else => {},
             }
         }
@@ -146,6 +158,12 @@ fn isMemoryOp(op: Opcode) bool {
         .load, .store, .prefetch, .matmul => true,
         else => false,
     };
+}
+
+/// Whether `v`'s type is `ptr`. Used to check `VaStart`/`VaArg`/`VaEnd`'s `list` operand,
+/// which must always be the address of a `va_list` object.
+fn isPtrValue(func: *const Function, v: Value) bool {
+    return func.types.type_kind(func.valueType(v)) == .ptr;
 }
 
 /// `dot`'s accumulator (and result) must be `<4 x i32>`; `a` and `b` must be
@@ -371,12 +389,14 @@ fn checkDominance(func: *const Function, diags: *Diagnostics) std.mem.Allocator.
                 .struct_new => |sn| for (func.valueList(sn.fields)) |field| {
                     try checkUse(&dominance, def_block, diags, field, bi);
                 },
-                .call => |c| for (func.valueList(c.args)) |arg| {
-                    try checkUse(&dominance, def_block, diags, arg, bi);
+                .call => |c| {
+                    for (func.valueList(c.args)) |arg| try checkUse(&dominance, def_block, diags, arg, bi);
+                    if (c.ret_dest) |rd| try checkUse(&dominance, def_block, diags, rd, bi); // ret_dest is a use too.
                 },
                 .call_indirect => |c| {
                     try checkUse(&dominance, def_block, diags, c.target, bi);
                     for (func.valueList(c.args)) |arg| try checkUse(&dominance, def_block, diags, arg, bi);
+                    if (c.ret_dest) |rd| try checkUse(&dominance, def_block, diags, rd, bi); // ret_dest is a use too.
                 },
                 .extract => |ex| try checkUse(&dominance, def_block, diags, ex.aggregate, bi),
                 .convert => |cv| try checkUse(&dominance, def_block, diags, cv.value, bi),
@@ -387,6 +407,9 @@ fn checkDominance(func: *const Function, diags: *Diagnostics) std.mem.Allocator.
                     try checkUse(&dominance, def_block, diags, st.ptr, bi);
                 },
                 .prefetch => |pf| try checkUse(&dominance, def_block, diags, pf.ptr, bi),
+                .va_start => |vs| try checkUse(&dominance, def_block, diags, vs.list, bi),
+                .va_arg => |va| try checkUse(&dominance, def_block, diags, va.list, bi),
+                .va_end => |ve| try checkUse(&dominance, def_block, diags, ve.list, bi),
                 .dot => |d| {
                     try checkUse(&dominance, def_block, diags, d.acc, bi);
                     try checkUse(&dominance, def_block, diags, d.a, bi);
@@ -405,7 +428,7 @@ fn checkDominance(func: *const Function, diags: *Diagnostics) std.mem.Allocator.
             }
         }
         if (func.terminator(block)) |term| switch (term) {
-            .ret => |value| if (value) |v| try checkUse(&dominance, def_block, diags, v, bi),
+            .ret => |r| for (r.slice()) |v| try checkUse(&dominance, def_block, diags, v, bi),
             .jump => |j| for (func.blockArgs(j)) |arg| try checkUse(&dominance, def_block, diags, arg, bi),
         };
     }
@@ -509,7 +532,7 @@ test "using a value not dominated by its definition is reported" {
     const x = try func.appendInst(left, i32_t, .{ .iconst = 7 });
     try func.setJump(left, merge, &.{});
     try func.setJump(right, merge, &.{});
-    func.setTerminator(merge, .{ .ret = x });
+    func.setTerminator(merge, .{ .ret = function.Ret.one(x) });
 
     var d = try verify(std.testing.allocator, &func, .high);
     defer d.deinit();
@@ -528,7 +551,7 @@ test "endian is rejected when not on a memory op" {
     const p = try func.appendBlockParam(entry, ptr_t);
     const loaded = try func.appendInst(entry, i32_t, .{ .load = .{ .ptr = p } });
     const sum = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .add, .lhs = loaded, .rhs = loaded } });
-    func.setTerminator(entry, .{ .ret = sum });
+    func.setTerminator(entry, .{ .ret = function.Ret.one(sum) });
 
     try func.addAttr(.{ .value = loaded }, .{ .endian = .big }); // ok: load result
     try func.addAttr(.{ .value = sum }, .{ .endian = .big }); // misplaced: iadd result
@@ -550,7 +573,7 @@ test "arith with mismatched operand types is reported" {
     const a = try func.appendBlockParam(entry, i32_t);
     const b = try func.appendBlockParam(entry, i64_t);
     const sum = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .add, .lhs = a, .rhs = b } });
-    func.setTerminator(entry, .{ .ret = sum });
+    func.setTerminator(entry, .{ .ret = function.Ret.one(sum) });
 
     var d = try verify(std.testing.allocator, &func, .high);
     defer d.deinit();
@@ -573,7 +596,7 @@ test "f16 value with f16<->f32 width-changing converts verifies clean" {
     const widened = try func.appendInst(entry, f32_t, .{ .convert = .{ .value = half } }); // f16 -> f32
     const narrowed = try func.appendInst(entry, f16_t, .{ .convert = .{ .value = widened } }); // f32 -> f16
     const back = try func.appendInst(entry, f32_t, .{ .convert = .{ .value = narrowed } }); // f16 -> f32 again
-    func.setTerminator(entry, .{ .ret = back });
+    func.setTerminator(entry, .{ .ret = function.Ret.one(back) });
 
     var d = try verify(std.testing.allocator, &func, .low);
     defer d.deinit();
@@ -593,7 +616,7 @@ test "f16 vs f32 operand type mismatch on arith is reported" {
     const a = try func.appendBlockParam(entry, f16_t);
     const b = try func.appendBlockParam(entry, f32_t);
     const sum = try func.appendInst(entry, f32_t, .{ .arith = .{ .op = .add, .lhs = a, .rhs = b } });
-    func.setTerminator(entry, .{ .ret = sum });
+    func.setTerminator(entry, .{ .ret = function.Ret.one(sum) });
 
     var d = try verify(std.testing.allocator, &func, .high);
     defer d.deinit();
@@ -614,7 +637,7 @@ test "dot with matching operand types verifies clean" {
     const a = try func.appendBlockParam(entry, v16i8);
     const b = try func.appendBlockParam(entry, v16i8);
     const result = try func.appendDot(entry, acc, a, b);
-    func.setTerminator(entry, .{ .ret = result });
+    func.setTerminator(entry, .{ .ret = function.Ret.one(result) });
 
     var d = try verify(std.testing.allocator, &func, .low);
     defer d.deinit();
@@ -636,7 +659,7 @@ test "dot with mismatched a/b types is reported" {
     const a = try func.appendBlockParam(entry, v16i8);
     const b = try func.appendBlockParam(entry, v16i16); // wrong: does not match a's type
     const result = try func.appendDot(entry, acc, a, b);
-    func.setTerminator(entry, .{ .ret = result });
+    func.setTerminator(entry, .{ .ret = function.Ret.one(result) });
 
     var d = try verify(std.testing.allocator, &func, .low);
     defer d.deinit();
@@ -657,7 +680,7 @@ test "dot with a non-<4 x i32> accumulator is reported" {
     const a = try func.appendBlockParam(entry, v16i8);
     const b = try func.appendBlockParam(entry, v16i8);
     const result = try func.appendInst(entry, v4i32, .{ .dot = .{ .acc = acc, .a = a, .b = b } });
-    func.setTerminator(entry, .{ .ret = result });
+    func.setTerminator(entry, .{ .ret = function.Ret.one(result) });
 
     var d = try verify(std.testing.allocator, &func, .low);
     defer d.deinit();
@@ -674,7 +697,7 @@ test "a well-formed function passes verification in both profiles" {
     const a = try func.appendBlockParam(entry, i32_t);
     const b = try func.appendBlockParam(entry, i32_t);
     const sum = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .add, .lhs = a, .rhs = b } });
-    func.setTerminator(entry, .{ .ret = sum });
+    func.setTerminator(entry, .{ .ret = function.Ret.one(sum) });
 
     var high = try verify(std.testing.allocator, &func, .high);
     defer high.deinit();
@@ -693,7 +716,7 @@ test "a prefetch hint verifies clean in the low profile and prints as a hint" {
     const entry = try func.appendBlock();
     const p = try func.appendBlockParam(entry, ptr_t);
     try func.appendPrefetch(entry, p);
-    func.setTerminator(entry, .{ .ret = null });
+    func.setTerminator(entry, .{ .ret = function.Ret.none() });
 
     var low = try verify(std.testing.allocator, &func, .low);
     defer low.deinit();
@@ -714,7 +737,7 @@ test "a matmul over pointer operands verifies clean and prints the tile" {
     const b = try func.appendBlockParam(entry, ptr_t);
     const c = try func.appendBlockParam(entry, ptr_t);
     try func.appendMatmul(entry, a, b, c, 4, 4, 4, .fp32, false);
-    func.setTerminator(entry, .{ .ret = null });
+    func.setTerminator(entry, .{ .ret = function.Ret.none() });
 
     var low = try verify(std.testing.allocator, &func, .low);
     defer low.deinit();
@@ -736,12 +759,43 @@ test "matmul with a non-pointer operand is reported" {
     const b = try func.appendBlockParam(entry, ptr_t);
     const c = try func.appendBlockParam(entry, i32_t); // wrong: not a pointer
     try func.appendMatmul(entry, a, b, c, 4, 4, 4, .fp32, false);
-    func.setTerminator(entry, .{ .ret = null });
+    func.setTerminator(entry, .{ .ret = function.Ret.none() });
 
     var d = try verify(std.testing.allocator, &func, .low);
     defer d.deinit();
     try std.testing.expect(!d.ok());
     try std.testing.expectEqual(Diagnostic{ .operand_type_mismatch = c }, d.items()[0]);
+}
+
+test "va_start with a ptr list verifies clean" {
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+
+    const ptr_t = try func.types.intern(.ptr);
+    const entry = try func.appendBlock();
+    const list = try func.appendBlockParam(entry, ptr_t);
+    try func.appendVaStart(entry, list);
+    func.setTerminator(entry, .{ .ret = function.Ret.none() });
+
+    var low = try verify(std.testing.allocator, &func, .low);
+    defer low.deinit();
+    try std.testing.expect(low.ok());
+}
+
+test "va_start with a non-ptr list is reported" {
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const entry = try func.appendBlock();
+    const list = try func.appendBlockParam(entry, i32_t); // wrong: not a pointer
+    try func.appendVaStart(entry, list);
+    func.setTerminator(entry, .{ .ret = function.Ret.none() });
+
+    var d = try verify(std.testing.allocator, &func, .low);
+    defer d.deinit();
+    try std.testing.expect(!d.ok());
+    try std.testing.expectEqual(Diagnostic{ .operand_type_mismatch = list }, d.items()[0]);
 }
 
 test "an int8 matmul with a mixed input_signs override verifies clean" {
@@ -754,7 +808,7 @@ test "an int8 matmul with a mixed input_signs override verifies clean" {
     const b = try func.appendBlockParam(entry, ptr_t);
     const c = try func.appendBlockParam(entry, ptr_t);
     try func.appendMatmulSigned(entry, a, b, c, 4, 4, 4, .int8, false, .{ .a_unsigned = true, .b_unsigned = false });
-    func.setTerminator(entry, .{ .ret = null });
+    func.setTerminator(entry, .{ .ret = function.Ret.none() });
 
     var low = try verify(std.testing.allocator, &func, .low);
     defer low.deinit();
@@ -772,7 +826,7 @@ test "a non-int8 matmul with an input_signs override is rejected" {
     const c = try func.appendBlockParam(entry, ptr_t);
     // fp32 has no signedness to override; input_signs is only meaningful paired with .int8.
     try func.appendMatmulSigned(entry, a, b, c, 4, 4, 4, .fp32, false, .{ .a_unsigned = true, .b_unsigned = false });
-    func.setTerminator(entry, .{ .ret = null });
+    func.setTerminator(entry, .{ .ret = function.Ret.none() });
 
     var d = try verify(std.testing.allocator, &func, .low);
     defer d.deinit();
@@ -790,7 +844,7 @@ test "a matmul quant epilogue on int8 verifies clean" {
     const b = try func.appendBlockParam(entry, ptr_t);
     const c = try func.appendBlockParam(entry, ptr_t);
     try func.appendMatmulQuant(entry, a, b, c, 4, 4, 4, .int8, false, .{ .scale = .{ .scalar = 0x3F000000 }, .relu = true });
-    func.setTerminator(entry, .{ .ret = null });
+    func.setTerminator(entry, .{ .ret = function.Ret.none() });
 
     var low = try verify(std.testing.allocator, &func, .low);
     defer low.deinit();
@@ -807,7 +861,7 @@ test "a matmul quant epilogue with a per_column scale of len==n verifies clean" 
     const b = try func.appendBlockParam(entry, ptr_t);
     const c = try func.appendBlockParam(entry, ptr_t);
     try func.appendMatmulQuantPerColumn(entry, a, b, c, 4, 4, 4, .int8, false, true, .i8, &.{ 0x3F800000, 0x3F000000, 0x3E800000, 0x40000000 });
-    func.setTerminator(entry, .{ .ret = null });
+    func.setTerminator(entry, .{ .ret = function.Ret.none() });
 
     var low = try verify(std.testing.allocator, &func, .low);
     defer low.deinit();
@@ -824,7 +878,7 @@ test "a matmul quant epilogue with a per_column scale of len!=n is reported" {
     const b = try func.appendBlockParam(entry, ptr_t);
     const c = try func.appendBlockParam(entry, ptr_t);
     try func.appendMatmulQuantPerColumn(entry, a, b, c, 4, 4, 4, .int8, false, true, .i8, &.{ 0x3F800000, 0x3F000000, 0x3E800000 });
-    func.setTerminator(entry, .{ .ret = null });
+    func.setTerminator(entry, .{ .ret = function.Ret.none() });
 
     var d = try verify(std.testing.allocator, &func, .low);
     defer d.deinit();
@@ -842,7 +896,7 @@ test "a matmul quant epilogue on a non-int8 dtype is reported" {
     const b = try func.appendBlockParam(entry, ptr_t);
     const c = try func.appendBlockParam(entry, ptr_t);
     try func.appendMatmulQuant(entry, a, b, c, 4, 4, 4, .fp32, false, .{ .scale = .{ .scalar = 0x3F000000 }, .relu = true });
-    func.setTerminator(entry, .{ .ret = null });
+    func.setTerminator(entry, .{ .ret = function.Ret.none() });
 
     var d = try verify(std.testing.allocator, &func, .low);
     defer d.deinit();
@@ -866,7 +920,7 @@ test "a matmul quant epilogue with a per-column bias of len==n and a nonzero zer
         .relu = true,
         .out = .u8,
     });
-    func.setTerminator(entry, .{ .ret = null });
+    func.setTerminator(entry, .{ .ret = function.Ret.none() });
 
     var low = try verify(std.testing.allocator, &func, .low);
     defer low.deinit();
@@ -887,7 +941,7 @@ test "a matmul quant epilogue with a per-column bias of len!=n is reported" {
         .bias = &.{ 1, -2, 3 }, // len 3, n is 4: mismatch
         .relu = true,
     });
-    func.setTerminator(entry, .{ .ret = null });
+    func.setTerminator(entry, .{ .ret = function.Ret.none() });
 
     var d = try verify(std.testing.allocator, &func, .low);
     defer d.deinit();
@@ -903,7 +957,7 @@ test "low profile rejects composite types, high profile allows them" {
     const st = try func.types.intern(.{ .@"struct" = &.{i32_t} });
     const entry = try func.appendBlock();
     _ = try func.appendBlockParam(entry, st);
-    func.setTerminator(entry, .{ .ret = null });
+    func.setTerminator(entry, .{ .ret = function.Ret.none() });
 
     var high = try verify(std.testing.allocator, &func, .high);
     defer high.deinit();
@@ -927,7 +981,7 @@ test "an edge passing the wrong number of arguments is reported" {
 
     const v = try func.appendInst(entry, i32_t, .{ .iconst = 1 });
     try func.setJump(entry, target, &.{v}); // passes 1 arg, target wants 2
-    func.setTerminator(target, .{ .ret = null });
+    func.setTerminator(target, .{ .ret = function.Ret.none() });
 
     var d = try verify(std.testing.allocator, &func, .high);
     defer d.deinit();
@@ -948,7 +1002,7 @@ test "an edge passing a mismatched argument type is reported" {
 
     const v = try func.appendInst(entry, i32_t, .{ .iconst = 1 }); // produces i32
     try func.setJump(entry, target, &.{v});
-    func.setTerminator(target, .{ .ret = null });
+    func.setTerminator(target, .{ .ret = function.Ret.none() });
 
     var d = try verify(std.testing.allocator, &func, .high);
     defer d.deinit();

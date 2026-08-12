@@ -1,7 +1,7 @@
-//! RISC-V instruction selection and register allocation. Lowers a low-profile
-//! Vulcan function to machine words: integer/float/RVV-vector arithmetic,
-//! control flow, calls, memory, with a liveness-based linear-scan allocator and
-//! stack spilling.
+//! RISC-V instruction selection and register allocation. This module lowers a
+//! low-profile Vulcan function to machine words. It handles integer, float,
+//! and RVV-vector arithmetic, control flow, calls, and memory access. It uses
+//! a liveness-based linear-scan allocator and stack spilling.
 
 const std = @import("std");
 const ir = @import("vulcan-ir");
@@ -23,29 +23,30 @@ const FReg = encode.FReg;
 
 /// Where an integer value lives at a given program point: a register or a stack spill slot. A
 /// whole-life value has one location for its entire range (today's `int`/`int_spill`). A split
-/// value has several, selected by position through `segments`.
+/// value has several locations, selected by position through `segments`.
 const IntLoc = union(enum) { reg: Reg, slot: u32 };
 
 /// Where a scalar-float value lives at a given program point: a float register or a stack spill slot.
-/// The analogue of `IntLoc` for the float class. The DEFAULT riscv64 allocator never splits a float
-/// (only int splitting exists), so `floatLocationAt` always falls back to `float`/`float_spill` and
-/// this is unused on the default path; the shared Wimmer translation is the only producer of a split
-/// float (a `float_segments` list).
+/// This is the float-class analogue of `IntLoc`. The default riscv64 allocator never splits a float
+/// value (only int splitting exists), so `floatLocationAt` always falls back to `float`/`float_spill`.
+/// This type stays unused on the default path. Only the shared Wimmer translation produces a split
+/// float value (a `float_segments` list).
 const FloatLoc = union(enum) { reg: FReg, slot: u32 };
 
 /// Where an RVV vector value lives at a given program point: a vector register or a 16-byte stack
-/// spill slot. The vector-class analogue of `IntLoc`/`FloatLoc`. The DEFAULT riscv64 allocator never
-/// splits a vector, so `vectorLocationAt` always falls back to `vector`/`vector_spill` and this is
-/// unused on the default path; the shared Wimmer translation is the only producer of a split vector
-/// (a `vector_segments` list), which is exactly how a vector live across a call is spilled/reloaded.
+/// spill slot. This is the vector-class analogue of `IntLoc`/`FloatLoc`. The default riscv64 allocator
+/// never splits a vector value, so `vectorLocationAt` always falls back to `vector`/`vector_spill` and
+/// this type stays unused on the default path. Only the shared Wimmer translation produces a split
+/// vector value (a `vector_segments` list). This is how a vector live across a call gets spilled and
+/// reloaded.
 const VectorLoc = union(enum) { reg: VReg, slot: u32 };
 
 /// Where an et-soc VPU vector value lives at a given program point: a VPU vector register (an FReg in
-/// the f16..f27 partition) or a 32-byte stack spill slot. The VPU-class analogue of `VectorLoc`. The
-/// DEFAULT riscv64 allocator never splits a VPU value, so `vpuLocationAt` always falls back to
-/// `vpu_vector`/`vpu_vector_spill` and this is unused on the default path; the shared Wimmer
-/// translation is the only producer of a split VPU value (a `vpu_segments` list), which is exactly how
-/// a VPU value live across a call is spilled/reloaded (every f16..f27 is caller-saved).
+/// the f16..f27 partition) or a 32-byte stack spill slot. This is the VPU-class analogue of
+/// `VectorLoc`. The default riscv64 allocator never splits a VPU value, so `vpuLocationAt` always
+/// falls back to `vpu_vector`/`vpu_vector_spill` and this type stays unused on the default path. Only
+/// the shared Wimmer translation produces a split VPU value (a `vpu_segments` list). This is how a VPU
+/// value live across a call gets spilled and reloaded (every f16..f27 register is caller-saved).
 const VpuLoc = union(enum) { reg: FReg, slot: u32 };
 
 /// One piece of a split integer value's life: the value lives in `loc` from position `from` until
@@ -70,26 +71,29 @@ const VectorSegment = struct { from: usize, loc: VectorLoc };
 /// as a register segment, then a spill-slot segment over the call, then a register segment again.
 const VpuSegment = struct { from: usize, loc: VpuLoc };
 
-/// A store, reload, or register move to emit at position `at`, produced when a value is live-range
-/// split. `class` selects the register file: 0 = integer (sd/ld/mv on `spill_base`), 1 = scalar
-/// float (fsd|fsw / fld|flw / fmv on `float_spill_base`), 2 = RVV vector (vse32/vle32/vmv.v.v on
-/// `vspill_base`, the address computed into `spill_scratch1`), 3 = et-soc VPU vector (fsw.ps/flw.ps on
-/// `vpu_vspill_base`, a reg->reg move routed through the `vpu_pack_base` scratch since the VPU has no
-/// packed register move). A `.store` writes the value's register to
-/// its slot at a split boundary; a `.reload` brings the slot back into a register (the second-chance
-/// re-home, Task 6d); a `.move` copies one register into another (a register-to-register re-home,
-/// produced only by the shared Wimmer translation); a `.slot_to_slot` (Wimmer bridge gap #7, mirrors
-/// aarch64/x86_64) re-homes a spilled value from `move_from_slot` to `slot` without ever giving it a
-/// value register: `emitSplitAction` expands it into a reload-then-store pair through the class
-/// scratch (int `spill_scratch0`, float `float_scratch`/`float_spill_scratch0_vpu`, RVV `vector_
-/// scratch`, VPU `float_scratch`), so `reg`/`freg`/`vreg` stay at their defaults and are never read for
-/// this kind. The native `allocateRegisters` only ever produces class-0 `.store`/`.reload`, so it
-/// leaves every added field at its default and emission is byte-identical. `.move`, class 1, class 2,
-/// class 3, and `.slot_to_slot` are reachable only through the shared Wimmer translation; per the
-/// shared `wimmer.zig` invariant (`orderMoves` expands every slot->slot shuffle through the class
-/// scratch BEFORE it ever becomes an `Action`), `.slot_to_slot` never actually reaches this backend
-/// through `walloc.actions` today, but the arm stays for defensive completeness (and is unit-tested
-/// directly, one per class). Drained in the emission loop in `at` order (see `emitSplitAction`).
+/// A store, reload, or register move to emit at position `at`. The allocator produces this when it
+/// splits a value's live range. `class` selects the register file: 0 = integer (sd/ld/mv on
+/// `spill_base`), 1 = scalar float (fsd|fsw / fld|flw / fmv on `float_spill_base`), 2 = RVV vector
+/// (vse32/vle32/vmv.v.v on `vspill_base`, address computed into `spill_scratch1`), 3 = et-soc VPU
+/// vector (fsw.ps/flw.ps on `vpu_vspill_base`, a reg-to-reg move routed through the `vpu_pack_base`
+/// scratch, since the VPU has no packed register move).
+/// A `.store` writes the value's register to its slot at a split boundary.
+/// A `.reload` brings the slot back into a register (the second-chance re-home).
+/// A `.move` copies one register into another (a register-to-register re-home). Only the shared
+/// Wimmer translation produces a `.move`.
+/// A `.slot_to_slot` re-homes a spilled value from `move_from_slot` to `slot`, without ever giving it
+/// a value register. This mirrors the aarch64 and x86_64 backends. `emitSplitAction` expands it into
+/// a reload-then-store pair through the class scratch (int `spill_scratch0`, float `float_scratch` or
+/// `float_spill_scratch0_vpu`, RVV `vector_scratch`, VPU `float_scratch`). So `reg`/`freg`/`vreg` stay
+/// at their defaults and this kind never reads them.
+/// The native `allocateRegisters` function only ever produces class-0 `.store`/`.reload` actions. It
+/// leaves every added field at its default, so emission stays byte-identical.
+/// `.move`, class 1, class 2, class 3, and `.slot_to_slot` are reachable only through the shared
+/// Wimmer translation. Per the shared `wimmer.zig` invariant, `orderMoves` expands every
+/// slot-to-slot shuffle through the class scratch before it ever becomes an `Action`. So
+/// `.slot_to_slot` never actually reaches this backend through `walloc.actions` today. The arm stays
+/// for defensive completeness, and a unit test covers one case per class.
+/// The emission loop drains these actions in `at` order (see `emitSplitAction`).
 const SplitAction = struct {
     at: usize,
     kind: enum { store, reload, move, slot_to_slot },
@@ -104,23 +108,22 @@ const SplitAction = struct {
     freg: FReg = .f0,
     /// Vector store source / reload or move destination (class 2).
     vreg: VReg = .v0,
-    /// Move source register; `reg`/`freg`/`vreg` is the destination. Class picks which is read.
+    /// Move source register. `reg`/`freg`/`vreg` is the destination. Class picks which is read.
     from_reg: Reg = .x0,
     from_freg: FReg = .f0,
     from_vreg: VReg = .v0,
     slot: u32 = 0,
-    /// The SOURCE slot of a `.slot_to_slot` re-home; `slot` is the destination. Produced only by the
+    /// The source slot of a `.slot_to_slot` re-home. `slot` is the destination. Produced only by the
     /// shared Wimmer translation.
     move_from_slot: u32 = 0,
 };
 
 /// One precomputed control-flow-edge move (the shared Wimmer path only), translated from a
-/// `wimmer.Move`: shuffle `src` into `dst` within `class` (0 int, 1 scalar float, 2 RVV vector, 3
+/// `wimmer.Move`. It shuffles `src` into `dst` within `class` (0 int, 1 scalar float, 2 RVV vector, 3
 /// et-soc VPU vector). The register index is stored raw and decoded to a `Reg`/`FReg`/`VReg` per class
-/// at emission. The shared allocator already
-/// ORDERED these into a valid parallel-move sequence (every source read before it is overwritten,
-/// cycles broken and any slot<->slot shuffle routed through the class scratch), so the emitter
-/// replays them op-by-op with no reordering.
+/// at emission. The shared allocator already orders these into a valid parallel-move sequence: it
+/// reads every source before it is overwritten, breaks cycles, and routes any slot-to-slot shuffle
+/// through the class scratch. So the emitter replays them op-by-op with no reordering.
 const EdgeLoc = union(enum) { reg: u16, slot: u32 };
 const EdgeMove = struct { class: u8, src: EdgeLoc, dst: EdgeLoc };
 
@@ -158,32 +161,37 @@ const Allocation = struct {
     /// incoming stack-argument index (0 = the 9th arg). The selector loads it from
     /// the caller's frame at function entry.
     incoming_stack: std.AutoHashMapUnmanaged(Value, u32),
-    /// Split integer values only: value -> ascending-by-`from` segment list. Empty means no value
-    /// was split, so `intLocationAt` falls back to `int`/`int_spill` and emission is byte-identical
-    /// to before splitting.
+    /// Split integer values only. Maps each value to its segment list, ascending by `from`. Empty
+    /// means no value was split, so `intLocationAt` falls back to `int`/`int_spill` and emission
+    /// stays byte-identical to before splitting.
     segments: std.AutoHashMapUnmanaged(Value, []Segment) = .empty,
-    /// Split scalar-float values only (the shared Wimmer path): value -> ascending-by-`from` float
-    /// segment list. Empty on the default path (the native allocator never splits a float), so
-    /// `floatLocationAt` falls back to `float`/`float_spill` and emission is byte-identical.
+    /// Split scalar-float values only (the shared Wimmer path). Maps each value to its float segment
+    /// list, ascending by `from`. Empty on the default path, since the native allocator never splits
+    /// a float value. Then `floatLocationAt` falls back to `float`/`float_spill` and emission stays
+    /// byte-identical.
     float_segments: std.AutoHashMapUnmanaged(Value, []FloatSegment) = .empty,
-    /// Split RVV vector values only (the shared Wimmer path): value -> ascending-by-`from` vector
-    /// segment list. Empty on the default path (the native allocator never splits a vector), so
-    /// `vectorLocationAt` falls back to `vector`/`vector_spill` and emission is byte-identical. A
-    /// vector live across a call lands here (register, then slot over the call, then register).
+    /// Split RVV vector values only (the shared Wimmer path). Maps each value to its vector segment
+    /// list, ascending by `from`. Empty on the default path, since the native allocator never splits
+    /// a vector value. Then `vectorLocationAt` falls back to `vector`/`vector_spill` and emission is
+    /// byte-identical. A vector live across a call lands here: register, then slot over the call,
+    /// then register.
     vector_segments: std.AutoHashMapUnmanaged(Value, []VectorSegment) = .empty,
-    /// Split et-soc VPU vector values only (the shared Wimmer path): value -> ascending-by-`from` VPU
-    /// segment list. Empty on the default path (the native allocator never splits a VPU value), so
-    /// `vpuLocationAt` falls back to `vpu_vector`/`vpu_vector_spill` and emission is byte-identical. A
-    /// VPU value live across a call lands here (register, then 32-byte slot over the call, then register).
+    /// Split et-soc VPU vector values only (the shared Wimmer path). Maps each value to its VPU
+    /// segment list, ascending by `from`. Empty on the default path, since the native allocator never
+    /// splits a VPU value. Then `vpuLocationAt` falls back to `vpu_vector`/`vpu_vector_spill` and
+    /// emission is byte-identical. A VPU value live across a call lands here: register, then 32-byte
+    /// slot over the call, then register.
     vpu_segments: std.AutoHashMapUnmanaged(Value, []VpuSegment) = .empty,
     /// Precomputed, ordered control-flow-edge moves (the shared Wimmer path only). When
-    /// `edge_move_driven` is set the `.jump` emission replays these per edge and derives no block-param
-    /// moves itself. Empty + false is the DEFAULT path, whose edge lowering stays byte-identical.
+    /// `edge_move_driven` is set, the `.jump` emission replays these per edge and derives no
+    /// block-param moves itself. Empty plus false is the default path, whose edge lowering stays
+    /// byte-identical.
     edge_moves: []EdgeMoveSet = &.{},
     edge_move_driven: bool = false,
-    /// Per value: its definition position, in the same linear numbering as the liveness pass. The
-    /// emission pos-coupling assert reads it. Always a heap-owned dupe (see `deinit`), so the `&.{}`
-    /// sentinel is a zero-length slice with no backing allocation and freeing it is a no-op.
+    /// Per value, its definition position, in the same linear numbering as the liveness pass. The
+    /// emission position-coupling assert reads it. This is always a heap-owned dupe (see `deinit`),
+    /// so the `&.{}` sentinel is a zero-length slice with no backing allocation, and freeing it is a
+    /// no-op.
     def_pos: []usize = &.{},
     /// Store/reload actions to drain during emission, one per split boundary, appended in ascending
     /// `at` order. Empty when no value was split, so emission is byte-identical to before splitting.
@@ -219,48 +227,48 @@ const Allocation = struct {
 };
 
 const VReg = encode.VReg;
-// v0 is the RVV mask register. The top four vector registers are reserved scratch:
-// v28/v29 reload spilled left/right operands, v30 holds a spilled result, v31 is
-// the slide-based pack/extract scratch. v1..v27 is the allocatable pool.
+// v0 is the RVV mask register. The top four vector registers are reserved scratch.
+// v28 and v29 reload spilled left and right operands. v30 holds a spilled result. v31 is
+// the slide-based pack and extract scratch. v1..v27 is the allocatable pool.
 const vec_op0: VReg = .v28;
 const vec_op1: VReg = .v29;
 const vec_work: VReg = .v30;
 const vector_scratch: VReg = .v31;
 
-/// Scratch registers for reloading/storing spilled integer values. x6 is the
-/// general scratch. x8 (fp, which Vulcan does not use) is the second so a binary
+/// Scratch registers for reloading and storing spilled integer values. x6 is the
+/// general scratch. x8 (fp, which Vulcan does not use) is the second, so a binary
 /// op with two spilled operands can reload both.
 const spill_scratch0: Reg = .x6;
 const spill_scratch1: Reg = .x8;
 
 /// Caller-saved float temporaries (ft0-ft7, ft8-ft9). ft10 (f30) and ft11 (f31) are reserved as
-/// the two float spill scratch registers (`float_spill_scratch0`/`1` below) rather than allocated,
-/// so they are kept out of this pool.
+/// the two float spill scratch registers (`float_spill_scratch0`/`1` below) instead of allocated,
+/// so they stay out of this pool.
 const float_temp_regs = [_]FReg{ .f0, .f1, .f2, .f3, .f4, .f5, .f6, .f7, .f28, .f29 };
 
-/// Scratch registers for reloading/storing spilled scalar-float values. Two are needed so a binary
-/// float op with both operands spilled can reload both. In non-vpu mode these are f30/f31, both
-/// caller-saved (ft10/ft11, so no callee-save slot is needed) and both kept out of the allocatable
-/// float pool. f31 doubles as the parallel-move `float_scratch`: safe because operand-spill reloads
-/// happen mid-block during instruction emit while float edge moves happen only at a block
-/// terminator, so the two uses of f31 are never live at the same time. In vpu mode the scratches
-/// are f8/f9 instead (see `float_spill_scratch0_vpu`), since f30/f31 sit inside the vpu vector
-/// partition (f16..f31).
+/// Scratch registers for reloading and storing spilled scalar-float values. It needs two, so a
+/// binary float op with both operands spilled can reload both. In non-vpu mode these are f30/f31,
+/// both caller-saved (ft10/ft11, so they need no callee-save slot) and both kept out of the
+/// allocatable float pool. f31 doubles as the parallel-move `float_scratch`. This is safe because
+/// operand-spill reloads happen mid-block during instruction emit, while float edge moves happen
+/// only at a block terminator, so the two uses of f31 are never live at the same time. In vpu mode
+/// the scratches are f8/f9 instead (see `float_spill_scratch0_vpu`), since f30/f31 sit inside the
+/// vpu vector partition (f16..f31).
 const float_spill_scratch0: FReg = .f30;
 const float_spill_scratch1: FReg = .f31;
 /// vpu-mode float spill scratch: f8/f9 (fs0/fs1), reserved out of the vpu scalar pool (which is then
 /// just f0..f7) and disjoint from the vpu vector partition (f16..f31). They are callee-saved, so a
 /// vpu function that actually spills a scalar float preserves them in its frame (see the frame
-/// layout). f31 (the parallel-move `float_scratch`) stays valid in vpu mode too: it is reserved
+/// layout). f31 (the parallel-move `float_scratch`) stays valid in vpu mode too. It is reserved
 /// headroom in the vpu vector partition that nothing in this lowering draws on, so it never aliases
 /// a real value during a scalar-float edge move.
 const float_spill_scratch0_vpu: FReg = .f8;
 const float_spill_scratch1_vpu: FReg = .f9;
 
 /// Reserved float scratch for cycle-breaking parallel moves across a jump edge (f31, the RVV/float
-/// analogue of `vector_scratch`). It is kept out of `float_temp_regs` (so it is never an allocatable
-/// float register in non-vpu mode) and is already reserved headroom in vpu mode (outside every vpu
-/// pool), so it is safe as a scratch in both modes: never a move source or destination.
+/// analogue of `vector_scratch`). It is kept out of `float_temp_regs`, so it is never an allocatable
+/// float register in non-vpu mode, and it is already reserved headroom in vpu mode (outside every
+/// vpu pool). So it is safe as a scratch in both modes: it is never a move source or destination.
 const float_scratch: FReg = .f31;
 
 /// Callee-saved float registers (fs0-fs11). Drawn after the caller-saved float
@@ -277,14 +285,14 @@ const vector_regs = [_]VReg{
 
 // --- et-soc VPU (CORE-ET Erbium packed-single) mode ---
 //
-// The VPU has no separate vector register file: its 8-lane f32 registers ARE f0..f31, the same
-// file scalar floats use. With zero execution feedback (no emulator decodes these custom opcodes,
-// see encode.zig), unifying the scalar and vector allocators is too risky to prove correct here. So
-// `vpu` mode instead partitions the file in half at comptime: scalar floats only ever draw from
-// f0..f9, VPU vectors only ever draw from f16..f31. The two halves can never alias, by construction,
-// with zero runtime check needed. fa0..fa5 (f10..f15) still carry the first six ABI float
-// arguments directly; a 7th+ float argument would land in fa6/fa7 (f16/f17), inside the vector
-// half, so `allocateRegisters` rejects that case instead (see the vpu bound check there).
+// The VPU has no separate vector register file. Its 8-lane f32 registers are f0..f31, the same
+// file scalar floats use. No emulator decodes these custom opcodes (see encode.zig), so there is
+// zero execution feedback. Unifying the scalar and vector allocators is too risky to prove correct
+// here. So `vpu` mode instead partitions the file in half at comptime: scalar floats only ever draw
+// from f0..f9, VPU vectors only ever draw from f16..f31. The two halves can never alias, by
+// construction, with zero runtime check needed. fa0..fa5 (f10..f15) still carry the first six ABI
+// float arguments directly. A 7th or later float argument would land in fa6/fa7 (f16/f17), inside
+// the vector half, so `allocateRegisters` rejects that case instead (see the vpu bound check there).
 
 /// VPU vector pool: f16..f27 (12 registers), disjoint from the vpu-mode scalar pool below.
 /// f28..f31 are reserved VPU scratch, mirroring the RVV vec_op0/op1/work/vector_scratch scheme.
@@ -295,9 +303,9 @@ const vpu_vec_op0: FReg = .f28;
 const vpu_vec_op1: FReg = .f29;
 const vpu_vec_work: FReg = .f30;
 // f31 is reserved headroom in the VPU vector partition (kept out of `vpu_vector_regs` and every
-// allocatable pool above), mirroring the RVV vec_op0/op1/work/vector_scratch scheme, but nothing
-// in this file's lowering (struct_new/extract included) currently draws on it: those use
-// vpu_vec_work/vpu_vec_op0 above.
+// allocatable pool above). It mirrors the RVV vec_op0/op1/work/vector_scratch scheme, but nothing
+// in this file's lowering (struct_new/extract included) currently draws on it. Those use
+// vpu_vec_work/vpu_vec_op0 above instead.
 
 /// vpu-mode scalar float temporaries: f0..f7 (the subset of `float_temp_regs` that stays clear of
 /// the vpu vector partition, f16..f31).
@@ -353,7 +361,7 @@ fn isVector(func: *const Function, ty: ir.types.Type) bool {
 }
 
 /// Whether `ty` is a vector whose scalar element is an integer. Under the VPU (`vpu`) this selects
-/// the CORE-ET packed-integer (`pi`) lowering; a float-element vector selects the packed-single
+/// the CORE-ET packed-integer (`pi`) lowering. A float-element vector selects the packed-single
 /// (`ps`) lowering instead. The lane scalars of a `<N x i32>` are plain i32 that live in (and spill
 /// from) the INT register file, so packing/unpacking them costs no scalar-float-pool pressure.
 fn isIntVector(func: *const Function, ty: ir.types.Type) bool {
@@ -363,9 +371,9 @@ fn isIntVector(func: *const Function, ty: ir.types.Type) bool {
     };
 }
 
-/// Whether the scalar element of the vector type `ty` is an unsigned integer. Programmer error if
-/// `ty` is not an integer-element vector (callers gate with `isIntVector`); it drives the logical
-/// vs. arithmetic choice for a packed-integer right shift.
+/// Whether the scalar element of the vector type `ty` is an unsigned integer. It is a programmer
+/// error if `ty` is not an integer-element vector (callers gate with `isIntVector`). This function
+/// drives the choice between a logical and an arithmetic packed-integer right shift.
 fn isUnsignedIntVector(func: *const Function, ty: ir.types.Type) bool {
     return switch (func.types.type_kind(ty)) {
         .vector => |v| switch (func.types.type_kind(v.elem)) {
@@ -391,20 +399,22 @@ fn isFloatTempReg(reg: FReg) bool {
 }
 
 /// A shared no-fold analysis for the paths that must stay fold-agnostic (the shared Wimmer
-/// differential compile). Its `baseOf`/`offOf`/`isDeadAdd` behave as if nothing folded, so those
-/// paths emit byte-identical code to before address folding existed.
+/// differential compile). Its `baseOf`, `offOf`, and `isDeadAdd` behave as if nothing folded, so
+/// those paths emit byte-identical code to before address folding existed.
 const empty_fold: addrfold.Analysis = addrfold.Analysis.empty;
 
-/// The riscv64 fold predicate for `addrfold.analyze`: fold a load/store whose pointer is an
+/// The riscv64 fold predicate for `addrfold.analyze`. It folds a load/store whose pointer is an
 /// `arith_imm.add(base, imm)` when `imm` fits the signed 12-bit displacement of the base+offset
-/// load/store forms (`ld`/`lw`/`flw`/`fld`/... and their stores), i.e. imm in [-2048, 2047]. Returns
-/// the byte offset (equal to the add's imm) when in range, else null. `analyze` calls this only after
-/// confirming the pointer is an `arith_imm.add`, so the unwraps below are guaranteed, still asserted.
+/// load/store forms (`ld`/`lw`/`flw`/`fld`/... and their stores), that is, imm in [-2048, 2047].
+/// It returns the byte offset (equal to the add's imm) when in range, else null. `analyze` calls
+/// this only after confirming the pointer is an `arith_imm.add`, so the unwraps below are
+/// guaranteed, though still asserted.
 ///
-/// NEVER folds a vector load/store, RVV OR VPU. RVV `vle32`/`vse32` have NO immediate operand, so a
-/// folded displacement would be impossible to encode; refusing the VPU `flw.ps`/`fsw.ps` too (they do
-/// carry an imm12) keeps the RVV constraint impossible to violate and costs only a marginal, here-
-/// unexecuted VPU win. So only SCALAR int and SCALAR float ever fold.
+/// This function never folds a vector load/store, neither RVV nor VPU. RVV `vle32`/`vse32` have no
+/// immediate operand, so a folded displacement would be impossible to encode. Refusing the VPU
+/// `flw.ps`/`fsw.ps` too (they do carry an imm12) keeps the RVV constraint impossible to violate,
+/// and costs only a marginal, here-unexecuted VPU win. So only scalar int and scalar float loads
+/// and stores ever fold.
 fn riscv64FoldOffset(_: void, func: *const Function, mem_inst: ir.function.Inst) ?i64 {
     const val = switch (func.opcode(mem_inst)) {
         .load => func.instResult(mem_inst).?, // the loaded value decides the access class
@@ -428,20 +438,21 @@ fn riscv64FoldOffset(_: void, func: *const Function, mem_inst: ir.function.Inst)
     return add.imm;
 }
 
-/// Rewrite `func` in place so address folding is SOUND under the fold-agnostic shared Wimmer
-/// allocator. The shared allocator (`wimmer.zig`) reads only the RAW IR operands, so for a foldable
-/// `p = arith_imm.add(base, imm); load(p)` it sees `base` used only at the add, lets `base` die there,
-/// and reuses its register after it. Emitting the fold (`imm(base)`, add dropped) would then read a
-/// stale register. This rewrite makes the fold VISIBLE to the allocator instead of hiding it:
-///   1. Repoint every folded load/store's `ptr` operand directly to its fold BASE, so `wimmer`'s
-///      interval build sees `base` used AT the load/store position and keeps its live range correct.
-///   2. Drop every now-dead address-add (its result had no use left once the folded ptr uses moved to
-///      the base), so the allocator wastes no register on it.
-/// `fold` stays consistent for emission: `folds` is keyed by the SURVIVING mem inst and holds the
-/// base+off, so `baseOf` returns the (now raw) ptr = base and `offOf` the displacement. Only dead
-/// adds are removed, never a mem inst, so the offsets survive. Runs on the CALLER's function (a Wimmer
-/// caller passes a throwaway copy), after critical-edge splitting and BEFORE `wimmer.allocate`. Sound
-/// cross-block: base dominated the add and the add dominated the load, so base dominates the load.
+/// Rewrite `func` in place so address folding is sound under the fold-agnostic shared Wimmer
+/// allocator. The shared allocator (`wimmer.zig`) reads only the raw IR operands. So for a foldable
+/// `p = arith_imm.add(base, imm); load(p)`, it sees `base` used only at the add, lets `base` die
+/// there, and reuses its register after it. Emitting the fold (`imm(base)`, add dropped) would then
+/// read a stale register. This rewrite makes the fold visible to the allocator instead of hiding it:
+///   1. It repoints every folded load/store's `ptr` operand directly to its fold base, so `wimmer`'s
+///      interval build sees `base` used at the load/store position and keeps its live range correct.
+///   2. It drops every now-dead address-add (its result had no use left once the folded ptr uses
+///      moved to the base), so the allocator wastes no register on it.
+/// `fold` stays consistent for emission: `folds` is keyed by the surviving mem inst and holds the
+/// base and offset, so `baseOf` returns the (now raw) ptr as base, and `offOf` returns the
+/// displacement. Only dead adds are removed, never a mem inst, so the offsets survive. This runs on
+/// the caller's function (a Wimmer caller passes a throwaway copy), after critical-edge splitting
+/// and before `wimmer.allocate`. It is sound cross-block: base dominated the add, and the add
+/// dominated the load, so base dominates the load.
 fn applyFoldRewriteRiscv(func: *Function, fold: *const addrfold.Analysis) void {
     var it = fold.folds.iterator();
     while (it.next()) |entry| {
@@ -483,7 +494,7 @@ fn isFloatTempRegVpu(reg: FReg) bool {
 pub const Error = std.mem.Allocator.Error || error{Unsupported};
 
 /// Which B-type branch a fused compare-and-branch uses. Chosen from the icmp's
-/// CmpOp and operand signedness (see `branchFor`); `emit` re-encodes it at patch
+/// CmpOp and operand signedness (see `branchFor`). `emit` re-encodes it at patch
 /// time once the offset is known.
 const BranchKind = enum {
     beq,
@@ -544,9 +555,9 @@ const j_type_min: i64 = -1048576;
 const j_type_max: i64 = 1048574;
 
 /// Count how many conditional-branch fixups marked `long` sit strictly before word
-/// index `idx` in the ORIGINAL layout. Each long branch expands from one word (the
-/// short branch) to two (inverted short branch + far `jal`), so this is exactly the
-/// number of EXTRA words relaxation inserts before `idx`. `long[i]` is only ever set
+/// index `idx` in the original layout. Each long branch expands from one word (the
+/// short branch) to two (inverted short branch plus far `jal`). So this count is exactly the
+/// number of extra words relaxation inserts before `idx`. `long[i]` is only ever set
 /// for `.branch`/`.cbranch` fixups, so no other kind is counted.
 fn extraBeforeWord(fixups: []const Fixup, long: []const bool, idx: usize) usize {
     var n: usize = 0;
@@ -572,7 +583,7 @@ fn branchFor(op: ir.function.CmpOp, unsigned: bool) struct { kind: BranchKind, s
 }
 
 /// The temporary registers used for instruction results. x6 is reserved as a
-/// scratch register for helper sequences (e.g. materializing float constants).
+/// scratch register for helper sequences (for example materializing float constants).
 const temp_regs = [_]Reg{ .x5, .x7, .x28, .x29, .x30, .x31 };
 const scratch_reg: Reg = .x6;
 
@@ -580,26 +591,27 @@ const scratch_reg: Reg = .x6;
 /// (no Zfh), so every f16 boundary emits an inline software convert (see `emitHalfToFloat` /
 /// `emitFloatToHalf`) that needs several dedicated scratch GPRs. x28..x31 (t3..t6) are reserved
 /// out of the allocatable pool for exactly that when f16 is present, leaving x5/x7 as the only
-/// caller-saved temps; the eleven callee-saved registers still back the rest. A non-f16 function
+/// caller-saved temps. The eleven callee-saved registers still back the rest. A non-f16 function
 /// keeps the full `temp_regs` and is byte-identical to before, so nothing else regresses.
 const temp_regs_f16 = [_]Reg{ .x5, .x7 };
 
 /// The four dedicated f16 software-convert scratch GPRs (t3..t6), reserved out of the allocatable
-/// pool whenever the function uses f16. Together with `scratch_reg` (x6) and `spill_scratch1` (x8)
-/// - both already reserved out of every pool - they give the convert routines six free GPRs, which
-/// is exactly what the round-to-nearest-even float->half truncate needs. None can ever alias a
+/// pool whenever the function uses f16. Together with `scratch_reg` (x6) and `spill_scratch1` (x8),
+/// both already reserved out of every pool, they give the convert routines six free GPRs. This is
+/// exactly what the round-to-nearest-even float-to-half truncate needs. None can ever alias a
 /// value-carrying register (a base pointer, an operand), so the sequences never clobber live state.
 const f16_scratch_a: Reg = .x28;
 const f16_scratch_b: Reg = .x29;
 const f16_scratch_c: Reg = .x30;
 const f16_scratch_d: Reg = .x31;
 
-/// The integer ABI argument registers a0..a7 (x10..x17). On RISC-V these are CALLER-saved, so a call
+/// The integer ABI argument registers a0..a7 (x10..x17). On RISC-V these are caller-saved, so a call
 /// clobbers every one. They are not in `temp_regs`/`saved_regs` (never allocated to an ordinary
-/// value), but an ENTRY PARAMETER is pinned to its arg register by the Wimmer hint, so a param the
-/// allocator leaves in its arg register across a call would be silently clobbered unless the per-call
-/// clobber list names these. Omitting them is a miscompile (see `riscv64RegDescription`'s call-site
-/// loop); mirrors aarch64 clobbering x0..x17 and x86_64 clobbering its arg registers.
+/// value), but an entry parameter is pinned to its arg register by the Wimmer hint. So a param the
+/// allocator leaves in its arg register across a call would be silently clobbered, unless the
+/// per-call clobber list names these. Omitting them causes a miscompile (see
+/// `riscv64RegDescription`'s call-site loop). This mirrors aarch64 clobbering x0..x17 and x86_64
+/// clobbering its arg registers.
 const int_arg_regs = [_]Reg{ .x10, .x11, .x12, .x13, .x14, .x15, .x16, .x17 };
 
 /// The float ABI argument registers fa0..fa7 (f10..f17). Caller-saved, same clobber reasoning as
@@ -607,9 +619,10 @@ const int_arg_regs = [_]Reg{ .x10, .x11, .x12, .x13, .x14, .x15, .x16, .x17 };
 const float_arg_regs = [_]FReg{ .f10, .f11, .f12, .f13, .f14, .f15, .f16, .f17 };
 
 /// The vpu-mode float ABI argument registers: fa0..fa5 (f10..f15) only. fa6/fa7 (f16/f17) sit inside
-/// the VPU vector partition (f16..f31), and `allocateRegisters` rejects a 7th+ float argument in vpu
-/// mode, so no scalar-float (class 1) param ever occupies them; clobbering just the six that a class-1
-/// value can actually sit in keeps the class-1 clobber set within the scalar-float half of the file.
+/// the VPU vector partition (f16..f31), and `allocateRegisters` rejects a 7th or later float argument
+/// in vpu mode, so no scalar-float (class 1) param ever occupies them. Clobbering just the six
+/// registers a class-1 value can actually sit in keeps the class-1 clobber set within the
+/// scalar-float half of the file.
 const float_arg_regs_vpu = [_]FReg{ .f10, .f11, .f12, .f13, .f14, .f15 };
 
 /// Callee-saved integer registers (s1, s2-s11). Drawn only after the caller-saved
@@ -624,12 +637,12 @@ fn isSavedReg(reg: Reg) bool {
     return false;
 }
 
-/// Resolve an integer operand to a register: if `v` lives in a register, return
-/// it. If it was spilled, reload it from its stack slot into `scratch` and return
-/// `scratch`. Spilled values occupy a full 8-byte slot.
+/// Resolve an integer operand to a register. If `v` lives in a register, this returns
+/// it. If it was spilled, this reloads it from its stack slot into `scratch` and returns
+/// `scratch`. A spilled value occupies a full 8-byte slot.
 /// The location of integer value `v` at position `pos`: its active segment if `v` was split,
-/// otherwise its whole-life register or spill slot. With no splits (segments empty) this is exactly
-/// today's int/int_spill lookup.
+/// otherwise its whole-life register or spill slot. With no splits (segments empty), this is exactly
+/// the int/int_spill lookup.
 fn intLocationAt(alloc: *const Allocation, v: Value, pos: usize) IntLoc {
     if (alloc.segments.get(v)) |segs| {
         var chosen = segs[0]; // non-empty, ascending by `from`
@@ -671,7 +684,7 @@ fn vectorLocationAt(alloc: *const Allocation, v: Value, pos: usize) VectorLoc {
 
 /// Reload a vector `v` into `scratch` if it lives in a slot at `pos` (vle32 from its 16-byte slot,
 /// whose address is computed into `addr`), else return the vector register it lives in there. `pos`
-/// selects a split value's active segment; with no splits it is unobservable (whole-life fallback),
+/// selects a split value's active segment. With no splits it is unobservable (whole-life fallback),
 /// so the default path is byte-identical.
 fn reloadVector(allocator: std.mem.Allocator, code: *std.ArrayList(u32), alloc: *const Allocation, vspill_base: u32, v: Value, pos: usize, scratch: VReg, addr: Reg) std.mem.Allocator.Error!VReg {
     switch (vectorLocationAt(alloc, v, pos)) {
@@ -723,10 +736,10 @@ fn vpuLocationAt(alloc: *const Allocation, v: Value, pos: usize) VpuLoc {
 }
 
 /// Reload a vpu-mode vector `v` into `scratch` if it lives in a slot at `pos` (`flw.ps` from its
-/// 32-byte slot on `sp`), else return the FReg it lives in there. Unlike `reloadVector`, no address
-/// register is needed: `flw.ps` (like scalar `flw`) carries its own 12-bit displacement. `pos` selects
-/// a split value's active segment; with no splits it is unobservable (whole-life fallback), so the
-/// default path is byte-identical.
+/// 32-byte slot on `sp`), else return the FReg it lives in there. Unlike `reloadVector`, this needs
+/// no address register: `flw.ps` (like scalar `flw`) carries its own 12-bit displacement. `pos`
+/// selects a split value's active segment. With no splits it is unobservable (whole-life fallback),
+/// so the default path is byte-identical.
 fn reloadVpuVector(allocator: std.mem.Allocator, code: *std.ArrayList(u32), alloc: *const Allocation, vpu_vspill_base: u32, v: Value, pos: usize, scratch: FReg) std.mem.Allocator.Error!FReg {
     switch (vpuLocationAt(alloc, v, pos)) {
         .reg => |fr| return fr,
@@ -774,11 +787,12 @@ fn floatLocationAt(alloc: *const Allocation, v: Value, pos: usize) FloatLoc {
     return .{ .slot = alloc.float_spill.get(v).? };
 }
 
-/// Resolve a scalar-float operand to a register: if `v` lives in a float register at `pos`, return
-/// it. If it lives in a slot, reload it from there into `scratch` and return `scratch`. `d64` picks
-/// the load width (fld for f64, flw for f32); spilled values occupy a full 8-byte slot regardless (an
-/// f32 uses the low 4 bytes), mirroring `reloadInt`. `pos` selects a split value's active segment;
-/// with no splits it is unobservable (whole-life fallback), so the default path is byte-identical.
+/// Resolve a scalar-float operand to a register. If `v` lives in a float register at `pos`, this
+/// returns it. If it lives in a slot, this reloads it from there into `scratch` and returns
+/// `scratch`. `d64` picks the load width (fld for f64, flw for f32). A spilled value occupies a full
+/// 8-byte slot regardless (an f32 uses the low 4 bytes), mirroring `reloadInt`. `pos` selects a split
+/// value's active segment. With no splits it is unobservable (whole-life fallback), so the default
+/// path is byte-identical.
 fn reloadFloat(allocator: std.mem.Allocator, code: *std.ArrayList(u32), alloc: *const Allocation, float_spill_base: u32, v: Value, pos: usize, d64: bool, scratch: FReg) std.mem.Allocator.Error!FReg {
     switch (floatLocationAt(alloc, v, pos)) {
         .reg => |r| return r,
@@ -811,20 +825,21 @@ fn storeFloat(allocator: std.mem.Allocator, code: *std.ArrayList(u32), alloc: *c
 }
 
 /// Emit one split-boundary action (see `SplitAction`). Class 0 is the integer file (sd/ld to
-/// `spill_base`, `mv` for a re-home), class 1 the scalar-float file (fsd|fsw / fld|flw to
-/// `float_spill_base`, `fmv` for a re-home, the width taken from the value's type). The native
-/// `allocateRegisters` only ever produces class-0 `.store`/`.reload`, so those arms are byte-identical
-/// to the inline drain they replace; `.move`, class 1, class 2, class 3, and `.slot_to_slot` are
-/// reachable only through the Wimmer path. Class 3 (et-soc VPU) stores/reloads a 32-byte packed slot
-/// with `fsw.ps`/`flw.ps` on `vpu_vspill_base`; its reg->reg re-home has no packed move instruction, so
-/// it round-trips through the reserved 32-byte `vpu_pack_base` scratch slot (`fsw.ps` then `flw.ps`).
+/// `spill_base`, `mv` for a re-home). Class 1 is the scalar-float file (fsd|fsw / fld|flw to
+/// `float_spill_base`, `fmv` for a re-home, with the width taken from the value's type). The native
+/// `allocateRegisters` only ever produces class-0 `.store`/`.reload` actions, so those arms are
+/// byte-identical to the inline drain they replace. `.move`, class 1, class 2, class 3, and
+/// `.slot_to_slot` are reachable only through the Wimmer path. Class 3 (et-soc VPU) stores and
+/// reloads a 32-byte packed slot with `fsw.ps`/`flw.ps` on `vpu_vspill_base`. Its reg-to-reg re-home
+/// has no packed move instruction, so it round-trips through the reserved 32-byte `vpu_pack_base`
+/// scratch slot (`fsw.ps` then `flw.ps`).
 /// `.slot_to_slot` re-homes a spilled value from `move_from_slot` to `slot` without ever giving it a
-/// value register: reload the source slot into the CLASS scratch (the same register
-/// `riscv64RegDescription` reserves out of every pool for that class: int `spill_scratch0`/x6, float
-/// `float_scratch`/f31 (`float_spill_scratch0_vpu`/f8 in vpu mode, since f31 stays reserved vpu-vector
-/// headroom), RVV `vector_scratch`/v31, VPU `float_scratch`/f31), then store the scratch straight back
-/// out to `slot`, at the same width the store/reload arms use. `vpu` selects the class-1 scratch (the
-/// same selection `riscv64RegDescription` makes); it is otherwise unused.
+/// value register. It reloads the source slot into the class scratch, the same register
+/// `riscv64RegDescription` reserves out of every pool for that class (int `spill_scratch0`/x6, float
+/// `float_scratch`/f31, or `float_spill_scratch0_vpu`/f8 in vpu mode, since f31 stays reserved
+/// vpu-vector headroom, RVV `vector_scratch`/v31, VPU `float_scratch`/f31). Then it stores the
+/// scratch straight back out to `slot`, at the same width the store/reload arms use. `vpu` selects
+/// the class-1 scratch, the same selection `riscv64RegDescription` makes. It is otherwise unused.
 fn emitSplitAction(allocator: std.mem.Allocator, code: *std.ArrayList(u32), func: *const Function, spill_base: u32, float_spill_base: u32, vspill_base: u32, vpu_vspill_base: u32, vpu_pack_base: u32, vpu: bool, act: SplitAction) std.mem.Allocator.Error!void {
     switch (act.class) {
         0 => switch (act.kind) {
@@ -855,7 +870,7 @@ fn emitSplitAction(allocator: std.mem.Allocator, code: *std.ArrayList(u32), func
         },
         2 => {
             // RVV vector: a 16-byte <4 x f32> slot. vse32/vle32 need the slot address in a GPR, so
-            // compute it into `spill_scratch1` (x8, reserved out of every pool). A reg->reg re-home is
+            // compute it into `spill_scratch1` (x8, reserved out of every pool). A reg-to-reg re-home is
             // a whole-register `vmv.v.v`. This is the class a vector live across a call spills through.
             const off: i12 = @intCast(vspill_base + act.slot * 16);
             switch (act.kind) {
@@ -879,11 +894,11 @@ fn emitSplitAction(allocator: std.mem.Allocator, code: *std.ArrayList(u32), func
         },
         3 => {
             // et-soc VPU vector: a 32-byte (8 x f32) slot addressed by `fsw.ps`/`flw.ps`'s own 12-bit
-            // displacement off `sp` (no address register needed). A reg->reg re-home has no packed VPU
+            // displacement off `sp` (no address register needed). A reg-to-reg re-home has no packed VPU
             // move instruction, so it round-trips through the reserved 32-byte `vpu_pack_base` scratch
             // slot: `fsw.ps` the source, then `flw.ps` into the destination (each move is atomic, so a
             // shared scratch slot is safe even inside a parallel-move cycle). This is the class a VPU
-            // value live across a call spills through (every f16..f27 is caller-saved).
+            // value live across a call spills through (every f16..f27 register is caller-saved).
             const off: i12 = @intCast(vpu_vspill_base + act.slot * 32);
             switch (act.kind) {
                 .store => try code.append(allocator, encode.fsw_ps(act.freg, .x2, off)),
@@ -904,10 +919,10 @@ fn emitSplitAction(allocator: std.mem.Allocator, code: *std.ArrayList(u32), func
 }
 
 /// Materialize a 32-bit value into integer register `rd`. When `bits` does not fit a 12-bit
-/// signed immediate this emits `lui rd, hi` immediately followed by `addi rd, rd, lo`, adjacent
-/// by construction (the same hi/lo address-pair shape `caps.fuse_addr_hi_lo` guards for
-/// `.global_addr`), but this helper is a free function called from ~25 sites with no `ModelCaps`
-/// in scope, so it carries no adjacency assert of its own: threading `caps` through every call
+/// signed immediate, this emits `lui rd, hi` immediately followed by `addi rd, rd, lo`. The pair
+/// is adjacent by construction (the same hi/lo address-pair shape `caps.fuse_addr_hi_lo` guards for
+/// `.global_addr`), but this helper is a free function called from about 25 sites with no `ModelCaps`
+/// in scope. So it carries no adjacency assert of its own. Threading `caps` through every call
 /// site just for an assert is not worth it, and the invariant holds unconditionally regardless.
 fn loadImm32(allocator: std.mem.Allocator, code: *std.ArrayList(u32), rd: Reg, bits: u32) std.mem.Allocator.Error!void {
     const signed: i32 = @bitCast(bits);
@@ -922,12 +937,13 @@ fn loadImm32(allocator: std.mem.Allocator, code: *std.ArrayList(u32), rd: Reg, b
 }
 
 /// Materialize a full 64-bit value into integer register `rd`. Small values fold to a single
-/// `addi`, signed-32-bit ones to the `lui`+`addi` pair (via `loadImm32`, whose sign extension
-/// fills the high 32 bits correctly). Anything wider is built MSB-first in 11-bit chunks: the top
-/// 9 bits seed `rd`, then each remaining 11-bit chunk is shifted in with `slli 11; ori chunk`.
-/// 9 + 5*11 = 64 exactly, and every `ori` immediate is a positive `u11` (bit 11 clear), so its
-/// sign extension is all zeros and the OR only sets the freshly-shifted low 11 bits. Needed for the
-/// et-soc tensor descriptors (`.matmul`), which are packed 64-bit CSR words with high fields set.
+/// `addi`. Signed-32-bit values fold to the `lui`+`addi` pair (via `loadImm32`, whose sign extension
+/// fills the high 32 bits correctly). Anything wider is built most-significant-bit-first in 11-bit
+/// chunks: the top 9 bits seed `rd`, then each remaining 11-bit chunk is shifted in with
+/// `slli 11; ori chunk`. 9 + 5*11 = 64 exactly, and every `ori` immediate is a positive `u11` (bit 11
+/// clear), so its sign extension is all zeros and the OR only sets the freshly-shifted low 11 bits.
+/// This is needed for the et-soc tensor descriptors (`.matmul`), which are packed 64-bit CSR words
+/// with high fields set.
 fn loadImm64(allocator: std.mem.Allocator, code: *std.ArrayList(u32), rd: Reg, value: u64) std.mem.Allocator.Error!void {
     const signed: i64 = @bitCast(value);
     if (signed >= -2048 and signed <= 2047) {
@@ -963,10 +979,11 @@ fn functionHasMatmul(func: *const Function) bool {
     return false;
 }
 
-/// True if `func` contains any `embedded` matmul, i.e. one that is NOT the whole reachable function
-/// and so needs the self-contained save/restore lowering (which draws a stack save-area from the
-/// frame). Reserving that area is gated on this so a function with only whole-function/standalone
-/// matmuls (every matmul built today) keeps its frame, and therefore its emitted bytes, unchanged.
+/// True if `func` contains any `embedded` matmul, that is, one that is not the whole reachable
+/// function and so needs the self-contained save/restore lowering (which draws a stack save-area from
+/// the frame). Reserving that area is gated on this, so a function with only whole-function or
+/// standalone matmuls (every matmul built today) keeps its frame, and therefore its emitted bytes,
+/// unchanged.
 fn functionHasEmbeddedMatmul(func: *const Function) bool {
     for (0..func.blockCount()) |bi| {
         for (func.blockInsts(@enumFromInt(bi))) |inst| {
@@ -980,11 +997,11 @@ fn functionHasEmbeddedMatmul(func: *const Function) bool {
 }
 
 /// True when the function holds any value the embedded matmul's per-float 32-bit save cannot preserve
-/// across it: an f64 (64-bit), or a vector (RVV/VPU, wider than 32 bits) that lives in a float register.
-/// The embedded save/restore stores each clobbered float register as a 32-bit `fsw` (the et-soc fp32
-/// case, the only float width sw-sysemu implements). A live f64 or vector crossing an embedded matmul
-/// would lose its high bits, so reject cleanly rather than silently miscompile it. fp32-scalar
-/// surroundings (the recognizer's target) are unaffected.
+/// across it: an f64 (64-bit), or a vector (RVV/VPU, wider than 32 bits) that lives in a float
+/// register. The embedded save/restore stores each clobbered float register as a 32-bit `fsw` (the
+/// et-soc fp32 case, the only float width sw-sysemu implements). A live f64 or vector crossing an
+/// embedded matmul would lose its high bits, so this function rejects that case cleanly instead of
+/// silently miscompiling it. fp32-scalar surroundings (the recognizer's target) are unaffected.
 fn functionHasWideFloatValue(func: *const Function) bool {
     var i: usize = 0;
     while (i < func.valueCount()) : (i += 1) {
@@ -998,9 +1015,9 @@ fn functionHasWideFloatValue(func: *const Function) bool {
     return false;
 }
 
-/// Registers holding a/b/c for the duration of an EMBEDDED matmul lowering, so the base pointers are
+/// Registers holding a/b/c for the duration of an embedded matmul lowering, so the base pointers are
 /// stable regardless of where the allocator placed a/b/c (they may land in the op's scratch set in an
-/// embedded context). x29/x30 are caller-saved temps the matmul body never otherwise uses; x9 is a
+/// embedded context). x29/x30 are caller-saved temps the matmul body never otherwise uses. x9 is a
 /// callee-saved temp used as the third holder. All three are saved on entry and restored on exit, so
 /// any live-across value the allocator put in them survives.
 const matmul_holder_a: Reg = .x29;
@@ -1029,27 +1046,27 @@ fn emitPtrPlusOffset(allocator: std.mem.Allocator, code: *std.ArrayList(u32), ds
     return dst;
 }
 
-/// Load a `num_rows` x `width` (element size `elem_bytes`, 1/2/4) sub-tile of a REAL row-major
+/// Load a `num_rows` x `width` (element size `elem_bytes`, 1/2/4) sub-tile of a real row-major
 /// matrix into consecutive L1 scratchpad lines `dst_scp .. dst_scp+num_rows-1`, then
-/// `tensor_wait` on `id`. `tensor_fma` reads one ROW-MAJOR matrix row per SCP line (the low
+/// `tensor_wait` on `id`. `tensor_fma` reads one row-major matrix row per SCP line (the low
 /// `width` elements of each 64-byte line are the valid data), so every row must land on its own
-/// line. This is the A-operand layout for every dtype, AND the B-operand layout for fp32 only
+/// line. This is the A-operand layout for every dtype, and also the B-operand layout for fp32 only
 /// (fp16/int8 B needs the K-interleaved transpose-pack `emitMatmulLoadBPacked`, since the tensor
 /// unit reads those B lines as `factor` consecutive-K elements per column, not one row per line).
 ///
-/// The et-soc `tensor_load` can only address 64-byte-aligned lines with a 64-byte-granular stride:
-/// hardware masks BOTH the descriptor address and the x31 stride with `~0x3f` (sw-sysemu
+/// The et-soc `tensor_load` can only address 64-byte-aligned lines with a 64-byte-granular stride.
+/// Hardware masks both the descriptor address and the x31 stride with `~0x3f` (sw-sysemu
 /// tensors.cpp `tensor_load_start`: `addr = control & 0xFFFFFFFFFFC0`, `stride = X31 &
 /// 0xFFFFFFFFFFC0`). A real row-major sub-tile has rows `row_pitch` bytes apart (k*4 for A, n*4 for
-/// B); that pitch is a multiple of 64 only when the matrix's inner dimension is a multiple of 16.
+/// B). That pitch is a multiple of 64 only when the matrix's inner dimension is a multiple of 16.
 /// So:
 ///   - `row_pitch % 64 == 0`: load the rows directly with one strided `tensor_load`.
 ///   - otherwise: stage the rows into `stage_ptr` (a 64-byte-aligned scratch with 64-byte row
 ///     pitch) via scalar word copies, then one stride-64 `tensor_load` from the staging buffer.
 /// The sub-tile base (`base_reg + tile_off`) is always 64-byte aligned (both `tile_off`, a
-/// multiple of 64, and the caller's 64-aligned base), so the descriptor's addr mask drops nothing.
+/// multiple of 64, and the caller's 64-aligned base), so the descriptor's address mask drops nothing.
 /// Emit a scalar load of `elem_bytes` (1/2/4) from `imm(rs1)` into `rd`. Widths select
-/// `lb`/`lh`/`lw`; the matmul staging only ever copies (never interprets) the bytes, so the
+/// `lb`/`lh`/`lw`. The matmul staging only ever copies (never interprets) the bytes, so the
 /// sign of the load is irrelevant (the paired store writes back the same width). Programmer
 /// error for any other width.
 fn emitScalarLoad(allocator: std.mem.Allocator, code: *std.ArrayList(u32), elem_bytes: u32, rd: Reg, rs1: Reg, imm: i12) std.mem.Allocator.Error!void {
@@ -1057,19 +1074,19 @@ fn emitScalarLoad(allocator: std.mem.Allocator, code: *std.ArrayList(u32), elem_
         1 => encode.lb(rd, rs1, imm),
         2 => encode.lh(rd, rs1, imm),
         4 => encode.lw(rd, rs1, imm),
-        else => unreachable, // matmul dtypes are int8/fp16/fp32 -> 1/2/4 bytes only
+        else => unreachable, // matmul dtypes are int8/fp16/fp32, so only 1, 2, or 4 bytes
     });
 }
 
 /// Emit a scalar store of `elem_bytes` (1/2/4) of `rs2` to `imm(rs1)`. Sibling of
-/// `emitScalarLoad`; `sb`/`sh`/`sw` write only the low `elem_bytes` of `rs2`. Programmer error
+/// `emitScalarLoad`. `sb`/`sh`/`sw` write only the low `elem_bytes` of `rs2`. Programmer error
 /// for any other width.
 fn emitScalarStore(allocator: std.mem.Allocator, code: *std.ArrayList(u32), elem_bytes: u32, rs2: Reg, rs1: Reg, imm: i12) std.mem.Allocator.Error!void {
     try code.append(allocator, switch (elem_bytes) {
         1 => encode.sb(rs2, rs1, imm),
         2 => encode.sh(rs2, rs1, imm),
         4 => encode.sw(rs2, rs1, imm),
-        else => unreachable, // matmul dtypes are int8/fp16/fp32 -> 1/2/4 bytes only
+        else => unreachable, // matmul dtypes are int8/fp16/fp32, so only 1, 2, or 4 bytes
     });
 }
 
@@ -1128,20 +1145,20 @@ fn emitMatmulLoadSubtile(
     try code.append(allocator, encode.csrw(encode.CSR_TENSOR_WAIT, desc));
 }
 
-/// Load and K-interleave-transpose-pack a `kslice` x `cols` sub-tile of a REAL row-major
+/// Load and K-interleave-transpose-pack a `kslice` x `cols` sub-tile of a real row-major
 /// fp16/int8 B matrix into `kslice/factor` L1 scratchpad lines starting at `dst_scp`, then
-/// `tensor_wait` on `id`. Only for `factor > 1` (fp16 factor=2, int8 factor=4); fp32 B uses the
-/// plain row-per-line `emitMatmulLoadSubtile`.
+/// `tensor_wait` on `id`. This applies only for `factor > 1` (fp16 factor=2, int8 factor=4). fp32 B
+/// uses the plain row-per-line `emitMatmulLoadSubtile`.
 ///
-/// WHY the transpose-pack: for the multi-element-per-K dtypes the tensor unit reads B NOT as one
-/// row per SCP line, but as `factor` consecutive-K elements packed into a fixed 4-byte slot per
-/// output column. From sw-sysemu `tensor_fma16a32_execute` (tensors.cpp:1322) and
-/// `tensor_ima8a32_execute` (:1424): for contraction index `k`, B lives in line `bstart + k/factor`
-/// and element B[k+x][j] is read from that line as `f16[2*j + x]` (fp16) / `u8[j*4 + x]` (int8),
-/// i.e. byte `j*4 + x*elem_bytes` (x in 0..factor). So SCP line p holds, for each column j, the
+/// Reason for the transpose-pack: for the multi-element-per-K dtypes, the tensor unit does not read
+/// B as one row per SCP line. Instead it reads `factor` consecutive-K elements packed into a fixed
+/// 4-byte slot per output column. From sw-sysemu `tensor_fma16a32_execute` (tensors.cpp:1322) and
+/// `tensor_ima8a32_execute` (:1424): for contraction index `k`, B lives in line `bstart + k/factor`,
+/// and element B[k+x][j] is read from that line as `f16[2*j + x]` (fp16) or `u8[j*4 + x]` (int8),
+/// that is, byte `j*4 + x*elem_bytes` (x in 0..factor). So SCP line p holds, for each column j, the
 /// `factor` elements B[factor*p + 0..factor-1][j] in a 4-byte group (`factor * elem_bytes == 4`).
 /// The source B is plain row-major (`B[kk][j]` at byte `kk*n_pitch + j*elem_bytes`), so this is a
-/// (factor x cols) -> (cols x factor) transpose done with scalar copies. `kslice` is a multiple of
+/// (factor x cols) to (cols x factor) transpose done with scalar copies. `kslice` is a multiple of
 /// `factor` (the caller rejects `k % factor != 0`), so every line is fully populated.
 fn emitMatmulLoadBPacked(
     allocator: std.mem.Allocator,
@@ -1186,7 +1203,7 @@ fn emitMatmulLoadBPacked(
     try loadImm64(allocator, code, desc, load_static);
     try code.append(allocator, encode.or_(desc, desc, stage_ptr));
     try code.append(allocator, encode.csrw(encode.CSR_TENSOR_LOAD, desc));
-    // tensor_wait (required on hardware before the fma reads the SCP; a no-op under sw-sysemu).
+    // tensor_wait (required on hardware before the fma reads the SCP. A no-op under sw-sysemu).
     try loadImm32(allocator, code, desc, id);
     try code.append(allocator, encode.csrw(encode.CSR_TENSOR_WAIT, desc));
 }
@@ -1219,6 +1236,13 @@ fn typeSize(func: *const Function, ty: ir.types.Type) Error!u32 {
             .f16 => 2,
         },
         .ptr => 8,
+        // A blob-typed alloca, sized for its stack slot only (element count times element size,
+        // like aarch64). The frontend stores an aggregate local as an array-of-64-bit-words blob
+        // (a struct local, a by-value struct return destination slot, or an aggregate `va_list`),
+        // so a function with any of those needs to size it. This was once gated on `is_variadic`,
+        // which rejected a struct local on riscv64. A function with no aggregate
+        // alloca never reaches this arm, so its frame stays byte-identical.
+        .array => |a| @as(u32, @intCast(a.len)) * try typeSize(func, a.elem),
         .vector => |v| v.len * try typeSize(func, v.elem),
         else => error.Unsupported,
     };
@@ -1248,10 +1272,11 @@ fn Move(comptime R: type) type {
 /// arguments into place.
 const RegMove = Move(Reg);
 
-/// Emit `moves_in` (dst<-src copies within ONE register class) as a *parallel* copy: every dst ends
-/// holding its src's ORIGINAL value. Non-conflicting moves (a dst that is no other move's source) go
-/// first; the remainder form permutation cycles (e.g. swapping two registers), broken by staging one
-/// value through `scratch`. `emit(allocator, code, dst, src)` appends the class's move instruction.
+/// Emit `moves_in` (dst-from-src copies within one register class) as a parallel copy: every dst ends
+/// holding its src's original value. Non-conflicting moves (a dst that is no other move's source) go
+/// first. The remainder form permutation cycles (for example, swapping two registers), broken by
+/// staging one value through `scratch`. `emit(allocator, code, dst, src)` appends the class's move
+/// instruction.
 ///
 /// `scratch` must be a register reserved out of the allocatable pool for that class, so it is never
 /// itself a move source or destination. A single scratch suffices even with several disjoint cycles:
@@ -1319,15 +1344,15 @@ fn emitVectorMove(allocator: std.mem.Allocator, code: *std.ArrayList(u32), dst: 
     try code.append(allocator, encode.vmv_v_v(dst, src));
 }
 
-/// Emit integer register moves as a parallel copy, breaking cycles with `scratch`. Needed so e.g.
-/// swapping two argument registers is correct.
+/// Emit integer register moves as a parallel copy, breaking cycles with `scratch`. This is needed so
+/// swapping two argument registers, for example, is correct.
 fn parallelMoveInt(allocator: std.mem.Allocator, code: *std.ArrayList(u32), moves_in: []const RegMove, scratch: Reg) std.mem.Allocator.Error!void {
     try parallelMove(Reg, allocator, code, moves_in, scratch, emitIntMove);
 }
 
 /// Emit float register moves as a parallel copy, breaking cycles with `scratch` (a reserved float
 /// register, `float_scratch`). Needed so a block edge that permutes its float loop-carried values
-/// (e.g. a swap) is correct.
+/// (for example a swap) is correct.
 fn parallelMoveFloat(allocator: std.mem.Allocator, code: *std.ArrayList(u32), moves_in: []const Move(FReg), scratch: FReg) std.mem.Allocator.Error!void {
     try parallelMove(FReg, allocator, code, moves_in, scratch, emitFloatMove);
 }
@@ -1342,6 +1367,34 @@ fn parallelMoveVector(allocator: std.mem.Allocator, code: *std.ArrayList(u32), m
 /// Integer argument register `i`: a0 = x10, a1 = x11, ...
 fn argReg(i: usize) Reg {
     return @enumFromInt(@as(u5, @intCast(10 + i)));
+}
+
+/// Floating argument/return register `i`: fa0 = f10, fa1 = f11, ... (fa0/fa1 also serve
+/// as the FP struct-return registers, the same registers lp64d passes float arguments in).
+fn floatArgReg(i: usize) FReg {
+    return @enumFromInt(@as(u5, @intCast(10 + i)));
+}
+
+/// Store a struct-by-value `.registers` return's register set into the
+/// dest slot at sp-relative displacement `doff`. Each `pieces[0..count]` entry is one return
+/// eightbyte. An integer piece stores the next a-register (a0, a1) with a full 8-byte `sd`. A
+/// float piece stores the next fa-register (fa0, fa1) at its own width (`fsd` for 8 bytes, `fsw`
+/// for 4). The two banks count independently, matching the ret-placement order. A pure-integer
+/// return keeps the same byte-for-byte behavior (`sd a{gp}, off(sp)`).
+fn emitStructRetStoreRV(allocator: std.mem.Allocator, code: *std.ArrayList(u32), pieces: [4]ir.function.RetPiece, count: u8, doff: i12) std.mem.Allocator.Error!void {
+    var gp_i: usize = 0;
+    var fp_i: usize = 0;
+    for (0..count) |i| {
+        const p = pieces[i];
+        const off: i12 = @intCast(@as(i32, doff) + @as(i32, p.offset));
+        if (p.fp) {
+            try code.append(allocator, if (p.bytes == 8) encode.fsd(floatArgReg(fp_i), .x2, off) else encode.fsw(floatArgReg(fp_i), .x2, off));
+            fp_i += 1;
+        } else {
+            try code.append(allocator, encode.sd(argReg(gp_i), .x2, off));
+            gp_i += 1;
+        }
+    }
 }
 
 /// Split critical edges: for each `if` edge that carries arguments, insert a
@@ -1416,9 +1469,9 @@ fn isSignedInt(func: *const Function, ty: ir.types.Type) bool {
 }
 
 /// Whether `ty` is the half-precision float `f16`. riscv64 has no hardware f16 (no Zfh), so an f16
-/// SSA value lives in a float register as its f32 WIDENING (a value exactly representable in half),
+/// SSA value lives in a float register as its f32 widening (a value exactly representable in half),
 /// mirroring the aarch64 emulation model. `is64Float(f16)` is false, so every in-register op picks
-/// the single-precision (f32) form naturally; the emulation work is only at the boundaries (load,
+/// the single-precision (f32) form naturally. The emulation work is only at the boundaries (load,
 /// store, arithmetic rounding, and cross-type convert), which round via the software routines below.
 fn isHalf(func: *const Function, ty: ir.types.Type) bool {
     return switch (func.types.type_kind(ty)) {
@@ -1427,14 +1480,15 @@ fn isHalf(func: *const Function, ty: ir.types.Type) bool {
     };
 }
 
-/// Software EXTEND f16 -> f32 (exact, no rounding). Reads the 16-bit half pattern in `in` (zero-
-/// extended, e.g. straight from an `lhu`) and writes the f32 bit pattern of the same value into
-/// `out`. Branchless via the Fabian Giesen magic-multiply half->float algorithm: shift the
-/// exponent+mantissa into an f32 whose exponent is biased low, multiply by a pure power of two
-/// (2^112, exact regardless of rounding mode) to rebias, then patch the inf/NaN exponent and OR in
-/// the sign. Every finite AND subnormal half comes out exact because the multiply renormalizes
-/// subnormals for free. `in` is left untouched; `out`, `f16_scratch_a`, `f16_scratch_b`, and the
-/// two float scratch registers `f0`/`f1` are clobbered. `out` must differ from `in`.
+/// Software extend f16 to f32 (exact, no rounding). Reads the 16-bit half pattern in `in` (zero-
+/// extended, for example straight from an `lhu`) and writes the f32 bit pattern of the same value
+/// into `out`. This is branchless via the Fabian Giesen magic-multiply half-to-float algorithm: it
+/// shifts the exponent and mantissa into an f32 whose exponent is biased low, multiplies by a pure
+/// power of two (2^112, exact regardless of rounding mode) to rebias, then patches the inf/NaN
+/// exponent and ORs in the sign. Every finite and subnormal half comes out exact, because the
+/// multiply renormalizes subnormals for free. `in` is left untouched. `out`, `f16_scratch_a`,
+/// `f16_scratch_b`, and the two float scratch registers `f0`/`f1` are clobbered. `out` must differ
+/// from `in`.
 fn emitHalfToFloat(allocator: std.mem.Allocator, code: *std.ArrayList(u32), out: Reg, in: Reg, f0: FReg, f1: FReg) std.mem.Allocator.Error!void {
     const s0 = f16_scratch_a;
     const s1 = f16_scratch_b;
@@ -1444,7 +1498,7 @@ fn emitHalfToFloat(allocator: std.mem.Allocator, code: *std.ArrayList(u32), out:
     try code.append(allocator, encode.srli(out, out, 36));
     try code.append(allocator, encode.fmv_w_x(f0, out)); // f0 = o.f (exponent biased low)
     // Multiply by the magic 2^112 (0x77800000) to rebias the exponent into f32 range. A pure power
-    // of two, so the product is exact and independent of the rounding mode; it also renormalizes a
+    // of two, so the product is exact and independent of the rounding mode. It also renormalizes a
     // subnormal half into a normal f32.
     try loadImm32(allocator, code, s0, 0x77800000);
     try code.append(allocator, encode.fmv_w_x(f1, s0));
@@ -1460,31 +1514,32 @@ fn emitHalfToFloat(allocator: std.mem.Allocator, code: *std.ArrayList(u32), out:
     try loadImm32(allocator, code, s1, 0x7F800000); // f32 all-ones exponent
     try code.append(allocator, encode.and_(s0, s0, s1));
     try code.append(allocator, encode.or_(out, out, s0));
-    // sign: bit 15 of the half -> bit 31 of the f32.
+    // sign: bit 15 of the half maps to bit 31 of the f32.
     try code.append(allocator, encode.srli(s1, in, 15));
     try code.append(allocator, encode.slli(s1, s1, 31));
     try code.append(allocator, encode.or_(out, out, s1));
 }
 
-/// Software TRUNCATE f32 -> f16 with round-to-nearest-EVEN. Reads the f32 bit pattern in `in` and
-/// writes the 16-bit half pattern into the LOW 16 bits of `out`. NOTE: the upper bits of `out` are
-/// NOT guaranteed clear (a negative input, sign-extended by the caller's `fmv.x.w`, leaves bits
-/// 16..47 set after the final sign OR); the only consumers are `sh` (takes the low 16) and
-/// `emitHalfToFloat` (re-masks bit 15 down), so this is fine, but a consumer that reads the whole
-/// register (e.g. `sw` or a full-width compare) must mask to 16 bits first. Branchless: it
-/// computes the normal, subnormal, and inf/NaN candidate results and blends them with masks derived
-/// from the input's exponent range, mirroring Fabian Giesen's `float_to_half_fast3_rtne` but with
-/// the three branches turned into masked selects so no basic block is split mid-emit. Handles RNE
-/// ties in both directions (the mant-odd bias), overflow to inf, gradual underflow into f16
-/// subnormals or signed zero, and NaN (mapped to a quiet NaN with nonzero mantissa). `in` is left
-/// untouched; `out` and the four `f16_scratch_*` registers plus float scratch `f0`/`f1` are
-/// clobbered. `in` and `out` must differ from each of the four scratch GPRs.
+/// Software truncate f32 to f16 with round-to-nearest-even. Reads the f32 bit pattern in `in` and
+/// writes the 16-bit half pattern into the low 16 bits of `out`. Note: the upper bits of `out` are
+/// not guaranteed clear (a negative input, sign-extended by the caller's `fmv.x.w`, leaves bits
+/// 16..47 set after the final sign OR). The only consumers are `sh` (takes the low 16) and
+/// `emitHalfToFloat` (re-masks bit 15 down), so this is fine. But a consumer that reads the whole
+/// register (for example `sw` or a full-width compare) must mask to 16 bits first. This is
+/// branchless: it computes the normal, subnormal, and inf/NaN candidate results and blends them
+/// with masks derived from the input's exponent range, mirroring Fabian Giesen's
+/// `float_to_half_fast3_rtne` but with the three branches turned into masked selects, so no basic
+/// block is split mid-emit. It handles round-to-nearest-even ties in both directions (the mant-odd
+/// bias), overflow to inf, gradual underflow into f16 subnormals or signed zero, and NaN (mapped to
+/// a quiet NaN with nonzero mantissa). `in` is left untouched. `out` and the four `f16_scratch_*`
+/// registers plus float scratch `f0`/`f1` are clobbered. `in` and `out` must differ from each of the
+/// four scratch GPRs.
 fn emitFloatToHalf(allocator: std.mem.Allocator, code: *std.ArrayList(u32), out: Reg, in: Reg, f0: FReg, f1: FReg) std.mem.Allocator.Error!void {
     const abs = f16_scratch_a; // |f| bits (kept live for the whole routine)
     const s1 = f16_scratch_b;
     const s2 = f16_scratch_c;
     const s3 = f16_scratch_d;
-    // abs = in & 0x7fffffff (strip the sign; slli 33 / srli 33 keeps the low 31 bits).
+    // abs = in & 0x7fffffff (strip the sign. slli 33 / srli 33 keeps the low 31 bits).
     try code.append(allocator, encode.slli(abs, in, 33));
     try code.append(allocator, encode.srli(abs, abs, 33));
 
@@ -1503,7 +1558,7 @@ fn emitFloatToHalf(allocator: std.mem.Allocator, code: *std.ArrayList(u32), out:
 
     // --- SUBNORMAL candidate, selected when abs < (113 << 23) ---
     // o_sub = bits(abs_as_f32 + 0.5) - 0x3f000000. Adding the magic 0.5 aligns the 10 mantissa bits
-    // at the bottom of the float under RNE; the integer subtract of the bias yields the half.
+    // at the bottom of the float under RNE. The integer subtract of the bias yields the half.
     try code.append(allocator, encode.fmv_w_x(f0, abs));
     try loadImm32(allocator, code, s1, 0x3F000000); // 0.5f
     try code.append(allocator, encode.fmv_w_x(f1, s1));
@@ -1534,7 +1589,7 @@ fn emitFloatToHalf(allocator: std.mem.Allocator, code: *std.ArrayList(u32), out:
     try code.append(allocator, encode.and_(s3, s3, s1));
     try code.append(allocator, encode.xor_(out, out, s3));
 
-    // Mask to 16 bits, then OR in the sign (bit 31 of the input -> bit 15 of the half).
+    // Mask to 16 bits, then OR in the sign (bit 31 of the input maps to bit 15 of the half).
     try code.append(allocator, encode.slli(out, out, 48));
     try code.append(allocator, encode.srli(out, out, 48));
     try code.append(allocator, encode.srli(s1, in, 31));
@@ -1549,9 +1604,9 @@ fn emitFloatToHalf(allocator: std.mem.Allocator, code: *std.ArrayList(u32), out:
 /// the bit pattern between the float register and the convert routines, whose own scratch is the
 /// four `f16_scratch_*` GPRs and the two float spill scratches `fspill0`/`fspill1`.
 fn emitRoundToHalf(allocator: std.mem.Allocator, code: *std.ArrayList(u32), fr: FReg, fspill0: FReg, fspill1: FReg) std.mem.Allocator.Error!void {
-    try code.append(allocator, encode.fmv_x_w(scratch_reg, fr)); // f32 bits -> x6
-    try emitFloatToHalf(allocator, code, spill_scratch1, scratch_reg, fspill0, fspill1); // half -> x8
-    try emitHalfToFloat(allocator, code, scratch_reg, spill_scratch1, fspill0, fspill1); // f32 -> x6
+    try code.append(allocator, encode.fmv_x_w(scratch_reg, fr)); // f32 bits into x6
+    try emitFloatToHalf(allocator, code, spill_scratch1, scratch_reg, fspill0, fspill1); // half into x8
+    try emitHalfToFloat(allocator, code, scratch_reg, spill_scratch1, fspill0, fspill1); // f32 into x6
     try code.append(allocator, encode.fmv_w_x(fr, scratch_reg)); // back into the float register
 }
 
@@ -1573,6 +1628,22 @@ fn intLoadInsn(func: *const Function, ty: ir.types.Type, rd: Reg, base: Reg, off
     if (bits <= 16) return if (signed) encode.lh(rd, base, off) else encode.lhu(rd, base, off);
     if (bits <= 32) return if (signed) encode.lw(rd, base, off) else encode.lwu(rd, base, off);
     return encode.ld(rd, base, off);
+}
+
+/// The LP64D count of this variadic function's fixed parameters that consumed an integer argument
+/// register (a0..a7). A fixed float/double parameter takes an fa-register instead and is not counted.
+/// `va_start` uses this to find the first variadic slot (`va_save_base + 8*count`). The count is
+/// uncapped, so the caller can reject a case with more than 8. Those extra fixed params spill to the
+/// stack, so the first variadic slot is no longer at the a-reg block, an edge this backend does not
+/// model.
+fn fixedIntParamCount(func: *const Function) u32 {
+    const eparams = func.blockParams(@enumFromInt(0));
+    const n_fixed = @min(func.num_fixed_params, @as(u32, @intCast(eparams.len)));
+    var gp: u32 = 0;
+    for (eparams[0..n_fixed]) |p| {
+        if (!isFloat(func, func.valueType(p))) gp += 1;
+    }
+    return gp;
 }
 
 /// The store instruction for an integer-like value of `ty` (width only).
@@ -1600,7 +1671,7 @@ fn arithWord(op: BinOp, rd: Reg, rs1: Reg, rs2: Reg) u32 {
         .add => encode.add(rd, rs1, rs2),
         .sub => encode.sub(rd, rs1, rs2),
         .mul => encode.mul(rd, rs1, rs2),
-        .mulh => encode.mulh(rd, rs1, rs2), // signed high multiply; unsigned takes mulhu in the caller
+        .mulh => encode.mulh(rd, rs1, rs2), // signed high multiply, unsigned takes mulhu in the caller
         .div => encode.div(rd, rs1, rs2),
         .rem => encode.rem(rd, rs1, rs2),
         .bit_and => encode.and_(rd, rs1, rs2),
@@ -1621,15 +1692,15 @@ fn isTempReg(reg: Reg) bool {
 /// Whether the integer `icmp` at `insts[idx]` fuses into an immediately-following
 /// `@"if"` whose condition it is and whose only use it is. When it fuses, the icmp's
 /// slt/sltu materialization is skipped and the if emits a native compare-and-branch on
-/// the icmp's two operands (see the `.icmp` and `.@"if"` cases). This is the ONE
+/// the icmp's two operands (see the `.icmp` and `.@"if"` cases). This is the one
 /// eligibility predicate shared by the icmp-skip and the fused if, so they never
-/// disagree (no dangling or doubled compare). Gated to integer operands (the slt/sltu
-/// path); float compares keep the materialize-then-test path. Immediately-preceding +
-/// single-use make skipping the boolean register-safe: nothing runs between the icmp and
-/// the if, so the operand registers still hold their values at the if, and no other
-/// reader needs the boolean.
+/// disagree (no dangling or doubled compare). It is gated to integer operands (the
+/// slt/sltu path). Float compares keep the materialize-then-test path. Being
+/// immediately-preceding and single-use makes skipping the boolean register-safe: nothing
+/// runs between the icmp and the if, so the operand registers still hold their values at
+/// the if, and no other reader needs the boolean.
 ///
-/// This predicate itself carries no model gate; both call sites in `emitFromAllocation` (the
+/// This predicate itself carries no model gate. Both call sites in `emitFromAllocation` (the
 /// icmp-skip and the fused `.@"if"`) additionally require the local `fuse_cmp_branch` (threaded
 /// from `caps.fuse_cmp_branch`) before honoring it, so a model without the fusion falls back to
 /// the materialize-then-test path unchanged.
@@ -1657,28 +1728,28 @@ fn fusesIntoNextIf(func: *const Function, insts: []const ir.function.Inst, idx: 
     return countUses(func, result) == 1;
 }
 
-/// Whether the float `mul` at `insts[idx]` (scalar or RVV vector) fuses into an immediately-
+/// Whether the float `mul` at `insts[idx]` (scalar or RVV vector) fuses into an immediately
 /// following float `add`/`sub` that consumes its result as a fused multiply-add/subtract (one
-/// rounding instead of two - legal because Vulcan permits fp-contraction). When it fuses, the
+/// rounding instead of two, legal because Vulcan permits fp-contraction). When it fuses, the
 /// mul's materialization is skipped and the add/sub emits the matching fused instruction on the
 /// mul's own operands (see the `.arith` case below): `fmadd`/`fmsub`/`fnmsub` for a scalar,
-/// `vfmacc`/`vfmsac`/`vfnmsac` for an RVV vector. This is the ONE eligibility predicate shared
+/// `vfmacc`/`vfmsac`/`vfnmsac` for an RVV vector. This is the one eligibility predicate shared
 /// by the mul-skip and the fused add/sub emission, so they never disagree (no dangling or
-/// doubled multiply) - mirrors `fusesIntoNextIf`. Gated to float operands, scalar or vector:
-/// integer `add(mul,c)` has no rounding to fuse away and is never an fma. Unlike aarch64's NEON
-/// FMLA/FMLS (which can only ever add or subtract the product, never negate the whole result,
-/// so `sub(mul,c) = a*b-c` has no matching instruction there), RVV's OPFVV fused family covers
-/// all three shapes - `vfmacc`/`vfmsac`/`vfnmsac` - so no shape needs rejecting here for a
-/// vector mul. et-soc VPU (`vpu`, the same flag `selectFunction` threads through the whole
-/// lowering pass) fuses only the FLOAT add shape: the CORE-ET ISA has just `fmadd.ps` (a*b+c),
+/// doubled multiply). It mirrors `fusesIntoNextIf`. It is gated to float operands, scalar or
+/// vector. An integer `add(mul,c)` has no rounding to fuse away and is never an fma. Unlike
+/// aarch64's NEON FMLA/FMLS (which can only ever add or subtract the product, never negate the
+/// whole result, so `sub(mul,c) = a*b-c` has no matching instruction there), RVV's OPFVV fused
+/// family covers all three shapes, `vfmacc`/`vfmsac`/`vfnmsac`, so no shape needs rejecting here
+/// for a vector mul. et-soc VPU (`vpu`, the same flag `selectFunction` threads through the whole
+/// lowering pass) fuses only the float add shape. The CORE-ET ISA has just `fmadd.ps` (a*b+c),
 /// with no packed subtract-fma (`fmsub.ps`/`fnmsub.ps`) and no packed-integer fma sibling of the
-/// `pi` ops. So a `vpu` INTEGER vector mul is rejected outright here, and a `vpu` float vector
+/// `pi` ops. So a `vpu` integer vector mul is rejected outright here, and a `vpu` float vector
 /// mul is accepted but only into an `add` (the `addsub.op != .add` guard below drops the sub
-/// shapes). The VPU add emission (see `.arith` below) re-checks this SAME predicate, so the two
-/// sites never disagree: without agreement a skipped-but-unfused product would be reloaded but
-/// never materialized. The immediately-preceding + single-use conditions make skipping the product
+/// shapes). The VPU add emission (see `.arith` below) re-checks this same predicate, so the two
+/// sites never disagree. Without agreement a skipped-but-unfused product would be reloaded but
+/// never materialized. Being immediately-preceding and single-use makes skipping the product
 /// register-safe: nothing runs between the mul and the add/sub, so the mul's operand registers
-/// still hold their values there (floats never spill in this allocator - see `alloc.float` - and
+/// still hold their values there (floats never spill in this allocator, see `alloc.float`, and
 /// a vector operand not yet spilled is unaffected by anything emitted in between, since nothing
 /// is), and no other reader needs the standalone product.
 fn fusesIntoNextArith(func: *const Function, insts: []const ir.function.Inst, idx: usize, vpu: bool) bool {
@@ -1688,11 +1759,11 @@ fn fusesIntoNextArith(func: *const Function, insts: []const ir.function.Inst, id
     };
     if (mul.op != .mul) return false;
     const lhs_ty = func.valueType(mul.lhs);
-    // A vector mul is assumed float (this backend's RVV arithmetic path - the `isVector` case
-    // in `.arith` below - only ever lowers float lanes; there is no integer RVV path to guard
-    // against). A scalar mul must be float too: !isFloat means an integer mul, no rounding to
-    // fuse away. A vector mul under `vpu` fuses only when float: there is no packed-integer fma,
-    // so a `vpu` INTEGER vector mul is rejected (see the doc comment above); a float one falls
+    // A vector mul is assumed float (this backend's RVV arithmetic path, the `isVector` case
+    // in `.arith` below, only ever lowers float lanes, so there is no integer RVV path to guard
+    // against). A scalar mul must be float too: !isFloat means an integer mul, with no rounding to
+    // fuse away. A vector mul under `vpu` fuses only when float, since there is no packed-integer fma.
+    // So a `vpu` integer vector mul is rejected (see the doc comment above), and a float one falls
     // through to the add-shape check below.
     const vector = isVector(func, lhs_ty);
     if (vector) {
@@ -1713,7 +1784,7 @@ fn fusesIntoNextArith(func: *const Function, insts: []const ir.function.Inst, id
     };
     if (addsub.op != .add and addsub.op != .sub) return false;
     // et-soc VPU has only `fmadd.ps` (a*b+c). There is no `fmsub.ps`/`fnmsub.ps`, so a `vpu`
-    // float vector mul fuses only into an `add`; the sub shapes keep their separate fmul.ps +
+    // float vector mul fuses only into an `add`. The sub shapes keep their separate fmul.ps plus
     // fsub.ps. The RVV vector path (vpu == false) still fuses both add and sub via its OPFVV
     // family, and the scalar path is unaffected.
     if (vector and vpu and addsub.op != .add) return false;
@@ -1725,17 +1796,18 @@ fn fusesIntoNextArith(func: *const Function, insts: []const ir.function.Inst, id
     return countUses(func, result) == 1;
 }
 
-/// Whether the SCALAR-FLOAT fused multiply-add at mul index `idx` may actually be emitted as a
-/// single R4-type `fmadd`/`fmsub`/`fnmsub`. Requires the shared `fusesIntoNextArith` eligibility
-/// AND that all four float values it involves (the mul's two operands, the accumulator, and the
-/// add/sub result) are register-resident: the R4 form reads three source registers at once, one
-/// more than the two float spill scratch registers can reload, so under float register pressure
-/// the pass must fall back to a separate mul + add (each within the two-scratch budget). Both the
-/// mul-skip and the fused-emission sites gate on this same predicate, so they never disagree. With
-/// no float spill (the common case) every operand is resident, so this is always true and the
-/// fused instruction is emitted exactly as before this spill support existed: byte-identical.
-/// Only meaningful for a scalar-float mul; the RVV vector fused path has three vector scratch
-/// registers and keeps its own spill handling, so it does not consult this.
+/// Whether the scalar-float fused multiply-add at mul index `idx` may actually be emitted as a
+/// single R4-type `fmadd`/`fmsub`/`fnmsub`. This requires the shared `fusesIntoNextArith`
+/// eligibility, and that all four float values it involves (the mul's two operands, the
+/// accumulator, and the add/sub result) are register-resident. The R4 form reads three source
+/// registers at once, one more than the two float spill scratch registers can reload, so under
+/// float register pressure the pass must fall back to a separate mul plus add (each within the
+/// two-scratch budget). Both the mul-skip and the fused-emission sites gate on this same
+/// predicate, so they never disagree. With no float spill (the common case) every operand is
+/// resident, so this is always true, and the fused instruction is emitted exactly as before this
+/// spill support existed, byte-identical.
+/// This is only meaningful for a scalar-float mul. The RVV vector fused path has three vector
+/// scratch registers and keeps its own spill handling, so it does not consult this.
 fn fusesScalarFloatArith(func: *const Function, alloc: *const Allocation, insts: []const ir.function.Inst, idx: usize, vpu: bool) bool {
     if (!fusesIntoNextArith(func, insts, idx, vpu)) return false;
     const mul = func.opcode(insts[idx]).arith;
@@ -1749,20 +1821,20 @@ fn fusesScalarFloatArith(func: *const Function, alloc: *const Allocation, insts:
 }
 
 /// Whether the `arith_imm{.shl, b, k}` at index `idx` fuses with the next `arith{.add}` into one
-/// Zba `sh{k}add rd, b, x` (rd = x + (b << k), a 64-bit result). This is the ONE eligibility
+/// Zba `sh{k}add rd, b, x` (rd = x + (b << k), a 64-bit result). This is the one eligibility
 /// predicate shared by the shl-skip (in the `.arith_imm` arm) and the fused emit (in the `.arith`
 /// add arm), so they never disagree (no dangling or doubled shift). `enabled` carries
-/// `caps.fuse_shift_add`, which is FALSE by default and TRUE only for a Zba model, so without it
+/// `caps.fuse_shift_add`, which is false by default and true only for a Zba model, so without it
 /// both sites fall back to the plain `slli`+`add` path and stay byte-identical.
 ///
 /// Conditions: `sh{k}add` exists only for k in {1, 2, 3}, so the shift amount must be one of those.
-/// The result is 64-bit (`sh{k}add` produces a full 64-bit sum: a 32-bit add would need `sh{k}add.uw`,
-/// deferred). Only `.add` folds (there is no sh-sub form), and it is commutative, so the shl result
-/// may be either add operand. Integer / GPR operands only (a float or vector shl routes elsewhere).
-/// The shl result is SINGLE-USE (its only reader is this add, so skipping the standalone shifted value
-/// is safe). The shl must immediately precede the add so nothing runs between them and `b` still holds
-/// its value at the add (loaded fresh there), exactly as `fusesIntoNextArith` relies on for the fused
-/// product's operands.
+/// The result is 64-bit (`sh{k}add` produces a full 64-bit sum, since a 32-bit add would need
+/// `sh{k}add.uw`, deferred). Only `.add` folds (there is no sh-sub form), and it is commutative, so
+/// the shl result may be either add operand. Integer and GPR operands only (a float or vector shl
+/// routes elsewhere). The shl result is single-use (its only reader is this add, so skipping the
+/// standalone shifted value is safe). The shl must immediately precede the add, so nothing runs
+/// between them and `b` still holds its value at the add (loaded fresh there), exactly as
+/// `fusesIntoNextArith` relies on for the fused product's operands.
 fn fusesIntoNextShiftAdd(func: *const Function, insts: []const ir.function.Inst, idx: usize, enabled: bool) bool {
     if (!enabled) return false;
     const shl = switch (func.opcode(insts[idx])) {
@@ -1772,7 +1844,7 @@ fn fusesIntoNextShiftAdd(func: *const Function, insts: []const ir.function.Inst,
     if (shl.op != .shl) return false;
     // sh{k}add supports only k in {1, 2, 3}. Any other shift amount stays on the plain path.
     if (shl.imm < 1 or shl.imm > 3) return false;
-    // Integer / GPR operands only: sh-add is a GPR ALU form. A float or vector shl is served elsewhere.
+    // Integer and GPR operands only: sh-add is a GPR ALU form. A float or vector shl is served elsewhere.
     if (isVector(func, func.valueType(shl.lhs)) or isFloat(func, func.valueType(shl.lhs))) return false;
     if (idx + 1 >= insts.len) return false; // must be immediately followed by the add
     const add = switch (func.opcode(insts[idx + 1])) {
@@ -1832,6 +1904,15 @@ fn usesInInst(func: *const Function, inst: ir.function.Inst, v: Value) usize {
         .prefetch => |pf| {
             if (pf.ptr == v) c += 1;
         },
+        .va_start => |vs| {
+            if (vs.list == v) c += 1;
+        },
+        .va_arg => |va| {
+            if (va.list == v) c += 1;
+        },
+        .va_end => |ve| {
+            if (ve.list == v) c += 1;
+        },
         .dot => |d| {
             if (d.acc == v) c += 1;
             if (d.a == v) c += 1;
@@ -1845,14 +1926,22 @@ fn usesInInst(func: *const Function, inst: ir.function.Inst, v: Value) usize {
         .struct_new => |sn| for (func.valueList(sn.fields)) |f| {
             if (f == v) c += 1;
         },
-        .call => |cl| for (func.valueList(cl.args)) |a| {
-            if (a == v) c += 1;
+        .call => |cl| {
+            for (func.valueList(cl.args)) |a| {
+                if (a == v) c += 1;
+            }
+            if (cl.ret_dest) |rd| if (rd == v) {
+                c += 1; // the register-return dest, read post-call
+            };
         },
         .call_indirect => |cl| {
             if (cl.target == v) c += 1;
             for (func.valueList(cl.args)) |a| {
                 if (a == v) c += 1;
             }
+            if (cl.ret_dest) |rd| if (rd == v) {
+                c += 1; // the register-return dest, read post-call
+            };
         },
         .extract => |e| {
             if (e.aggregate == v) c += 1;
@@ -1879,7 +1968,7 @@ fn usesInInst(func: *const Function, inst: ir.function.Inst, v: Value) usize {
 fn usesInTerm(func: *const Function, block: Block, v: Value) usize {
     var c: usize = 0;
     if (func.terminator(block)) |term| switch (term) {
-        .ret => |x| if (x) |xx| {
+        .ret => |r| for (r.slice()) |xx| {
             if (xx == v) c += 1;
         },
         .jump => |j| for (func.blockArgs(j)) |a| {
@@ -1892,29 +1981,29 @@ fn usesInTerm(func: *const Function, block: Block, v: Value) usize {
 // ===========================================================================
 // riscv64 RegDescription for the shared Wimmer-Franz allocator (wimmer.zig).
 //
-// riscv64 has FOUR register classes, versus aarch64's two:
+// riscv64 has four register classes, versus aarch64's two:
 //   class 0 "int"        (Reg,  8-byte slot)  index = @intFromEnum(Reg)  x0..x31
 //   class 1 "float"      (FReg, 8-byte slot)  index = @intFromEnum(FReg) f0..f31
 //   class 2 "vector"     (VReg, 16-byte slot) index = @intFromEnum(VReg) v0..v31  (RVV)
 //   class 3 "vpu_vector" (FReg, 32-byte slot) index = @intFromEnum(FReg) f0..f31  (et-soc VPU)
 //
-// A per-function `vpu` bool (from caps.vpu) picks ONE of the two vector classes: RVV (class 2) when
-// false, et-soc VPU (class 3) when true, so exactly one of class 2 / class 3 has a non-empty pool.
-// vpu mode also NARROWS the scalar-float pool (class 1) to f0..f7, because the VPU has no separate
+// A per-function `vpu` bool (from caps.vpu) picks one of the two vector classes: RVV (class 2) when
+// false, et-soc VPU (class 3) when true. So exactly one of class 2 or class 3 has a non-empty pool.
+// vpu mode also narrows the scalar-float pool (class 1) to f0..f7, because the VPU has no separate
 // vector file and instead partitions the shared FReg file (see the vpu note above `vpu_vector_regs`).
 //
-// INDEX-SPACE OVERLAP: class 1 and class 3 BOTH index the FReg enum, so their register indices
-// collide numerically (e.g. index 16 is f16 for either). They stay disjoint by POOL, never by index:
-// class 1 draws from f0..f7 (vpu) or f0..f9/f18..f29 (non-vpu), class 3 draws from f16..f27, and the
-// two are never both active in one function. The (class, index) pair is what disambiguates them, and
-// the eventual translation (Task 3) maps a (class, index) back to the right FReg/VReg. This is only
-// the DESCRIPTION; no allocation runs here.
+// Index-space overlap: class 1 and class 3 both index the FReg enum, so their register indices
+// collide numerically (for example index 16 is f16 for either). They stay disjoint by pool, never by
+// index. Class 1 draws from f0..f7 (vpu) or f0..f9/f18..f29 (non-vpu), class 3 draws from f16..f27, and
+// the two are never both active in one function. The (class, index) pair is what disambiguates them, and
+// the eventual translation maps a (class, index) back to the right FReg/VReg. This is only
+// the description. No allocation runs here.
 //
 // This mirrors `aarch64RegDescription`'s shape and builds its content from the same pools/ABI/call
 // logic the retired native linear scan used, now the sole allocation description for riscv64.
 
 /// Backend context threaded through `classOf`/`useKind`. Unlike aarch64 (whose class decision needs
-/// no state), riscv64's class for a VECTOR value depends on the per-function `vpu` mode, so the ctx
+/// no state), riscv64's class for a vector value depends on the per-function `vpu` mode, so the ctx
 /// carries it. Two file-scope singletons give a stable, non-owned `ctx` pointer per mode with no
 /// per-call allocation (the shared `RegDescription.deinit` does not free `ctx`).
 const Riscv64RegCtx = struct { vpu: bool };
@@ -1932,7 +2021,7 @@ fn riscv64ClassOf(ctx: *const anyopaque, func: *const Function, v: Value) u16 {
 }
 
 /// `RegDescription.useKind` for riscv64: every operand needs a register. riscv64 has no memory
-/// operands, and some sites (e.g. the fused compare-and-branch) cannot reload a spilled operand, so
+/// operands, and some sites (for example the fused compare-and-branch) cannot reload a spilled operand, so
 /// `must_have_register` is both conservative and correct. Unused params are the generic hook shape.
 fn riscv64UseKind(ctx: *const anyopaque, func: *const Function, inst: ir.function.Inst, operand: Value) wimmer.UseKind {
     _ = ctx;
@@ -1949,9 +2038,9 @@ fn regIndexSlice(allocator: std.mem.Allocator, comptime RegT: type, regs: []cons
     return out;
 }
 
-/// Allocate a `[]u16` of the class-relative indices of `a` followed by `b`. The caller owns it. Used
-/// to build a per-call clobber set from the allocatable caller-saved temp slice PLUS the ABI argument
-/// registers (both caller-saved, both clobbered by a call).
+/// Allocate a `[]u16` of the class-relative indices of `a` followed by `b`. The caller owns it. This
+/// is used to build a per-call clobber set from the allocatable caller-saved temp slice plus the ABI
+/// argument registers (both caller-saved, both clobbered by a call).
 fn regIndexSliceCat(allocator: std.mem.Allocator, comptime RegT: type, a: []const RegT, b: []const RegT) std.mem.Allocator.Error![]u16 {
     const out = try allocator.alloc(u16, a.len + b.len);
     for (a, 0..) |r, i| out[i] = @intFromEnum(r);
@@ -1962,27 +2051,28 @@ fn regIndexSliceCat(allocator: std.mem.Allocator, comptime RegT: type, a: []cons
 /// Build the per-function riscv64 `RegDescription` the shared Wimmer-Franz allocator consumes,
 /// mirroring `aarch64RegDescription`. The four classes, entry-param pinning, per-call clobbers, and
 /// scratch registers come from `allocateRegisters`'s pools/ABI/call logic. `vpu` selects the et-soc
-/// VPU register model (class 3 active, narrowed float pool) over the RVV one (class 2 active). Task 1
-/// builds only the description (no allocation runs). The caller owns the result and must `deinit` it.
+/// VPU register model (class 3 active, narrowed float pool) over the RVV one (class 2 active). This
+/// function builds only the description. No allocation runs here. The caller owns the result and
+/// must `deinit` it.
 ///
-/// Call-clobber mechanism: every call site clobbers, per class, that class's CALLER-SAVED registers,
-/// AND ALL of the active vector class's registers (v1..v27 for RVV, f16..f27 for VPU), since every
-/// vector register is caller-saved. A vector value therefore cannot survive a call in a register, so
-/// the shared allocator SPILLS/splits it across the call. This GENERALIZES the old riscv64 path,
-/// which bailed `error.Unsupported` on a vector live across a call.
+/// Call-clobber mechanism: every call site clobbers, per class, that class's caller-saved registers,
+/// and also every register of the active vector class (v1..v27 for RVV, f16..f27 for VPU), since
+/// every vector register is caller-saved. A vector value therefore cannot survive a call in a
+/// register, so the shared allocator spills or splits it across the call. This generalizes the old
+/// riscv64 path, which bailed `error.Unsupported` on a vector live across a call.
 ///
-/// Gap B (SP3 Task 2): `uses_f16` shrinks class 0's caller-saved temp slice from `temp_regs` (x5/x7/
-/// x28..x31) to `temp_regs_f16` (x5/x7 only), mirroring the OLD `compileFunction`'s
+/// `uses_f16` shrinks class 0's caller-saved temp slice from `temp_regs` (x5/x7/
+/// x28..x31) to `temp_regs_f16` (x5/x7 only), mirroring the old `compileFunction`'s
 /// `reserve_f16_scratch` gate (`uses_f16 and !zfh`, computed by the caller). x28..x31 are the
 /// dedicated software-f16 convert scratch (`emitHalfToFloat`/`emitFloatToHalf`, see `f16_scratch_a`
-/// et al.): every f16 load/convert/store boundary clobbers them unconditionally at emission time,
+/// et al.). Every f16 load/convert/store boundary clobbers them unconditionally at emission time,
 /// regardless of what the allocator does, so a function that uses software f16 must keep the shared
-/// allocator from EVER placing a live value in one of them - both as an allocatable register (so
-/// nothing is ever assigned there) and as a per-call clobber (so nothing is ever forced to treat it as
-/// caller-saved-but-alive-across-a-call there either; harmless either way since nothing is ever
-/// assigned there, but keeping the two lists in sync avoids a stray fixed interval for a register nothing
-/// can occupy). `false` (every non-f16 caller, and any Zfh-native caller once one exists) is
-/// byte-identical to before this parameter existed: class 0 uses the full `temp_regs`.
+/// allocator from ever placing a live value in one of them. This applies both as an allocatable
+/// register (so nothing is ever assigned there) and as a per-call clobber (so nothing is ever forced
+/// to treat it as caller-saved-but-alive-across-a-call there either). It is harmless either way since
+/// nothing is ever assigned there, but keeping the two lists in sync avoids a stray fixed interval
+/// for a register nothing can occupy. `false` (every non-f16 caller, and any Zfh-native caller once
+/// one exists) is byte-identical to before this parameter existed: class 0 uses the full `temp_regs`.
 pub fn riscv64RegDescription(allocator: std.mem.Allocator, func: *const Function, vpu: bool, uses_f16: bool) Error!wimmer.RegDescription {
     // --- Class 0 (int): caller-saved temps x5/x7[/x28..x31 unless f16 shrinks them] + callee-saved
     // x9/x18..x27. ---
@@ -1994,7 +2084,7 @@ pub fn riscv64RegDescription(allocator: std.mem.Allocator, func: *const Function
     const int_cs = try regIndexSlice(allocator, Reg, &saved_regs);
     errdefer allocator.free(int_cs);
 
-    // --- Class 1 (float): vpu narrows to f0..f7 (no callee-saved); non-vpu is the full temp +
+    // --- Class 1 (float): vpu narrows to f0..f7 (no callee-saved). Non-vpu is the full temp +
     // callee-saved float pool. ---
     const float_alloc = if (vpu)
         try regIndexSlice(allocator, FReg, &float_temp_regs_vpu)
@@ -2038,8 +2128,8 @@ pub fn riscv64RegDescription(allocator: std.mem.Allocator, func: *const Function
 
     // --- Entry params: the first 8 int params pin a0..a7 (x10..x17), the first 8 float params pin
     // fa0..fa7 (f10..f17). A vector entry param has no ABI register (riscv64 rejects it downstream),
-    // so it is NOT pre-colored. Params past the first 8 of a class arrive on the stack and are left
-    // to the translation. int/float use SEPARATE ABI counters, matching `allocateRegisters`. ---
+    // so it is not pre-colored. Params past the first 8 of a class arrive on the stack and are left
+    // to the translation. int and float use separate ABI counters, matching `allocateRegisters`. ---
     var ef: std.ArrayList(wimmer.FixedAssign) = .empty;
     errdefer ef.deinit(allocator);
     if (func.blockCount() != 0) {
@@ -2047,9 +2137,9 @@ pub fn riscv64RegDescription(allocator: std.mem.Allocator, func: *const Function
         var float_idx: usize = 0;
         for (func.blockParams(@enumFromInt(0))) |p| {
             const ty = func.valueType(p);
-            if (isVector(func, ty)) continue; // no ABI vector register; not pre-colored
+            if (isVector(func, ty)) continue; // no ABI vector register, not pre-colored
             if (isFloat(func, ty)) {
-                // In vpu mode fa6/fa7 (f16/f17) sit INSIDE the VPU vector partition (class 3), so
+                // In vpu mode fa6/fa7 (f16/f17) sit inside the VPU vector partition (class 3), so
                 // pinning a 7th/8th float param there as a class-1 hint could land a scalar-float
                 // value on top of a live VPU vector (a silent alias). Reject that shape, matching the
                 // native `allocateRegisters` reject (`if (vpu and float_arg >= 6)` below) so both paths
@@ -2066,7 +2156,7 @@ pub fn riscv64RegDescription(allocator: std.mem.Allocator, func: *const Function
     const entry_fixed = try ef.toOwnedSlice(allocator);
     errdefer allocator.free(entry_fixed);
 
-    // --- Call sites: one per `.call` position, in the SAME single-step numbering `buildIntervals`
+    // --- Call sites: one per `.call` position, in the same single-step numbering `buildIntervals`
     // uses (block-param row, one position per instruction, one terminator slot, over every block), so
     // the positions line up with the intervals. ---
     var call_positions: std.ArrayList(u32) = .empty;
@@ -2098,16 +2188,16 @@ pub fn riscv64RegDescription(allocator: std.mem.Allocator, func: *const Function
     }
     for (call_positions.items, 0..) |cpos, i| {
         // Class 0: the caller-saved int registers a value can occupy across a call: the allocatable
-        // temps (`int_temps`: t0/t2[/t3..t6]) PLUS the ABI argument registers a0..a7. The arg
-        // registers are caller-saved and MUST be clobbered - an entry param the hint left in its arg
-        // register would otherwise be wrongly treated as surviving the call (a miscompile: the callee
-        // overwrites it), which is exactly why the off-ABI param eviction never fired before this fix.
-        // The callee-saved x9/x18..x27 correctly survive and stay out of the list; `int_temps` also
-        // drops x28..x31 when f16 shrinks the pool (nothing is ever allocated there).
+        // temps (`int_temps`: t0/t2[/t3..t6]) plus the ABI argument registers a0..a7. The arg
+        // registers are caller-saved and must be clobbered. An entry param the hint left in its arg
+        // register would otherwise be wrongly treated as surviving the call (a miscompile, since the
+        // callee overwrites it), which is exactly why the off-ABI param eviction never fired before
+        // this fix. The callee-saved x9/x18..x27 correctly survive and stay out of the list. `int_temps`
+        // also drops x28..x31 when f16 shrinks the pool (nothing is ever allocated there).
         const int_clob = try regIndexSliceCat(allocator, Reg, int_temps, &int_arg_regs);
         errdefer allocator.free(int_clob);
-        // Class 1: the caller-saved float temps (vpu: f0..f7; non-vpu: f0..f7/f28/f29) PLUS the ABI
-        // float argument registers (fa0..fa7 non-vpu; fa0..fa5 in vpu, where fa6/fa7 lie in the VPU
+        // Class 1: the caller-saved float temps (vpu: f0..f7, non-vpu: f0..f7/f28/f29) plus the ABI
+        // float argument registers (fa0..fa7 non-vpu, fa0..fa5 in vpu, where fa6/fa7 lie in the VPU
         // vector partition and no class-1 param ever sits). Same arg-register clobber reasoning as
         // class 0.
         const float_clob = if (vpu)
@@ -2115,13 +2205,13 @@ pub fn riscv64RegDescription(allocator: std.mem.Allocator, func: *const Function
         else
             try regIndexSliceCat(allocator, FReg, &float_temp_regs, &float_arg_regs);
         errdefer allocator.free(float_clob);
-        // Class 2: ALL of v1..v27 (every RVV register is caller-saved). Empty under vpu.
+        // Class 2: all of v1..v27 (every RVV register is caller-saved). Empty under vpu.
         const vec_clob = if (vpu)
             try allocator.alloc(u16, 0)
         else
             try regIndexSlice(allocator, VReg, &vector_regs);
         errdefer allocator.free(vec_clob);
-        // Class 3: ALL of f16..f27 (every VPU vector register is caller-saved). Empty in non-vpu.
+        // Class 3: all of f16..f27 (every VPU vector register is caller-saved). Empty in non-vpu.
         const vpu_clob = if (vpu)
             try regIndexSlice(allocator, FReg, &vpu_vector_regs)
         else
@@ -2158,12 +2248,13 @@ pub fn riscv64RegDescription(allocator: std.mem.Allocator, func: *const Function
 }
 
 // ===========================================================================
-// Shared Wimmer-Franz integration (riscv64 adoption Tasks 2/3/4): translate a finished
+// Shared Wimmer-Franz integration: translate a finished
 // `wimmer.Allocation` into this backend's own `Allocation` and drive the existing
-// `emitFromAllocation`. Covers ALL FOUR classes: INT, scalar-FLOAT, RVV VECTOR (0/1/2) and the et-soc
-// VPU VECTOR class (3, RV-T4); anything not faithfully translatable (an f16 function, a wrong-width
-// vector, a split/spilled entry param, a same-position action hazard, an if-edge move) bails
-// `error.Unsupported`, never a silent miscompile. The default `compileFunction` path is untouched.
+// `emitFromAllocation`. It covers all four classes: int, scalar-float, RVV vector (0/1/2) and the
+// et-soc VPU vector class (3). Anything not faithfully translatable (an f16 function, a
+// wrong-width vector, a split/spilled entry param, a same-position action hazard, an if-edge move)
+// bails with `error.Unsupported`, never a silent miscompile. The default `compileFunction` path is
+// untouched.
 // ===========================================================================
 
 /// The register class of `v` for the shared allocator: 0 int, 1 scalar float, 2 RVV vector, 3 VPU
@@ -2210,13 +2301,13 @@ fn edgeLocFromWimmer(loc: wimmer.Location) EdgeLoc {
     };
 }
 
-/// Build the drain action realizing `src -> dst` for an INT `value` at `at`: register->slot a
-/// `.store`, slot->register a `.reload`, register->register a `.move`, and slot->slot a
-/// `.slot_to_slot` (Wimmer bridge gap #7: `emitSplitAction` expands it into a reload-then-store pair
-/// through the int class scratch, so it never needs a value register of its own). Infallible, but kept
-/// `Error!` for symmetry with the rest of the translation pipeline (every arm here always succeeds; per
-/// the shared `wimmer.zig` invariant this arm is unreachable through `walloc.actions` today, see
-/// `SplitAction`'s doc comment).
+/// Build the drain action realizing a move from `src` to `dst` for an int `value` at `at`: register
+/// to slot is a `.store`, slot to register is a `.reload`, register to register is a `.move`, and
+/// slot to slot is a `.slot_to_slot` (`emitSplitAction` expands it into a reload-then-store pair
+/// through the int class scratch, so it never needs a value register of its own). This is infallible,
+/// but kept `Error!` for symmetry with the rest of the translation pipeline (every arm here always
+/// succeeds. Per the shared `wimmer.zig` invariant this arm is unreachable through `walloc.actions`
+/// today, see `SplitAction`'s doc comment).
 fn transitionIntAction(value: Value, src: IntLoc, dst: IntLoc, at: usize) Error!SplitAction {
     return switch (src) {
         .reg => |sr| switch (dst) {
@@ -2230,7 +2321,7 @@ fn transitionIntAction(value: Value, src: IntLoc, dst: IntLoc, at: usize) Error!
     };
 }
 
-/// The scalar-float analogue of `transitionIntAction` (class 1, `freg`/`from_freg`); `.slot_to_slot`
+/// The scalar-float analogue of `transitionIntAction` (class 1, `freg`/`from_freg`). `.slot_to_slot`
 /// expands through the class-1 scratch (`float_scratch`, or `float_spill_scratch0_vpu` in vpu mode).
 fn transitionFloatAction(value: Value, src: FloatLoc, dst: FloatLoc, at: usize) Error!SplitAction {
     return switch (src) {
@@ -2246,9 +2337,9 @@ fn transitionFloatAction(value: Value, src: FloatLoc, dst: FloatLoc, at: usize) 
 }
 
 /// The RVV vector analogue of `transitionIntAction`/`transitionFloatAction` (class 2, `vreg`/
-/// `from_vreg`): register->slot a `.store` (vse32), slot->register a `.reload` (vle32), register->
-/// register a `.move` (vmv.v.v), and slot->slot a `.slot_to_slot` expanding through the class-2 scratch
-/// (`vector_scratch`).
+/// `from_vreg`): register to slot is a `.store` (vse32), slot to register is a `.reload` (vle32),
+/// register to register is a `.move` (vmv.v.v), and slot to slot is a `.slot_to_slot` expanding
+/// through the class-2 scratch (`vector_scratch`).
 fn transitionVectorAction(value: Value, src: VectorLoc, dst: VectorLoc, at: usize) Error!SplitAction {
     return switch (src) {
         .reg => |sr| switch (dst) {
@@ -2263,9 +2354,10 @@ fn transitionVectorAction(value: Value, src: VectorLoc, dst: VectorLoc, at: usiz
 }
 
 /// The et-soc VPU vector analogue of `transitionVectorAction` (class 3, `freg`/`from_freg` on the
-/// f16..f27 partition): register->slot a `.store` (fsw.ps), slot->register a `.reload` (flw.ps),
-/// register->register a `.move` (a `vpu_pack_base` round trip, see the class-3 `emitSplitAction`), and
-/// slot->slot a `.slot_to_slot` expanding through the class-3 scratch (`float_scratch`).
+/// f16..f27 partition): register to slot is a `.store` (fsw.ps), slot to register is a `.reload`
+/// (flw.ps), register to register is a `.move` (a `vpu_pack_base` round trip, see the class-3
+/// `emitSplitAction`), and slot to slot is a `.slot_to_slot` expanding through the class-3 scratch
+/// (`float_scratch`).
 fn transitionVpuAction(value: Value, src: VpuLoc, dst: VpuLoc, at: usize) Error!SplitAction {
     return switch (src) {
         .reg => |sr| switch (dst) {
@@ -2290,7 +2382,7 @@ fn blockHasIf(func: *const Function, block: Block) bool {
 
 /// Whether any translated edge move sits on an edge whose predecessor ends in an `if`. The riscv64
 /// `.@"if"` emission only branches (it never realizes a move), and `splitCriticalEdges` splits only
-/// CRITICAL edges, so a surviving non-critical if-edge move would be silently dropped. Bail on it.
+/// critical edges, so a surviving non-critical if-edge move would be silently dropped. Bail on it.
 fn edgeMoveOnIfEdge(func: *const Function, alloc: *const Allocation) bool {
     for (alloc.edge_moves) |set| {
         if (set.moves.len != 0 and blockHasIf(func, set.pred)) return true;
@@ -2301,25 +2393,26 @@ fn edgeMoveOnIfEdge(func: *const Function, alloc: *const Allocation) bool {
 /// Translate a finished shared `wimmer.Allocation` into this backend's `Allocation` so the existing
 /// `emitFromAllocation` can consume it. A whole-life value (one segment) lands in the class `int`/
 /// `float` (register) or `int_spill`/`float_spill` (slot) maps exactly as the native allocator would
-/// leave it; a genuinely split value lands in `segments`/`float_segments`/`vector_segments`/
-/// `vpu_segments`. The intra-block re-home actions for split values are NOT derived per-value here:
-/// the shared allocator already emitted them into `walloc.actions`, ordered per same-position cluster
-/// into a hazard-free parallel-move sequence (`orderIntraActions`), and a single loop after every
-/// value's segments/maps are populated consumes that list verbatim (this backend's own same-position
-/// hazard detector is retired, no longer needed). An RVV vector (class 2) lands in `vector`/
-/// `vector_spill`/`vector_segments`; an et-soc VPU value (class 3) lands in `vpu_vector`/
-/// `vpu_vector_spill`/`vpu_segments`, a VPU value live across a call spilling to a 32-byte slot.
+/// leave it. A genuinely split value lands in `segments`/`float_segments`/`vector_segments`/
+/// `vpu_segments`. The intra-block re-home actions for split values are not derived per-value here.
+/// The shared allocator already emitted them into `walloc.actions`, ordered per same-position cluster
+/// into a hazard-free parallel-move sequence (`orderIntraActions`). A single loop after every
+/// value's segments and maps are populated consumes that list verbatim (this backend's own
+/// same-position hazard detector is retired, no longer needed). An RVV vector (class 2) lands in
+/// `vector`/`vector_spill`/`vector_segments`. An et-soc VPU value (class 3) lands in `vpu_vector`/
+/// `vpu_vector_spill`/`vpu_segments`, with a VPU value live across a call spilling to a 32-byte slot.
 ///
-/// Gap A (SP3 Task 2 - the entry-param ABI hint, mirroring aarch64 SP1 gaps #4/#5): an int/float entry
-/// param (class 0/1 only - a vector param has no ABI register, rejected upstream) is no longer
-/// required to sit whole-life in its ABI arg register. A whole-life placement off the ABI register
-/// (e.g. a param live across a call, parked in a callee-saved register) is realized by
-/// `emitFromAllocation`'s entry-param setup loop, which emits `if (home != arg) mv home, arg`
-/// UNCONDITIONALLY for every int/float param - riscv64 has no leaf-only fast path that skips this move
-/// (unlike aarch64), so there is no leaf-vs-non-leaf distinction to make here. A whole-life param
-/// spilled straight to a slot, or a genuinely SPLIT param, is realized the same way: the entry-param
-/// setup loop stores/moves the incoming ABI argument into the param's first segment/slot, then this
-/// function's normal per-transition drain actions (or `walloc.edge_moves`) realize every later re-home.
+/// The entry-param ABI hint (mirroring aarch64's own gaps here): an int or float entry
+/// param (class 0/1 only, since a vector param has no ABI register and is rejected upstream) is no
+/// longer required to sit whole-life in its ABI arg register. A whole-life placement off the ABI
+/// register (for example a param live across a call, parked in a callee-saved register) is realized
+/// by `emitFromAllocation`'s entry-param setup loop, which emits `if (home != arg) mv home, arg`
+/// unconditionally for every int or float param. riscv64 has no leaf-only fast path that skips this
+/// move (unlike aarch64), so there is no leaf-vs-non-leaf distinction to make here. A whole-life param
+/// spilled straight to a slot, or a genuinely split param, is realized the same way: the entry-param
+/// setup loop stores or moves the incoming ABI argument into the param's first segment or slot, then
+/// this function's normal per-transition drain actions (or `walloc.edge_moves`) realize every later
+/// re-home.
 fn translateAllocation(allocator: std.mem.Allocator, func: *const Function, vpu: bool, walloc: *const wimmer.Allocation) Error!Allocation {
     var alloc: Allocation = .{
         .int = .empty,
@@ -2346,7 +2439,7 @@ fn translateAllocation(allocator: std.mem.Allocator, func: *const Function, vpu:
     alloc.vector_spill_count = walloc.slot_count_per_class[2];
     alloc.vpu_vector_spill_count = walloc.slot_count_per_class[3];
 
-    // def_pos in the SAME single-step numbering the shared allocator and `emitFromAllocation` use
+    // def_pos in the same single-step numbering the shared allocator and `emitFromAllocation` use
     // (block-param row, one position per instruction, one terminator slot, over every block). Every
     // block reaching here is either reachable or neutralized-empty, so each contributes a consistent
     // param-row + insts + terminator span, matching buildIntervals and emitFromAllocation.
@@ -2369,13 +2462,13 @@ fn translateAllocation(allocator: std.mem.Allocator, func: *const Function, vpu:
     }
 
     // riscv64 has no ABI vector register (a vector param would need to arrive on the stack, unmodeled
-    // here), so reject a vector entry param up front. A 9th+ INT param arrives on the stack (the
-    // caller's outgoing-argument area) and IS modeled: it is recorded in `incoming_stack` below and
+    // here), so reject a vector entry param up front. A 9th+ int param arrives on the stack (the
+    // caller's outgoing-argument area) and is modeled: it is recorded in `incoming_stack` below and
     // `emitFromAllocation`'s entry-param loop loads it from that area, restoring the native path's
-    // stack-parameter support. A 9th+ FLOAT stack param is still unmodeled (the float entry-param loop
-    // has no incoming-stack load), so it stays rejected. Gap A (SP3 Task 2): a param placed off its ABI
-    // arg register (a value live across a call, parked in a callee-saved register) and a genuinely SPLIT
-    // param are both handled by the class-0/1 arms below and the entry-param setup loop.
+    // stack-parameter support. A 9th or later float stack param is still unmodeled (the float
+    // entry-param loop has no incoming-stack load), so it stays rejected. A param placed off its ABI
+    // arg register (a value live across a call, parked in a callee-saved register) and a genuinely
+    // split param are both handled by the class-0/1 arms below and the entry-param setup loop.
     if (func.blockCount() != 0) {
         var int_idx: usize = 0;
         var float_idx: usize = 0;
@@ -2385,7 +2478,7 @@ fn translateAllocation(allocator: std.mem.Allocator, func: *const Function, vpu:
             if (isFloat(func, ty)) {
                 // Match the entry-param pin in `riscv64RegDescription`: in vpu mode fa6/fa7 (f16/f17)
                 // lie in the VPU vector partition, so a 7th/8th float param there would alias a class-3
-                // vector; reject it. And a 9th+ float stack param is unmodeled here.
+                // vector. Reject it. And a 9th+ float stack param is unmodeled here.
                 if (vpu and float_idx >= 6) return error.Unsupported;
                 if (float_idx >= 8) return error.Unsupported; // fp stack params not modeled here
                 float_idx += 1;
@@ -2404,7 +2497,7 @@ fn translateAllocation(allocator: std.mem.Allocator, func: *const Function, vpu:
         // The RVV lowering hardcodes VL=4 in its `vsetivli` preamble, so a vector of any other width
         // would be miscompiled. Reject it (mirrors the native path's `isRvvWidth` gate).
         if (class == 2 and !isRvvWidth(func, func.valueType(value))) return error.Unsupported;
-        // The et-soc VPU is a fixed 8-lane machine; any other width would be miscompiled. Reject it
+        // The et-soc VPU is a fixed 8-lane machine. Any other width would be miscompiled. Reject it
         // (mirrors the native path's `isVpuWidth` gate).
         if (class == 3 and !isVpuWidth(func, func.valueType(value))) return error.Unsupported;
 
@@ -2412,8 +2505,8 @@ fn translateAllocation(allocator: std.mem.Allocator, func: *const Function, vpu:
             if (wsegs.len == 1) {
                 switch (wsegs[0].loc) {
                     .reg => |ri| {
-                        // Gap A: an entry param placed off its ABI arg register (e.g. live across a
-                        // call, parked in a callee-saved register) is NOT rejected: `emitFromAllocation`'s
+                        // Gap A: an entry param placed off its ABI arg register (for example live across a
+                        // call, parked in a callee-saved register) is not rejected: `emitFromAllocation`'s
                         // entry-param setup loop unconditionally emits `if (home != arg) mv home, arg`
                         // for every int param (riscv64 has no leaf-only fast path that skips this move,
                         // unlike aarch64), so recording the allocated register here is all this needs.
@@ -2427,7 +2520,7 @@ fn translateAllocation(allocator: std.mem.Allocator, func: *const Function, vpu:
                     .slot => |s| try alloc.int_spill.put(allocator, value, s),
                 }
             } else {
-                // Gap A: a genuinely SPLIT value, param or not. A split entry param's `segments[0]`
+                // Gap A: a genuinely split value, param or not. A split entry param's `segments[0]`
                 // still needs establishing from the incoming ABI argument, but that is
                 // `emitFromAllocation`'s job (the per-instruction position it runs at does not exist
                 // yet here): its entry-param setup loop consults `alloc.segments` directly and emits a
@@ -2438,8 +2531,8 @@ fn translateAllocation(allocator: std.mem.Allocator, func: *const Function, vpu:
                     allocator.free(segs);
                     return err;
                 };
-                // The intra-block re-home actions for these transitions are NOT derived here: the
-                // shared allocator already emitted them into `walloc.actions`, ORDERED per same-position
+                // The intra-block re-home actions for these transitions are not derived here: the
+                // shared allocator already emitted them into `walloc.actions`, ordered per same-position
                 // cluster into a hazard-free parallel-move sequence (`orderIntraActions`). The loop below
                 // (after every value's segments/maps are populated) consumes that list verbatim.
             }
@@ -2464,7 +2557,7 @@ fn translateAllocation(allocator: std.mem.Allocator, func: *const Function, vpu:
         } else if (class == 2) {
             // class 2: RVV vector. A vector entry param is rejected above (no ABI vector register), so
             // no ABI-register check is needed here. A whole-life vector lands in `vector` (register) or
-            // `vector_spill` (16-byte slot); a split vector - the shape a vector live across a call
+            // `vector_spill` (16-byte slot). A split vector - the shape a vector live across a call
             // takes, since every vector register is caller-saved - lands in `vector_segments` plus one
             // store/reload/move action per boundary, drained by the class-2 arm of `emitSplitAction`.
             if (wsegs.len == 1) {
@@ -2485,9 +2578,10 @@ fn translateAllocation(allocator: std.mem.Allocator, func: *const Function, vpu:
             // class 3: et-soc VPU vector (FReg partition f16..f27, 32-byte slots). A VPU vector entry
             // param is rejected above (a vector entry param has no ABI register), so no ABI check is
             // needed. A whole-life value lands in `vpu_vector` (register) or `vpu_vector_spill` (32-byte
-            // slot); a split value - the shape a VPU value live across a call takes, since every f16..f27
-            // is caller-saved - lands in `vpu_segments` plus one store/reload/move action per boundary,
-            // drained by the class-3 arm of `emitSplitAction`. This UN-BAILS the old RV-T4 stub.
+            // slot). A split value, the shape a VPU value live across a call takes, since every f16..f27
+            // is caller-saved, lands in `vpu_segments` plus one store/reload/move action per boundary,
+            // drained by the class-3 arm of `emitSplitAction`. This replaces the old class-3 stub, which
+            // used to bail instead.
             std.debug.assert(class == 3);
             if (wsegs.len == 1) {
                 switch (wsegs[0].loc) {
@@ -2507,12 +2601,12 @@ fn translateAllocation(allocator: std.mem.Allocator, func: *const Function, vpu:
     }
 
     // Consume the shared allocator's already-ordered intra-block actions. Each is one primitive
-    // transfer at its position (`src -> dst` in the shared per-class `Location` space); map both sides
+    // transfer at its position (`src -> dst` in the shared per-class `Location` space). Map both sides
     // into this backend's per-class `Loc` and turn it into the matching `SplitAction` via the same
     // `transition{Int,Float,Vector,Vpu}Action` helpers the per-value walk above used to call inline.
     // `walloc.actions` is ascending by `at` with each same-position cluster already in hazard-free
     // order (`orderIntraActions`), so appending it verbatim and draining in order never clobbers a live
-    // value; this retires the backend's own `hasSamePosRegHazard` detector (deleted, no longer needed).
+    // value. This retires the backend's own `hasSamePosRegHazard` detector (deleted, no longer needed).
     for (walloc.actions) |wa| {
         const at: usize = wa.at;
         const act = switch (wa.class) {
@@ -2526,7 +2620,7 @@ fn translateAllocation(allocator: std.mem.Allocator, func: *const Function, vpu:
     }
 
     // Control-flow-edge moves: translate each ordered `wimmer.Move` into this backend's `EdgeMove`,
-    // keyed by (pred, succ). A scalar-float edge move that touches a SLOT is rejected: the width the
+    // keyed by (pred, succ). A scalar-float edge move that touches a slot is rejected: the width the
     // slot was written with is unknown here (the `Move` carries no value), so an 8-byte round trip
     // could mismatch a 4-byte f32 store and read a non-NaN-boxed value. Register-to-register float
     // moves are safe (fmv.d copies the whole 64-bit register). A class-2 (RVV vector) or class-3
@@ -2550,11 +2644,11 @@ fn translateAllocation(allocator: std.mem.Allocator, func: *const Function, vpu:
     alloc.edge_moves = try edge_sets.toOwnedSlice(allocator);
     alloc.edge_move_driven = true;
 
-    // Record the stack index of every 9th+ INT entry param, so `emitFromAllocation`'s entry-param loop
+    // Record the stack index of every 9th+ int entry param, so `emitFromAllocation`'s entry-param loop
     // loads it from the caller's outgoing-argument area (`frame_size + idx*8`) rather than an ABI arg
     // register (there is none for the 9th onward). This restores the native path's stack-parameter
     // support (a 10-argument callee, `tests/cases.zig`). The emit-side load only handles a whole-life
-    // REGISTER home (`alloc.int`); a 9th+ param the shared allocator instead spilled to a slot or split
+    // register home (`alloc.int`). A 9th+ param the shared allocator instead spilled to a slot or split
     // has no incoming-stack load path yet, so reject that rare shape cleanly rather than emit a wrong
     // read from a nonexistent arg register.
     if (func.blockCount() != 0) {
@@ -2593,7 +2687,7 @@ fn emitEdgeMoves(allocator: std.mem.Allocator, code: *std.ArrayList(u32), alloc:
 
 /// Emit one ordered edge move. Class 0 (int): reg->reg `mv`, reg->slot `sd`, slot->reg `ld` (8-byte
 /// slots). Class 1 (float): reg->reg `fmv.d` (a whole 64-bit copy, correct for both f32 NaN-box and
-/// f64); a slot-resident float move never reaches here (the translation rejects it). Class 2 (RVV
+/// f64). A slot-resident float move never reaches here (the translation rejects it). Class 2 (RVV
 /// vector): reg->reg `vmv.v.v`, reg->slot `vse32`, slot->reg `vle32` (16-byte slots, the fixed
 /// <4 x f32> width), the slot address computed into `spill_scratch1`. Class 3 (et-soc VPU vector):
 /// reg->reg a `vpu_pack_base` round trip (no packed move op), reg->slot `fsw.ps`, slot->reg `flw.ps`
@@ -2684,15 +2778,15 @@ fn emitOneEdgeMove(allocator: std.mem.Allocator, code: *std.ArrayList(u32), spil
     }
 }
 
-/// TEST-ONLY: compile `func` through the SHARED Wimmer-Franz allocator instead of the backend's own
-/// `allocateRegisters`, then emit through the SAME battle-tested `emitFromAllocation`. Covers all four
-/// classes: INT, scalar-FLOAT, RVV VECTOR, and (when `vpu`) the et-soc VPU VECTOR class. A vector live
-/// across a call now spills/splits (every RVV register, and every f16..f27 VPU register, is
-/// caller-saved) instead of bailing. SOFTWARE f16 (SP3 Task 2, Gap B) is now handled too:
+/// Test-only: compile `func` through the shared Wimmer-Franz allocator instead of the backend's own
+/// `allocateRegisters`, then emit through the same battle-tested `emitFromAllocation`. It covers all
+/// four classes: int, scalar-float, RVV vector, and (when `vpu`) the et-soc VPU vector class. A
+/// vector live across a call now spills or splits (every RVV register, and every f16..f27 VPU
+/// register, is caller-saved) instead of bailing. Software f16 is now handled too:
 /// `riscv64RegDescription`'s f16 scratch-shrunk pool keeps x28..x31 out of both class 0's allocatable
 /// set and its per-call clobber list, so the software convert routines' unconditional clobber of those
 /// four registers can never collide with a live value. A vector of a width other than the fixed
-/// 4-lane RVV group or 8-lane VPU width, a (VPU or RVV) vector ENTRY param (no ABI vector register), a
+/// 4-lane RVV group or 8-lane VPU width, a (VPU or RVV) vector entry param (no ABI vector register), a
 /// same-position action hazard, an unreachable block, or an if-edge move all bail `error.Unsupported`
 /// (never a silent miscompile). `vpu` selects the et-soc VPU register model (class 3, narrowed
 /// scalar-float pool) over the RVV one (class 2). Splits critical edges up front (mutating `func`, so
@@ -2700,27 +2794,27 @@ fn emitOneEdgeMove(allocator: std.mem.Allocator, code: *std.ArrayList(u32), spil
 /// target-independent `Allocation` into this backend's. The default `compileFunction` is untouched.
 pub fn compileFunctionWimmerRiscv(allocator: std.mem.Allocator, func: *Function, vpu: bool) Error!Compiled {
     if (func.blockCount() == 0) return error.Unsupported;
-    // Only SCALAR f16 is handled (mirrors `compileFunction`'s own composite-f16 gate); f16 nested in a
+    // Only scalar f16 is handled (mirrors `compileFunction`'s own composite-f16 gate). f16 nested in a
     // vector/aggregate would fall through to the raw-vector path and miscompile the half lanes.
     if (ir.function.functionUsesCompositeF16(func)) return error.Unsupported;
-    // SOFTWARE f16 (no Zfh - this entry has no model capability input, so it is always the software
-    // emulation path, exactly like `compileFunction`'s default `.{}` caps): the convert routines need
-    // x28..x31 as dedicated scratch, so shrink class 0's pool the same way `compileFunction` does (see
-    // `riscv64RegDescription` and `ModelCaps.zfh`'s doc comment). A non-f16 function computes `false`
-    // here and gets the byte-identical full pool.
+    // Software f16 (no Zfh, this entry has no model capability input, so it is always the software
+    // emulation path, exactly like `compileFunction`'s default `.{}` caps). The convert routines need
+    // x28..x31 as dedicated scratch, so this shrinks class 0's pool the same way `compileFunction` does
+    // (see `riscv64RegDescription` and `ModelCaps.zfh`'s doc comment). A non-f16 function computes
+    // `false` here and gets the byte-identical full pool.
     const uses_f16 = ir.function.functionUsesF16(func);
 
-    // Split edges FIRST (mutating `func`), before any numbering is built, so the resolver's
-    // no-critical-edge precondition holds and the description/scan/emission all see one CFG. TWO
+    // Split edges first (mutating `func`), before any numbering is built, so the resolver's
+    // no-critical-edge precondition holds and the description/scan/emission all see one control-flow graph. Two
     // passes: `ir.critical_edge` splits every genuinely critical edge (giving the resolver a block for
     // its shuffle), then this backend's own `splitCriticalEdges` splits every remaining if-edge that
-    // still carries ARGS into a jump landing block. The riscv64 `.@"if"` emission only branches (it
+    // still carries args into a jump landing block. The riscv64 `.@"if"` emission only branches (it
     // cannot host an edge move, unlike aarch64's `emitIf`), so every block-param move must land on a
-    // JUMP edge; the second pass guarantees that, exactly as the native riscv64 path already does.
+    // jump edge. The second pass guarantees that, exactly as the native riscv64 path already does.
     try ir.critical_edge.splitCriticalEdges(allocator, func);
     try splitCriticalEdges(allocator, func);
 
-    // The shared numbering covers EVERY block, but `emitFromAllocation` skips unreachable ones without
+    // The shared numbering covers every block, but `emitFromAllocation` skips unreachable ones without
     // advancing its position counter. To keep the two numberings in lockstep, require all-reachable.
     var doms = try dominators.compute(allocator, func);
     defer doms.deinit(allocator);
@@ -2741,31 +2835,31 @@ pub fn compileFunctionWimmerRiscv(allocator: std.mem.Allocator, func: *Function,
     if (edgeMoveOnIfEdge(func, &alloc)) return error.Unsupported;
 
     const caps: ModelCaps = .{ .vpu = vpu };
-    // The Wimmer path does NOT fold addresses: the shared `wimmer.zig` liveness is fold-unaware, so
-    // feeding a real analysis would desync its intervals from emission. Pass the no-fold analysis so
-    // `baseOf`/`offOf`/`isDeadAdd` behave exactly as before folding existed (byte-identical). Note
+    // The Wimmer path does not fold addresses. The shared `wimmer.zig` liveness is fold-unaware, so
+    // feeding a real analysis would desync its intervals from emission. This passes the no-fold analysis
+    // so `baseOf`/`offOf`/`isDeadAdd` behave exactly as before folding existed (byte-identical). Note
     // `compileFunctionWimmerRiscv` never calls `allocateRegisters` (it uses the shared allocator via
     // `wimmer.allocate` + `translateAllocation`), so no fold reaches allocation here either.
     return emitFromAllocation(allocator, func, caps, uses_f16, doms.reachable, &alloc, &empty_fold);
 }
 
-/// Like `compileFunctionWimmerRiscv`, but with ADDRESS-MODE FOLDING ON: the exact pipeline the SP3
-/// production flip (Task 5) will use. It analyzes the folds, then `applyFoldRewriteRiscv` repoints each
-/// folded mem op's `ptr` to its base and DCEs the dead adds IN PLACE, so the fold is VISIBLE to the
+/// Like `compileFunctionWimmerRiscv`, but with address-mode folding on: this is the exact pipeline
+/// production compilation uses. It analyzes the folds, then `applyFoldRewriteRiscv` repoints each
+/// folded mem op's `ptr` to its base and removes the dead adds in place, so the fold is visible to the
 /// fold-blind shared allocator (which reads only raw operands) and `base` stays live to the load/store.
-/// The SAME analysis threads into allocation AND emission: `folds` is keyed by the surviving mem inst,
-/// so `baseOf` returns the (now raw) ptr = base and `offOf` the displacement, consistent with the
-/// rewritten IR (the mem inst survives, only the add is removed, so the offset side-table stays valid).
-/// TEST-ONLY here (the fold-under-pressure differential exercises the rewrite). The flip wires this
-/// pipeline into the production entry. Takes `func` by mutable pointer: `splitCriticalEdges` and
-/// `applyFoldRewriteRiscv` mutate it in place, so a differential caller builds two identical functions
-/// and compiles one each way.
+/// The same analysis threads into both allocation and emission: `folds` is keyed by the surviving mem
+/// inst, so `baseOf` returns the (now raw) ptr as base, and `offOf` the displacement, consistent with
+/// the rewritten IR (the mem inst survives, only the add is removed, so the offset side-table stays
+/// valid). This is test-only here (the fold-under-pressure differential exercises the rewrite). The
+/// flip wires this pipeline into the production entry. It takes `func` by mutable pointer:
+/// `splitCriticalEdges` and `applyFoldRewriteRiscv` mutate it in place, so a differential caller builds
+/// two identical functions and compiles one each way.
 pub fn compileFunctionWimmerRiscvFold(allocator: std.mem.Allocator, func: *Function, vpu: bool) Error!Compiled {
     if (func.blockCount() == 0) return error.Unsupported;
     if (ir.function.functionUsesCompositeF16(func)) return error.Unsupported;
     const uses_f16 = ir.function.functionUsesF16(func);
 
-    // Split edges FIRST (mutating `func`), matching `compileFunctionWimmerRiscv` (both passes).
+    // Split edges first (mutating `func`), matching `compileFunctionWimmerRiscv` (both passes).
     try ir.critical_edge.splitCriticalEdges(allocator, func);
     try splitCriticalEdges(allocator, func);
 
@@ -2793,7 +2887,7 @@ pub fn compileFunctionWimmerRiscvFold(allocator: std.mem.Allocator, func: *Funct
     if (edgeMoveOnIfEdge(func, &alloc)) return error.Unsupported;
 
     const caps: ModelCaps = .{ .vpu = vpu };
-    // Thread the REAL fold into emission: `baseOf`/`offOf` are keyed by the surviving mem inst, so the
+    // Thread the real fold into emission: `baseOf`/`offOf` are keyed by the surviving mem inst, so the
     // base+offset form is emitted and the (already removed) dead add contributes nothing.
     return emitFromAllocation(allocator, func, caps, uses_f16, doms.reachable, &alloc, &fold);
 }
@@ -2806,6 +2900,11 @@ pub const RelocKind = enum {
     pcrel_hi20,
     /// An `addi`'s low 12 bits, paired with the `auipc` at `pair`.
     pcrel_lo12,
+    /// An `auipc`'s high 20 bits of the PC-relative address of a symbol's GOT entry (the high
+    /// half of a GOT-indirect `auipc`/`ld` data-import pair). The paired `ld` reuses
+    /// `pcrel_lo12` (its target is the local `auipc` label). Only emitted for a `via_got`
+    /// `global_addr`. The dynamic linker synthesizes the GOT slot.
+    got_hi20,
 };
 
 pub const Reloc = struct {
@@ -2843,7 +2942,7 @@ pub const Compiled = struct {
 /// `compileFunction` callers in `link.zig`/`object.zig`): no loop-header alignment padding, RVV
 /// (not VPU) vector lowering, a dropped `.prefetch` hint, and the `fuse_*` flags at their
 /// no-extension-required defaults. `fuse_cmp_branch` gates the compare-into-branch fold (see
-/// `fusesIntoNextIf`); the rest are foundation only (no fold reads them yet, so they are inert
+/// `fusesIntoNextIf`). The rest are foundation only (no fold reads them yet, so they are inert
 /// either way).
 pub const ModelCaps = struct {
     /// Loop-header alignment in bytes (0 disables it). See `compileFunction`'s doc comment.
@@ -2852,10 +2951,10 @@ pub const ModelCaps = struct {
     vpu: bool = false,
     /// Lower the IR `.prefetch` hint to a real Zicbop `prefetch.r` instead of dropping it.
     /// Set only when the target model's `features.riscv64.zicbop` is true (see
-    /// `selectFunctionForModel`); `Model.prefetches()` gates whether the insertion pass ever
+    /// `selectFunctionForModel`). `Model.prefetches()` gates whether the insertion pass ever
     /// produces a hint to lower in the first place.
     zicbop: bool = false,
-    /// Lower f16 NATIVELY via the Zfh half-precision instructions (an f16 held natively in a float
+    /// Lower f16 natively via the Zfh half-precision instructions (an f16 held natively in a float
     /// register) instead of the default software emulation (an f16 held as its f32 widening with a
     /// per-boundary inline convert). Set only when the target model's `features.riscv64.zfh` is
     /// true (see `selectFunctionForModel`). Every non-model caller passes `.{}` (zfh = false), so
@@ -2863,7 +2962,7 @@ pub const ModelCaps = struct {
     zfh: bool = false,
     /// Fuse a compare into its consumer branch. riscv64's `beq`/`bne`/`blt`/... already compare-
     /// and-branch in one instruction with no extension, so true by default. Gates
-    /// `fusesIntoNextIf` (see its doc comment); false falls back to materializing the boolean
+    /// `fusesIntoNextIf` (see its doc comment). False falls back to materializing the boolean
     /// with `slt`/`sltu` then testing it with `bne`, exactly as if the icmp/if pair were never
     /// eligible to fuse.
     fuse_cmp_branch: bool = true,
@@ -2873,7 +2972,7 @@ pub const ModelCaps = struct {
     fuse_arith_branch: bool = false,
     /// Fuse a shift into a following add (sh1add/sh2add/sh3add). Needs the Zba extension, so off
     /// unless the model both declares the fusion and sets `features.riscv64.zba` (see
-    /// `selectFunctionForModel`). Gates `fusesIntoNextShiftAdd`; false leaves the plain slli-then-add
+    /// `selectFunctionForModel`). Gates `fusesIntoNextShiftAdd`. False leaves the plain slli-then-add
     /// path, so a non-Zba compile is byte-identical.
     fuse_shift_add: bool = false,
     /// Fuse a high/low address-pair computation (auipc+addi) into one microarch-recognized
@@ -2885,11 +2984,11 @@ pub const ModelCaps = struct {
     fuse_addr_hi_lo: bool = false,
 };
 
-/// Run the SHARED Wimmer allocation for `func` (on a throwaway clone, so the caller's function is
-/// untouched) and hand its per-value segment lists to `f`. The Wimmer allocation is the PRODUCTION
-/// allocator (the SP3 flip), so the split/re-home test gates measure the same allocator `compileFunction`
+/// Run the shared Wimmer allocation for `func` (on a throwaway clone, so the caller's function is
+/// untouched) and hand its per-value segment lists to `f`. The Wimmer allocation is the production
+/// allocator, so the split/re-home test gates measure the same allocator `compileFunction`
 /// uses. It runs the two edge splits `compileFunction` runs (the shared numbering assumes them) but
-/// skips the address-fold rewrite (which only matters for functions with foldable addresses; the
+/// skips the address-fold rewrite. That only matters for functions with foldable addresses. The
 /// split/re-home test inputs are fold-free single-block arithmetic, and `desc` is built vpu-off,
 /// software-f16-off, matching those inputs). A value's `[]wimmer.Segment` is ascending by `from`, and
 /// each segment's `loc` is a register (`.reg`) or a spill slot (`.slot`).
@@ -2908,8 +3007,8 @@ fn forEachWimmerSegments(allocator: std.mem.Allocator, func: *const Function, co
     return count;
 }
 
-/// Test hook: report how many values the shared Wimmer allocator SPLIT (their life spans more than
-/// one segment, e.g. a register prefix plus a spill tail). Zero means no split occurred. The int-spill
+/// Test hook: report how many values the shared Wimmer allocator split (their life spans more than
+/// one segment, for example a register prefix plus a spill tail). Zero means no split occurred. The int-spill
 /// tests call this to assert a case actually exercises the splitter before checking its results (the
 /// production allocator is now Wimmer, so this measures the real path).
 pub fn splitCountForTest(allocator: std.mem.Allocator, func: *const Function) Error!usize {
@@ -2921,8 +3020,8 @@ pub fn splitCountForTest(allocator: std.mem.Allocator, func: *const Function) Er
     return forEachWimmerSegments(allocator, func, count.f);
 }
 
-/// Test hook: report how many values the shared Wimmer allocator RE-HOMED, a value whose segment list
-/// holds a register (`.reg`) segment AFTER a spill (`.slot`) segment (spilled, then brought back into a
+/// Test hook: report how many values the shared Wimmer allocator re-homed, a value whose segment list
+/// holds a register (`.reg`) segment after a spill (`.slot`) segment (spilled, then brought back into a
 /// register for its remaining tail uses). A plain tail-split produces `.reg` then `.slot`, so only a
 /// re-home puts a `.reg` after a `.slot`. Exists so an execution test can prove a reload-into-register
 /// actually fired, not merely that a value was spilled.
@@ -2951,7 +3050,7 @@ pub fn selectFunction(allocator: std.mem.Allocator, func: *const Function) Error
 }
 
 /// Like `selectFunction`, but pads loop-header blocks with nops so they land on a
-/// `fetch_align`-byte boundary (a performance hint from the microarch model; 0
+/// `fetch_align`-byte boundary (a performance hint from the microarch model, 0
 /// disables it). Never changes the function's result, only where headers fall.
 pub fn selectFunctionAligned(allocator: std.mem.Allocator, func: *const Function, fetch_align: u16) Error![]u32 {
     const compiled = try compileFunction(allocator, func, .{ .fetch_align = fetch_align });
@@ -2962,9 +3061,9 @@ pub fn selectFunctionAligned(allocator: std.mem.Allocator, func: *const Function
 
 /// Compile `func` tuned to `model`: the machine-level hooks read the model's `fetch_align`
 /// (loop-header alignment), `vpu()` (whether to lower vectorized f32 arithmetic to the CORE-ET
-/// VPU packed-single unit instead of RVV; only et-soc sets this), and `features.riscv64.zicbop`
+/// VPU packed-single unit instead of RVV, only et-soc sets this), and `features.riscv64.zicbop`
 /// (whether to lower the IR `.prefetch` hint to a real Zicbop `prefetch.r` instead of dropping
-/// it; only river-rc1.f/.ma set this, see registry.zig), and `fuse_cmp_branch` (whether the
+/// it, only river-rc1.f/.ma set this, see registry.zig), and `fuse_cmp_branch` (whether the
 /// compare-into-branch fold runs). An inert model (fetch_align 0, vpu false, zicbop false,
 /// fuse_cmp_branch true - the no-extension-required default) makes this byte-identical to
 /// `selectFunction`. Builds the full `ModelCaps` and calls `compileFunction` directly rather than
@@ -3060,84 +3159,84 @@ fn alignPadWords(words: usize, fetch_align: u16) usize {
 /// `caps.vpu` selects the et-soc CORE-ET packed-single VPU lowering for vectorized f32 arithmetic
 /// (8-lane, `f16..f31` disjoint from the vpu-mode scalar float pool) instead of the default RVV
 /// lowering (4-lane, `v1..v27`). False (the RVV path, the behavior of every existing caller) is
-/// byte-identical to before this parameter existed; only a caller that explicitly asks for `vpu`
+/// byte-identical to before this parameter existed. Only a caller that explicitly asks for `vpu`
 /// (today, only `selectFunctionForModel` under an et-soc model) reaches the new path. The VPU
 /// path is encoding-validated against the CORE-ET RTL masks (see encode.zig) and IR-verified, but
 /// unlike RVV it is never executed here: no emulator decodes these custom opcodes.
 ///
 /// `caps.zicbop` lowers the IR `.prefetch` hint to a real Zicbop `prefetch.r` instead of dropping
 /// it (see the `.prefetch` case below). False (drop the hint, the behavior of every existing
-/// caller) is byte-identical to before this capability existed; only `selectFunctionForModel`
+/// caller) is byte-identical to before this capability existed. Only `selectFunctionForModel`
 /// under a model with `features.riscv64.zicbop` set reaches the new path. `prefetch.r` is
-/// ORI-shaped (see encode.zig), so unlike the VPU path this one IS execution-validated: it
+/// ORI-shaped (see encode.zig), so unlike the VPU path this one is execution-validated: it
 /// decodes as a harmless no-op on any qemu-riscv64 host, Zicbop or not.
 pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps: ModelCaps) Error!Compiled {
-    // f16 lowering has two modes (see `ModelCaps.zfh`). SOFTWARE EMULATION (no Zfh, the default):
+    // f16 lowering has two modes (see `ModelCaps.zfh`). Software emulation (no Zfh, the default):
     // an f16 is held as its f32 widening in a float register and every boundary rounds via the
-    // inline convert routines (`emitHalfToFloat`/`emitFloatToHalf`); those routines need dedicated
+    // inline convert routines (`emitHalfToFloat`/`emitFloatToHalf`). Those routines need dedicated
     // scratch GPRs, so the allocator reserves x28..x31 out of the integer temp pool (see
-    // `temp_regs_f16`). NATIVE (Zfh): an f16 is held natively in a float register and every op is a
+    // `temp_regs_f16`). Native (Zfh): an f16 is held natively in a float register and every op is a
     // real half instruction, so no integer scratch is needed and the reservation is skipped, keeping
     // native allocation closer to a normal function. Only the software path drives the reservation,
     // so `reserve_f16_scratch` gates on `!zfh`. A non-f16 function (or a native one) keeps the full
     // integer pool, byte-identical to before f16 support.
     const uses_f16 = ir.function.functionUsesF16(func);
     const reserve_f16_scratch = uses_f16 and !caps.zfh;
-    // Only SCALAR f16 is handled; f16 nested in a vector/aggregate would fall through to the
+    // Only scalar f16 is handled. f16 nested in a vector/aggregate would fall through to the
     // raw-vector path and miscompile the half lanes, so reject that composite case cleanly.
     if (ir.function.functionUsesCompositeF16(func)) return error.Unsupported;
     if (func.blockCount() == 0) return error.Unsupported;
 
-    // PRODUCTION register allocator: the SHARED Wimmer-Franz linear-scan-on-SSA allocator (Wimmer
-    // cutover SP3, the production flip). There is NO fallback to the retired native linear scan
+    // Production register allocator: the shared Wimmer-Franz linear-scan-on-SSA allocator. There is
+    // no fallback to the retired native linear scan
     // (`allocateRegisters`, removed). This is exactly `compileFunctionWimmerRiscvFold`'s pipeline
-    // (splitCriticalEdges x2 -> addrfold.analyze -> applyFoldRewriteRiscv -> riscv64RegDescription ->
-    // wimmer.allocate -> translateAllocation -> emitFromAllocation), but run on an independently owned
+    // (splitCriticalEdges twice, then addrfold.analyze, applyFoldRewriteRiscv, riscv64RegDescription,
+    // wimmer.allocate, translateAllocation, emitFromAllocation), but run on an independently owned
     // deep `clone` so the public `*const Function` entry points never touch a caller's function (a
-    // caller may reuse or SHARE its function across backends). The REAL `caps` and the REAL `fold`
+    // caller may reuse or share its function across backends). The real `caps` and the real `fold`
     // analysis thread to emission (unlike the differential entries' inert-caps, empty-fold compile).
     //
-    // The Wimmer pipeline MUTATES the function (both split passes append forwarding blocks and retarget
-    // if-edges, and `applyFoldRewriteRiscv` repoints folded pointers and drops the dead adds), so we
-    // work on the clone and leave the caller's function byte-for-byte pristine. This keeps every public
+    // The Wimmer pipeline mutates the function (both split passes append forwarding blocks and retarget
+    // if-edges, and `applyFoldRewriteRiscv` repoints folded pointers and drops the dead adds), so this
+    // works on the clone and leaves the caller's function byte-for-byte pristine. This keeps every public
     // `*const` signature unchanged.
     var work = try func.clone(allocator);
     defer work.deinit();
 
-    // Split edges FIRST, before any numbering is built. TWO passes, exactly as the differential entries
+    // Split edges first, before any numbering is built. Two passes, exactly as the differential entries
     // do: `ir.critical_edge` splits every genuinely critical edge (giving the resolver a block for its
     // shuffle), then this backend's own `splitCriticalEdges` splits every remaining if-edge that still
-    // carries ARGS into a jump landing block (the riscv64 `.@"if"` emission only branches, it cannot
-    // host an edge move, so every block-param move must land on a JUMP edge).
+    // carries args into a jump landing block (the riscv64 `.@"if"` emission only branches, it cannot
+    // host an edge move, so every block-param move must land on a jump edge).
     try ir.critical_edge.splitCriticalEdges(allocator, &work);
     try splitCriticalEdges(allocator, &work);
 
     // Reachability from the entry (block 0), and neutralization of every unreachable block, both now live
-    // in the shared `ir.reachable.neutralizeUnreachable`. An orphaned unreachable nest (e.g. a
-    // matmul-recognized loop the IR cannot delete) still holds instructions that USE values defined in
-    // reachable blocks, and `buildIntervals` (wimmer.zig) walks ALL blocks, so such a value would get a
+    // in the shared `ir.reachable.neutralizeUnreachable`. An orphaned unreachable nest (for example a
+    // matmul-recognized loop the IR cannot delete) still holds instructions that use values defined in
+    // reachable blocks, and `buildIntervals` (wimmer.zig) walks all blocks, so such a value would get a
     // first live range built entirely from the dead nest, one that does not contain its def in the
     // reachable entry, tripping the allocator's SSA "def lies in the earliest range" assert. Emptying
     // every unreachable block's params, instructions, and terminator removes the spurious uses, turning
     // that value into a harmless dead def ([def, def+1)) instead of a cross-region range. Each dead block
-    // is kept PHYSICALLY PRESENT (its index and enum handle stay stable) so branch and reloc targets,
-    // which reference blocks by handle, are undisturbed. The matmul op itself lives in a REACHABLE block,
+    // is kept physically present (its index and enum handle stay stable) so branch and reloc targets,
+    // which reference blocks by handle, are undisturbed. The matmul op itself lives in a reachable block,
     // so it is never neutralized.
     //
-    // `emitFromAllocation` still SKIPS these now-empty blocks in emission while ACCOUNTING for their
+    // `emitFromAllocation` still skips these now-empty blocks in emission while accounting for their
     // positions, so the all-block Wimmer numbering stays in lockstep with the post-neutralize `work` (see
-    // the dead-block arm there). This does NOT require all-reachable, unlike the differential entries, so
+    // the dead-block arm there). This does not require all-reachable, unlike the differential entries, so
     // the reachability-aware isel path (the matmul enabler) keeps working.
     const reachable = try ir.reachable.neutralizeUnreachable(allocator, &work);
     defer allocator.free(reachable);
 
-    // Address-mode folding is a PRE-ALLOCATION IR REWRITE so it is SOUND under the fold-agnostic shared
+    // Address-mode folding is a pre-allocation IR rewrite, so it is sound under the fold-agnostic shared
     // Wimmer allocator (which reads only the actual IR operands). `analyze` recognizes each foldable
-    // `p = arith_imm.add(base, imm); load/store(p)`; `applyFoldRewriteRiscv` then repoints each folded
-    // mem op's `ptr` to `base` and drops the dead adds IN THE CLONE, so the allocator keeps `base` live
-    // to the load/store. The SAME analysis threads into emission via `fold`: `folds` is keyed by the
-    // surviving mem inst, so `baseOf`/`offOf` stay consistent with the rewritten IR. A function with
-    // nothing foldable yields an empty analysis, keeping its output byte-identical.
+    // `p = arith_imm.add(base, imm)` followed by `load/store(p)`. `applyFoldRewriteRiscv` then repoints
+    // each folded mem op's `ptr` to `base` and drops the dead adds in the clone, so the allocator keeps
+    // `base` live to the load/store. The same analysis threads into emission via `fold`: `folds` is
+    // keyed by the surviving mem inst, so `baseOf`/`offOf` stay consistent with the rewritten IR. A
+    // function with nothing foldable yields an empty analysis, keeping its output byte-identical.
     var fold = try addrfold.analyze(allocator, &work, {}, riscv64FoldOffset);
     defer fold.deinit(allocator);
     applyFoldRewriteRiscv(&work, &fold);
@@ -3157,12 +3256,12 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
     var compiled = try emitFromAllocation(allocator, &work, caps, uses_f16, reachable, &alloc, &fold);
     errdefer compiled.deinit(allocator);
 
-    // Every `Reloc.symbol` is a BORROWED slice into the emitting function's symbol storage, and the
+    // Every `Reloc.symbol` is a borrowed slice into the emitting function's symbol storage, and the
     // contract is that those names outlive `Compiled` (the caller's function does). Emission borrowed
-    // them from the CLONE, whose storage `work.deinit` frees on return, so re-point each name to the
-    // original `func`'s identical, longer-lived symbol string (the clone re-interned symbols 1:1, so
+    // them from the clone, whose storage `work.deinit` frees on return, so this re-points each name to
+    // the original `func`'s identical, longer-lived symbol string (the clone re-interned symbols 1:1, so
     // the same name exists there). A `pcrel_lo12` reloc borrows nothing (its `symbol` is the empty
-    // sentinel, its target is the local `auipc` at `pair`), so skip it.
+    // sentinel, its target is the local `auipc` at `pair`), so it is skipped.
     for (compiled.relocs) |*r| {
         if (r.symbol.len == 0) continue;
         r.symbol = rebindSymbolName(func, r.symbol);
@@ -3172,7 +3271,7 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
 
 /// The `func`-owned symbol string equal to `name`. Every emitted relocation names a callee or global
 /// the function interned (a `call`/`global_addr`'s `symbol` indexes `func`'s symbol table), so a match
-/// always exists; a miss would be a codegen bug, not a runtime condition.
+/// always exists. A miss would be a codegen bug, not a runtime condition.
 fn rebindSymbolName(func: *const Function, name: []const u8) []const u8 {
     var i: u32 = 0;
     while (i < func.symbolCount()) : (i += 1) {
@@ -3183,11 +3282,11 @@ fn rebindSymbolName(func: *const Function, name: []const u8) []const u8 {
 }
 
 /// Emit machine code from a finished `Allocation` (the second half of `compileFunction`, split out
-/// so the shared Wimmer allocator can drive the SAME battle-tested emission through
-/// `compileFunctionWimmerRiscv`). This is a PURE extraction of everything after `allocateRegisters`:
+/// so the shared Wimmer allocator can drive the same battle-tested emission through
+/// `compileFunctionWimmerRiscv`). This is a pure extraction of everything after `allocateRegisters`:
 /// the frame layout, prologue, the per-block/instruction loop reading each value's location through
 /// `intLocationAt`/`floatLocationAt`, the split-boundary action drain, block-edge moves, branch
-/// relaxation, and the epilogue. `caps` carries the model seams (`fetch_align`/`vpu`/`zicbop`/`zfh`);
+/// relaxation, and the epilogue. `caps` carries the model seams (`fetch_align`/`vpu`/`zicbop`/`zfh`).
 /// `uses_f16` and `reachable` are what `compileFunction` computed. `alloc` is consumed read-only
 /// except for the defensive sort of its action list. Byte-identical for every existing caller (the
 /// full riscv64 suite proves it).
@@ -3202,7 +3301,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
     const fuse_cmp_branch = caps.fuse_cmp_branch;
     // Whether the Zba sh-add fold runs (see `fusesIntoNextShiftAdd`). Threaded to both the shl-skip
     // site (the `.arith_imm` arm) and the fused emit site (the `.arith` add arm) below so they agree:
-    // FALSE by default (no Zba), so both fall back to the plain slli-then-add path unchanged.
+    // false by default (no Zba), so both fall back to the plain slli-then-add path unchanged.
     const fuse_shift_add = caps.fuse_shift_add;
     // Whether the `.global_addr` arm's adjacency assert runs (see its site below). The auipc+addi
     // pair is emitted back-to-back unconditionally, so this never changes emission either way, it
@@ -3210,11 +3309,11 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
     const fuse_addr_hi_lo = caps.fuse_addr_hi_lo;
 
     // Split-boundary actions must drain in ascending `at` with each same-position cluster in a
-    // hazard-free order. The edge-move-driven (shared Wimmer) allocation ALREADY delivers exactly that:
+    // hazard-free order. The edge-move-driven (shared Wimmer) allocation already delivers exactly that:
     // `wimmer.allocate` orders every same-position cluster as a parallel move and `translateAllocation`
     // appends the clusters in ascending `at`, so re-sorting here (an unstable sort) would only risk
     // scrambling that resolution. Leave it untouched. The native `allocateRegisters` appends in
-    // monotonic `at` order too but does NOT parallel-move-order a cluster, so it keeps the defensive
+    // monotonic `at` order too but does not parallel-move-order a cluster, so it keeps the defensive
     // sort whose comparator breaks `at` ties on kind (a `.reload` before a `.store`: a value reloaded
     // slot->reg and immediately re-spilled reg->slot at one use position must reload first, or the
     // store saves a stale register).
@@ -3226,7 +3325,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     .move => 1,
                     .store => 2,
                     // The native allocator never produces this kind (Wimmer-only), so its tiebreak
-                    // position is a don't-care; kept last for exhaustiveness.
+                    // position is a don't-care. Kept last for exhaustiveness.
                     .slot_to_slot => 3,
                 };
             }
@@ -3281,7 +3380,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
             break;
         };
         // A split value is removed from `alloc.int`, its register handed to the taker (usually still
-        // seen above). But a callee-saved register held ONLY by a split prefix segment must still be
+        // seen above). But a callee-saved register held only by a split prefix segment must still be
         // preserved, so scan the segments too when the direct scan came up empty.
         if (!used) {
             var sit = alloc.segments.valueIterator();
@@ -3313,7 +3412,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
             used = true;
             break;
         };
-        // A split float value is not in `alloc.float`; a callee-saved float register held only by a
+        // A split float value is not in `alloc.float`. A callee-saved float register held only by a
         // split prefix segment must still be preserved, so scan `float_segments` too (empty on the
         // default path, so this loop finds nothing and the frame is byte-identical there).
         if (!used) {
@@ -3349,14 +3448,19 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
     }
 
     // A non-leaf function (one that makes a call) must preserve ra across the
-    // call, which clobbers it: reserve a frame slot for ra.
+    // call, which clobbers it, so this reserves a frame slot for ra. An indirect
+    // `call_indirect` clobbers ra via `jalr` exactly like a direct `call`'s `jal` does, so it
+    // must force the same save/restore. This scan once checked only `func.opcode(inst) == .call`,
+    // which silently left a `call_indirect`-only (no direct `call` at all) function
+    // leaf-classified, clobbering its own caller's return address with no save/restore at all.
     var non_leaf = false;
     for (0..func.blockCount()) |bi| {
-        // A `call` that lives only in dead code is never emitted, so it never clobbers ra and does
-        // not force a save slot. (With all blocks reachable this is exactly the old scan.)
+        // A `call`/`call_indirect` that lives only in dead code is never emitted, so it never
+        // clobbers ra and does not force a save slot. (With all blocks reachable this is
+        // exactly the old scan.)
         if (!reachable[bi]) continue;
         for (func.blockInsts(@enumFromInt(bi))) |inst| {
-            if (func.opcode(inst) == .call) {
+            if (func.opcode(inst) == .call or func.opcode(inst) == .call_indirect) {
                 non_leaf = true;
                 break;
             }
@@ -3402,7 +3506,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
     // from distinct scalars goes through this reserved 32-byte slot: 8 scalar `fsw`s at
     // consecutive 4-byte offsets, then one `flw.ps` loads all 8 lanes at once. Reserved
     // unconditionally in vpu mode (a few bytes in a vpu function that happens not to pack is a
-    // fair price for a fixed, easy-to-verify offset); never reserved outside vpu mode.
+    // fair price for a fixed, easy-to-verify offset). Never reserved outside vpu mode.
     var vpu_pack_base: u32 = 0;
     if (vpu) {
         frame = alignUp(frame, 32);
@@ -3420,7 +3524,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
         matmul_stage_base = frame;
         frame += 16 * 64 + 63;
     }
-    // et-soc EMBEDDED matmul save-area: an embedded matmul is lowered self-contained (it saves every
+    // et-soc embedded matmul save-area: an embedded matmul is lowered self-contained (it saves every
     // register it clobbers on entry and restores on exit), so it needs a fixed stack area to save
     // into. Layout (all 8-byte slots, see the `.matmul` lowering): the 4 clobbered int scratch temps
     // (x5/x7/x28/x31), the 3 a/b/c holder registers' incoming values (x29/x30/x9), 3 a/b/c pointer
@@ -3432,9 +3536,19 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
         matmul_save_base = alignUp(frame, 8);
         frame = matmul_save_base + matmul_save_int_bytes + matmul_save_float_bytes;
     }
+    // LP64D variadic register save area (only for a variadic definition): reserve a 64-byte block
+    // for a0..a7 (x10..x17) at the top of the frame, immediately below the incoming stack-argument
+    // area at sp + frame_size. 64 is 16-aligned, so it does not disturb the alignUp below and the
+    // block ends exactly at frame_size. The 8 saved a-reg slots are then contiguous with the incoming
+    // stack args above them, so all varargs (register-passed then stack-passed) form one contiguous
+    // run of 8-byte slots. A non-variadic function reserves nothing here, so its frame is byte-identical.
+    if (func.is_variadic) frame += 64;
     if (frame > 2047) return error.Unsupported;
 
     const frame_size: i12 = @intCast(alignUp(frame, 16));
+    // Base (sp offset) of the variadic a-reg save block: the top 64 bytes of the frame. Zero (and
+    // unused) for a non-variadic function.
+    const va_save_base: u32 = if (func.is_variadic) @as(u32, @intCast(frame_size)) - 64 else 0;
     // Prologue: open the frame, then preserve ra and the callee-saved registers.
     if (frame_size != 0) try code.append(allocator, encode.addi(.x2, .x2, -frame_size));
     if (non_leaf) try code.append(allocator, encode.sd(.x1, .x2, ra_off)); // save ra
@@ -3445,17 +3559,30 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
     // mode a callee-saved float may hold an f64, so the 64-bit fsd is required.
     for (used_float_saved.items) |sv| try code.append(allocator, if (vpu) encode.fsw(sv.reg, .x2, sv.off) else encode.fsd(sv.reg, .x2, sv.off));
 
+    // LP64D variadic register save: spill every integer argument register a0..a7 (x10..x17) into the
+    // 64-byte save block BEFORE the argument-homing moves below (which may overwrite a0..a7) and
+    // before the body. Anonymous varargs (INCLUDING doubles) arrive in a0..a7 per the LP64D
+    // variadic-in-GPR rule, so only the integer registers are spilled (never fa0..fa7). Only a
+    // variadic definition reaches here, so a normal prologue is byte-identical.
+    if (func.is_variadic) {
+        var gi: usize = 0;
+        while (gi < 8) : (gi += 1) {
+            try code.append(allocator, encode.sd(argReg(gi), .x2, @intCast(va_save_base + gi * 8)));
+        }
+    }
+
     // Move any entry parameter homed to a non-argument register (because it
     // outlives a call) out of its incoming argument register. Load stack
     // parameters from the caller's outgoing-argument area.
     //
-    // Gap A (SP3 Task 2, mirrors aarch64 SP1 gap #4): a genuinely SPLIT entry param's `segments[0]`/
-    // `float_segments[0]` is established HERE from the incoming ABI argument (a register move if the
-    // first segment is a register, a store if it is a slot) - nothing else ever establishes it, since
-    // (unlike a computed value, whose defining instruction writes straight into its first segment) a
-    // param's "definition" is the ABI calling convention. Checked BEFORE `alloc.int`/`alloc.float`
-    // (mutually exclusive: `translateAllocation` puts a value in exactly one of segments/reg/slot maps).
-    // A whole-life param the allocator spilled straight to a slot (gap #4's other shape: the native
+    // This mirrors a similar gap fixed in the aarch64 backend: a genuinely split entry param's
+    // `segments[0]`/`float_segments[0]` is established here from the incoming ABI argument (a register
+    // move if the first segment is a register, a store if it is a slot). Nothing else ever establishes
+    // it, since (unlike a computed value, whose defining instruction writes straight into its first
+    // segment) a param's "definition" is the ABI calling convention. This is checked before
+    // `alloc.int`/`alloc.float` (mutually exclusive: `translateAllocation` puts a value in exactly one
+    // of segments/reg/slot maps).
+    // A whole-life param the allocator spilled straight to a slot (the native
     // path never produces this for an int param, but the shared allocator can) stores the incoming
     // argument straight into it, exactly as the float arm already did for its own whole-spill case.
     if (func.blockCount() != 0) {
@@ -3504,7 +3631,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                         if (home != arg) try code.append(allocator, encode.addi(home, arg, 0));
                     }
                 } else {
-                    // Entry int param spilled straight to a slot (Wimmer-only shape; the native
+                    // Entry int param spilled straight to a slot (Wimmer-only shape. The native
                     // allocator never spills an int entry param, it bails under pressure instead - see
                     // `allocateRegisters`'s entry-param arm): store the incoming argument into it.
                     const slot = alloc.int_spill.get(p).?;
@@ -3550,26 +3677,26 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
         for (li.loops) |l| is_loop_header[l.header] = true;
     }
 
-    // `pos` mirrors the allocator's liveness numbering EXACTLY so the location each integer read is
+    // `pos` mirrors the allocator's liveness numbering exactly so the location each integer read is
     // resolved at matches the position its allocation was computed for. Per reachable block: the
     // block-parameter row occupies one position, then each instruction one position, then the
-    // terminator one position. An unreachable block is skipped WITHOUT advancing `pos`, matching the
+    // terminator one position. An unreachable block is skipped without advancing `pos`, matching the
     // allocator. With no splits (segments empty) `pos` is otherwise unobservable, so the per-result
     // assert below is how a threading bug is caught now instead of in a later splitting task.
     var pos: usize = 0;
     var action_cursor: usize = 0;
     for (0..func.blockCount()) |bi| {
-        // Emit ONLY reachable blocks, so a dead block produces no code (and no header padding). Its
+        // Emit only reachable blocks, so a dead block produces no code (and no header padding). Its
         // `block_start[bi]` entry is left as-is and is never read: no reachable branch fixup targets
         // an unreachable block (valid SSA), and the relaxation loops below skip it in lockstep.
         //
-        // The shared Wimmer allocator (`wimmer.allocate` + `translateAllocation`) numbers EVERY block
+        // The shared Wimmer allocator (`wimmer.allocate` + `translateAllocation`) numbers every block
         // (`def_pos`/`.at` count params + insts + terminator over all blocks, reachable or not), so to
         // keep emission's `pos` and `action_cursor` in lockstep with that all-block numbering we must
-        // still ACCOUNT for a dead block here: advance `pos` over its position span and DISCARD any
+        // still account for a dead block here: advance `pos` over its position span and discard any
         // split actions the allocator recorded inside it (a dead block is never entered, so those
         // moves are pure liveness bookkeeping with no runtime effect). This is what lets a function
-        // with an orphaned unreachable nest (e.g. a matmul-recognized loop the IR cannot delete) lower
+        // with an orphaned unreachable nest (for example a matmul-recognized loop the IR cannot delete) lower
         // through this production path: block 0 stays byte-identical, and the dead tail never desyncs a
         // later reachable block. When every block is reachable this branch is never taken, so the two
         // Wimmer differential entries (which require all-reachable) stay byte-identical.
@@ -3585,7 +3712,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
         const block: Block = @enumFromInt(bi);
         // The block emitted immediately after this one falls through, so a branch or jump to it can be
         // elided. Blocks emit in index order and only reachable ones emit, so the next emitted block is
-        // `bi + 1` exactly when that index exists AND is reachable. A terminator only ever targets a
+        // `bi + 1` exactly when that index exists and is reachable. A terminator only ever targets a
         // reachable block, so when `bi + 1` is unreachable no edge names it and no elision is missed.
         const next_block: ?Block = if (bi + 1 < func.blockCount() and reachable[bi + 1]) @enumFromInt(bi + 1) else null;
         if (fetch_align > 4 and is_loop_header[bi]) {
@@ -3597,7 +3724,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
         // A structured `if` is the block's exit. The trailing terminator is dead.
         var exited = false;
         const block_insts = func.blockInsts(block);
-        // The block-parameter row occupies `pos`; the first instruction is the next position. Compute
+        // The block-parameter row occupies `pos`. The first instruction is the next position. Compute
         // each instruction's position from this base plus its index (robust to the `continue`/`break`
         // paths in the switch, which a trailing increment would desync).
         const first_inst_pos = pos + 1;
@@ -3621,12 +3748,12 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
             while (action_cursor < alloc.actions.items.len and alloc.actions.items[action_cursor].at <= inst_pos) {
                 const act = alloc.actions.items[action_cursor];
                 std.debug.assert(act.at == inst_pos); // actions land on instruction positions only
-                // A `.store` writes the victim's register to its slot; a `.reload` is the second-chance
-                // re-home (Task 6d) that loads the slot back into `act.reg` just before its next use,
+                // A `.store` writes the victim's register to its slot. A `.reload` is the second-chance
+                // re-home that loads the slot back into `act.reg` just before its next use,
                 // after which the value's `.reg` re-home segment makes `intLocationAt` read the register
-                // directly. A reload MUST drain before a store at the same position (the sort tiebreak
+                // directly. A reload must drain before a store at the same position (the sort tiebreak
                 // guarantees it), so a reload-then-respill at one use loads live bits before re-saving.
-                // The Wimmer path also produces class-1 (float) and `.move` actions; `emitSplitAction`
+                // The Wimmer path also produces class-1 (float) and `.move` actions. `emitSplitAction`
                 // dispatches on class/kind and is byte-identical for the native class-0 store/reload.
                 try emitSplitAction(allocator, &code, func, spill_base, float_spill_base, vspill_base, vpu_vspill_base, vpu_pack_base, vpu, act);
                 action_cursor += 1;
@@ -3636,7 +3763,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     // Fused multiply-add/sub: when this is a scalar float `mul` that is the
                     // single-use, immediately-preceding operand of the next add/sub, skip its
                     // materialization entirely. The `.arith` add/sub branch below re-checks the
-                    // SAME predicate and emits the fused fmadd/fmsub/fnmsub on these operands,
+                    // same predicate and emits the fused fmadd/fmsub/fnmsub on these operands,
                     // so the multiply is emitted exactly once (mirrors the icmp/if fusion above).
                     if (a.op == .mul and fusesIntoNextArith(func, block_insts, inst_idx, vpu)) {
                         // A vector mul always fuses (the RVV fused path below has three vector
@@ -3644,7 +3771,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                         // result is register-resident (the R4-type fma needs three live source
                         // registers, one more than the two float spill scratches): otherwise it
                         // falls through and materializes as a standalone mul, and the add/sub below
-                        // gates on the SAME predicate so it likewise does not fuse.
+                        // gates on the same predicate so it likewise does not fuse.
                         if (isVector(func, func.valueType(a.lhs)) or fusesScalarFloatArith(func, alloc, block_insts, inst_idx, vpu)) continue;
                     }
                     if (isVector(func, func.valueType(a.lhs))) {
@@ -3657,13 +3784,13 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                             // packed-integer fma, so the sub shapes and `<8 x i32>` mul+add keep
                             // their separate ps/pi lowering below). The mul at inst_idx-1 already
                             // had its materialization skipped by the `.mul` branch above via the
-                            // SAME `fusesIntoNextArith` gate, so emit `fmadd.ps rd = a*b + c` here.
+                            // same `fusesIntoNextArith` gate, so emit `fmadd.ps rd = a*b + c` here.
                             // fmadd.ps is a 3-source form (fd separate from all of fs1/fs2/fs3), so
                             // unlike the RVV accumulate-into-vd path no copy of c is needed and no
                             // source aliasing can corrupt a live c. Register safety: the vpu scratch
-                            // f28/f29/f30 (op0/op1/work) are DISJOINT from the allocatable vpu pool
+                            // f28/f29/f30 (op0/op1/work) are disjoint from the allocatable vpu pool
                             // f16..f27, so a register-resident rd never aliases va/vb/vc. When
-                            // `result` spills, rd == vpu_vec_work == vc's reg (f30); `fmadd.ps
+                            // `result` spills, rd == vpu_vec_work == vc's reg (f30). `fmadd.ps
                             // f30,f28,f29,f30` reads f30 as fs3 before writing fd = f30, which is
                             // correct (all sources are read before fd is written), and f28/f29
                             // (va/vb) are always distinct from f30 so a*b is read intact.
@@ -3685,7 +3812,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                             // riscv64/tests/etsoc_sysemu.zig, which runs this path's compiled
                             // output on sw-sysemu and checks the result bit-for-bit against a
                             // scalar reference. That emulator is not present in CI, so those
-                            // tests skip there rather than fail; they run wherever sw-sysemu is
+                            // tests skip there rather than fail. They run wherever sw-sysemu is
                             // on PATH.
                             const lhs = try reloadVpuVector(allocator, &code, alloc, vpu_vspill_base, a.lhs, inst_pos, vpu_vec_op0);
                             const rhs = try reloadVpuVector(allocator, &code, alloc, vpu_vspill_base, a.rhs, inst_pos, vpu_vec_op1);
@@ -3693,7 +3820,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                             // The vector partition holds both `<8 x f32>` and `<8 x i32>` (isVector
                             // routes either here). The element type selects the op family: an
                             // integer element lowers to the packed-integer `pi` ops (the sibling of
-                            // the packed-single `ps` ops), operating on the SAME vpu vector
+                            // the packed-single `ps` ops), operating on the same vpu vector
                             // registers. The reload/dst/store above are identical for both.
                             const word = if (isIntVector(func, func.valueType(a.lhs))) blk: {
                                 // Packed-integer arithmetic (8-lane i32). A right shift picks
@@ -3727,9 +3854,9 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                             // Fused RVV multiply-add/sub, the add/sub side (mirrors the scalar
                             // fused case below, and aarch64's vector FMLA/FMLS): the mul at
                             // inst_idx-1 already had its materialization skipped by the `.mul`
-                            // branch above via the SAME `fusesIntoNextArith` check. Resolve its
+                            // branch above via the same `fusesIntoNextArith` check. Resolve its
                             // own operands (a, b) plus this add/sub's other operand (the
-                            // accumulator, c). vfmacc/vfmsac/vfnmsac ACCUMULATE into vd (vd is
+                            // accumulator, c). vfmacc/vfmsac/vfnmsac accumulate into vd (vd is
                             // also a source), so c must be resident in vd before the op runs.
                             // Move it into the fixed scratch `vector_scratch` (v31, outside
                             // every allocation pool, so it never aliases a/b) first - a naive
@@ -3777,7 +3904,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     } else if (isFloat(func, func.valueType(a.lhs))) {
                         // Fused multiply-add/sub, the add/sub side: when the immediately-
                         // preceding instruction is a single-use float mul that is exactly one
-                        // of this add/sub's operands (the SAME predicate the mul case above used
+                        // of this add/sub's operands (the same predicate the mul case above used
                         // to skip its materialization), load the mul's own operands (never
                         // materialized) plus the add/sub's other operand (the accumulator, `c`),
                         // and emit the one R4-type instruction whose hardware semantics matches
@@ -3847,7 +3974,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                         const result = func.instResult(inst).?;
                         // Zba sh-add fold, the add side: when the immediately-preceding instruction is
                         // a single-use `shl` by 1/2/3 whose result is one of this 64-bit add's operands
-                        // (the SAME predicate the `.arith_imm` shl-skip below uses), emit one
+                        // (the same predicate the `.arith_imm` shl-skip below uses), emit one
                         // `sh{k}add rd, b, x` (rd = x + (b << k)) instead of a separate slli then add.
                         // The shl was skipped, so load `b` (the shifted operand) and `x` (the addend)
                         // directly here (both still resident, nothing ran between them and this add).
@@ -3907,7 +4034,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     if (fold.isDeadAdd(inst)) continue;
                     // Zba sh-add fold, the shl side: when this `shl` by 1/2/3 is the single-use,
                     // immediately-preceding operand of the next 64-bit add, skip its materialization.
-                    // The `.arith` add arm re-checks the SAME `fusesIntoNextShiftAdd` gate and emits
+                    // The `.arith` add arm re-checks the same `fusesIntoNextShiftAdd` gate and emits
                     // the fused `sh{k}add`, so the shift is emitted exactly once (mirrors the mul/fma
                     // skip above). `inst_pos` still advanced from `inst_idx`, so numbering holds.
                     if (a.op == .shl and fusesIntoNextShiftAdd(func, block_insts, inst_idx, fuse_shift_add)) continue;
@@ -3949,7 +4076,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                         if (is64Float(func, func.valueType(res))) return error.Unsupported;
                         const fr = dstFloat(alloc, res, inst_pos, fspill0);
                         // Native f16 (Zfh): a float-typed integer constant is a zero-init, so move
-                        // its low 16 bits into the float register NaN-boxed (`fmv.h.x`); moving the
+                        // its low 16 bits into the float register NaN-boxed (`fmv.h.x`). Moving the
                         // f32-widening bits with `fmv.w.x` would leave an invalid NaN-box that the
                         // half ops read as NaN. SOFTWARE f16 / f32: the f32-widening bits go in via
                         // `fmv.w.x` unchanged.
@@ -3986,7 +4113,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                         try code.append(allocator, encode.lui(rd, hi));
                         try code.append(allocator, encode.addi(rd, rd, lo));
                     } else {
-                        // Full 64-bit constant (e.g. a division magic number): built MSB-first.
+                        // Full 64-bit constant (for example a division magic number): built MSB-first.
                         try loadImm64(allocator, &code, rd, @bitCast(c));
                     }
                     switch (rd_loc) {
@@ -3996,7 +4123,16 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                 },
                 .fconst => |val| {
                     const result = func.instResult(inst).?;
-                    if (is64Float(func, func.valueType(result))) return error.Unsupported; // f64 const: later
+                    if (is64Float(func, func.valueType(result))) {
+                        // f64 const (lp64d): build the 64-bit pattern in the int scratch, then move
+                        // it into the float register with `fmv.d.x`. Needed for a `double` argument
+                        // to a variadic call such as `printf("%.1f", 3.5)`.
+                        const fr = dstFloat(alloc, result, inst_pos, fspill0);
+                        try loadImm64(allocator, &code, scratch_reg, @bitCast(val));
+                        try code.append(allocator, encode.fmv_d_x(fr, scratch_reg));
+                        try storeFloat(allocator, &code, alloc, float_spill_base, result, inst_pos, true, fr);
+                        continue;
+                    }
                     const fr = dstFloat(alloc, result, inst_pos, fspill0);
                     // Native f16 (Zfh): materialize the 16-bit half pattern and move it into the
                     // float register NaN-boxed with `fmv.h.x`, giving a native half.
@@ -4030,22 +4166,35 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     try code.append(allocator, encode.addi(rd, .x2, off));
                 },
                 .global_addr => |ga| {
-                    // PC-relative symbol address: `auipc rd, %pcrel_hi(sym)` then
-                    // `addi rd, rd, %pcrel_lo(.Lhi)`. The two relocations resolve together.
                     const rd = switch (intLocationAt(alloc, func.instResult(inst).?, inst_pos)) {
                         .reg => |r| r,
                         .slot => return error.Unsupported,
                     };
                     const name = func.symbolName(ga.symbol);
                     const hi = code.items.len;
-                    try relocs.append(allocator, .{ .offset = hi, .symbol = name, .kind = .pcrel_hi20 });
-                    try code.append(allocator, encode.auipc(rd, 0));
-                    try relocs.append(allocator, .{ .offset = code.items.len, .symbol = "", .kind = .pcrel_lo12, .pair = hi });
-                    try code.append(allocator, encode.addi(rd, rd, 0));
-                    // The addr_hi_lo macro-op fusion (`caps.fuse_addr_hi_lo`) relies on the addi
-                    // landing exactly one word after its auipc; the two `code.append`s above
-                    // guarantee that unconditionally, so this only asserts the invariant a fusing
-                    // microarch depends on rather than changing anything.
+                    if (ga.via_got) {
+                        // GOT-indirect data import: `auipc rd, %got_pcrel_hi(sym)` then
+                        // `ld rd, %pcrel_lo(.Lhi)(rd)`. The `auipc` gets the high 20 bits of the
+                        // PC-relative address of the symbol's GOT slot. The `ld` loads the
+                        // symbol's runtime address out of that slot (vs the direct `addi`, which
+                        // adds the lo12 to compute the address). The dynamic linker synthesizes
+                        // the GOT slot + `R_RISCV_64` and patches both to the slot.
+                        try relocs.append(allocator, .{ .offset = hi, .symbol = name, .kind = .got_hi20 });
+                        try code.append(allocator, encode.auipc(rd, 0));
+                        try relocs.append(allocator, .{ .offset = code.items.len, .symbol = "", .kind = .pcrel_lo12, .pair = hi });
+                        try code.append(allocator, encode.ld(rd, rd, 0));
+                    } else {
+                        // PC-relative symbol address: `auipc rd, %pcrel_hi(sym)` then
+                        // `addi rd, rd, %pcrel_lo(.Lhi)`. The two relocations resolve together.
+                        try relocs.append(allocator, .{ .offset = hi, .symbol = name, .kind = .pcrel_hi20 });
+                        try code.append(allocator, encode.auipc(rd, 0));
+                        try relocs.append(allocator, .{ .offset = code.items.len, .symbol = "", .kind = .pcrel_lo12, .pair = hi });
+                        try code.append(allocator, encode.addi(rd, rd, 0));
+                    }
+                    // The addr_hi_lo macro-op fusion (`caps.fuse_addr_hi_lo`) relies on the second
+                    // instruction (the direct `addi` or the GOT `ld`) landing exactly one word
+                    // after its auipc. The two `code.append`s above guarantee that unconditionally,
+                    // so this only asserts the invariant a fusing microarch depends on.
                     if (fuse_addr_hi_lo) std.debug.assert(code.items.len == hi + 2);
                 },
                 .select => |sel| {
@@ -4058,7 +4207,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                         .slot => return error.Unsupported,
                     };
                     // The three operands each need a live register through the branch sequence, more
-                    // than the two int spill scratches can reload; a spilled operand (e.g. a spilled
+                    // than the two int spill scratches can reload. A spilled operand (for example a spilled
                     // int block param) is rejected cleanly rather than panicking on the unwrap.
                     // Resident in every currently-compiling case (byte-identical there).
                     const cond = switch (intLocationAt(alloc, sel.cond, inst_pos)) {
@@ -4086,7 +4235,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     const src_half = isHalf(func, src_ty);
                     const dst_half = isHalf(func, dst_ty);
                     if (src_float and dst_float) {
-                        // Float -> float. Only conversions involving f16 are lowered here; a plain
+                        // Float -> float. Only conversions involving f16 are lowered here. A plain
                         // f32<->f64 convert is still deferred (falls through to Unsupported below).
                         // An f16 is held as its f32 widening, so the single-precision view is shared.
                         if (src_half and !dst_half) {
@@ -4109,7 +4258,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                             const rd = dstFloat(alloc, result, inst_pos, fspill0);
                             if (zfh) {
                                 // The native path does one single-rounded narrow to a native half (`fcvt.h.s` /
-                                // `fcvt.h.d`); the double-round through f32 is unnecessary.
+                                // `fcvt.h.d`). The double-round through f32 is unnecessary.
                                 try code.append(allocator, if (is64Float(func, src_ty)) encode.fcvt_h_d(rd, rs) else encode.fcvt_h_s(rd, rs));
                             } else {
                                 // In the software path, reduce to f32 (exact for f32, one round for f64) then round
@@ -4126,8 +4275,8 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                             return error.Unsupported; // f32<->f64 (no f16) not yet lowered
                         }
                     } else if (src_float == dst_float) {
-                        // int <-> int width change. Widening extends by the SOURCE signedness
-                        // (sign-extend a signed source, zero-extend an unsigned one); same-width or
+                        // int <-> int width change. Widening extends by the source signedness
+                        // (sign-extend a signed source, zero-extend an unsigned one). Same-width or
                         // narrowing keeps the low bits. Values live in 64-bit registers, so a widen
                         // shifts the source up to its top bit then arithmetic/logically back down,
                         // which also discards any dirty high bits above the source width.
@@ -4168,8 +4317,8 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                             // (`fcvt.h.w`), no detour through f32 and no software re-round.
                             try code.append(allocator, encode.fcvt_h_w(rd, rs));
                         } else {
-                            // Software int -> f16 goes through f32 (fcvt.s.w) then rounds to half;
-                            // int -> f32/f64 is the direct fcvt. `is64Float(f16)` is false, so f16
+                            // Software int-to-f16 goes through f32 (fcvt.s.w) then rounds to half.
+                            // int-to-f32/f64 is the direct fcvt. `is64Float(f16)` is false, so f16
                             // picks the s-form.
                             try code.append(allocator, if (is64Float(func, dst_ty)) encode.fcvt_d_w(rd, rs) else encode.fcvt_s_w(rd, rs));
                             if (dst_half) try emitRoundToHalf(allocator, &code, rd, fspill0, fspill1);
@@ -4196,7 +4345,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                 .load => {
                     const result = func.instResult(inst).?;
                     // A folded load addresses `disp(base)` directly: `baseOf` yields the fold base (the
-                    // add's lhs) and `offOf` the displacement; both are the raw ptr and 0 when unfolded,
+                    // add's lhs) and `offOf` the displacement. Both are the raw ptr and 0 when unfolded,
                     // so the non-folding case is byte-identical. foldOffset never folds a vector, so a
                     // vector load's `offOf` is 0 and its `vle32`/`flw.ps` addressing stays base-only.
                     const base_val = fold.baseOf(func, inst);
@@ -4335,7 +4484,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                 .icmp => |cmp| if (fuse_cmp_branch and fusesIntoNextIf(func, block_insts, inst_idx)) {
                     // Fused compare-and-branch: this integer icmp is the single-use
                     // condition of the immediately-following if, so skip its slt/sltu
-                    // materialization entirely. The `.@"if"` case re-checks the SAME
+                    // materialization entirely. The `.@"if"` case re-checks the same
                     // predicate and emits the native compare-and-branch on these operands,
                     // so the comparison is emitted exactly once.
                 } else if (isFloat(func, func.valueType(cmp.lhs))) {
@@ -4347,8 +4496,8 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     const d = is64Float(func, func.valueType(cmp.lhs));
                     const rs1 = try reloadFloat(allocator, &code, alloc, float_spill_base, cmp.lhs, inst_pos, d, fspill0);
                     const rs2 = try reloadFloat(allocator, &code, alloc, float_spill_base, cmp.rhs, inst_pos, d, fspill1);
-                    // Native f16 (Zfh): compare the native halves directly (`feq.h`/`flt.h`/`fle.h`);
-                    // the s-form compare would misread the NaN-boxed half's upper bits. SOFTWARE f16
+                    // Native f16 (Zfh): compare the native halves directly (`feq.h`/`flt.h`/`fle.h`).
+                    // The s-form compare would misread the NaN-boxed half's upper bits. Software f16
                     // compares its held-as-f32 widening with the s-form, which is exact.
                     const half_native = zfh and isHalf(func, func.valueType(cmp.lhs));
                     const feq = if (half_native) &encode.feq_h else if (d) &encode.feq_d else &encode.feq_s;
@@ -4406,7 +4555,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     if (func.blockArgs(cf.then).len != 0 or func.blockArgs(cf.@"else").len != 0) return error.Unsupported;
                     // Fused compare-and-branch: when the immediately-preceding instruction
                     // is a single-use integer icmp that is exactly this if's condition (the
-                    // SAME predicate the icmp case used to skip its materialization), branch
+                    // same predicate the icmp case used to skip its materialization), branch
                     // on the icmp's two operands directly instead of re-testing a boolean.
                     // The else edge falls through to the jal as usual, and the fixup carries
                     // the chosen branch encoder + both source registers so the offset patch
@@ -4418,11 +4567,11 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                         const sel = branchFor(cmp.op, isUnsignedInt(func, func.valueType(cmp.lhs)));
                         const rs1 = if (sel.swap) rr else rl;
                         const rs2 = if (sel.swap) rl else rr;
-                        // Fall-through elision. THEN is checked first so a degenerate `if` whose THEN and
-                        // ELSE are BOTH the next block still resolves (branch to THEN, fall through to
-                        // ELSE, both reach the same block). When THEN is next, INVERT the branch to target
-                        // ELSE and fall through to THEN, dropping the `jal`. When ELSE is next, keep the
-                        // branch to THEN and drop the `jal` (falling through to ELSE). Relaxation expands
+                        // Fall-through elision. Then is checked first so a degenerate `if` whose then and
+                        // else are both the next block still resolves (branch to then, fall through to
+                        // else, both reach the same block). When then is next, invert the branch to target
+                        // else and fall through to then, dropping the `jal`. When else is next, keep the
+                        // branch to then and drop the `jal` (falling through to else). Relaxation expands
                         // the (possibly inverted) `.cbranch` on its own if the target is far.
                         if (next_block != null and cf.then.target == next_block.?) {
                             const inv = sel.kind.invert();
@@ -4442,7 +4591,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                         exited = true;
                         break;
                     }
-                    // A spilled condition (e.g. an i1 block param used directly as the branch test)
+                    // A spilled condition (for example an i1 block param used directly as the branch test)
                     // has no reload path here yet: reject cleanly rather than panic. Resident in
                     // every currently-compiling case (byte-identical there).
                     const cond_reg = switch (intLocationAt(alloc, cf.cond, inst_pos)) {
@@ -4450,11 +4599,11 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                         .slot => return error.Unsupported,
                     };
                     // bne cond, x0, then  /  jal x0, else  (offsets patched later). Fall-through elision
-                    // mirrors the fused path. When THEN is next, invert `bne cond, x0` to `beq cond, x0`
-                    // targeting ELSE and fall through to THEN, dropping the `jal`. A `.cbranch{ .beq }`
-                    // fixup carries it so relaxation can expand a far ELSE (beq.invert = bne, so the long
-                    // form is `bne cond, x0, +8; jal else`, the original skip-and-jump). When ELSE is
-                    // next, keep the `bne` to THEN and drop the `jal`.
+                    // mirrors the fused path. When then is next, invert `bne cond, x0` to `beq cond, x0`
+                    // targeting else and fall through to then, dropping the `jal`. A `.cbranch{ .beq }`
+                    // fixup carries it so relaxation can expand a far else (beq.invert = bne, so the long
+                    // form is `bne cond, x0, +8; jal else`, the original skip-and-jump). When else is
+                    // next, keep the `bne` to then and drop the `jal`.
                     if (next_block != null and cf.then.target == next_block.?) {
                         try fixups.append(allocator, .{ .index = code.items.len, .target = cf.@"else".target, .kind = .{ .cbranch = .{ .kind = .beq, .rs1 = cond_reg, .rs2 = .x0 } } });
                         try code.append(allocator, encode.beq(cond_reg, .x0, 0));
@@ -4485,10 +4634,24 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     defer int_spilled.deinit(allocator);
                     var int_stack: std.ArrayList(Reg) = .empty; // register sources for args 9+
                     defer int_stack.deinit(allocator);
+                    // lp64d variadic rule: an ANONYMOUS float/double argument (index >= num_fixed) is
+                    // passed in the next integer a-register (or on the stack), not an f-register. It is
+                    // bit-copied out of its f-register with `fmv.x.{w,d}` AFTER the integer permutation
+                    // below has read every source (its destination a-register may be another integer
+                    // argument's source), so the copies are deferred into this list.
+                    var anon_float: std.ArrayList(struct { arg: Value, dst: Reg, d64: bool }) = .empty;
+                    defer anon_float.deinit(allocator);
                     var int_i: usize = 0;
                     var float_i: usize = 0;
-                    for (func.valueList(c.args)) |arg| {
-                        if (isFloat(func, func.valueType(arg))) {
+                    for (func.valueList(c.args), 0..) |arg, arg_idx| {
+                        const anonymous = c.is_variadic and arg_idx >= c.num_fixed;
+                        if (isFloat(func, func.valueType(arg)) and anonymous) {
+                            // Anonymous float/double -> next integer a-register (lp64d). Overflow to
+                            // the integer stack area is not handled yet (no test needs it).
+                            if (int_i >= 8) return error.Unsupported;
+                            try anon_float.append(allocator, .{ .arg = arg, .dst = argReg(int_i), .d64 = is64Float(func, func.valueType(arg)) });
+                            int_i += 1;
+                        } else if (isFloat(func, func.valueType(arg))) {
                             if (float_i >= 8) return error.Unsupported;
                             const d = is64Float(func, func.valueType(arg));
                             const dst = fargReg(float_i);
@@ -4526,6 +4689,15 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     try parallelMoveInt(allocator, &code, int_moves.items, spill_scratch0);
                     for (int_spilled.items) |s| try code.append(allocator, encode.ld(s.dst, .x2, s.off));
 
+                    // Anonymous float/double args (lp64d): bit-copy each into its integer a-register
+                    // now that the integer permutation has read every source register. The float
+                    // source (an f-register or a reload of its spill slot) is untouched by the integer
+                    // moves above, so it survives to here.
+                    for (anon_float.items) |af| {
+                        const src = try reloadFloat(allocator, &code, alloc, float_spill_base, af.arg, inst_pos, af.d64, fspill0);
+                        try code.append(allocator, if (af.d64) encode.fmv_x_d(af.dst, src) else encode.fmv_x_w(af.dst, src));
+                    }
+
                     // jal ra, <callee>. The target is a relocation.
                     try relocs.append(allocator, .{ .offset = code.items.len, .symbol = func.symbolName(c.symbol) });
                     try code.append(allocator, encode.jal(.x1, 0));
@@ -4546,6 +4718,15 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                             .slot => |slot| try code.append(allocator, encode.sd(.x10, .x2, @intCast(spill_base + slot * 8))),
                         }
                     }
+                    if (c.ret_dest) |dest| {
+                        // A struct returned in registers. The callee left
+                        // each eightbyte in the next return register of its bank (integer a0/a1,
+                        // float fa0/fa1). Store them into the frontend destination slot (a frame-
+                        // relative alloca, addressed sp-relative like the `.alloca` arm). The return
+                        // registers hold the values, so store them straight through sp with no scratch.
+                        const doff = slot_offset.get(dest).?;
+                        try emitStructRetStoreRV(allocator, &code, c.ret_pieces, c.ret_regs, doff);
+                    }
                 },
                 .struct_new => |sn| {
                     const result = func.instResult(inst).?;
@@ -4560,7 +4741,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                         // 8 lanes at once.
                         if (fields.len != 8) return error.Unsupported;
                         if (isIntVector(func, func.valueType(result))) {
-                            // Packed-integer pack: the 8 lane scalars are i32 living in the INT
+                            // Packed-integer pack: the 8 lane scalars are i32 living in the int
                             // register file (which spills freely via int_spill), so each is stored
                             // with a 32-bit `sw` into the pack scratch. No scalar-float-pool
                             // pressure, unlike the packed-single pack below. A single int scratch
@@ -4652,28 +4833,28 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     }
                 },
                 .matmul => |mmv| {
-                    // et-soc tensor matmul: `C(m x n) = A(m x k) @ B(k x n)` over ARBITRARY
+                    // et-soc tensor matmul: `C(m x n) = A(m x k) @ B(k x n)` over arbitrary
                     // compile-time m/n/k, emitted as the pure CSR-write protocol proven correct on
-                    // sw-sysemu (the single-tile reference kernel is /tmp/etsoc-build/matmul/mm.s; the
+                    // sw-sysemu (the single-tile reference kernel is /tmp/etsoc-build/matmul/mm.s. The
                     // encoders + descriptor packers are in encode.zig). The native output tile is 16
-                    // rows x up to 16 cols; the contraction per fma pass (K) is up to 16 fp32 / 32 fp16
+                    // rows x up to 16 cols. The contraction per fma pass (K) is up to 16 fp32 / 32 fp16
                     // / 64 int8 (one 64-byte SCP line holds 16 f32 = 32 f16 = 64 int8). Larger shapes
                     // are handled by a fully compile-time-unrolled tile grid (all straight-line, no
                     // runtime branches, since m/n/k are compile-time constants). A/B element dtype comes
-                    // from `mmv.dtype`; C is ALWAYS 32-bit (fp32 accumulators for fp32/fp16, int32 for
+                    // from `mmv.dtype`. C is always 32-bit (fp32 accumulators for fp32/fp16, int32 for
                     // int8/uint8), so the fsw.ps readback is dtype-independent. Only the et-soc VPU
-                    // model reaches this path; every other model (and non-riscv backend) rejects matmul.
+                    // model reaches this path. Every other model (and non-riscv backend) rejects matmul.
                     if (!vpu) return error.Unsupported; // matmul only lowers under the et-soc tensor unit
-                    // An EMBEDDED matmul saves the int temps x28..x31 as part of its clobber set, but
+                    // An embedded matmul saves the int temps x28..x31 as part of its clobber set, but
                     // when the function uses software f16 those same registers are reserved as the
                     // f16 convert scratch (see `temp_regs_f16` and `f16_scratch_*`), so a live f16
-                    // conversion around the matmul would collide. Reject this combination cleanly; a
+                    // conversion around the matmul would collide. Reject this combination cleanly. A
                     // non-embedded matmul (standalone/whole-function) is unaffected. See the brief.
                     if (mmv.embedded and uses_f16) return error.Unsupported;
-                    // An EMBEDDED matmul saves each clobbered float register with a 32-bit `fsw` (the
+                    // An embedded matmul saves each clobbered float register with a 32-bit `fsw` (the
                     // et-soc fp32 case, the only width sw-sysemu implements), so a live f64 or 256-bit
                     // VPU vector crossing the op would lose its high bits. Reject cleanly rather than
-                    // silently truncate it; fp32-scalar surroundings (the recognizer's target) pass.
+                    // silently truncate it. fp32-scalar surroundings (the recognizer's target) pass.
                     if (mmv.embedded and functionHasWideFloatValue(func)) return error.Unsupported;
                     const m = mmv.m;
                     const n = mmv.n;
@@ -4681,7 +4862,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     // Per-dtype layout. `factor` = elements packed per 4-byte column slot (= K per SCP
                     // line / 16), `elem` = A/B element size in bytes, `tt` = the fma `type` field, `uns`
                     // = tena/tenb_unsigned (uint8 only). Citations: tensors.h `tensor_fma` type field
-                    // (fp32=0, fp16->fp32=1, int8->int32=3); sw-sysemu tensors.cpp acols scaling per
+                    // (fp32=0, fp16->fp32=1, int8->int32=3). sw-sysemu tensors.cpp acols scaling per
                     // dtype (`acols=(field+1)*1|2|4` in tensor_fma32/16a32/ima8a32_execute) and the
                     // signed/unsigned int8 element reads (`ua`/`ub` -> sext8 vs zero-extend, :1499/:1507).
                     const DInfo = struct { tt: encode.TensorType, factor: u32, elem: u32, uns: bool };
@@ -4694,7 +4875,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     // The tensor_quant epilogue only requantizes int32 TenC (fp32/fp16 write fp32
                     // TenC, which the quant transform chain cannot consume). `function.verify`
                     // already rejects a non-int8 dtype paired with a quant, but that is upstream of
-                    // this backend; check it again here so a malformed IR that skipped verify fails
+                    // this backend. Check it again here so a malformed IR that skipped verify fails
                     // cleanly instead of mis-lowering.
                     const has_quant = mmv.quant != null;
                     if (has_quant and di.tt != .int8) return error.Unsupported;
@@ -4710,9 +4891,9 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     // Same defensive re-check for the optional per-column bias: the per-tile
                     // materialization below indexes `bias[ni*TILE+g]` up to column n-1, so a bias
                     // list shorter than n would read out of bounds. verify already enforces
-                    // len == n when bias is present; this is the isel-side backstop.
+                    // len == n when bias is present. This is the isel-side backstop.
                     if (has_quant) if (mmv.quant.?.bias) |bh| if (func.biasList(bh).len != n) return error.Unsupported;
-                    // accumulate=true means real `C += A*B`: the tile grid below PRELOADS the existing
+                    // accumulate=true means real `C += A*B`: the tile grid below preloads the existing
                     // fp32 C tile into TenC (f0..) before the fma passes so the first_pass=0 fma computes
                     // `C_initial + A*B`. That preload only makes sense for the fp32-accumulator dtypes
                     // (fp32, and fp16 which also accumulates into an fp32 TenC). Two combinations are out
@@ -4727,7 +4908,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     if (mmv.accumulate and di.tt == .int8) return error.Unsupported;
                     // Bounds: nonzero dims, N a multiple of 4 (the fma b_cols field is `cols/4 - 1`), and
                     // K a multiple of `factor` so every fma pass reads a whole packed column group (the
-                    // acols field encodes K/factor; a partial group has no representation). M is free.
+                    // acols field encodes K/factor, and a partial group has no representation). M is free.
                     if (m == 0 or n == 0 or k == 0) return error.Unsupported;
                     if (n % 4 != 0) return error.Unsupported;
                     if (k % di.factor != 0) return error.Unsupported; // int8 needs K%4==0, fp16 K%2==0
@@ -4738,9 +4919,9 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     const m_tiles: u32 = (@as(u32, m) + TILE - 1) / TILE;
                     const n_tiles: u32 = (@as(u32, n) + TILE - 1) / TILE;
                     const k_tiles: u32 = (@as(u32, k) + K_TILE - 1) / K_TILE;
-                    // CODE-SIZE CAP: compile-time unrolling emits O(m_tiles*n_tiles*k_tiles) tensor
+                    // Code-size cap: compile-time unrolling emits O(m_tiles*n_tiles*k_tiles) tensor
                     // passes (plus per-row staging copies for unaligned dims), so a huge matrix would
-                    // blow up the instruction stream. Cap the total tile-pass count; beyond it,
+                    // blow up the instruction stream. Cap the total tile-pass count. Beyond it,
                     // runtime-loop tiling (a deferred follow-up) is needed, so reject cleanly. The
                     // product is computed in u64 so it cannot overflow before the cap rejects it.
                     if (@as(u64, m_tiles) * n_tiles * k_tiles > 64) return error.Unsupported;
@@ -4748,7 +4929,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     // The lowering clobbers a fixed set of scratch registers: x6 (the reserved
                     // descriptor scratch), x31 (load stride|id + address/lane temp), x5 (sub-tile
                     // pointer), x7 (staging word copy), x28 (64-aligned staging base). The a/b/c
-                    // pointers must be register-resident (the raw `alloc.int.get`); how they must
+                    // pointers must be register-resident (the raw `alloc.int.get`). How they must
                     // relate to the scratch set differs by embedded-ness and is handled just below.
                     const a_reg = switch (intLocationAt(alloc, mmv.a, inst_pos)) {
                         .reg => |r| r,
@@ -4767,9 +4948,9 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     const copy_tmp: Reg = .x7; // staging word-copy temp
                     const stage_ptr: Reg = .x28; // 64-byte-aligned staging base
                     const stride_reg: Reg = .x31; // load stride|id, and store address/lane temp
-                    // NON-EMBEDDED (standalone/whole-function) matmul: a/b/c must already live outside
+                    // Non-embedded (standalone/whole-function) matmul: a/b/c must already live outside
                     // the scratch set. They arrive in arg registers a0..a2 and never move, so this
-                    // holds in practice; a conflicting allocation is rejected rather than clobbered.
+                    // holds in practice. A conflicting allocation is rejected rather than clobbered.
                     // Embedded matmul drops this gate: it copies a/b/c into the dedicated holder
                     // registers below (saved/restored around the op), so their starting placement,
                     // even inside the scratch set, cannot be clobbered.
@@ -4786,10 +4967,10 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     const base_b = if (mmv.embedded) matmul_holder_b else b_reg;
                     const base_c = if (mmv.embedded) matmul_holder_c else c_reg;
 
-                    // Staging (a stack scratch is needed) when: A's memory row pitch k*elem is not a
-                    // multiple of 64 (`emitMatmulLoadSubtile` can't do a direct strided load); OR B
-                    // needs it - fp32 B stages iff n*4 is not 64-aligned (n%16!=0), and fp16/int8 B
-                    // ALWAYS stages because its SCP layout is the K-interleaved transpose-pack
+                    // Staging (a stack scratch is needed) when A's memory row pitch k*elem is not a
+                    // multiple of 64 (`emitMatmulLoadSubtile` can't do a direct strided load), or B
+                    // needs it. fp32 B stages when n*4 is not 64-aligned (n%16!=0), and fp16/int8 B
+                    // always stages because its SCP layout is the K-interleaved transpose-pack
                     // (`emitMatmulLoadBPacked`), never a direct copy of row-major memory.
                     const needs_stage = ((@as(u64, k) * di.elem) % 64 != 0) or (di.factor > 1) or (n % 16 != 0);
 
@@ -4866,9 +5047,9 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     }
 
                     // BASE SCP line for the matmul-quant epilogue's inputs. L1 SCP has 48 lines
-                    // (0..47); A/B tiles use at most lines 0..31 (A occupies 0..rows-1, B occupies
+                    // (0..47). A/B tiles use at most lines 0..31 (A occupies 0..rows-1, B occupies
                     // rows..rows+15), so line 40 never collides with a live A/B tile. Up to 3
-                    // consecutive lines starting here (40, 41, 42) hold, in READ ORDER, the
+                    // consecutive lines starting here (40, 41, 42) hold, in read order, the
                     // optional per-column bias, the scale (scalar-replicated or per-column), and
                     // the optional per-tensor zero-point (also replicated): `packTensorQuant`'s
                     // `scp_loc` field names only this base line, and the tensor unit auto-advances
@@ -4880,7 +5061,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     // independently for A and B (mixed uint8-A x int8-B and vice versa). verify.zig
                     // only allows input_signs paired with dtype == .int8, so di.tt is always .int8
                     // here and every other dtype-derived field above (factor/elem/K-tiling/B
-                    // transpose-pack/tenc2rf) is unaffected; only the two `ua`/`ub` bits packed into
+                    // transpose-pack/tenc2rf) is unaffected. Only the two `ua`/`ub` bits packed into
                     // the fma descriptor change. Constant for the whole matmul, hoisted above the tile grid.
                     const a_uns = if (mmv.input_signs) |s| s.a_unsigned else di.uns;
                     const b_uns = if (mmv.input_signs) |s| s.b_unsigned else di.uns;
@@ -4895,16 +5076,16 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                             const cols = @min(TILE, n - ni * TILE); // output cols (a multiple of 4)
                             std.debug.assert(cols % 4 == 0);
 
-                            // C-TILE PRELOAD for accumulate=true (fp32/fp16 only, non-quant). TenC row
+                            // C-tile preload for accumulate=true (fp32/fp16 only, non-quant). TenC row
                             // i lives in f(2i)/f(2i+1). The (ki==0) fma below runs with first_pass=0
-                            // whenever accumulate is set, so it computes `TenC += A*B` onto WHATEVER
+                            // whenever accumulate is set, so it computes `TenC += A*B` onto whatever
                             // TenC holds. Loading the existing C tile into those same FREGS first is
-                            // what turns the op into real `C += A*B`. This is the exact REVERSE of the
+                            // what turns the op into real `C += A*B`. This is the exact reverse of the
                             // non-quant C-store below (full 8-col groups <-> fsw.ps, 4-col remainder <->
-                            // scalar lane stores), and it is fully gated so accumulate=false emits ZERO
+                            // scalar lane stores), and it is fully gated so accumulate=false emits zero
                             // preload bytes (byte-identical to before this field had real semantics).
-                            // fp16 needs no special case: a fp16-INPUT matmul writes an fp32 C tile (the
-                            // accumulator is fp32 in FREGS), so its C in memory is fp32 and this exact
+                            // fp16 needs no special case: a fp16-input matmul writes an fp32 C tile (the
+                            // accumulator is fp32 in float registers), so its C in memory is fp32 and this exact
                             // fp32 flw.ps path preloads it.
                             if (mmv.accumulate and !has_quant) {
                                 const full_groups = cols / 8;
@@ -4918,7 +5099,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                                     try code.append(allocator, encode.add(desc, base_c, stride_reg));
                                     // Full 8-col groups: one flw.ps each (256-bit, 8 valid f32 = 32
                                     // bytes, no overhang since a full group is 8 valid columns), into
-                                    // f(2i+g), the SAME reg the store's fsw.ps reads back.
+                                    // f(2i+g), the same reg the store's fsw.ps reads back.
                                     var g: u16 = 0;
                                     while (g < full_groups) : (g += 1) {
                                         const freg: encode.FReg = @enumFromInt(@as(u5, @intCast(i * 2 + g)));
@@ -4926,9 +5107,9 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                                     }
                                     if (has_rem) {
                                         // 4-col remainder: a direct 8-lane flw.ps here would read 4
-                                        // valid C words PLUS 4 words past this C row (into the next row,
+                                        // valid C words plus 4 words past this C row (into the next row,
                                         // or past C's end at the last row) = a potential page fault. So
-                                        // STAGE the 4 valid words into the 64-aligned scratch (scalar
+                                        // stage the 4 valid words into the 64-aligned scratch (scalar
                                         // lw/sw, in-bounds) and flw.ps all 8 lanes from the scratch. The
                                         // upper 4 lanes read staging leftovers, which is harmless: the
                                         // 4-col fma only computes lanes 0..3 and the 4-col store only
@@ -4967,9 +5148,9 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                                 }
 
                                 // tensor_fma: reads A from SCP line 0, B from SCP line `rows`. The
-                                // a_cols field is K/factor (tensors.cpp scales it back by `factor`);
+                                // a_cols field is K/factor (tensors.cpp scales it back by `factor`).
                                 // type + tena/tenb_unsigned come from the dtype. first_pass is set on the
-                                // first K slice (fresh TenC = A*B); later slices accumulate (TenC += A*B)
+                                // first K slice (fresh TenC = A*B). Later slices accumulate (TenC += A*B)
                                 // into the same registers. An accumulate op forces the first slice to
                                 // accumulate onto whatever TenC held (true C-memory accumulation is unused).
                                 const first_pass = (ki == 0) and !mmv.accumulate;
@@ -4977,13 +5158,13 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                                 // a_cols-1 into the field). Passing kslice/factor makes the field
                                 // kslice/factor-1, which tensors.cpp scales as (field+1)*factor = kslice.
                                 const a_cols_arg: u5 = @intCast(kslice / di.factor);
-                                // bit 23 (packTensorFma's `tenc_in_mem`) is REINTERPRETED by the int8
+                                // bit 23 (packTensorFma's `tenc_in_mem`) is reinterpreted by the int8
                                 // path: tensors.cpp `tensor_ima8a32_execute` accumulates into the
-                                // internal TenC and copies it to the vector regfile (FREGS, which the
+                                // internal TenC and copies it to the vector regfile (float registers, which the
                                 // fsw.ps readback reads) only when this bit ("tenc2rf") is set on the
-                                // LAST internal K iteration. fp32/fp16 write FREGS directly and ignore
+                                // last internal K iteration. fp32/fp16 write float registers directly and ignore
                                 // the bit. So set it for int8/uint8 on the final K-tile only (0 on
-                                // intermediate tiles so they keep accumulating in TenC); fp32/fp16 leave
+                                // intermediate tiles so they keep accumulating in TenC). fp32/fp16 leave
                                 // it 0 (fp32 thus stays byte-identical).
                                 const tenc_to_rf = (di.tt == .int8) and (ki == k_tiles - 1);
                                 const fma_desc = encode.packTensorFma(di.tt, @intCast(rows), a_cols_arg, @intCast(cols), 0, 0, @intCast(rows), tenc_to_rf, a_uns, b_uns, first_pass);
@@ -4995,12 +5176,12 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
 
                             if (has_quant) {
                                 // Materialize + load this tile's quant inputs into consecutive SCP
-                                // lines starting at QUANT_SCP, in READ ORDER (bias, then scale, then
+                                // lines starting at QUANT_SCP, in read order (bias, then scale, then
                                 // zero-point): the tensor unit auto-advances its internal scp_loc by
                                 // one after every SCP-reading transform in the chain built below, so
                                 // whichever transform reads a given line must be the Nth one in the
                                 // chain if this line is loaded Nth here. Uniform per-tile loading for
-                                // BOTH scalar and per_column scale (the scalar case now redundantly
+                                // both scalar and per_column scale (the scalar case now redundantly
                                 // re-replicates the same bits every tile - a tiny, harmless waste of
                                 // instructions, not correctness) keeps this block a single, simple
                                 // shape instead of a pre-loop/per-tile split.
@@ -5018,7 +5199,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                                     try emitQuantScpLineLoad(allocator, &code, scp_line, stage_ptr, desc, stride_reg);
                                     scp_line += 1;
                                 }
-                                // 2. scale: scalar broadcasts one fp32 bit pattern to all 16 slots;
+                                // 2. scale: scalar broadcasts one fp32 bit pattern to all 16 slots.
                                 // per_column loads this tile's `cols` scales, column-indexed like bias.
                                 switch (q.scale) {
                                     .scalar => |scale_bits| {
@@ -5058,7 +5239,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                                 // (bias?) -> (relu?) -> *scale -> round -> (zero_point?) ->
                                 // sat[u]int8 -> pack. start_reg is 0 because every tile's TenC is
                                 // f0-based (the fma above always writes f0..). The col/row fields
-                                // encode this tile's cols/rows; scp_loc is QUANT_SCP, the first of
+                                // encode this tile's cols/rows. scp_loc is QUANT_SCP, the first of
                                 // the (up to 3) lines loaded just above, matched in order.
                                 const q = mmv.quant.?;
                                 var chain = [_]encode.QuantTransform{.last} ** 10;
@@ -5102,13 +5283,13 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                             if (has_quant) {
                                 // 8-bit output (signed int8 or unsigned uint8, per quant.out): C is
                                 // row-major bytes (stride n). After pack_128b, row i's `cols` results
-                                // are packed in the low `cols` bytes of the EVEN reg f(2i) = cols/4
+                                // are packed in the low `cols` bytes of the even reg f(2i) = cols/4
                                 // words (lanes 0..cols/4-1). The store is byte-identical for either
                                 // signedness (bytes are bytes). Extract each word and store it. cols
                                 // is always a multiple of 4, so there is no sub-word remainder.
                                 var i: u16 = 0;
                                 while (i < rows) : (i += 1) {
-                                    const c_off = (@as(u64, mi) * TILE + i) * n + @as(u64, ni) * TILE; // BYTES, int8 stride n
+                                    const c_off = (@as(u64, mi) * TILE + i) * n + @as(u64, ni) * TILE; // bytes, int8 stride n
                                     try loadImm64(allocator, &code, stride_reg, c_off);
                                     try code.append(allocator, encode.add(desc, base_c, stride_reg));
                                     const freg: encode.FReg = @enumFromInt(@as(u5, @intCast(i * 2))); // even reg holds the packed row
@@ -5121,8 +5302,8 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                             } else {
                                 // Store the completed output tile from TenC to real row-major C. TenC row i
                                 // is f(2i) [cols 0..7] and f(2i+1) [cols 8..15]. Each full 8-column group is
-                                // one fsw.ps (exactly 8 f32 = 32 bytes, no overhang since all 8 are valid);
-                                // a trailing 4-column remainder (cols % 8 == 4) is written with 4 scalar
+                                // one fsw.ps (exactly 8 f32 = 32 bytes, no overhang since all 8 are valid).
+                                // A trailing 4-column remainder (cols % 8 == 4) is written with 4 scalar
                                 // lane stores, because fsw.ps always writes 8 lanes and would clobber the
                                 // next row / past the end of C. c row R = mi*TILE+i, col base = ni*TILE.
                                 const full_groups = cols / 8;
@@ -5173,6 +5354,142 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                         try code.append(allocator, encode.ld(matmul_holder_c, .x2, sb + 48)); // x9
                     }
                 },
+                .call_indirect => |cl| {
+                    // A variadic call through a function pointer is not supported yet. Fail
+                    // closed instead of routing an anonymous float argument to an fa-register,
+                    // which would miscompile silently.
+                    if (cl.is_variadic) return error.Unsupported;
+                    // Indirect call through a function pointer: identical
+                    // argument setup to the direct `.call` case above, except the target is a
+                    // value (`cl.target`), not a relocatable symbol, and the branch is `jalr`
+                    // (through a register) instead of `jal` (through a relocation).
+                    //
+                    // Stage the target into `spill_scratch1` (x8) unconditionally, before any
+                    // argument moves touch a0-a7. `reloadInt` only reloads through its scratch
+                    // when `cl.target` is spilled. When the allocator left it resident in a
+                    // register, `reloadInt` returns that register verbatim, which can be any of
+                    // a0-a7 (an argument register). The arg-setup sequence below writes new
+                    // values into a0-a7 (directly, via `parallelMoveInt`'s `spill_scratch0`/x6
+                    // cycle-break, and via the spilled-arg reloads after it), so leaving the
+                    // target sitting in an argument register would let that setup clobber it
+                    // before the `jalr` reads it. Forcing an explicit copy into the dedicated,
+                    // non-argument `spill_scratch1` (x8) here, mirroring aarch64's unconditional
+                    // copy into `x16` and x86_64's into `r10`, makes the staging safe regardless
+                    // of where the allocator placed the target.
+                    const target_raw = try reloadInt(allocator, &code, alloc, spill_base, cl.target, inst_pos, spill_scratch1);
+                    if (target_raw != spill_scratch1) try code.append(allocator, encode.addi(spill_scratch1, target_raw, 0)); // mv
+                    const target_reg = spill_scratch1;
+
+                    var int_moves: std.ArrayList(RegMove) = .empty;
+                    defer int_moves.deinit(allocator);
+                    var int_spilled: std.ArrayList(struct { dst: Reg, off: i12 }) = .empty;
+                    defer int_spilled.deinit(allocator);
+                    var int_stack: std.ArrayList(Reg) = .empty; // register sources for args 9+
+                    defer int_stack.deinit(allocator);
+                    var int_i: usize = 0;
+                    var float_i: usize = 0;
+                    for (func.valueList(cl.args)) |arg| {
+                        if (isFloat(func, func.valueType(arg))) {
+                            if (float_i >= 8) return error.Unsupported;
+                            const d = is64Float(func, func.valueType(arg));
+                            const dst = fargReg(float_i);
+                            const src = try reloadFloat(allocator, &code, alloc, float_spill_base, arg, inst_pos, d, fspill0);
+                            if (src != dst) try code.append(allocator, if (d) encode.fmv_d(dst, src) else encode.fmv_s(dst, src));
+                            float_i += 1;
+                        } else if (int_i < 8) {
+                            const dst = argReg(int_i);
+                            switch (intLocationAt(alloc, arg, inst_pos)) {
+                                .reg => |src| try int_moves.append(allocator, .{ .src = src, .dst = dst }),
+                                .slot => |slot| try int_spilled.append(allocator, .{ .dst = dst, .off = @intCast(spill_base + slot * 8) }),
+                            }
+                            int_i += 1;
+                        } else {
+                            // Stack argument: must be register-resident for now.
+                            try int_stack.append(allocator, switch (intLocationAt(alloc, arg, inst_pos)) {
+                                .reg => |r| r,
+                                .slot => return error.Unsupported,
+                            });
+                            int_i += 1;
+                        }
+                    }
+                    if (int_stack.items.len != 0 and int_spilled.items.len != 0) return error.Unsupported;
+
+                    const stack_area: i12 = @intCast(alignUp(@intCast(int_stack.items.len * 8), 16));
+                    if (stack_area != 0) {
+                        try code.append(allocator, encode.addi(.x2, .x2, -stack_area));
+                        for (int_stack.items, 0..) |src, j| try code.append(allocator, encode.sd(src, .x2, @intCast(j * 8)));
+                    }
+                    try parallelMoveInt(allocator, &code, int_moves.items, spill_scratch0);
+                    for (int_spilled.items) |s| try code.append(allocator, encode.ld(s.dst, .x2, s.off));
+
+                    // jalr ra, target_reg, 0. Unlike `jal` (a relocatable direct call), the
+                    // target is a runtime value already resolved into `target_reg` above.
+                    try code.append(allocator, encode.jalr(.x1, target_reg, 0));
+                    if (stack_area != 0) try code.append(allocator, encode.addi(.x2, .x2, stack_area));
+
+                    // A result returns in a0 / fa0. Route it to its register or slot (identical
+                    // to the direct `.call` case's own result routing).
+                    if (func.instResult(inst)) |result| {
+                        if (isFloat(func, func.valueType(result))) {
+                            const d = is64Float(func, func.valueType(result));
+                            if (alloc.float.get(result)) |rd| {
+                                if (rd != .f10) try code.append(allocator, if (d) encode.fmv_d(rd, .f10) else encode.fmv_s(rd, .f10));
+                            } else {
+                                try storeFloat(allocator, &code, alloc, float_spill_base, result, inst_pos, d, .f10);
+                            }
+                        } else switch (intLocationAt(alloc, result, inst_pos)) {
+                            .reg => |rd| if (rd != .x10) try code.append(allocator, encode.addi(rd, .x10, 0)),
+                            .slot => |slot| try code.append(allocator, encode.sd(.x10, .x2, @intCast(spill_base + slot * 8))),
+                        }
+                    }
+                    if (cl.ret_dest) |dest| {
+                        // Store the register-return eightbytes into the
+                        // dest slot, sp-relative, see the direct `.call` arm above.
+                        const doff = slot_offset.get(dest).?;
+                        try emitStructRetStoreRV(allocator, &code, cl.ret_pieces, cl.ret_regs, doff);
+                    }
+                },
+                // LP64D variadic define side. `va_list` is a plain `void*` that walks a
+                // single contiguous run of 8-byte slots (the a0..a7 save block, then the incoming
+                // stack args). `va_end` owns no resource and is a no-op.
+                .va_start => |vs| {
+                    // `*list = &(first variadic slot)`. `vs.list` is the address of the void* va_list
+                    // object. The first variadic slot sits `8*num_fixed_gp` bytes into the contiguous
+                    // run whose base is the a-reg save block (`va_save_base`). num_fixed_gp counts the
+                    // fixed parameters that consumed an integer a-register. A fixed float/double uses an
+                    // fa-register and does not count, per the LP64D fixed-argument rule.
+                    const raw_gp = fixedIntParamCount(func);
+                    if (raw_gp > 8) return error.Unsupported; // >8 fixed integer params also spill to the stack (unmodeled)
+                    const first_off: u32 = va_save_base + 8 * raw_gp;
+                    const lp = try reloadInt(allocator, &code, alloc, spill_base, vs.list, inst_pos, spill_scratch0);
+                    try code.append(allocator, encode.addi(spill_scratch1, .x2, @intCast(first_off))); // &first-vararg-slot = sp + first_off
+                    try code.append(allocator, encode.sd(spill_scratch1, lp, 0)); // *list = that pointer
+                },
+                .va_arg => |va| {
+                    // `p = *list; *list = p + 8; result = *p`. Every slot is 8 bytes (doubles too), so
+                    // the stride is always 8. A double result reads the 8 raw bytes with `fld` (the bits
+                    // are already in the slot from the integer-register spill). An int/pointer result
+                    // reads its own width.
+                    const result = func.instResult(inst).?;
+                    const lp = try reloadInt(allocator, &code, alloc, spill_base, va.list, inst_pos, spill_scratch0);
+                    try code.append(allocator, encode.ld(spill_scratch1, lp, 0)); // p = *list
+                    if (isFloat(func, func.valueType(result))) {
+                        const d = is64Float(func, func.valueType(result));
+                        const rd = dstFloat(alloc, result, inst_pos, fspill0);
+                        try code.append(allocator, if (d) encode.fld(rd, spill_scratch1, 0) else encode.flw(rd, spill_scratch1, 0)); // result = *p
+                        try storeFloat(allocator, &code, alloc, float_spill_base, result, inst_pos, d, rd);
+                    } else {
+                        const rd = switch (intLocationAt(alloc, result, inst_pos)) {
+                            .reg => |r| r,
+                            .slot => return error.Unsupported, // a spilled va_arg result is unmodeled (resident in every current case)
+                        };
+                        try code.append(allocator, intLoadInsn(func, func.valueType(result), rd, spill_scratch1, 0)); // result = *p
+                    }
+                    // Advance: `*list = p + 8`. p (spill_scratch1) is dead after the load, so reuse it.
+                    try code.append(allocator, encode.addi(spill_scratch1, spill_scratch1, 8));
+                    try code.append(allocator, encode.sd(spill_scratch1, lp, 0));
+                },
+                .va_end => {},
                 else => return error.Unsupported,
             }
         }
@@ -5195,19 +5512,72 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
         }
         if (!exited) {
             switch (func.terminator(block) orelse return error.Unsupported) {
-                .ret => |value| {
-                    if (value) |v| {
-                        if (isFloat(func, func.valueType(v))) {
-                            // fmv fa0, freg  (skipped when already in fa0). A spilled return value
-                            // reloads from its slot into the scratch first.
-                            const d = is64Float(func, func.valueType(v));
-                            const fr = try reloadFloat(allocator, &code, alloc, float_spill_base, v, term_pos, d, fspill0);
-                            if (fr != .f10) try code.append(allocator, if (d) encode.fmv_d(.f10, fr) else encode.fmv_s(.f10, fr));
-                        } else {
-                            // mv a0, reg  (skipped when already in a0)
-                            const r = try reloadInt(allocator, &code, alloc, spill_base, v, term_pos, spill_scratch0);
-                            if (r != .x10) try code.append(allocator, encode.addi(.x10, r, 0));
-                        }
+                .ret => |ret_vals| {
+                    switch (ret_vals.count) {
+                        0 => {},
+                        1 => {
+                            const v = ret_vals.values[0];
+                            if (isFloat(func, func.valueType(v))) {
+                                // fmv fa0, freg  (skipped when already in fa0). A spilled return value
+                                // reloads from its slot into the scratch first.
+                                const d = is64Float(func, func.valueType(v));
+                                const fr = try reloadFloat(allocator, &code, alloc, float_spill_base, v, term_pos, d, fspill0);
+                                if (fr != .f10) try code.append(allocator, if (d) encode.fmv_d(.f10, fr) else encode.fmv_s(.f10, fr));
+                            } else {
+                                // mv a0, reg  (skipped when already in a0)
+                                const r = try reloadInt(allocator, &code, alloc, spill_base, v, term_pos, spill_scratch0);
+                                if (r != .x10) try code.append(allocator, encode.addi(.x10, r, 0));
+                            }
+                        },
+                        else => {
+                            // A small struct returned by value across two
+                            // register banks. Each value is one eightbyte, routed by its own type to
+                            // the next return register of its bank: an integer eightbyte into a0/a1,
+                            // a float eightbyte into fa0/fa1. The two banks count independently.
+                            // lp64d returns at most 2 eightbytes in registers (a bigger struct is
+                            // `.sret`), so the count never exceeds 2.
+                            if (ret_vals.count > 2) return error.Unsupported;
+                            // Stage each eightbyte into a dedicated scratch of its bank first (GPR
+                            // x6/x8, FPR fspill0/fspill1, none an argument register), so placing one
+                            // eightbyte into a return register cannot clobber another that still lives
+                            // there (the sources can overlap the return set in any permutation).
+                            const gp_stage = [_]Reg{ spill_scratch0, spill_scratch1 };
+                            const fp_stage = [_]FReg{ fspill0, fspill1 };
+                            var gp_staged: [2]Reg = undefined;
+                            var fp_staged: [2]FReg = undefined;
+                            var fp_wide: [2]bool = undefined;
+                            var is_fp: [2]bool = undefined;
+                            var gp_i: usize = 0;
+                            var fp_i: usize = 0;
+                            for (ret_vals.slice(), 0..) |v, i| {
+                                if (isFloat(func, func.valueType(v))) {
+                                    const d = is64Float(func, func.valueType(v));
+                                    const r = try reloadFloat(allocator, &code, alloc, float_spill_base, v, term_pos, d, fp_stage[fp_i]);
+                                    if (r != fp_stage[fp_i]) try code.append(allocator, if (d) encode.fmv_d(fp_stage[fp_i], r) else encode.fmv_s(fp_stage[fp_i], r));
+                                    fp_staged[fp_i] = fp_stage[fp_i];
+                                    fp_wide[fp_i] = d;
+                                    is_fp[i] = true;
+                                    fp_i += 1;
+                                } else {
+                                    const r = try reloadInt(allocator, &code, alloc, spill_base, v, term_pos, gp_stage[gp_i]);
+                                    if (r != gp_stage[gp_i]) try code.append(allocator, encode.addi(gp_stage[gp_i], r, 0));
+                                    gp_staged[gp_i] = gp_stage[gp_i];
+                                    is_fp[i] = false;
+                                    gp_i += 1;
+                                }
+                            }
+                            var gp_p: usize = 0;
+                            var fp_p: usize = 0;
+                            for (0..ret_vals.count) |i| {
+                                if (is_fp[i]) {
+                                    try code.append(allocator, if (fp_wide[fp_p]) encode.fmv_d(floatArgReg(fp_p), fp_staged[fp_p]) else encode.fmv_s(floatArgReg(fp_p), fp_staged[fp_p]));
+                                    fp_p += 1;
+                                } else {
+                                    try code.append(allocator, encode.addi(argReg(gp_p), gp_staged[gp_p], 0));
+                                    gp_p += 1;
+                                }
+                            }
+                        },
                     }
                     // Epilogue: restore ra and the callee-saved registers, close the frame.
                     if (non_leaf) try code.append(allocator, encode.ld(.x1, .x2, ra_off)); // restore ra
@@ -5219,7 +5589,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     try code.append(allocator, encode.jalr(.x0, .x1, 0)); // ret
                 },
                 .jump => |j| jump_blk: {
-                    // Shared Wimmer path: the allocator already RESOLVED this edge into an ordered
+                    // Shared Wimmer path: the allocator already resolved this edge into an ordered
                     // parallel-move sequence (params, live-through values, spills, and cycles), so
                     // replay it op-by-op and derive nothing, then the jal. `edge_move_driven` is false
                     // for every default caller, so the derivation below runs unchanged there.
@@ -5233,8 +5603,8 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                         break :jump_blk;
                     }
                     // Move each argument into its block parameter's register before the jump. The
-                    // edge's (arg_reg -> param_reg) moves can form a permutation CYCLE (a loop
-                    // header whose back-edge permutes its carried values - e.g. a swap x10<->x11 -
+                    // edge's (arg_reg -> param_reg) moves can form a permutation cycle (a loop
+                    // header whose back-edge permutes its carried values - for example a swap x10<->x11 -
                     // has the header's fixed param registers feeding back into themselves reordered).
                     // A naive in-order emit would clobber a value mid-cycle, so the moves are
                     // gathered per register class and realized by `parallelMove*` (which breaks
@@ -5250,8 +5620,8 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     // and any arg feeding a spilled param stores, ordered around the parallel move.
                     var int_moves: std.ArrayList(RegMove) = .empty;
                     defer int_moves.deinit(allocator);
-                    // A spilled int arg feeding a register param reloads AFTER the reg->reg move;
-                    // any arg feeding a spilled int param stores BEFORE it (while arg registers still
+                    // A spilled int arg feeding a register param reloads after the reg-to-reg move.
+                    // Any arg feeding a spilled int param stores before it (while arg registers still
                     // hold their edge values). Mirrors the float/vector split below.
                     var int_reloads: std.ArrayList(struct { arg: Value, dst: Reg }) = .empty;
                     defer int_reloads.deinit(allocator);
@@ -5262,7 +5632,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     var vec_moves: std.ArrayList(Move(VReg)) = .empty;
                     defer vec_moves.deinit(allocator);
                     // Spilled-float edges, ordered exactly like the spilled-vector edges below: a
-                    // spilled arg feeding a register param reloads; any arg feeding a spilled param
+                    // spilled arg feeding a register param reloads. Any arg feeding a spilled param
                     // stores. Stores read arg registers first (before the reg->reg parallel move
                     // clobbers them), then the reg->reg move, then reloads write the final param regs.
                     var float_reloads: std.ArrayList(struct { arg: Value, dst: FReg, d64: bool }) = .empty;
@@ -5270,7 +5640,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     var float_stores: std.ArrayList(struct { arg: Value, off: i12, d64: bool }) = .empty;
                     defer float_stores.deinit(allocator);
                     // Spilled-vector edges (rare: the block-local vectorizer keeps vectors in-block).
-                    // A spilled arg feeding a register param reloads; any arg feeding a spilled param
+                    // A spilled arg feeding a register param reloads. Any arg feeding a spilled param
                     // stores. Neither forms a cycle (distinct arg/param slots), so they are ordered
                     // safely around the reg->reg move: stores read arg registers first (before the
                     // reg->reg moves clobber them), then the reg->reg parallel move, then reloads
@@ -5317,7 +5687,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                             }
                         } else {
                             // The destination param reads stay direct (a param is never split). The
-                            // ARG source is read through `intLocationAt` at the terminator position.
+                            // arg source is read through `intLocationAt` at the terminator position.
                             if (alloc.int.get(param)) |pr| {
                                 switch (intLocationAt(alloc, arg, term_pos)) {
                                     .reg => |ar| try int_moves.append(allocator, .{ .src = ar, .dst = pr }),
@@ -5400,7 +5770,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
     std.debug.assert(action_cursor == alloc.actions.items.len);
 
     // Branch relaxation. RISC-V B-type conditional branches reach only ±4KiB (i13,
-    // even); a branch whose target lies farther would wrap (release) or panic (safe)
+    // even). A branch whose target lies farther would wrap (release) or panic (safe)
     // in the patch below. Decide per conditional-branch fixup whether it must take the
     // long form (an inverted short branch that skips a `jal` reaching ±1MiB), then
     // rebuild the code so every other branch/jump still lands correctly.
@@ -5415,7 +5785,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
     // so iterate to a fixpoint. Marks are monotonic (a long branch never reverts), and
     // each pass either flips at least one flag or stops, so this converges in at most
     // (#conditional branches) passes. At the fixpoint every branch is classified under
-    // the FINAL layout: shorts are provably in i13 range, longs are exactly those that
+    // the final layout: shorts are provably in i13 range, longs are exactly those that
     // are not.
     var any_long = false;
     var changed = true;
@@ -5426,7 +5796,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                 .branch, .cbranch => {},
                 .jal => continue,
             }
-            if (long[i]) continue; // already long; monotonic
+            if (long[i]) continue; // already long, monotonic
             const target_word = block_start[@intFromEnum(fx.target)];
             const adj_target = target_word + extraBeforeWord(fixups.items, long, target_word);
             const adj_branch = fx.index + extraBeforeWord(fixups.items, long, fx.index);
@@ -5461,14 +5831,14 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                 if (long[fi]) {
                     // Long form: inverted short branch skipping the far `jal` (+8 bytes =
                     // the instruction after the jal), then `jal x0, far_target`. The far
-                    // target is patched below; the skip is fully determined now.
+                    // target is patched below. The skip is fully determined now.
                     const skip = switch (fx.kind) {
                         .branch => |rs1| BranchKind.bne.invert().emit(rs1, .x0, 8),
                         .cbranch => |cb| cb.kind.invert().emit(cb.rs1, cb.rs2, 8),
                         .jal => unreachable, // a jal is never marked long
                     };
                     try new_code.append(allocator, skip);
-                    // The fixup now targets the SECOND word (the jal) and re-encodes as a
+                    // The fixup now targets the second word (the jal) and re-encodes as a
                     // plain far jump at patch time.
                     try new_fixups.append(allocator, .{ .index = new_code.items.len, .target = fx.target, .kind = .jal });
                     try new_code.append(allocator, encode.jal(.x0, 0));
@@ -5482,17 +5852,17 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
         }
 
         // Shift every block start by the extra words inserted before it. Computed from
-        // the ORIGINAL positions, so read-before-write in place is safe.
+        // the original positions, so read-before-write in place is safe.
         for (0..func.blockCount()) |bi| {
-            // Only reachable blocks have a valid `block_start` (the emission loop set theirs);
-            // an unreachable block's entry is untouched and unread, so skip it to avoid reading
+            // Only reachable blocks have a valid `block_start` (the emission loop set theirs).
+            // An unreachable block's entry is untouched and unread, so skip it to avoid reading
             // and rewriting an undefined slot. With all blocks reachable this shifts every entry
             // exactly as before.
             if (!reachable[bi]) continue;
             block_start[bi] = block_start[bi] + extraBeforeWord(fixups.items, long, block_start[bi]);
         }
 
-        // Move the relaxed image into `code`/`fixups`; neutralize the temporaries' error
+        // Move the relaxed image into `code`/`fixups`. Neutralize the temporaries' error
         // cleanup so ownership is not double-freed.
         code.deinit(allocator);
         code = new_code;
@@ -5504,7 +5874,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
 
     // Patch each branch/jump now that every block's position is known. Post-relaxation,
     // short conditional branches are guaranteed in i13 range (asserted as a programmer-
-    // error invariant); a `jal` beyond ±1MiB is a clean failure, not a wrap.
+    // error invariant). A `jal` beyond ±1MiB is a clean failure, not a wrap.
     for (fixups.items) |fx| {
         const target_idx: i64 = @intCast(block_start[@intFromEnum(fx.target)]);
         const from_idx: i64 = @intCast(fx.index);
@@ -5533,9 +5903,9 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
 }
 
 test "an unreachable block does not change the compiled output (byte-identical)" {
-    // Reachability-aware isel: a block unreachable from the entry must contribute NOTHING. Compile a
+    // Reachability-aware isel: a block unreachable from the entry must contribute nothing. Compile a
     // normal function, then append a dead block (nothing branches to it) carrying enough live
-    // block-params and arithmetic that, if isel processed it, it WOULD allocate registers and emit
+    // block-params and arithmetic that, if isel processed it, it would allocate registers and emit
     // code and thus shift the output. The compiled bytes must be identical before and after.
     var func = Function.init(std.testing.allocator);
     defer func.deinit();
@@ -5545,19 +5915,19 @@ test "an unreachable block does not change the compiled output (byte-identical)"
     const p0 = try func.appendBlockParam(entry, i64_t);
     const p1 = try func.appendBlockParam(entry, i64_t);
     const s = try func.appendInst(entry, i64_t, .{ .arith = .{ .op = .add, .lhs = p0, .rhs = p1 } });
-    func.setTerminator(entry, .{ .ret = s });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(s) });
 
     const before = try selectFunction(std.testing.allocator, &func);
     defer std.testing.allocator.free(before);
 
-    // Append the UNREACHABLE block. Its eight params plus the add chain over them are exactly the
+    // Append the unreachable block. Its eight params plus the add chain over them are exactly the
     // kind of live values that would draw registers and emit `add`s if they were ever processed.
     const dead = try func.appendBlock();
     var dp: [8]Value = undefined;
     for (&dp) |*d| d.* = try func.appendBlockParam(dead, i64_t);
     var accd = try func.appendInst(dead, i64_t, .{ .arith = .{ .op = .add, .lhs = dp[0], .rhs = dp[1] } });
     for (dp[2..]) |d| accd = try func.appendInst(dead, i64_t, .{ .arith = .{ .op = .add, .lhs = accd, .rhs = d } });
-    func.setTerminator(dead, .{ .ret = accd });
+    func.setTerminator(dead, .{ .ret = ir.function.Ret.one(accd) });
 
     const after = try selectFunction(std.testing.allocator, &func);
     defer std.testing.allocator.free(after);
@@ -5567,7 +5937,7 @@ test "an unreachable block does not change the compiled output (byte-identical)"
 }
 
 test "an unreachable register-pressure block is skipped so the function still compiles" {
-    // The plan-17 enabler in miniature: the ONLY reachable content is trivial (a ptr param and a
+    // The plan-17 enabler in miniature: the only reachable content is trivial (a ptr param and a
     // void return), but an unreachable block carries far more simultaneously-live integer
     // block-params than the 17 allocatable integer registers. Block params have no spill path, so if
     // isel walked the dead block `allocateRegisters` would return `error.Unsupported`. Because the
@@ -5579,7 +5949,7 @@ test "an unreachable register-pressure block is skipped so the function still co
     const ptr_t = try func.types.intern(.ptr);
     const entry = try func.appendBlock();
     _ = try func.appendBlockParam(entry, ptr_t);
-    func.setTerminator(entry, .{ .ret = null });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
 
     const dead = try func.appendBlock();
     var dp: [40]Value = undefined; // 40 > 17 allocatable integer registers, no block-param spill path
@@ -5587,9 +5957,9 @@ test "an unreachable register-pressure block is skipped so the function still co
     // Chain them so every param is live simultaneously at block entry (the last param is used last).
     var accd = try func.appendInst(dead, i64_t, .{ .arith = .{ .op = .add, .lhs = dp[0], .rhs = dp[1] } });
     for (dp[2..]) |d| accd = try func.appendInst(dead, i64_t, .{ .arith = .{ .op = .add, .lhs = accd, .rhs = d } });
-    func.setTerminator(dead, .{ .ret = accd });
+    func.setTerminator(dead, .{ .ret = ir.function.Ret.one(accd) });
 
-    // Before reachability-aware isel this returned error.Unsupported; now it succeeds.
+    // Before reachability-aware isel this returned error.Unsupported. Now it succeeds.
     const code = try selectFunction(std.testing.allocator, &func);
     defer std.testing.allocator.free(code);
     try std.testing.expect(code.len > 0);
@@ -5605,7 +5975,7 @@ test "a big-endian load byte-swaps after the load" {
     const p = try func.appendBlockParam(entry, ptr_t);
     const v = try func.appendInst(entry, i64_t, .{ .load = .{ .ptr = p } });
     try func.addAttr(.{ .value = v }, .{ .endian = .big });
-    func.setTerminator(entry, .{ .ret = v });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(v) });
 
     const code = try selectFunction(std.testing.allocator, &func);
     defer std.testing.allocator.free(code);
@@ -5630,7 +6000,7 @@ test "a big-endian store byte-swaps before the store" {
     try func.appendStore(entry, v, p);
     const insts = func.blockInsts(entry);
     try func.addAttr(.{ .inst = insts[insts.len - 1] }, .{ .endian = .big });
-    func.setTerminator(entry, .{ .ret = null });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
 
     const code = try selectFunction(std.testing.allocator, &func);
     defer std.testing.allocator.free(code);
@@ -5660,7 +6030,7 @@ test "callee-saved float registers are preserved in the frame" {
     for (&vals) |*v| v.* = try func.appendInst(entry, f32_t, .{ .arith = .{ .op = .add, .lhs = p0, .rhs = p1 } });
     var acc = try func.appendInst(entry, f32_t, .{ .arith = .{ .op = .add, .lhs = vals[0], .rhs = vals[1] } });
     for (vals[2..]) |v| acc = try func.appendInst(entry, f32_t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = v } });
-    func.setTerminator(entry, .{ .ret = acc });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(acc) });
 
     const code = try selectFunction(std.testing.allocator, &func);
     defer std.testing.allocator.free(code);
@@ -5703,7 +6073,7 @@ test "a callee-saved register is saved in the prologue and restored before ret" 
     for (&vals) |*v| v.* = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .add, .lhs = p0, .rhs = p1 } });
     var acc = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .add, .lhs = vals[0], .rhs = vals[1] } });
     for (vals[2..]) |v| acc = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = v } });
-    func.setTerminator(entry, .{ .ret = acc });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(acc) });
 
     const code = try selectFunction(std.testing.allocator, &func);
     defer std.testing.allocator.free(code);
@@ -5740,7 +6110,7 @@ test "an entry parameter that outlives a call is homed to a callee-saved registe
     const y = try func.appendBlockParam(entry, i32_t);
     const a = try func.appendCall(entry, i32_t, "f", &.{y}); // x is live across this call
     const r = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = a } });
-    func.setTerminator(entry, .{ .ret = r });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(r) });
 
     const code = try selectFunction(std.testing.allocator, &func);
     defer std.testing.allocator.free(code);
@@ -5767,7 +6137,7 @@ test "a value live across a call is placed in a callee-saved register" {
     const s = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = y } });
     const a = try func.appendCall(entry, i32_t, "f", &.{y}); // s is live across this call
     const r = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .add, .lhs = s, .rhs = a } });
-    func.setTerminator(entry, .{ .ret = r });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(r) });
 
     const code = try selectFunction(std.testing.allocator, &func);
     defer std.testing.allocator.free(code);
@@ -5791,7 +6161,7 @@ test "a void call discards its result" {
     const entry = try func.appendBlock();
     const x = try func.appendBlockParam(entry, i32_t);
     try func.appendVoidCall(entry, "sink", &.{x});
-    func.setTerminator(entry, .{ .ret = null });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
 
     var compiled = try compileFunction(std.testing.allocator, &func, .{});
     defer compiled.deinit(std.testing.allocator);
@@ -5817,7 +6187,7 @@ test "calls an external symbol and routes its result" {
     const v0 = try func.appendBlockParam(entry, i32_t);
     const v1 = try func.appendBlockParam(entry, i32_t);
     const r = try func.appendCall(entry, i32_t, "add", &.{ v0, v1 });
-    func.setTerminator(entry, .{ .ret = r });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(r) });
 
     var compiled = try compileFunction(std.testing.allocator, &func, .{});
     defer compiled.deinit(std.testing.allocator);
@@ -5855,7 +6225,7 @@ test "an alloca opens a stack frame and addresses its slot" {
     const p = try func.appendInst(entry, ptr_t, .{ .alloca = .{ .elem = i32_t } });
     try func.appendStore(entry, x, p);
     const v = try func.appendInst(entry, i32_t, .{ .load = .{ .ptr = p } });
-    func.setTerminator(entry, .{ .ret = v });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(v) });
 
     const code = try selectFunction(std.testing.allocator, &func);
     defer std.testing.allocator.free(code);
@@ -5882,7 +6252,7 @@ test "sub-word integer loads and stores pick the right width" {
     const b = try func.appendBlockParam(entry, i8_t);
     try func.appendStore(entry, b, p);
     const v = try func.appendInst(entry, i8_t, .{ .load = .{ .ptr = p } });
-    func.setTerminator(entry, .{ .ret = v });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(v) });
 
     const code = try selectFunction(std.testing.allocator, &func);
     defer std.testing.allocator.free(code);
@@ -5904,7 +6274,7 @@ test "an unsigned halfword load zero-extends" {
     const entry = try func.appendBlock();
     const p = try func.appendBlockParam(entry, ptr_t);
     const v = try func.appendInst(entry, u16_t, .{ .load = .{ .ptr = p } });
-    func.setTerminator(entry, .{ .ret = v });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(v) });
 
     const code = try selectFunction(std.testing.allocator, &func);
     defer std.testing.allocator.free(code);
@@ -5926,7 +6296,7 @@ test "selects loads and stores" {
     const p = try func.appendBlockParam(entry, ptr_t);
     const v = try func.appendInst(entry, i32_t, .{ .load = .{ .ptr = p } });
     try func.appendStore(entry, v, p);
-    func.setTerminator(entry, .{ .ret = null });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
 
     const code = try selectFunction(std.testing.allocator, &func);
     defer std.testing.allocator.free(code);
@@ -5953,7 +6323,7 @@ test "splits critical edges so the canonical max lowers" {
     const r = try func.appendBlockParam(block1, i32_t);
 
     try func.appendIf(block0, c, .{ .target = block1, .args = &.{a} }, .{ .target = block1, .args = &.{b} });
-    func.setTerminator(block1, .{ .ret = r });
+    func.setTerminator(block1, .{ .ret = ir.function.Ret.one(r) });
 
     try splitCriticalEdges(std.testing.allocator, &func);
 
@@ -5977,7 +6347,7 @@ test "selects float block arguments on a jump edge" {
     const v1 = try func.appendBlockParam(block1, f32_t);
 
     try func.setJump(block0, block1, &.{v0});
-    func.setTerminator(block1, .{ .ret = v1 });
+    func.setTerminator(block1, .{ .ret = ir.function.Ret.one(v1) });
 
     const code = try selectFunction(std.testing.allocator, &func);
     defer std.testing.allocator.free(code);
@@ -5985,7 +6355,7 @@ test "selects float block arguments on a jump edge" {
     // block1 is emitted right after block0, so the jump falls through: the parallel-move copy still
     // runs, but the `jal` is elided.
     try std.testing.expectEqualSlices(u32, &.{
-        encode.fmv_d(.f0, .f10), // fmv.d ft0, fa0  (parallel-move copies the whole float reg;
+        encode.fmv_d(.f0, .f10), // fmv.d ft0, fa0  (parallel-move copies the whole float reg,
         // a full 64-bit copy carries the f32 value's exact bits, NaN-box included, across the edge)
         encode.fmv_s(.f10, .f0), // fmv.s fa0, ft0  (return v1)
         encode.jalr(.x0, .x1, 0), // ret
@@ -6003,12 +6373,12 @@ test "selects block arguments on a jump edge" {
     const v1 = try func.appendBlockParam(block1, i32_t);
 
     try func.setJump(block0, block1, &.{v0});
-    func.setTerminator(block1, .{ .ret = v1 });
+    func.setTerminator(block1, .{ .ret = ir.function.Ret.one(v1) });
 
     const code = try selectFunction(std.testing.allocator, &func);
     defer std.testing.allocator.free(code);
 
-    // block0: mv t0, a0  (pass v0 into v1's register); block1 is emitted next so the jump falls
+    // block0: mv t0, a0  (pass v0 into v1's register). block1 is emitted next so the jump falls
     // through (the edge move stays, the `jal` is elided).
     // block1: mv a0, t0  (return v1) then ret.
     try std.testing.expectEqualSlices(u32, &.{
@@ -6027,7 +6397,7 @@ test "selects unsigned division with divu" {
     const a = try func.appendBlockParam(entry, u32_t);
     const b = try func.appendBlockParam(entry, u32_t);
     const q = try func.appendInst(entry, u32_t, .{ .arith = .{ .op = .div, .lhs = a, .rhs = b } });
-    func.setTerminator(entry, .{ .ret = q });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(q) });
 
     const code = try selectFunction(std.testing.allocator, &func);
     defer std.testing.allocator.free(code);
@@ -6049,7 +6419,7 @@ test "selects an unsigned comparison with sltu" {
     const a = try func.appendBlockParam(entry, u32_t);
     const b = try func.appendBlockParam(entry, u32_t);
     const c = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = a, .rhs = b } });
-    func.setTerminator(entry, .{ .ret = c });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(c) });
 
     const code = try selectFunction(std.testing.allocator, &func);
     defer std.testing.allocator.free(code);
@@ -6071,7 +6441,7 @@ test "selects an integer comparison" {
     const a = try func.appendBlockParam(entry, i32_t);
     const b = try func.appendBlockParam(entry, i32_t);
     const c = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = a, .rhs = b } });
-    func.setTerminator(entry, .{ .ret = c });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(c) });
 
     const code = try selectFunction(std.testing.allocator, &func);
     defer std.testing.allocator.free(code);
@@ -6094,17 +6464,17 @@ test "selects a conditional branch" {
     const block2 = try func.appendBlock();
 
     try func.appendIf(block0, c, .{ .target = block1 }, .{ .target = block2 });
-    func.setTerminator(block1, .{ .ret = null });
-    func.setTerminator(block2, .{ .ret = null });
+    func.setTerminator(block1, .{ .ret = ir.function.Ret.none() });
+    func.setTerminator(block2, .{ .ret = ir.function.Ret.none() });
 
     const code = try selectFunction(std.testing.allocator, &func);
     defer std.testing.allocator.free(code);
 
-    // Layout: block0 [beq], block1 [ret], block2 [ret]. THEN (block1) is the block emitted next, so
-    // fall-through elision inverts the non-fused test `bne c, x0 -> block1` to `beq c, x0 -> block2`
+    // Layout: block0 [beq], block1 [ret], block2 [ret]. Then (block1) is the block emitted next, so
+    // fall-through elision inverts the non-fused test `bne c, x0` (to block1) to `beq c, x0` (to block2)
     // and drops the `jal`, falling through to block1. block2's `ret` sits two words after the branch.
     try std.testing.expectEqualSlices(u32, &.{
-        encode.beq(.x10, .x0, 8), // beq c, x0, block2 (inverted; fall through to block1)
+        encode.beq(.x10, .x0, 8), // beq c, x0, block2 (inverted, fall through to block1)
         encode.jalr(.x0, .x1, 0), // block1: ret
         encode.jalr(.x0, .x1, 0), // block2: ret
     }, code);
@@ -6117,7 +6487,7 @@ test "selects a wide constant with lui+addi" {
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const entry = try func.appendBlock();
     const v = try func.appendInst(entry, i32_t, .{ .iconst = 0x12345 });
-    func.setTerminator(entry, .{ .ret = v });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(v) });
 
     const code = try selectFunction(std.testing.allocator, &func);
     defer std.testing.allocator.free(code);
@@ -6137,7 +6507,7 @@ test "selects a small constant" {
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const entry = try func.appendBlock();
     const v = try func.appendInst(entry, i32_t, .{ .iconst = 42 });
-    func.setTerminator(entry, .{ .ret = v });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(v) });
 
     const code = try selectFunction(std.testing.allocator, &func);
     defer std.testing.allocator.free(code);
@@ -6164,7 +6534,7 @@ test "register allocation reuses registers across a long value chain" {
     for (0..12) |_| {
         last = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .add, .lhs = last, .rhs = last } });
     }
-    func.setTerminator(entry, .{ .ret = last });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(last) });
 
     const code = try selectFunction(std.testing.allocator, &func);
     defer std.testing.allocator.free(code);
@@ -6185,7 +6555,7 @@ test "full pipeline: high-profile struct IR lowers to machine bytes" {
     const s = try func.appendStructNew(entry, st, &.{ a, b });
     const f0 = try func.appendInst(entry, i32_t, .{ .extract = .{ .aggregate = s, .index = 0 } });
     const sum = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .add, .lhs = f0, .rhs = b } });
-    func.setTerminator(entry, .{ .ret = sum });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(sum) });
 
     // Legalize the aggregate away, then select and emit.
     try ir.legalize.legalize(std.testing.allocator, &func);
@@ -6240,7 +6610,7 @@ test "selects a float comparison" {
     const a = try func.appendBlockParam(entry, f32_t);
     const b = try func.appendBlockParam(entry, f32_t);
     const c = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = a, .rhs = b } });
-    func.setTerminator(entry, .{ .ret = c });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(c) });
 
     const code = try selectFunction(std.testing.allocator, &func);
     defer std.testing.allocator.free(code);
@@ -6262,7 +6632,7 @@ test "selects float loads and stores" {
     const p = try func.appendBlockParam(entry, ptr_t);
     const v = try func.appendInst(entry, f32_t, .{ .load = .{ .ptr = p } });
     try func.appendStore(entry, v, p);
-    func.setTerminator(entry, .{ .ret = null });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
 
     const code = try selectFunction(std.testing.allocator, &func);
     defer std.testing.allocator.free(code);
@@ -6281,7 +6651,7 @@ test "selects a float constant" {
     const f32_t = try func.types.intern(.{ .float = .f32 });
     const entry = try func.appendBlock();
     const v = try func.appendInst(entry, f32_t, .{ .fconst = 1.5 });
-    func.setTerminator(entry, .{ .ret = v });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(v) });
 
     const code = try selectFunction(std.testing.allocator, &func);
     defer std.testing.allocator.free(code);
@@ -6306,7 +6676,7 @@ test "immediate arithmetic lowers without materializing the constant" {
     const a = try func.appendArithImm(entry, i32_t, .add, x, 5); // x + 5  -> addi
     const b = try func.appendArithImm(entry, i32_t, .shl, a, 2); // a << 2 -> slli
     const c = try func.appendArithImm(entry, i32_t, .bit_and, b, 255); // b & 255 -> andi
-    func.setTerminator(entry, .{ .ret = c });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(c) });
 
     const code = try selectFunction(std.testing.allocator, &func);
     defer std.testing.allocator.free(code);
@@ -6329,7 +6699,7 @@ test "selects an int-to-float conversion" {
     const entry = try func.appendBlock();
     const x = try func.appendBlockParam(entry, i32_t);
     const f = try func.appendInst(entry, f32_t, .{ .convert = .{ .value = x } });
-    func.setTerminator(entry, .{ .ret = f });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(f) });
 
     const code = try selectFunction(std.testing.allocator, &func);
     defer std.testing.allocator.free(code);
@@ -6350,7 +6720,7 @@ test "selects a float-to-int conversion" {
     const entry = try func.appendBlock();
     const x = try func.appendBlockParam(entry, f32_t);
     const i = try func.appendInst(entry, i32_t, .{ .convert = .{ .value = x } });
-    func.setTerminator(entry, .{ .ret = i });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(i) });
 
     const code = try selectFunction(std.testing.allocator, &func);
     defer std.testing.allocator.free(code);
@@ -6371,7 +6741,7 @@ test "selects a float add function" {
     const a = try func.appendBlockParam(entry, f32_t);
     const b = try func.appendBlockParam(entry, f32_t);
     const sum = try func.appendInst(entry, f32_t, .{ .arith = .{ .op = .add, .lhs = a, .rhs = b } });
-    func.setTerminator(entry, .{ .ret = sum });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(sum) });
 
     const code = try selectFunction(std.testing.allocator, &func);
     defer std.testing.allocator.free(code);
@@ -6386,7 +6756,7 @@ test "selects a float add function" {
 test "an f16 function now compiles (software-emulated, no Zfh) instead of being rejected" {
     // f16 was previously rejected on riscv64 (no hardware half). It is now emulated: held as its
     // f32 widening, arithmetic in f32 with a per-op software round to half. This just proves the
-    // gate is gone and codegen succeeds; the qemu differentials in tests/f16.zig prove correctness.
+    // gate is gone and codegen succeeds. The qemu differentials in tests/f16.zig prove correctness.
     var func = Function.init(std.testing.allocator);
     defer func.deinit();
 
@@ -6395,7 +6765,7 @@ test "an f16 function now compiles (software-emulated, no Zfh) instead of being 
     const a = try func.appendBlockParam(entry, f16_t);
     const b = try func.appendBlockParam(entry, f16_t);
     const sum = try func.appendInst(entry, f16_t, .{ .arith = .{ .op = .add, .lhs = a, .rhs = b } });
-    func.setTerminator(entry, .{ .ret = sum });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(sum) });
 
     const code = try selectFunction(std.testing.allocator, &func);
     defer std.testing.allocator.free(code);
@@ -6411,7 +6781,7 @@ test "selects a simple add function to RISC-V" {
     const a = try func.appendBlockParam(entry, i32_t);
     const b = try func.appendBlockParam(entry, i32_t);
     const sum = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .add, .lhs = a, .rhs = b } });
-    func.setTerminator(entry, .{ .ret = sum });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(sum) });
 
     const code = try selectFunction(std.testing.allocator, &func);
     defer std.testing.allocator.free(code);
@@ -6446,8 +6816,8 @@ fn runRvvFloat(allocator: std.mem.Allocator, func: *Function, fargs: []const f32
     try program.appendSlice(allocator, code);
 
     const bytes = std.mem.sliceAsBytes(program.items);
-    const ld = @import("ld.zig");
-    const elf = try ld.writeElfExec(allocator, bytes, bytes.len, 0x10000, 0x10000);
+    const ld = @import("vulcan-link");
+    const elf = try ld.writeElfExec(.riscv64, allocator, bytes, bytes.len, 0x10000, 0x10000);
     defer allocator.free(elf);
 
     var tmp = std.testing.tmpDir(.{});
@@ -6488,7 +6858,7 @@ test "qemu-riscv-V: a packed <4 x f32> add runs on RVV and reduces to the right 
     const s01 = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = c[0], .rhs = c[1] } });
     const s012 = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = s01, .rhs = c[2] } });
     const s = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = s012, .rhs = c[3] } });
-    func.setTerminator(b, .{ .ret = s });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(s) });
 
     const av = [4]f32{ 1.1, 2.2, 3.3, 4.4 };
     const bv = [4]f32{ 5.5, 6.6, 7.7, 8.8 };
@@ -6520,7 +6890,7 @@ test "qemu-riscv-V: a chained (a+b)*a keeps the intermediate in a vector registe
     const s01 = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = c[0], .rhs = c[1] } });
     const s012 = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = s01, .rhs = c[2] } });
     const s = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = s012, .rhs = c[3] } });
-    func.setTerminator(b, .{ .ret = s });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(s) });
 
     const av = [4]f32{ 1.1, 2.2, 3.3, 4.4 };
     const bv = [4]f32{ 5.5, 6.6, 7.7, 8.8 };
@@ -6555,7 +6925,7 @@ test "qemu-riscv-V: a <4 x f32> round-trips through an alloca slot (vse32 then v
     const s01 = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = c[0], .rhs = c[1] } });
     const s012 = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = s01, .rhs = c[2] } });
     const s = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = s012, .rhs = c[3] } });
-    func.setTerminator(b, .{ .ret = s });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(s) });
 
     const av = [4]f32{ 1.1, 2.2, 3.3, 4.4 };
     const bv = [4]f32{ 5.5, 6.6, 7.7, 8.8 };
@@ -6587,7 +6957,7 @@ test "qemu-riscv-V: high vector pressure spills whole vectors to 16-byte slots a
     const s01 = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = c[0], .rhs = c[1] } });
     const s012 = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = s01, .rhs = c[2] } });
     const s = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = s012, .rhs = c[3] } });
-    func.setTerminator(b, .{ .ret = s });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(s) });
 
     const ec = try runRvvFloat(allocator, &func, &.{}); // no float args, vectors built from fconsts
     var lane: f32 = @floatCast(@as(f64, 0.1));
@@ -6626,7 +6996,7 @@ test "qemu-riscv-V: a vector crosses a block edge via a merge-block vector param
     const s01 = try func.appendInst(merge, t, .{ .arith = .{ .op = .add, .lhs = c[0], .rhs = c[1] } });
     const s012 = try func.appendInst(merge, t, .{ .arith = .{ .op = .add, .lhs = s01, .rhs = c[2] } });
     const s = try func.appendInst(merge, t, .{ .arith = .{ .op = .add, .lhs = s012, .rhs = c[3] } });
-    func.setTerminator(merge, .{ .ret = s });
+    func.setTerminator(merge, .{ .ret = ir.function.Ret.one(s) });
 
     const a1 = [4]f32{ 1.1, 2.2, 3.3, 4.5 };
     const b1 = [4]f32{ 9.9, 1.0, 1.0, 1.0 };
@@ -6644,7 +7014,7 @@ test "qemu-riscv-V: a vector crosses a block edge via a merge-block vector param
 /// only by funct7). Masks the opcode field per instructions.vh's `casex`, like encode.zig's tests.
 /// True if `code` contains a real VPU packed-single arithmetic word (`fadd.ps`/`fsub.ps`/
 /// `fmul.ps`/`fdiv.ps`, opcode 0x7B, `encode.vpuPsRType`). Checking the opcode and funct3 alone is
-/// NOT enough: `mov.m.x md, xs, imm8` (the M0 mask preamble every VPU kernel starts with) is ALSO
+/// not enough: `mov.m.x md, xs, imm8` (the M0 mask preamble every VPU kernel starts with) is ALSO
 /// opcode 0x7B, and `mov_m_x(0, .x0, 0xFF)` happens to place 0b111 in the funct3 field too (imm8's
 /// low 3 bits, 0xFF & 0x7 == 0b111, sit at bits [14:12]), so an opcode+funct3-only check matches
 /// the preamble even when no arithmetic op was ever emitted. Two more conditions rule the preamble
@@ -6718,7 +7088,7 @@ test "et-soc VPU: an 8-lane elementwise f32 add compiles to VPU words with an M0
         const addr_out = try func.appendArithImm(b, ptr_t, .add, ptr_out, @intCast(i * 4));
         try func.appendStore(b, c, addr_out);
     }
-    func.setTerminator(b, .{ .ret = null });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
 
     // No emulator decodes et-soc's custom VPU opcodes (see encode.zig), so this is the
     // structural oracle: IR verification plus encoding checks against the RTL match masks.
@@ -6733,12 +7103,12 @@ test "et-soc VPU: an 8-lane elementwise f32 add compiles to VPU words with an M0
 
     // Compiles cleanly (no error.Unsupported for this simple shape) and contains both a VPU
     // arithmetic word (the fused add) and VPU load/store words (the scalar element accesses use
-    // plain flw/fsw, not these; the vector pack/spill path is what would use flw.ps/fsw.ps -- this
+    // plain flw/fsw, not these. The vector pack/spill path is what would use flw.ps/fsw.ps -- this
     // kernel has no vector spill, so absence would also be acceptable, but the M0 preamble and the
     // fused vector add are load-bearing).
     try std.testing.expect(hasVpuArithWord(code));
 
-    // hasVpuArithWord only proves *some* arith-shaped word exists; pin the exact word too, so a
+    // hasVpuArithWord only proves *some* arith-shaped word exists. Pin the exact word too, so a
     // regression that emits, say, fsub.ps by mistake (or drops the add and leaves only the M0
     // preamble, which also decodes to opcode 0x7B/funct3 0b111, see hasVpuArithWord's doc comment)
     // cannot slip through. The register allocator's vpu_vector pool is drawn f16-first (see
@@ -6780,7 +7150,7 @@ test "et-soc VPU: a 4-lane vector (RVV's fixed width, not the VPU's fixed 8) is 
     const vb = try func.appendInst(b, v4, .{ .struct_new = .{ .fields = try func.internValueList(&bp) } });
     const vc = try func.appendInst(b, v4, .{ .arith = .{ .op = .add, .lhs = va, .rhs = vb } });
     const c0 = try func.appendInst(b, t, .{ .extract = .{ .aggregate = vc, .index = 0 } });
-    func.setTerminator(b, .{ .ret = c0 });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(c0) });
 
     // The VPU is a fixed 8-lane unit: a 4-lane vector (the RVV width) is a shape this path
     // cannot serve, so `allocateRegisters`'s isVpuWidth check rejects it up front. A clean
@@ -6819,7 +7189,7 @@ fn hasIntPackStore(code: []const u32) bool {
 }
 
 /// True if `code` contains an `fmv.w.x` word (opcode 0x53, funct7 0b1111000, rs2 0, funct3 0): the
-/// GPR-to-FPR move the packed-SINGLE lane extract emits after `fmvs.x.ps`. The packed-INTEGER lane
+/// GPR-to-FPR move the packed-SINGLE lane extract emits after `fmvs.x.ps`. The packed-integer lane
 /// extract keeps the extracted lane in the GPR (it IS the i32 result), so it emits no such move.
 fn hasFmvWX(code: []const u32) bool {
     for (code) |w| {
@@ -6835,7 +7205,7 @@ fn hasFmvWX(code: []const u32) bool {
 /// Build the 8-lane `<8 x i32>` kernel `out[i] = op(a[i], b[i])` in the exact SLP shape the et-soc
 /// vectorizer produces (8 scalar int loads, one `struct_new` pack, one vector `arith`, 8 `extract`s,
 /// 8 scalar int stores), over an element of the given `signedness`. Mirrors `buildAddKernel` but the
-/// lanes are integers, so packing/unpacking rides the INT register file, not the scalar float pool.
+/// lanes are integers, so packing/unpacking rides the int register file, not the scalar float pool.
 fn buildIntVecKernel(func: *Function, op: ir.function.BinOp, signedness: std.builtin.Signedness) !void {
     const V = ir.function.Value;
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = signedness, .bits = 32 } });
@@ -6864,7 +7234,7 @@ fn buildIntVecKernel(func: *Function, op: ir.function.BinOp, signedness: std.bui
         const addr_out = try func.appendArithImm(b, ptr_t, .add, ptr_out, @intCast(i * 4));
         try func.appendStore(b, c, addr_out);
     }
-    func.setTerminator(b, .{ .ret = null });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
 }
 
 test "et-soc VPU: an 8-lane <8 x i32> op lowers to packed-integer (pi) words, int-store pack, and GPR-kept extract" {
@@ -6919,7 +7289,7 @@ test "et-soc VPU: a <8 x i32> vector op with no packed-integer equivalent (div) 
     var func = Function.init(allocator);
     defer func.deinit();
     // Integer divide has no `pi` op, so the vector arith lowering must reject it rather than emit a
-    // wrong word. (`rem` is likewise unsupported; `div` stands in for both.)
+    // wrong word. (`rem` is likewise unsupported. `div` stands in for both.)
     try buildIntVecKernel(&func, .div, .signed);
     const model = mm.modelFor(.@"et-soc");
     try std.testing.expectError(error.Unsupported, selectFunctionForModel(allocator, &func, model));
@@ -6965,14 +7335,14 @@ test "selectFunctionAligned pads a loop header with nops but never changes fetch
     const racc = try func.appendBlockParam(done, t);
 
     const zero = try func.appendInst(entry, t, .{ .iconst = 0 });
-    // Seed the accumulator with a NARROW constant (a single `addi` entry word) so the loop header
-    // lands on an ODD word offset and genuinely needs an alignment pad. Fall-through elision drops the
+    // Seed the accumulator with a narrow constant (a single `addi` entry word) so the loop header
+    // lands on an odd word offset and genuinely needs an alignment pad. Fall-through elision drops the
     // entry's `jal` into the header, so the header offset is exactly the entry's emitted word count.
-    // Under the shared Wimmer allocator (the SP3 flip) the entry prologue saves two callee-saved
-    // registers (three prologue words), so with the narrow seed the header lands on word 5 (odd): the
-    // fetch_align-8 hook pads it. A WIDE `lui + addi` seed would push it to word 6 (already 8-aligned),
+    // Under the shared Wimmer allocator the entry prologue saves two callee-saved
+    // registers (three prologue words), so with the narrow seed the header lands on word 5 (odd). The
+    // fetch_align-8 hook pads it. A wide `lui + addi` seed would push it to word 6 (already 8-aligned),
     // making the pad a no-op, which is not what these tests exercise. The function is never executed
-    // here (structural padding + seam-equivalence checks only), so the seed value is immaterial.
+    // here (structural padding and seam-equivalence checks only), so the seed value is immaterial.
     const seed = try func.appendInst(entry, t, .{ .iconst = 7 });
     try func.setJump(entry, loop, &.{ zero, seed });
     const cmp = try func.appendInst(loop, bool_t, .{ .icmp = .{ .op = .lt, .lhs = i, .rhs = n } });
@@ -6980,7 +7350,7 @@ test "selectFunctionAligned pads a loop header with nops but never changes fetch
     const ni = try func.appendArithImm(body, t, .add, bi, 1);
     const nacc = try func.appendInst(body, t, .{ .arith = .{ .op = .add, .lhs = bacc, .rhs = bi } });
     try func.setJump(body, loop, &.{ ni, nacc });
-    func.setTerminator(done, .{ .ret = racc });
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(racc) });
 
     // The `if` at `loop` carries edge arguments, which this backend requires split
     // into arg-free landing blocks first (the same pipeline `tests/harness.zig`
@@ -6997,7 +7367,7 @@ test "selectFunctionAligned pads a loop header with nops but never changes fetch
 
     // The loop header (`loop`, with a real back-edge from `body`) gets padded to a
     // 32-byte boundary, so the aligned build is strictly longer and contains at least
-    // one nop word (the padding); the fetch_align-0 path stays untouched.
+    // one nop word (the padding). The fetch_align-0 path stays untouched.
     try std.testing.expect(aligned.len > unaligned.len);
     var found_nop = false;
     for (aligned) |w| {
@@ -7024,14 +7394,14 @@ test "selectFunctionForModel fires the alignment hook from river-rc1.ma, matches
     const racc = try func.appendBlockParam(done, t);
 
     const zero = try func.appendInst(entry, t, .{ .iconst = 0 });
-    // Seed the accumulator with a NARROW constant (a single `addi` entry word) so the loop header
-    // lands on an ODD word offset and genuinely needs an alignment pad. Fall-through elision drops the
+    // Seed the accumulator with a narrow constant (a single `addi` entry word) so the loop header
+    // lands on an odd word offset and genuinely needs an alignment pad. Fall-through elision drops the
     // entry's `jal` into the header, so the header offset is exactly the entry's emitted word count.
-    // Under the shared Wimmer allocator (the SP3 flip) the entry prologue saves two callee-saved
-    // registers (three prologue words), so with the narrow seed the header lands on word 5 (odd): the
-    // fetch_align-8 hook pads it. A WIDE `lui + addi` seed would push it to word 6 (already 8-aligned),
+    // Under the shared Wimmer allocator the entry prologue saves two callee-saved
+    // registers (three prologue words), so with the narrow seed the header lands on word 5 (odd). The
+    // fetch_align-8 hook pads it. A wide `lui + addi` seed would push it to word 6 (already 8-aligned),
     // making the pad a no-op, which is not what these tests exercise. The function is never executed
-    // here (structural padding + seam-equivalence checks only), so the seed value is immaterial.
+    // here (structural padding and seam-equivalence checks only), so the seed value is immaterial.
     const seed = try func.appendInst(entry, t, .{ .iconst = 7 });
     try func.setJump(entry, loop, &.{ zero, seed });
     const cmp = try func.appendInst(loop, bool_t, .{ .icmp = .{ .op = .lt, .lhs = i, .rhs = n } });
@@ -7039,7 +7409,7 @@ test "selectFunctionForModel fires the alignment hook from river-rc1.ma, matches
     const ni = try func.appendArithImm(body, t, .add, bi, 1);
     const nacc = try func.appendInst(body, t, .{ .arith = .{ .op = .add, .lhs = bacc, .rhs = bi } });
     try func.setJump(body, loop, &.{ ni, nacc });
-    func.setTerminator(done, .{ .ret = racc });
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(racc) });
 
     try ir.legalize.legalize(allocator, &func);
     try splitCriticalEdges(allocator, &func);
@@ -7068,17 +7438,17 @@ test "selectFunctionForModel fires the alignment hook from river-rc1.ma, matches
 }
 
 // ===========================================================================
-// Wimmer bridge gap #7 (SP3 Task 1): a live-range split whose two adjacent segments are BOTH spill
+// A Wimmer bridge gap: a live-range split whose two adjacent segments are both spill
 // slots. `transition{Int,Float,Vector,Vpu}Action` now build a `.slot_to_slot` action instead of
 // bailing `error.Unsupported`, and `emitSplitAction` expands it into a reload-then-store pair through
 // the class scratch (int `spill_scratch0`, float `float_scratch`/`float_spill_scratch0_vpu` in vpu
 // mode, RVV `vector_scratch`, VPU `float_scratch`).
 //
-// A NATURAL Wimmer allocation never reaches this shape on riscv64, for the same structural reason
+// A natural Wimmer allocation never reaches this shape on riscv64, for the same structural reason
 // documented at aarch64's and x86_64's own `.slot_to_slot` tests: `riscv64UseKind` makes every operand
-// use `must_have_register`, so a placed value alternates register -> slot -> register and two adjacent
-// slot segments never arise; the shared `wimmer.zig` `orderMoves`/`orderIntraActions` machinery also
-// expands any slot->slot PARALLEL-MOVE shuffle through the class scratch before it ever becomes an
+// use `must_have_register`, so a placed value alternates register, slot, register, and two adjacent
+// slot segments never arise. The shared `wimmer.zig` `orderMoves`/`orderIntraActions` machinery also
+// expands any slot-to-slot parallel-move shuffle through the class scratch before it ever becomes an
 // `Action` (see `SplitAction`'s doc comment), so `walloc.actions` never carries one either. These
 // tests exercise the exact mechanism (`emitSplitAction`'s `.slot_to_slot` arm) directly with a
 // hand-built `SplitAction`, one per register class, the same way the aarch64/x86_64 bridges do.
@@ -7091,7 +7461,7 @@ test "emitSplitAction .slot_to_slot expands to reload+store through the int scra
     const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
     const b = try func.appendBlock();
     const v = try func.appendBlockParam(b, t);
-    func.setTerminator(b, .{ .ret = v });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(v) });
 
     var code: std.ArrayList(u32) = .empty;
     defer code.deinit(allocator);
@@ -7114,7 +7484,7 @@ test "emitSplitAction .slot_to_slot expands to reload+store through the float sc
     const t = try func.types.intern(.{ .float = .f64 });
     const b = try func.appendBlock();
     const v = try func.appendBlockParam(b, t);
-    func.setTerminator(b, .{ .ret = v });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(v) });
 
     var code: std.ArrayList(u32) = .empty;
     defer code.deinit(allocator);
@@ -7136,7 +7506,7 @@ test "emitSplitAction .slot_to_slot expands to reload+store through the vpu-mode
     const t = try func.types.intern(.{ .float = .f32 });
     const b = try func.appendBlock();
     const v = try func.appendBlockParam(b, t);
-    func.setTerminator(b, .{ .ret = v });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(v) });
 
     var code: std.ArrayList(u32) = .empty;
     defer code.deinit(allocator);
@@ -7161,7 +7531,7 @@ test "emitSplitAction .slot_to_slot round-trips an RVV <4 x f32> vector through 
     const v4 = try func.types.intern(.{ .vector = .{ .len = 4, .elem = f32_t } });
     const b = try func.appendBlock();
     const v = try func.appendBlockParam(b, v4);
-    func.setTerminator(b, .{ .ret = v });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(v) });
 
     var code: std.ArrayList(u32) = .empty;
     defer code.deinit(allocator);
@@ -7186,7 +7556,7 @@ test "emitSplitAction .slot_to_slot round-trips an et-soc VPU <8 x f32> vector t
     const v8 = try func.types.intern(.{ .vector = .{ .len = 8, .elem = f32_t } });
     const b = try func.appendBlock();
     const v = try func.appendBlockParam(b, v8);
-    func.setTerminator(b, .{ .ret = v });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(v) });
 
     var code: std.ArrayList(u32) = .empty;
     defer code.deinit(allocator);

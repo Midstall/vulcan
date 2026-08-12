@@ -115,26 +115,96 @@ pub const Unary = struct { op: UnaryOp, value: Value };
 pub const Alloca = struct { elem: Type };
 
 /// Call a function named by symbol index, passing `args`. The result type is the
-/// instruction's result type (use a zero-width result for a void call).
-pub const Call = struct { symbol: u32, args: ValueList };
+/// instruction's result type. Use a zero-width result for a void call. `is_variadic`
+/// and `num_fixed` mark a variadic C call, for example `printf("%d", n)`. `num_fixed`
+/// holds the callee's own declared parameter count. `args[0..num_fixed]` are the
+/// callee's declared parameters, `args[num_fixed..]` are the variadic arguments (the
+/// frontend already applies default argument promotion to them). Both fields default
+/// to the non-variadic values, so every existing construction site stays byte-identical
+/// (this mirrors the defaulted-bool pattern of `Load.@"volatile"`). IR construction,
+/// clone, and print carry these bits through. A later change makes the backend read them.
+/// One return-register eightbyte of a struct-by-value `.registers` return. `fp`
+/// selects the register bank the eightbyte comes back in (`false` an integer register,
+/// `true` a floating-point register). `offset` is the eightbyte's byte offset in the
+/// struct, and `bytes` its width (4 or 8). The caller's post-call store reads each
+/// return register of its bank and writes `bytes` of it into `[ret_dest + offset]`.
+/// An integer eightbyte defaults to `fp=false`, `offset=0`, `bytes=8` (a full-register
+/// store), which reproduces the plain integer-return store, so a pure-integer return
+/// stays byte-identical. This lives at the IR level, with no dependency on the
+/// frontend's `abi` classifier, so a backend can read it without that import.
+pub const RetPiece = struct { fp: bool = false, offset: u8 = 0, bytes: u8 = 8 };
+
+/// `ret_dest`/`ret_regs`/`ret_pieces`/`sret` carry a struct-by-value return. A small
+/// struct returned in registers (`abi.classify`'s `.registers` plan) sets `ret_dest`
+/// to a frontend-allocated destination slot (a frame-relative `alloca` address), and
+/// `ret_regs` to how many eightbytes the return occupies (1 to 4). The call itself
+/// produces no ordinary scalar result (its `result` is null, like a void call), and
+/// the backend stores the return registers into `ret_dest` after the call.
+/// `ret_pieces[0..ret_regs]` describe each return register's bank, offset, and width
+/// for that store (see `RetPiece`), so a return mixing integer and floating eightbytes
+/// lands the right register in the right dest slot. `ret_dest` is therefore an operand
+/// (a use) of the call, so every operand-scanning pass counts it and keeps the
+/// destination live, and its `alloca` is never dropped. `sret` marks the greater-than-
+/// 16-byte hidden-pointer return: `args[0]` is the caller's result-slot address. All
+/// fields default to the non-struct-return values, so every existing construction site
+/// stays byte-identical (this mirrors the defaulted-field pattern of `is_variadic`).
+pub const Call = struct { symbol: u32, args: ValueList, is_variadic: bool = false, num_fixed: u32 = 0, ret_dest: ?Value = null, ret_regs: u8 = 0, ret_pieces: [4]RetPiece = @splat(.{}), sret: bool = false };
 
 /// Call the function whose address is `target` (a `ptr`), passing `args`. The result
-/// type is the instruction's result type.
-pub const CallIndirect = struct { target: Value, args: ValueList };
+/// type is the instruction's result type. `is_variadic`/`num_fixed` mirror `Call`'s own
+/// fields, see there. `ret_dest`/`ret_regs`/`ret_pieces`/`sret` also mirror `Call`'s.
+pub const CallIndirect = struct { target: Value, args: ValueList, is_variadic: bool = false, num_fixed: u32 = 0, ret_dest: ?Value = null, ret_regs: u8 = 0, ret_pieces: [4]RetPiece = @splat(.{}), sret: bool = false };
 
 /// The address of a named global symbol (a module-level constant or variable),
-/// yielding a `ptr`. The symbol is resolved at link time.
-pub const GlobalAddr = struct { symbol: u32 };
+/// yielding a `ptr`. The symbol is resolved at link time. `via_got` requests
+/// GOT-indirect addressing: the code loads the symbol's address from the Global
+/// Offset Table (a data import from another shared object) rather than forming
+/// it directly. Defaults to `false` (an ordinary direct address), so every
+/// existing construction site keeps the byte-identical direct lowering.
+pub const GlobalAddr = struct { symbol: u32, via_got: bool = false };
 
-pub const Load = struct { ptr: Value };
+/// `volatile` marks an access to a C `volatile`-qualified lvalue. The optimizer must
+/// treat it as having an observable side effect: it must not eliminate it, reorder it
+/// across another volatile access, or coalesce it with another load or store, even
+/// though a plain `load` is otherwise pure. Defaults to `false` (an ordinary load), so
+/// every existing named-field construction site is unaffected. A later change makes
+/// the optimizer honor it; this only carries the bit through IR construction, clone,
+/// and remap.
+pub const Load = struct { ptr: Value, @"volatile": bool = false };
 
-/// A store to memory. Produces no result.
-pub const Store = struct { value: Value, ptr: Value };
+/// A store to memory. Produces no result. `volatile` mirrors `Load.volatile` (see its doc).
+pub const Store = struct { value: Value, ptr: Value, @"volatile": bool = false };
 
 /// A software prefetch hint for the address at `ptr`. Produces no result and has
 /// no observable effect on the function's result, it only hints the backend to
 /// warm the cache ahead of a later access.
 pub const Prefetch = struct { ptr: Value };
+
+/// Initialize a `va_list` object for reading a variadic call's extra arguments. This is
+/// C11 7.15's `va_start`. `list` is the address (a `ptr`) of the `va_list` object (the
+/// frontend's `__builtin_va_start(ap, last)` resolves `ap` to its address the same way any
+/// other lvalue does, see `ctype.builtinVaList` for the object's per-target shape). No
+/// result. A later backend expansion gives this its actual meaning, recording the first
+/// unnamed argument's location. This only carries it through IR construction, clone,
+/// print, and verify.
+pub const VaStart = struct { list: Value };
+
+/// Fetch the next variadic argument of the instruction's result type from the `va_list`
+/// object at `list`. This is C11 7.15's `va_arg`, advancing `list` past it. `list` is a
+/// `ptr` (mirrors `VaStart.list`). `ty` restates the result type on the op itself, rather
+/// than relying solely on the instruction's own result type the way `Convert` does, since
+/// a later backend expansion needs it to pick the right load width or register class
+/// without re-deriving it from the surrounding `InstData`. A later backend gives this its
+/// actual meaning; this only carries it through IR construction, clone, print, and verify.
+pub const VaArg = struct { list: Value, ty: Type };
+
+/// Finalize a `va_list` object at `list`. This is C11 7.15's `va_end`. `list` is a `ptr`
+/// (mirrors `VaStart.list`). No result. On every target this compiler lowers, `va_end` is
+/// a no-op at run time, since there is no allocated resource to release. It exists so the
+/// IR shape mirrors the C source exactly, and a future target that does need cleanup has
+/// somewhere to hang it. A later backend gives this its actual meaning; this only carries
+/// it through IR construction, clone, print, and verify.
+pub const VaEnd = struct { list: Value };
 
 /// An INT8 4-way dot-product accumulate: `result = acc + dot(a, b)`. Pure (no
 /// memory effect), like `arith`. `acc` and the result are `<4 x i32>`; `a` and
@@ -240,11 +310,44 @@ pub const Jump = struct { target: Block, args: ValueList };
 /// conditional-branch terminator in the low profile.
 pub const If = struct { cond: Value, then: Jump, @"else": Jump };
 
+/// The value list of a `ret` terminator. Holds up to 4 values inline: a void
+/// return has a count of 0, a scalar return has a count of 1 (both lower
+/// identically to today), and a count of 2 or more represents a future
+/// register-pair or HFA struct return. No backend lowers a count above 1 yet.
+pub const Ret = struct {
+    values: [4]Value = undefined,
+    count: u8 = 0,
+
+    /// A void return.
+    pub fn none() Ret {
+        return .{ .count = 0 };
+    }
+
+    /// A single-value return. The common case, byte-identical to today's
+    /// `?Value` path.
+    pub fn one(v: Value) Ret {
+        return .{ .values = .{ v, undefined, undefined, undefined }, .count = 1 };
+    }
+
+    /// A multi-value return. `vals` must hold at most 4 values.
+    pub fn many(vals: []const Value) Ret {
+        std.debug.assert(vals.len <= 4);
+        var r: Ret = .{ .count = @intCast(vals.len) };
+        for (vals, 0..) |v, i| r.values[i] = v;
+        return r;
+    }
+
+    /// The live values, in return order.
+    pub fn slice(self: *const Ret) []const Value {
+        return self.values[0..self.count];
+    }
+};
+
 /// How a block ends. The terminator transfers control out of the block. An unset
 /// terminator is an implicit `ret void`.
 pub const Terminator = union(enum) {
-    /// Return from the function, optionally with a value.
-    ret: ?Value,
+    /// Return from the function, with 0 to 4 values.
+    ret: Ret,
     /// Branch unconditionally to a block, passing arguments to its parameters.
     jump: Jump,
 };
@@ -318,6 +421,14 @@ pub const Opcode = union(enum) {
     /// A software prefetch hint for an address. Produces no result and has no
     /// observable effect.
     prefetch: Prefetch,
+    /// Initialize a `va_list` object for reading a variadic call's extra arguments.
+    /// Produces no result.
+    va_start: VaStart,
+    /// Fetch the next variadic argument from a `va_list` object, advancing it.
+    /// Result type is the op's own `ty`.
+    va_arg: VaArg,
+    /// Finalize a `va_list` object. Produces no result.
+    va_end: VaEnd,
     /// An INT8 4-way dot-product accumulate. Pure, like `arith`.
     dot: Dot,
     /// An et-soc fixed-tile matrix multiply. Produces no result. EFFECTFUL
@@ -371,6 +482,32 @@ pub const Function = struct {
     attributes: std.ArrayList(AttrEntry),
     /// Callee names referenced by `call` instructions, owned by the function.
     symbols: std.ArrayList([]const u8),
+    /// True when this function itself is a variadic definition, for example `int sum(int
+    /// n, ...) { ... }`, as opposed to `Call.is_variadic`, which marks a variadic call site
+    /// inside some function. The two are independent: a non-variadic function can still call
+    /// a variadic one. Defaults to `false`, so every existing construction site stays byte-
+    /// identical. A later backend reads it to decide whether to spill the incoming unnamed
+    /// register or stack arguments, so `va_start`/`va_arg` can walk them.
+    is_variadic: bool = false,
+    /// This function's own fixed (declared, named) parameter count when `is_variadic` is
+    /// set. Mirrors `Call.num_fixed`'s meaning but for the callee side. Meaningless when
+    /// `is_variadic` is false, and then stays at its default `0`, matching every other
+    /// defaulted-bool-paired field in this file, for example `Call.num_fixed`.
+    num_fixed_params: u32 = 0,
+    /// True when this function returns a struct through a hidden result pointer
+    /// (`abi.classify`'s `.sret` plan for an aggregate over 16 bytes). The first entry
+    /// parameter is that hidden pointer, and the function copies its result there and
+    /// returns the same address in the ABI return register. Defaults to `false` (an
+    /// ordinary return), so every existing construction site stays byte-identical. A
+    /// register return sets it nowhere, since it needs no hidden pointer. It exists now
+    /// so the marker round-trips through `clone`.
+    sret: bool = false,
+    /// True when this function has internal linkage (a C `static` function), so its object
+    /// symbol is emitted with local binding. A local symbol does not participate in
+    /// cross-object resolution, so two translation units that each define their own copy of a
+    /// `static inline` helper (glibc's `__bswap_16`) do not collide at link time. Defaults
+    /// to `false` (external/global), so every existing construction site stays byte-identical.
+    is_local: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) Function {
         return .{
@@ -416,6 +553,11 @@ pub const Function = struct {
     pub fn clone(self: *const Function, allocator: std.mem.Allocator) std.mem.Allocator.Error!Function {
         var out = Function.init(allocator);
         errdefer out.deinit();
+
+        // Whole-function variadic metadata is plain data, copied straight across.
+        out.is_variadic = self.is_variadic;
+        out.num_fixed_params = self.num_fixed_params;
+        out.sret = self.sret;
 
         // Types: re-intern each kind in the original's order. The original table is deduped (every
         // kind unique), and interning is order-preserving, so the n-th kind receives handle n exactly,
@@ -628,12 +770,37 @@ pub const Function = struct {
 
     /// Append a store to a block.
     pub fn appendStore(self: *Function, block: Block, value: Value, ptr: Value) std.mem.Allocator.Error!void {
-        try self.appendStmt(block, .{ .store = .{ .value = value, .ptr = ptr } });
+        try self.appendStoreVol(block, value, ptr, false);
+    }
+
+    /// Append a store to a block, marking it `volatile` when `is_volatile` is set.
+    /// The frontend uses this when writing through a `volatile`-qualified lvalue.
+    /// `appendStore` is this with `is_volatile = false`.
+    pub fn appendStoreVol(self: *Function, block: Block, value: Value, ptr: Value, is_volatile: bool) std.mem.Allocator.Error!void {
+        try self.appendStmt(block, .{ .store = .{ .value = value, .ptr = ptr, .@"volatile" = is_volatile } });
     }
 
     /// Append a software prefetch hint for `ptr` to a block. No observable effect.
     pub fn appendPrefetch(self: *Function, block: Block, ptr: Value) std.mem.Allocator.Error!void {
         try self.appendStmt(block, .{ .prefetch = .{ .ptr = ptr } });
+    }
+
+    /// Append a `va_start`: initialize the `va_list` object at `list` (its
+    /// address, a `ptr`). No result.
+    pub fn appendVaStart(self: *Function, block: Block, list: Value) std.mem.Allocator.Error!void {
+        try self.appendStmt(block, .{ .va_start = .{ .list = list } });
+    }
+
+    /// Append a `va_arg`: fetch the next variadic argument of type `ty` from the
+    /// `va_list` object at `list` (its address, a `ptr`), returning the fetched value.
+    pub fn appendVaArg(self: *Function, block: Block, list: Value, ty: Type) std.mem.Allocator.Error!Value {
+        return self.appendInst(block, ty, .{ .va_arg = .{ .list = list, .ty = ty } });
+    }
+
+    /// Append a `va_end`: finalize the `va_list` object at `list` (its address, a
+    /// `ptr`). No result.
+    pub fn appendVaEnd(self: *Function, block: Block, list: Value) std.mem.Allocator.Error!void {
+        try self.appendStmt(block, .{ .va_end = .{ .list = list } });
     }
 
     /// Append an INT8 4-way dot-product accumulate: `result = acc + dot(a, b)`.
@@ -727,6 +894,36 @@ pub const Function = struct {
         return self.appendInst(block, ty, .{ .call_indirect = .{ .target = target, .args = list } });
     }
 
+    /// Append a variadic call to `name` with `args`, returning the result of type
+    /// `ty`. `num_fixed` is the callee's own fixed (declared) parameter count, see `Call`'s
+    /// doc comment. `appendCall` above is this with `is_variadic = false`, `num_fixed = 0`.
+    pub fn appendCallV(self: *Function, block: Block, ty: Type, name: []const u8, args: []const Value, num_fixed: u32) std.mem.Allocator.Error!Value {
+        const symbol = try self.internSymbol(name);
+        const list = try self.internValues(args);
+        return self.appendInst(block, ty, .{ .call = .{ .symbol = symbol, .args = list, .is_variadic = true, .num_fixed = num_fixed } });
+    }
+
+    /// Append a variadic indirect call through `target` with `args`, returning the
+    /// result. Mirrors `appendCallV`, see there.
+    pub fn appendCallIndirectV(self: *Function, block: Block, ty: Type, target: Value, args: []const Value, num_fixed: u32) std.mem.Allocator.Error!Value {
+        const list = try self.internValues(args);
+        return self.appendInst(block, ty, .{ .call_indirect = .{ .target = target, .args = list, .is_variadic = true, .num_fixed = num_fixed } });
+    }
+
+    /// A void-returning indirect call - the `call_indirect` counterpart of `appendVoidCall`. It
+    /// is a statement (no result), so the backend emits the call without a result move, exactly
+    /// as it does for a void direct `.call`. A `void (*fp)(void)` call reaches this.
+    pub fn appendVoidCallIndirect(self: *Function, block: Block, target: Value, args: []const Value) std.mem.Allocator.Error!void {
+        const list = try self.internValues(args);
+        try self.appendStmt(block, .{ .call_indirect = .{ .target = target, .args = list } });
+    }
+
+    /// The variadic form of `appendVoidCallIndirect`.
+    pub fn appendVoidCallIndirectV(self: *Function, block: Block, target: Value, args: []const Value, num_fixed: u32) std.mem.Allocator.Error!void {
+        const list = try self.internValues(args);
+        try self.appendStmt(block, .{ .call_indirect = .{ .target = target, .args = list, .is_variadic = true, .num_fixed = num_fixed } });
+    }
+
     /// Append a `global_addr` for the named symbol, returning its address as `ty`
     /// (which should be `ptr`). The symbol is resolved at link time.
     pub fn appendGlobalAddr(self: *Function, block: Block, ty: Type, name: []const u8) std.mem.Allocator.Error!Value {
@@ -734,11 +931,73 @@ pub const Function = struct {
         return self.appendInst(block, ty, .{ .global_addr = .{ .symbol = symbol } });
     }
 
+    /// Append a GOT-indirect `global_addr` for the named symbol, returning its address
+    /// as `ty` (which should be `ptr`). The address is loaded from the GOT at run time
+    /// (a data import from another shared object); only aarch64 lowers this today.
+    pub fn appendGlobalAddrGot(self: *Function, block: Block, ty: Type, name: []const u8) std.mem.Allocator.Error!Value {
+        const symbol = try self.internSymbol(name);
+        return self.appendInst(block, ty, .{ .global_addr = .{ .symbol = symbol, .via_got = true } });
+    }
+
     /// Append a call to `name` with `args` that discards its result (a statement).
     pub fn appendVoidCall(self: *Function, block: Block, name: []const u8, args: []const Value) std.mem.Allocator.Error!void {
         const symbol = try self.internSymbol(name);
         const list = try self.internValues(args);
         try self.appendStmt(block, .{ .call = .{ .symbol = symbol, .args = list } });
+    }
+
+    /// Append a variadic void call, `appendVoidCall`'s counterpart for a
+    /// `void`-returning variadic callee, for example `void warn(const char *fmt, ...)`. Mirrors
+    /// `appendCallV`, see there.
+    pub fn appendVoidCallV(self: *Function, block: Block, name: []const u8, args: []const Value, num_fixed: u32) std.mem.Allocator.Error!void {
+        const symbol = try self.internSymbol(name);
+        const list = try self.internValues(args);
+        try self.appendStmt(block, .{ .call = .{ .symbol = symbol, .args = list, .is_variadic = true, .num_fixed = num_fixed } });
+    }
+
+    /// Copy `pieces` (at most 4) into a fixed `[4]RetPiece`, defaulting the unused tail slots.
+    fn retPieceArray(pieces: []const RetPiece) [4]RetPiece {
+        std.debug.assert(pieces.len <= 4);
+        var out: [4]RetPiece = @splat(.{});
+        for (pieces, 0..) |p, i| out[i] = p;
+        return out;
+    }
+
+    /// Append a call to `name` that returns a struct in registers. The
+    /// call has no scalar result, since its "result" is written to memory. The backend stores the
+    /// return registers into `ret_dest` (a frame-relative destination slot address) after the
+    /// call, one per `pieces` entry, each into `[ret_dest + piece.offset]` from `piece`'s bank.
+    /// `pieces` has one entry per return eightbyte (1 to 4). See `RetPiece` and `Call`'s doc.
+    pub fn appendCallStructRet(self: *Function, block: Block, name: []const u8, args: []const Value, ret_dest: Value, pieces: []const RetPiece) std.mem.Allocator.Error!void {
+        const symbol = try self.internSymbol(name);
+        const list = try self.internValues(args);
+        try self.appendStmt(block, .{ .call = .{ .symbol = symbol, .args = list, .ret_dest = ret_dest, .ret_regs = @intCast(pieces.len), .ret_pieces = retPieceArray(pieces) } });
+    }
+
+    /// `appendCallStructRet`'s indirect-call counterpart, a struct-returning call through a
+    /// computed `target` pointer. Mirrors `appendCallStructRet`, see there and `CallIndirect`.
+    pub fn appendCallIndirectStructRet(self: *Function, block: Block, target: Value, args: []const Value, ret_dest: Value, pieces: []const RetPiece) std.mem.Allocator.Error!void {
+        const list = try self.internValues(args);
+        try self.appendStmt(block, .{ .call_indirect = .{ .target = target, .args = list, .ret_dest = ret_dest, .ret_regs = @intCast(pieces.len), .ret_pieces = retPieceArray(pieces) } });
+    }
+
+    /// Append a call to `name` that returns a struct through a hidden result pointer
+    /// (the `.sret` plan for a struct over 16 bytes). The call has no scalar result: `args[0]`
+    /// is the caller's destination slot address (the hidden pointer), and the callee writes its
+    /// return value there. The frontend passes the same slot address on as this call's lvalue, so
+    /// the call itself needs neither `ret_dest` nor `ret_regs`, since the callee did the store. See
+    /// `Call`'s doc for the `sret` field.
+    pub fn appendCallSret(self: *Function, block: Block, name: []const u8, args: []const Value) std.mem.Allocator.Error!void {
+        const symbol = try self.internSymbol(name);
+        const list = try self.internValues(args);
+        try self.appendStmt(block, .{ .call = .{ .symbol = symbol, .args = list, .sret = true } });
+    }
+
+    /// `appendCallSret`'s indirect-call counterpart, a hidden-pointer struct-returning call through
+    /// a computed `target` pointer. Mirrors `appendCallSret`, see there and `CallIndirect`.
+    pub fn appendCallIndirectSret(self: *Function, block: Block, target: Value, args: []const Value) std.mem.Allocator.Error!void {
+        const list = try self.internValues(args);
+        try self.appendStmt(block, .{ .call_indirect = .{ .target = target, .args = list, .sret = true } });
     }
 
     /// Append an aggregate construction, returning the struct value. `ty` must be
@@ -826,6 +1085,9 @@ pub const Function = struct {
                     st.ptr = r(from, to, st.ptr);
                 },
                 .prefetch => |*pf| pf.ptr = r(from, to, pf.ptr),
+                .va_start => |*vs| vs.list = r(from, to, vs.list),
+                .va_arg => |*va| va.list = r(from, to, va.list),
+                .va_end => |*ve| ve.list = r(from, to, ve.list),
                 .dot => |*d| {
                     d.acc = r(from, to, d.acc);
                     d.a = r(from, to, d.a);
@@ -839,11 +1101,13 @@ pub const Function = struct {
                 .struct_new => |sn| for (self.valueListMut(sn.fields)) |*f| {
                     f.* = r(from, to, f.*);
                 },
-                .call => |c| for (self.valueListMut(c.args)) |*arg| {
-                    arg.* = r(from, to, arg.*);
+                .call => |*c| {
+                    if (c.ret_dest) |*rd| rd.* = r(from, to, rd.*); // The register-return dest is a use.
+                    for (self.valueListMut(c.args)) |*arg| arg.* = r(from, to, arg.*);
                 },
                 .call_indirect => |*c| {
                     c.target = r(from, to, c.target);
+                    if (c.ret_dest) |*rd| rd.* = r(from, to, rd.*); // The register-return dest is a use.
                     for (self.valueListMut(c.args)) |*arg| arg.* = r(from, to, arg.*);
                 },
                 .@"if" => |*cf| {
@@ -856,8 +1120,8 @@ pub const Function = struct {
         for (0..self.blockCount()) |bi| {
             const term = self.terminatorPtr(@enumFromInt(bi));
             if (term.*) |*t| switch (t.*) {
-                .ret => |*v| if (v.*) |vv| {
-                    v.* = r(from, to, vv);
+                .ret => |*ret| for (ret.values[0..ret.count]) |*vv| {
+                    vv.* = r(from, to, vv.*);
                 },
                 .jump => |*j| for (self.valueListMut(j.args)) |*arg| {
                     arg.* = r(from, to, arg.*);
@@ -1006,7 +1270,11 @@ pub const Function = struct {
 
         if (self.terminator(src)) |term| {
             const new_term: Terminator = switch (term) {
-                .ret => |v| .{ .ret = if (v) |vv| remapValue(map, vv) else null },
+                .ret => |r| blk: {
+                    var nr = r;
+                    for (nr.values[0..nr.count]) |*vv| vv.* = remapValue(map, vv.*);
+                    break :blk .{ .ret = nr };
+                },
                 .jump => |j| .{
                     .jump = .{
                         .target = j.target, // block targets are never remapped, only values are
@@ -1041,14 +1309,32 @@ pub const Function = struct {
             .extract => |ex| .{ .extract = .{ .aggregate = remapValue(map, ex.aggregate), .index = ex.index } },
             .convert => |cv| .{ .convert = .{ .value = remapValue(map, cv.value) } },
             .unary => |u| .{ .unary = .{ .op = u.op, .value = remapValue(map, u.value) } },
-            .call => |c| .{ .call = .{ .symbol = c.symbol, .args = try self.remapValueList(allocator, c.args, map) } },
+            .call => |c| .{ .call = .{
+                .symbol = c.symbol,
+                .args = try self.remapValueList(allocator, c.args, map),
+                .is_variadic = c.is_variadic,
+                .num_fixed = c.num_fixed,
+                .ret_dest = if (c.ret_dest) |rd| remapValue(map, rd) else null,
+                .ret_regs = c.ret_regs,
+                .ret_pieces = c.ret_pieces,
+                .sret = c.sret,
+            } },
             .call_indirect => |c| .{ .call_indirect = .{
                 .target = remapValue(map, c.target),
                 .args = try self.remapValueList(allocator, c.args, map),
+                .is_variadic = c.is_variadic,
+                .num_fixed = c.num_fixed,
+                .ret_dest = if (c.ret_dest) |rd| remapValue(map, rd) else null,
+                .ret_regs = c.ret_regs,
+                .ret_pieces = c.ret_pieces,
+                .sret = c.sret,
             } },
-            .load => |ld| .{ .load = .{ .ptr = remapValue(map, ld.ptr) } },
-            .store => |st| .{ .store = .{ .value = remapValue(map, st.value), .ptr = remapValue(map, st.ptr) } },
+            .load => |ld| .{ .load = .{ .ptr = remapValue(map, ld.ptr), .@"volatile" = ld.@"volatile" } },
+            .store => |st| .{ .store = .{ .value = remapValue(map, st.value), .ptr = remapValue(map, st.ptr), .@"volatile" = st.@"volatile" } },
             .prefetch => |pf| .{ .prefetch = .{ .ptr = remapValue(map, pf.ptr) } },
+            .va_start => |vs| .{ .va_start = .{ .list = remapValue(map, vs.list) } },
+            .va_arg => |va| .{ .va_arg = .{ .list = remapValue(map, va.list), .ty = va.ty } },
+            .va_end => |ve| .{ .va_end = .{ .list = remapValue(map, ve.list) } },
             .dot => |d| .{ .dot = .{ .acc = remapValue(map, d.acc), .a = remapValue(map, d.a), .b = remapValue(map, d.b) } },
             .matmul => |mm| blk: {
                 // Only a/b/c are Values. The m/n/k/dtype/accumulate/embedded/quant/input_signs are
@@ -1348,10 +1634,14 @@ fn printInst(self: *const Function, w: *std.Io.Writer, inst: Inst) std.Io.Writer
             self.valueName(data.result.?),
             self.types.fmt(al.elem),
         }),
-        .global_addr => |ga| try w.print("let v{d} = global_addr @{s}", .{
+        .global_addr => |ga| try w.print("let v{d} = global_addr{s} @{s}", .{
             self.valueName(data.result.?),
+            if (ga.via_got) " got" else "",
             self.symbolName(ga.symbol),
         }),
+        // TODO: is_variadic/num_fixed are not printed here, so they do not round-trip
+        // through the text IR. This matches Load.@"volatile", which also is not printed.
+        // Fix this before any variadic call is serialized, in bitcode, LTO, or text IR.
         .call => |c| {
             if (data.result) |res| {
                 try w.print("let v{d} = call {f} @{s}(", .{
@@ -1398,6 +1688,13 @@ fn printInst(self: *const Function, w: *std.Io.Writer, inst: Inst) std.Io.Writer
         }),
         .store => |st| try w.print("store v{d}, v{d}", .{ self.valueName(st.value), self.valueName(st.ptr) }),
         .prefetch => |pf| try w.print("prefetch v{d}", .{self.valueName(pf.ptr)}),
+        .va_start => |vs| try w.print("va_start v{d}", .{self.valueName(vs.list)}),
+        .va_arg => |va| try w.print("let v{d} = va_arg {f}, v{d}", .{
+            self.valueName(data.result.?),
+            self.types.fmt(va.ty),
+            self.valueName(va.list),
+        }),
+        .va_end => |ve| try w.print("va_end v{d}", .{self.valueName(ve.list)}),
         .dot => |d| try w.print("let v{d} = dot v{d}, v{d}, v{d}", .{
             self.valueName(data.result.?),
             self.valueName(d.acc),
@@ -1456,11 +1753,15 @@ fn printTerminator(self: *const Function, w: *std.Io.Writer, term: ?Terminator) 
         return;
     };
     switch (t) {
-        .ret => |value| {
-            if (value) |v| {
-                try w.print("ret v{d}", .{self.valueName(v)});
-            } else {
+        .ret => |r| {
+            if (r.count == 0) {
                 try w.writeAll("ret void");
+            } else {
+                try w.writeAll("ret ");
+                for (r.slice(), 0..) |v, i| {
+                    if (i != 0) try w.writeAll(", ");
+                    try w.print("v{d}", .{self.valueName(v)});
+                }
             }
         },
         .jump => |j| try printEdge(self, w, j),
@@ -1563,6 +1864,49 @@ test "prefetch hints an address and has no result" {
     try std.testing.expectEqual(null, func.instResult(insts[insts.len - 1]));
 }
 
+test "va_start/va_arg/va_end round-trip through print and clone" {
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr_t = try func.types.intern(.ptr);
+    const entry = try func.appendBlock();
+    const list = try func.appendBlockParam(entry, ptr_t);
+    try func.appendVaStart(entry, list);
+    const v = try func.appendVaArg(entry, list, i32_t);
+    try func.appendVaEnd(entry, list);
+    func.setTerminator(entry, .{ .ret = Ret.one(v) });
+
+    const expected =
+        \\fn {
+        \\  block0(v0: ptr):
+        \\    va_start v0
+        \\    let v1 = va_arg i32, v0
+        \\    va_end v0
+        \\    ret v1
+        \\}
+    ;
+    try std.testing.expectFmt(expected, "{f}", .{func});
+
+    var cloned = try func.clone(std.testing.allocator);
+    defer cloned.deinit();
+    try std.testing.expectFmt(expected, "{f}", .{cloned});
+
+    const insts = func.blockInsts(entry);
+    try std.testing.expectEqual(list, func.opcode(insts[0]).va_start.list);
+    try std.testing.expectEqual(list, func.opcode(insts[1]).va_arg.list);
+    try std.testing.expectEqual(i32_t, func.opcode(insts[1]).va_arg.ty);
+    try std.testing.expectEqual(i32_t, func.valueType(v));
+    try std.testing.expectEqual(list, func.opcode(insts[2]).va_end.list);
+}
+
+test "Function.is_variadic/num_fixed_params default to non-variadic" {
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+    try std.testing.expect(!func.is_variadic);
+    try std.testing.expectEqual(@as(u32, 0), func.num_fixed_params);
+}
+
 test "dot accumulates a 4-way INT8 dot-product" {
     var func = Function.init(std.testing.allocator);
     defer func.deinit();
@@ -1620,7 +1964,7 @@ test "struct construction prints its fields" {
     const b = try func.appendBlockParam(entry, i32_t);
     const st = try func.types.intern(.{ .@"struct" = &.{ i32_t, i32_t } });
     const s = try func.appendStructNew(entry, st, &.{ a, b });
-    func.setTerminator(entry, .{ .ret = s });
+    func.setTerminator(entry, .{ .ret = Ret.one(s) });
 
     try std.testing.expectFmt(
         \\fn {
@@ -1706,9 +2050,11 @@ test "a block can be terminated with a return" {
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const block = try func.appendBlock();
     const v = try func.appendInst(block, i32_t, .{ .iconst = 42 });
-    func.setTerminator(block, .{ .ret = v });
+    func.setTerminator(block, .{ .ret = Ret.one(v) });
 
-    try std.testing.expectEqual(Terminator{ .ret = v }, func.terminator(block).?);
+    const term_ret = func.terminator(block).?.ret;
+    try std.testing.expectEqual(@as(u8, 1), term_ret.count);
+    try std.testing.expectEqual(v, term_ret.values[0]);
 }
 
 test "a jump passes arguments to its target block params" {
@@ -1761,7 +2107,7 @@ test "printing a minimal function" {
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const entry = try func.appendBlock();
     const v = try func.appendInst(entry, i32_t, .{ .iconst = 42 });
-    func.setTerminator(entry, .{ .ret = v });
+    func.setTerminator(entry, .{ .ret = Ret.one(v) });
 
     try std.testing.expectFmt(
         \\fn {
@@ -1781,7 +2127,7 @@ test "printing a call names the callee, result type, and arguments" {
     const a = try func.appendBlockParam(entry, i32_t);
     const b = try func.appendBlockParam(entry, i32_t);
     const r = try func.appendCall(entry, i32_t, "add", &.{ a, b });
-    func.setTerminator(entry, .{ .ret = r });
+    func.setTerminator(entry, .{ .ret = Ret.one(r) });
 
     try std.testing.expectFmt(
         \\fn {
@@ -1800,7 +2146,7 @@ test "printing an alloca names the slot type" {
     const ptr_t = try func.types.intern(.ptr);
     const entry = try func.appendBlock();
     const p = try func.appendInst(entry, ptr_t, .{ .alloca = .{ .elem = i32_t } });
-    func.setTerminator(entry, .{ .ret = p });
+    func.setTerminator(entry, .{ .ret = Ret.one(p) });
 
     try std.testing.expectFmt(
         \\fn {
@@ -1820,7 +2166,7 @@ test "printing a convert names its target type and source" {
     const entry = try func.appendBlock();
     const i = try func.appendInst(entry, i32_t, .{ .iconst = 3 });
     const f = try func.appendInst(entry, f32_t, .{ .convert = .{ .value = i } });
-    func.setTerminator(entry, .{ .ret = f });
+    func.setTerminator(entry, .{ .ret = Ret.one(f) });
 
     try std.testing.expectFmt(
         \\fn {
@@ -1845,7 +2191,7 @@ test "printing a function with params, iadd, and a jump" {
 
     const sum = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .add, .lhs = a, .rhs = b } });
     try func.setJump(entry, exit, &.{sum});
-    func.setTerminator(exit, .{ .ret = r });
+    func.setTerminator(exit, .{ .ret = Ret.one(r) });
 
     try std.testing.expectFmt(
         \\fn {
@@ -1873,8 +2219,8 @@ test "printing a conditional branch" {
     const cond = try func.appendInst(entry, bool_t, .{ .iconst = 1 });
     const x = try func.appendInst(entry, i32_t, .{ .iconst = 5 });
     try func.appendIf(entry, cond, .{ .target = then_b, .args = &.{x} }, .{ .target = else_b });
-    func.setTerminator(then_b, .{ .ret = null });
-    func.setTerminator(else_b, .{ .ret = null });
+    func.setTerminator(then_b, .{ .ret = Ret.none() });
+    func.setTerminator(else_b, .{ .ret = Ret.none() });
 
     try std.testing.expectFmt(
         \\fn {
@@ -1981,7 +2327,7 @@ test "reorderBlocks permutes a 3-block chain and remaps jump targets" {
     const marker = try func.appendInst(mid, i32_t, .{ .iconst = 99 });
     try func.setJump(entry, mid, &.{});
     try func.setJump(mid, tail, &.{});
-    func.setTerminator(tail, .{ .ret = null });
+    func.setTerminator(tail, .{ .ret = Ret.none() });
     _ = marker;
 
     // New order: entry stays first, old tail moves to index 1, old mid to index 2.
@@ -1990,7 +2336,7 @@ test "reorderBlocks permutes a 3-block chain and remaps jump targets" {
     // New index 1 now holds the old tail block (empty, ret void terminator).
     const new_tail: Block = @enumFromInt(1);
     try std.testing.expectEqual(@as(usize, 0), func.blockInsts(new_tail).len);
-    try std.testing.expectEqual(Terminator{ .ret = null }, func.terminator(new_tail).?);
+    try std.testing.expectEqual(@as(u8, 0), func.terminator(new_tail).?.ret.count);
 
     // New index 2 now holds the old mid block, carrying the marker const and its jump.
     const new_mid: Block = @enumFromInt(2);
@@ -2024,7 +2370,7 @@ test "reorderBlocks remaps if then/else edges" {
     try func.appendIf(entry, cond, .{ .target = then_b }, .{ .target = else_b });
     try func.setJump(then_b, merge, &.{});
     try func.setJump(else_b, merge, &.{});
-    func.setTerminator(merge, .{ .ret = null });
+    func.setTerminator(merge, .{ .ret = Ret.none() });
 
     // Swap then_b and else_b's positions (and move merge before else_b).
     try func.reorderBlocks(std.testing.allocator, &.{ entry, else_b, then_b, merge });
@@ -2059,8 +2405,8 @@ test "reorderBlocks identity permutation leaves the function unchanged" {
 
     const cond = try func.appendInst(entry, bool_t, .{ .iconst = 1 });
     try func.appendIf(entry, cond, .{ .target = then_b }, .{ .target = else_b });
-    func.setTerminator(then_b, .{ .ret = null });
-    func.setTerminator(else_b, .{ .ret = null });
+    func.setTerminator(then_b, .{ .ret = Ret.none() });
+    func.setTerminator(else_b, .{ .ret = Ret.none() });
 
     const before = try std.fmt.allocPrint(std.testing.allocator, "{f}", .{func});
     defer std.testing.allocator.free(before);
@@ -2075,6 +2421,36 @@ test "reorderBlocks identity permutation leaves the function unchanged" {
     var d = try verify.verify(std.testing.allocator, &func, .high);
     defer d.deinit();
     try std.testing.expect(d.ok());
+}
+
+test "a variadic call's is_variadic/num_fixed round-trip through print and clone" {
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const entry = try func.appendBlock();
+    const a = try func.appendBlockParam(entry, i32_t);
+    const b = try func.appendBlockParam(entry, i32_t);
+    const r = try func.appendCallV(entry, i32_t, "printf", &.{ a, b }, 1);
+    func.setTerminator(entry, .{ .ret = Ret.one(r) });
+
+    // `is_variadic`/`num_fixed` carry no new print syntax, since this is plumbing only, with
+    // no backend behavior yet. Printing must still exercise the arm cleanly and name the
+    // callee and args exactly like a non-variadic call does.
+    const printed = try std.fmt.allocPrint(std.testing.allocator, "{f}", .{func});
+    defer std.testing.allocator.free(printed);
+    try std.testing.expect(std.mem.indexOf(u8, printed, "call i32 @printf(v0, v1)") != null);
+
+    // cloneBlock (via remapOpcode) must carry the flag/count through, not silently reset
+    // them to the non-variadic defaults.
+    var map: std.AutoHashMapUnmanaged(Value, Value) = .empty;
+    defer map.deinit(std.testing.allocator);
+    const dst = try func.cloneBlock(std.testing.allocator, entry, &map);
+    const dst_insts = func.blockInsts(dst);
+    try std.testing.expectEqual(@as(usize, 1), dst_insts.len);
+    const cloned_call = func.opcode(dst_insts[0]).call;
+    try std.testing.expect(cloned_call.is_variadic);
+    try std.testing.expectEqual(@as(u32, 1), cloned_call.num_fixed);
 }
 
 test "cloneBlock copies params and instructions with fresh values" {
@@ -2146,7 +2522,7 @@ test "cloneBlock leaves external references unchanged" {
     const src = try func.appendBlock();
     const p = try func.appendBlockParam(src, i32_t);
     const mixed = try func.appendInst(src, i32_t, .{ .arith = .{ .op = .add, .lhs = p, .rhs = ext } });
-    func.setTerminator(src, .{ .ret = mixed });
+    func.setTerminator(src, .{ .ret = Ret.one(mixed) });
 
     var map: std.AutoHashMapUnmanaged(Value, Value) = .empty;
     defer map.deinit(std.testing.allocator);
@@ -2167,14 +2543,18 @@ test "cloneBlock remaps a ret terminator's value" {
     const src = try func.appendBlock();
     const p = try func.appendBlockParam(src, i32_t);
     const x = try func.appendInst(src, i32_t, .{ .arith = .{ .op = .add, .lhs = p, .rhs = p } });
-    func.setTerminator(src, .{ .ret = x });
+    func.setTerminator(src, .{ .ret = Ret.one(x) });
 
     var map: std.AutoHashMapUnmanaged(Value, Value) = .empty;
     defer map.deinit(std.testing.allocator);
     const dst = try func.cloneBlock(std.testing.allocator, src, &map);
 
-    try std.testing.expectEqual(Terminator{ .ret = map.get(x).? }, func.terminator(dst).?);
-    try std.testing.expectEqual(Terminator{ .ret = x }, func.terminator(src).?); // src unchanged
+    const dst_ret = func.terminator(dst).?.ret;
+    try std.testing.expectEqual(@as(u8, 1), dst_ret.count);
+    try std.testing.expectEqual(map.get(x).?, dst_ret.values[0]);
+    const src_ret = func.terminator(src).?.ret; // src unchanged
+    try std.testing.expectEqual(@as(u8, 1), src_ret.count);
+    try std.testing.expectEqual(x, src_ret.values[0]);
 }
 
 test "cloneBlock remaps a jump terminator's args" {
@@ -2184,7 +2564,7 @@ test "cloneBlock remaps a jump terminator's args" {
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const target = try func.appendBlock();
     _ = try func.appendBlockParam(target, i32_t);
-    func.setTerminator(target, .{ .ret = null });
+    func.setTerminator(target, .{ .ret = Ret.none() });
 
     const src = try func.appendBlock();
     const p = try func.appendBlockParam(src, i32_t);
@@ -2214,7 +2594,7 @@ test "cloneBlock produces a block verify accepts once wired into the CFG" {
     const src = try func.appendBlock();
     const p = try func.appendBlockParam(src, i32_t);
     const y = try func.appendInst(src, i32_t, .{ .arith = .{ .op = .add, .lhs = p, .rhs = p } });
-    func.setTerminator(src, .{ .ret = y });
+    func.setTerminator(src, .{ .ret = Ret.one(y) });
 
     var map: std.AutoHashMapUnmanaged(Value, Value) = .empty;
     defer map.deinit(std.testing.allocator);
@@ -2241,7 +2621,7 @@ test "clone deep-copies a function and leaves the original untouched" {
     const x = try func.appendBlockParam(entry, i32_t);
     _ = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .gt, .lhs = x, .rhs = x } });
     const called = try func.appendCall(entry, i32_t, "callee", &.{x});
-    func.setTerminator(entry, .{ .ret = called });
+    func.setTerminator(entry, .{ .ret = Ret.one(called) });
     try func.addAttr(.{ .inst = @enumFromInt(0) }, .{ .custom = .{ .namespace = "debug", .key = "line", .value = .{ .int = 12 } } });
 
     var copy = try func.clone(allocator);

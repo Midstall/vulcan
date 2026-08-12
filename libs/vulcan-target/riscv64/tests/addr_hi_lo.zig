@@ -1,10 +1,10 @@
-//! addr_hi_lo fusion (Task 7), the LAST `FuseKind`. HONEST framing: unlike `fuse_cmp_branch` /
+//! addr_hi_lo fusion, the LAST `FuseKind`. HONEST framing: unlike `fuse_cmp_branch` /
 //! `fuse_shift_add`, this kind needs NO new transform. The `.global_addr` arm (isel.zig) already
 //! emits `auipc rd, %pcrel_hi(sym)` immediately followed by `addi rd, rd, %pcrel_lo(.Lhi)` back to
-//! back, by construction, on every path - there is nothing to fold and nothing to decline. This
+//! back, by construction, on every path. There is nothing to fold and nothing to decline. This
 //! test is a regression guard: it decodes a compiled `global_addr` and confirms the auipc/addi pair
 //! really is adjacent (the invariant `caps.fuse_addr_hi_lo`'s assert in isel.zig depends on), and
-//! that the flag is a pure observer - `fuse_addr_hi_lo = true` and `= false` compile the SAME
+//! that the flag is a pure observer. `fuse_addr_hi_lo = true` and `= false` compile the SAME
 //! function to byte-identical code.
 
 const std = @import("std");
@@ -13,14 +13,14 @@ const isel = @import("../isel.zig");
 
 const Function = ir.function.Function;
 
-/// `fn entry() ptr { return &sym; }` - the minimal shape that reaches the `.global_addr` arm.
+/// `fn entry() ptr { return &sym; }`, the minimal shape that reaches the `.global_addr` arm.
 fn buildGlobalAddr(allocator: std.mem.Allocator, sym: []const u8) !Function {
     var func = Function.init(allocator);
     errdefer func.deinit();
     const ptr_t = try func.types.intern(.ptr);
     const blk = try func.appendBlock();
     const p = try func.appendGlobalAddr(blk, ptr_t, sym);
-    func.setTerminator(blk, .{ .ret = p });
+    func.setTerminator(blk, .{ .ret = ir.function.Ret.one(p) });
     return func;
 }
 
@@ -50,6 +50,7 @@ test "riscv64 addr_hi_lo: a global address emits an adjacent auipc+addi pcrel pa
                 lo = reloc;
             },
             .call => unreachable, // no calls in this function
+            .got_hi20 => unreachable, // this function uses a direct (non-GOT) global_addr
         }
     }
     const hi = hi_offset.?;

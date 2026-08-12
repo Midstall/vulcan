@@ -45,7 +45,7 @@ fn buildSum(func: *Function) anyerror!void {
     const ns = try func.appendInst(body, t, .{ .arith = .{ .op = .add, .lhs = bs, .rhs = bi } });
     const ni = try func.appendArithImm(body, t, .add, bi, 1);
     try func.setJump(body, loop, &.{ ni, ns });
-    func.setTerminator(done, .{ .ret = s });
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(s) });
 }
 
 /// `for (i = 0; i < n; i += 1) s += i*i;  return s` (a richer per-iteration increment).
@@ -69,7 +69,7 @@ fn buildSumSquares(func: *Function) anyerror!void {
     const ns = try func.appendInst(body, t, .{ .arith = .{ .op = .add, .lhs = bs, .rhs = sq } });
     const ni = try func.appendArithImm(body, t, .add, bi, 1);
     try func.setJump(body, loop, &.{ ni, ns });
-    func.setTerminator(done, .{ .ret = s });
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(s) });
 }
 
 /// Two accumulators at once: `for (i) { s += i; p += 2*i + 1; } return s + p` (proves multiple
@@ -102,7 +102,7 @@ fn buildTwoAccumulators(func: *Function) anyerror!void {
     const rs = try func.appendBlockParam(done, t);
     const rp = try func.appendBlockParam(done, t);
     const total = try func.appendInst(done, t, .{ .arith = .{ .op = .add, .lhs = rs, .rhs = rp } });
-    func.setTerminator(done, .{ .ret = total });
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(total) });
 }
 
 fn expectSplitMatches(build: Builder) !void {

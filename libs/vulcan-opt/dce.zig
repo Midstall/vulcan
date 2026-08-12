@@ -17,6 +17,8 @@ fn isPure(op: ir.function.Opcode) bool {
         // A prefetch hint has no result but must be kept, like a store. A
         // matmul writes the `c` memory, likewise kept.
         .load, .store, .prefetch, .matmul, .@"if", .call, .call_indirect => false,
+        // SM12 T3: mutate/read the `va_list` object at `list`, like `load`/`store` above.
+        .va_start, .va_arg, .va_end => false,
     };
 }
 
@@ -51,6 +53,9 @@ fn countUses(func: *const Function, uses: []u32) void {
                     uses[@intFromEnum(st.ptr)] += 1;
                 },
                 .prefetch => |pf| uses[@intFromEnum(pf.ptr)] += 1,
+                .va_start => |vs| uses[@intFromEnum(vs.list)] += 1,
+                .va_arg => |va| uses[@intFromEnum(va.list)] += 1,
+                .va_end => |ve| uses[@intFromEnum(ve.list)] += 1,
                 .dot => |d| {
                     uses[@intFromEnum(d.acc)] += 1;
                     uses[@intFromEnum(d.a)] += 1;
@@ -64,12 +69,14 @@ fn countUses(func: *const Function, uses: []u32) void {
                 .struct_new => |sn| for (func.valueList(sn.fields)) |f| {
                     uses[@intFromEnum(f)] += 1;
                 },
-                .call => |c| for (func.valueList(c.args)) |arg| {
-                    uses[@intFromEnum(arg)] += 1;
+                .call => |c| {
+                    for (func.valueList(c.args)) |arg| uses[@intFromEnum(arg)] += 1;
+                    if (c.ret_dest) |rd| uses[@intFromEnum(rd)] += 1; // SM14 M4d-c T1: dest kept alive for the post-call store
                 },
                 .call_indirect => |c| {
                     uses[@intFromEnum(c.target)] += 1;
                     for (func.valueList(c.args)) |arg| uses[@intFromEnum(arg)] += 1;
+                    if (c.ret_dest) |rd| uses[@intFromEnum(rd)] += 1; // SM14 M4d-c T1: dest kept alive for the post-call store
                 },
                 .@"if" => |cf| {
                     uses[@intFromEnum(cf.cond)] += 1;
@@ -79,7 +86,7 @@ fn countUses(func: *const Function, uses: []u32) void {
             }
         }
         if (func.terminator(block)) |term| switch (term) {
-            .ret => |v| if (v) |vv| {
+            .ret => |r| for (r.slice()) |vv| {
                 uses[@intFromEnum(vv)] += 1;
             },
             .jump => |j| for (func.blockArgs(j)) |arg| {
@@ -130,7 +137,7 @@ test "removes a chain of dead pure instructions" {
     // dead1 = x + x, dead2 = dead1 * x, (neither used), ret x
     const dead1 = try func.appendInst(b, i32_t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = x } });
     _ = try func.appendInst(b, i32_t, .{ .arith = .{ .op = .mul, .lhs = dead1, .rhs = x } });
-    func.setTerminator(b, .{ .ret = x });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(x) });
 
     try std.testing.expectEqual(@as(usize, 2), func.blockInsts(b).len);
 
@@ -151,7 +158,7 @@ test "keeps an impure call even if its result is unused" {
     const b = try func.appendBlock();
     const x = try func.appendBlockParam(b, i32_t);
     _ = try func.appendCall(b, i32_t, "sink", &.{x}); // result unused, but a call has effects
-    func.setTerminator(b, .{ .ret = x });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(x) });
 
     var analyses = pass.Analyses{ .allocator = allocator, .func = &func };
     defer analyses.deinit();
@@ -170,7 +177,7 @@ test "keeps a matmul even though it has no result to be used" {
     const bp = try func.appendBlockParam(b, ptr_t);
     const c = try func.appendBlockParam(b, ptr_t);
     try func.appendMatmul(b, a, bp, c, 4, 4, 4, .fp32, false);
-    func.setTerminator(b, .{ .ret = null });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
 
     var analyses = pass.Analyses{ .allocator = allocator, .func = &func };
     defer analyses.deinit();

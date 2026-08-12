@@ -37,7 +37,7 @@ fn buildFmaFunc(allocator: std.mem.Allocator, dbl: bool, shape: FmaShape) !Funct
         .sub => try func.appendInst(b, ft, .{ .arith = .{ .op = .sub, .lhs = prod, .rhs = c_p } }),
         .csub => try func.appendInst(b, ft, .{ .arith = .{ .op = .sub, .lhs = c_p, .rhs = prod } }),
     };
-    func.setTerminator(b, .{ .ret = r });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
     return func;
 }
 
@@ -137,7 +137,7 @@ test "fma: a multi-use mul does NOT fuse (separate fmul+fadd, correct result, qe
     const prod = try func.appendInst(blk, ft, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = b } });
     const s = try func.appendInst(blk, ft, .{ .arith = .{ .op = .add, .lhs = prod, .rhs = c } }); // a*b+c, fusible shape...
     const r = try func.appendInst(blk, ft, .{ .arith = .{ .op = .add, .lhs = s, .rhs = prod } }); // ...but prod is reused here
-    func.setTerminator(blk, .{ .ret = r });
+    func.setTerminator(blk, .{ .ret = ir.function.Ret.one(r) });
 
     const code = try isel.selectFunction(allocator, &func);
     defer allocator.free(code);
@@ -159,7 +159,7 @@ test "fma: a multi-use mul does NOT fuse (separate fmul+fadd, correct result, qe
     const prod2 = try run_func.appendInst(blk2, ft2, .{ .arith = .{ .op = .mul, .lhs = a2, .rhs = b2 } });
     const s2 = try run_func.appendInst(blk2, ft2, .{ .arith = .{ .op = .add, .lhs = prod2, .rhs = c2 } });
     const r2 = try run_func.appendInst(blk2, ft2, .{ .arith = .{ .op = .add, .lhs = s2, .rhs = prod2 } });
-    run_func.setTerminator(blk2, .{ .ret = r2 });
+    run_func.setTerminator(blk2, .{ .ret = ir.function.Ret.one(r2) });
 
     const av: f32 = 2.5;
     const bv: f32 = 3.25;

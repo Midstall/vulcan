@@ -168,10 +168,10 @@ test "x + 0 simplifies to x (the return now yields x directly)" {
     const s = try oneParam(&func);
     const zero = try func.appendInst(s.b, s.t, .{ .iconst = 0 });
     const y = try func.appendInst(s.b, s.t, .{ .arith = .{ .op = .add, .lhs = s.x, .rhs = zero } });
-    func.setTerminator(s.b, .{ .ret = y });
+    func.setTerminator(s.b, .{ .ret = ir.function.Ret.one(y) });
 
     try testing.expect(try runOnce(allocator, &func));
-    try testing.expectEqual(s.x, func.terminator(s.b).?.ret.?); // ret x, not ret (x+0)
+    try testing.expectEqual(s.x, func.terminator(s.b).?.ret.values[0]); // ret x, not ret (x+0)
 }
 
 test "x * 0 simplifies to the constant 0" {
@@ -181,7 +181,7 @@ test "x * 0 simplifies to the constant 0" {
     const s = try oneParam(&func);
     const zero = try func.appendInst(s.b, s.t, .{ .iconst = 0 });
     const y = try func.appendInst(s.b, s.t, .{ .arith = .{ .op = .mul, .lhs = s.x, .rhs = zero } });
-    func.setTerminator(s.b, .{ .ret = y });
+    func.setTerminator(s.b, .{ .ret = ir.function.Ret.one(y) });
 
     try testing.expect(try runOnce(allocator, &func));
     try testing.expectEqual(@as(i64, 0), func.opcode(func.definingInst(y).?).iconst);
@@ -193,7 +193,7 @@ test "x - x simplifies to the constant 0" {
     defer func.deinit();
     const s = try oneParam(&func);
     const y = try func.appendInst(s.b, s.t, .{ .arith = .{ .op = .sub, .lhs = s.x, .rhs = s.x } });
-    func.setTerminator(s.b, .{ .ret = y });
+    func.setTerminator(s.b, .{ .ret = ir.function.Ret.one(y) });
 
     try testing.expect(try runOnce(allocator, &func));
     try testing.expectEqual(@as(i64, 0), func.opcode(func.definingInst(y).?).iconst);
@@ -206,11 +206,11 @@ test "arith_imm: x * 1 simplifies to x, x & x to x" {
     const s = try oneParam(&func);
     const one_mul = try func.appendArithImm(s.b, s.t, .mul, s.x, 1); // x * 1 -> x
     const anded = try func.appendInst(s.b, s.t, .{ .arith = .{ .op = .bit_and, .lhs = one_mul, .rhs = one_mul } }); // (x)&(x) -> x
-    func.setTerminator(s.b, .{ .ret = anded });
+    func.setTerminator(s.b, .{ .ret = ir.function.Ret.one(anded) });
 
     try testing.expect(try runOnce(allocator, &func));
     // x*1 -> x turns `anded` into x & x, and x & x -> x, so the return is x.
-    try testing.expectEqual(s.x, func.terminator(s.b).?.ret.?);
+    try testing.expectEqual(s.x, func.terminator(s.b).?.ret.values[0]);
 }
 
 test "no change when there is nothing to simplify" {
@@ -220,7 +220,7 @@ test "no change when there is nothing to simplify" {
     const s = try oneParam(&func);
     const two = try func.appendInst(s.b, s.t, .{ .iconst = 2 });
     const y = try func.appendInst(s.b, s.t, .{ .arith = .{ .op = .mul, .lhs = s.x, .rhs = two } }); // x * 2: kept
-    func.setTerminator(s.b, .{ .ret = y });
+    func.setTerminator(s.b, .{ .ret = ir.function.Ret.one(y) });
     try testing.expect(!try runOnce(allocator, &func));
 }
 
@@ -233,7 +233,7 @@ test "float x + 0.0 is left alone (unsound to simplify)" {
     const x = try func.appendBlockParam(b, t);
     const zero = try func.appendInst(b, t, .{ .fconst = 0.0 });
     const y = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = zero } });
-    func.setTerminator(b, .{ .ret = y });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(y) });
     try testing.expect(!try runOnce(allocator, &func)); // floats are not simplified
 }
 
@@ -247,10 +247,10 @@ test "select(true, a, b) folds to a and select(false, a, b) folds to b" {
         const bool_t = try func.types.intern(.bool);
         const cond = try func.appendInst(s.b, bool_t, .{ .iconst = case[0] });
         const sel = try func.appendInst(s.b, s.t, .{ .select = .{ .cond = cond, .then = s.x, .@"else" = y } });
-        func.setTerminator(s.b, .{ .ret = sel });
+        func.setTerminator(s.b, .{ .ret = ir.function.Ret.one(sel) });
         try testing.expect(try runOnce(allocator, &func));
         const expected = if (case[1]) s.x else y;
-        try testing.expectEqual(expected, func.terminator(s.b).?.ret.?);
+        try testing.expectEqual(expected, func.terminator(s.b).?.ret.values[0]);
     }
 }
 
@@ -262,9 +262,9 @@ test "select(c, x, x) folds to x for a non-constant condition" {
     const bool_t = try func.types.intern(.bool);
     const cond = try func.appendBlockParam(s.b, bool_t); // runtime condition
     const sel = try func.appendInst(s.b, s.t, .{ .select = .{ .cond = cond, .then = s.x, .@"else" = s.x } });
-    func.setTerminator(s.b, .{ .ret = sel });
+    func.setTerminator(s.b, .{ .ret = ir.function.Ret.one(sel) });
     try testing.expect(try runOnce(allocator, &func));
-    try testing.expectEqual(s.x, func.terminator(s.b).?.ret.?);
+    try testing.expectEqual(s.x, func.terminator(s.b).?.ret.values[0]);
 }
 
 test "self-comparison folds to a constant bool" {
@@ -281,7 +281,7 @@ test "self-comparison folds to a constant bool" {
         const s = try oneParam(&func);
         const bool_t = try func.types.intern(bool_t_kind);
         const cmp = try func.appendInst(s.b, bool_t, .{ .icmp = .{ .op = case.op, .lhs = s.x, .rhs = s.x } });
-        func.setTerminator(s.b, .{ .ret = cmp });
+        func.setTerminator(s.b, .{ .ret = ir.function.Ret.one(cmp) });
         try testing.expect(try runOnce(allocator, &func));
         try testing.expectEqual(case.expect, func.opcode(func.definingInst(cmp).?).iconst);
     }

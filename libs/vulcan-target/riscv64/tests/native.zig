@@ -27,7 +27,7 @@ test "module disasm: linked functions get labels and a resolved, named call" {
     const gx = try g.appendBlockParam(gb, gi);
     const three = try g.appendInst(gb, gi, .{ .iconst = 3 }); // riscv64 has no immediate mul
     const gm = try g.appendInst(gb, gi, .{ .arith = .{ .op = .mul, .lhs = gx, .rhs = three } });
-    g.setTerminator(gb, .{ .ret = gm });
+    g.setTerminator(gb, .{ .ret = ir.function.Ret.one(gm) });
 
     var f = Function.init(a);
     defer f.deinit();
@@ -37,7 +37,7 @@ test "module disasm: linked functions get labels and a resolved, named call" {
     const fbp = try f.appendBlockParam(fb, fi);
     const called = try f.appendCall(fb, fi, "helper", &.{fa});
     const fsum = try f.appendInst(fb, fi, .{ .arith = .{ .op = .add, .lhs = called, .rhs = fbp } });
-    f.setTerminator(fb, .{ .ret = fsum });
+    f.setTerminator(fb, .{ .ret = ir.function.Ret.one(fsum) });
 
     var module = link.Module{};
     defer module.deinit(a);
@@ -68,7 +68,7 @@ test "codegen+disasm round-trip: integer add" {
     const x = try func.appendBlockParam(e, i32_t);
     const y = try func.appendBlockParam(e, i32_t);
     const s = try func.appendInst(e, i32_t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = y } });
-    func.setTerminator(e, .{ .ret = s });
+    func.setTerminator(e, .{ .ret = ir.function.Ret.one(s) });
 
     const code = try isel.selectFunction(a, &func);
     defer a.free(code);
@@ -103,7 +103,7 @@ test "codegen+disasm round-trip: control flow (max via if/else)" {
     const r = try func.appendBlockParam(m, i32_t);
     const c = try func.appendInst(e, bool_t, .{ .icmp = .{ .op = .gt, .lhs = x, .rhs = y } });
     try func.appendIf(e, c, .{ .target = m, .args = &.{x} }, .{ .target = m, .args = &.{y} });
-    func.setTerminator(m, .{ .ret = r });
+    func.setTerminator(m, .{ .ret = ir.function.Ret.one(r) });
 
     var words = try harness.compileFunc(a, &func);
     defer words.deinit(a);
@@ -143,9 +143,9 @@ test "codegen+disasm round-trip: fused compare-and-branch for if(icmp)" {
     const c = try func.appendInst(e, bool_t, .{ .icmp = .{ .op = .lt, .lhs = x, .rhs = y } });
     try func.appendIf(e, c, .{ .target = tb, .args = &.{} }, .{ .target = eb, .args = &.{} });
     const one = try func.appendInst(tb, u32_t, .{ .iconst = 1 });
-    func.setTerminator(tb, .{ .ret = one });
+    func.setTerminator(tb, .{ .ret = ir.function.Ret.one(one) });
     const zero = try func.appendInst(eb, u32_t, .{ .iconst = 0 });
-    func.setTerminator(eb, .{ .ret = zero });
+    func.setTerminator(eb, .{ .ret = ir.function.Ret.one(zero) });
 
     var words = try harness.compileFunc(a, &func);
     defer words.deinit(a);
@@ -173,8 +173,8 @@ fn buildUnsignedMinIf(allocator: std.mem.Allocator) !Function {
     const eb = try func.appendBlock();
     const c = try func.appendInst(e, bool_t, .{ .icmp = .{ .op = .lt, .lhs = x, .rhs = y } });
     try func.appendIf(e, c, .{ .target = tb, .args = &.{} }, .{ .target = eb, .args = &.{} });
-    func.setTerminator(tb, .{ .ret = x }); // x < y -> x is the min
-    func.setTerminator(eb, .{ .ret = y });
+    func.setTerminator(tb, .{ .ret = ir.function.Ret.one(x) }); // x < y -> x is the min
+    func.setTerminator(eb, .{ .ret = ir.function.Ret.one(y) });
     return func;
 }
 
@@ -282,7 +282,7 @@ test "qemu-user-riscv: a conditional branch past ±4KiB relaxes and runs both ed
 
     // Taken edge (x == 7): return 111.
     const r_then = try func.appendInst(then_b, i32_t, .{ .iconst = 111 });
-    func.setTerminator(then_b, .{ .ret = r_then });
+    func.setTerminator(then_b, .{ .ret = ir.function.Ret.one(r_then) });
 
     // Not-taken edge: a 1300-long add chain accumulating `x` each step (each add feeds
     // the next, so none is dead and the running sum is opaque to a constant-folder). It
@@ -293,7 +293,7 @@ test "qemu-user-riscv: a conditional branch past ±4KiB relaxes and runs both ed
     while (pad < 1300) : (pad += 1) {
         acc = try func.appendInst(else_b, i32_t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = ex } });
     }
-    func.setTerminator(else_b, .{ .ret = acc });
+    func.setTerminator(else_b, .{ .ret = ir.function.Ret.one(acc) });
 
     var words = try harness.compileFunc(a, &func);
     defer words.deinit(a);
@@ -332,9 +332,9 @@ test "qemu-user-riscv: a near conditional branch stays single-word (no relaxatio
     try func.appendIf(entry, c, .{ .target = then_b, .args = &.{} }, .{ .target = else_b, .args = &.{} });
 
     const r_then = try func.appendInst(then_b, i32_t, .{ .iconst = 111 });
-    func.setTerminator(then_b, .{ .ret = r_then });
+    func.setTerminator(then_b, .{ .ret = ir.function.Ret.one(r_then) });
     const r_else = try func.appendInst(else_b, i32_t, .{ .iconst = 222 });
-    func.setTerminator(else_b, .{ .ret = r_else });
+    func.setTerminator(else_b, .{ .ret = ir.function.Ret.one(r_else) });
 
     var words = try harness.compileFunc(a, &func);
     defer words.deinit(a);
@@ -408,7 +408,7 @@ test "qemu-user-riscv: a loop's backward conditional branch past -4KiB relaxes a
     try func.appendIf(loop, cont, .{ .target = loop, .args = &.{} }, .{ .target = done, .args = &.{} });
 
     const racc = try func.appendInst(done, i32_t, .{ .load = .{ .ptr = pacc } });
-    func.setTerminator(done, .{ .ret = racc });
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(racc) });
 
     var words = try harness.compileFunc(a, &func);
     defer words.deinit(a);
@@ -454,7 +454,7 @@ test "riscv64 fallthrough: an unconditional jump to the next block elides the ja
     const s = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = y } });
     try func.setJump(entry, tail, &.{s});
     const p = try func.appendBlockParam(tail, i32_t);
-    func.setTerminator(tail, .{ .ret = p });
+    func.setTerminator(tail, .{ .ret = ir.function.Ret.one(p) });
 
     var words = try harness.compileFunc(a, &func);
     defer words.deinit(a);
@@ -485,9 +485,9 @@ test "riscv64 fallthrough: an if whose else-edge targets the next block elides t
     const c = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .eq, .lhs = x, .rhs = seven } });
     try func.appendIf(entry, c, .{ .target = then_b, .args = &.{} }, .{ .target = else_b, .args = &.{} });
     const r_then = try func.appendInst(then_b, i32_t, .{ .iconst = 111 });
-    func.setTerminator(then_b, .{ .ret = r_then });
+    func.setTerminator(then_b, .{ .ret = ir.function.Ret.one(r_then) });
     const r_else = try func.appendInst(else_b, i32_t, .{ .iconst = 222 });
-    func.setTerminator(else_b, .{ .ret = r_else });
+    func.setTerminator(else_b, .{ .ret = ir.function.Ret.one(r_else) });
 
     var words = try harness.compileFunc(a, &func);
     defer words.deinit(a);
@@ -522,9 +522,9 @@ test "riscv64 fallthrough: an if whose then-edge targets the next block inverts 
     const c = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .eq, .lhs = x, .rhs = seven } });
     try func.appendIf(entry, c, .{ .target = then_b, .args = &.{} }, .{ .target = else_b, .args = &.{} });
     const r_then = try func.appendInst(then_b, i32_t, .{ .iconst = 111 });
-    func.setTerminator(then_b, .{ .ret = r_then });
+    func.setTerminator(then_b, .{ .ret = ir.function.Ret.one(r_then) });
     const r_else = try func.appendInst(else_b, i32_t, .{ .iconst = 222 });
-    func.setTerminator(else_b, .{ .ret = r_else });
+    func.setTerminator(else_b, .{ .ret = ir.function.Ret.one(r_else) });
 
     var words = try harness.compileFunc(a, &func);
     defer words.deinit(a);
@@ -559,7 +559,7 @@ test "riscv64 fallthrough: block-param moves on a jump fall-through edge stay co
     const p = try func.appendBlockParam(tail, i32_t);
     const q = try func.appendBlockParam(tail, i32_t);
     const d = try func.appendInst(tail, i32_t, .{ .arith = .{ .op = .sub, .lhs = p, .rhs = q } });
-    func.setTerminator(tail, .{ .ret = d });
+    func.setTerminator(tail, .{ .ret = ir.function.Ret.one(d) });
 
     var words = try harness.compileFunc(a, &func);
     defer words.deinit(a);
@@ -591,7 +591,7 @@ test "riscv64 fallthrough: a diamond and a loop compute correctly under elision"
         const r = try func.appendBlockParam(merge, i32_t);
         const c = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .gt, .lhs = x, .rhs = y } });
         try func.appendIf(entry, c, .{ .target = merge, .args = &.{x} }, .{ .target = merge, .args = &.{y} });
-        func.setTerminator(merge, .{ .ret = r });
+        func.setTerminator(merge, .{ .ret = ir.function.Ret.one(r) });
 
         var words = try harness.compileFunc(a, &func);
         defer words.deinit(a);
@@ -635,7 +635,7 @@ test "riscv64 fallthrough: a diamond and a loop compute correctly under elision"
         try func.setJump(body, loop, &.{});
 
         const rsum = try func.appendInst(done, i32_t, .{ .load = .{ .ptr = psum } });
-        func.setTerminator(done, .{ .ret = rsum });
+        func.setTerminator(done, .{ .ret = ir.function.Ret.one(rsum) });
 
         var words = try harness.compileFunc(a, &func);
         defer words.deinit(a);
@@ -655,6 +655,6 @@ test "native-riscv: arithmetic runs in-process when the host is RISC-V" {
     const b = try func.appendBlockParam(e, t);
     const p = try func.appendInst(e, t, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = b } });
     const s = try func.appendInst(e, t, .{ .arith = .{ .op = .add, .lhs = p, .rhs = a } });
-    func.setTerminator(e, .{ .ret = s });
+    func.setTerminator(e, .{ .ret = ir.function.Ret.one(s) });
     try std.testing.expectEqual(@as(i64, 15), try runNative(allocator, &func, &.{ 3, 4 }));
 }

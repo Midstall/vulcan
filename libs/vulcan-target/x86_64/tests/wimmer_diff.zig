@@ -1,12 +1,14 @@
-//! x86_64 adoption Task 2: the SHARED Wimmer-Franz allocator produces EXECUTABLE x86-64 code. Each
-//! test builds TWO identical functions, compiles one through the backend's own `selectFunction` (the
-//! reference) and the other through `isel.compileFunctionWimmerX86` (the shared allocator + the same
-//! emission), runs BOTH under qemu-x86_64 (-cpu max), and asserts the results are bit-identical
-//! across many inputs. Scope is the gpr + xmm classes (scalar float AND 128/256-bit SIMD vectors),
-//! including the NEW capability: a value live across a call occupies a callee-saved GPR (rbx/r12..r15)
-//! via the new push/pop prologue rather than spilling. qemu is the execution oracle: a divergence
-//! means the shared allocation was translated or emitted wrong. The 256-bit (AVX) cases need `-cpu
-//! max`, which the harness always passes.
+//! The shared Wimmer-Franz allocator produces executable x86-64 code. Each test builds two identical
+//! functions. The test compiles one function with the backend's own `selectFunction` (the reference
+//! path). The test compiles the other function with `isel.compileFunctionWimmerX86` (the shared
+//! allocator and the same emission code). The test runs both functions under qemu-x86_64 (`-cpu max`)
+//! and checks the results are bit-identical across many inputs.
+//!
+//! The scope covers the gpr and xmm register classes (scalar float values and 128-bit or 256-bit SIMD
+//! vectors). It also covers this rule: a value that stays live across a call occupies a callee-saved
+//! GPR (rbx or r12 to r15) through a push/pop prologue, instead of a spill. qemu is the execution
+//! oracle. A mismatch means the shared allocator translated or emitted the code wrong. The 256-bit
+//! (AVX) cases need `-cpu max`, which the harness always passes.
 
 const std = @import("std");
 const ir = @import("vulcan-ir");
@@ -18,24 +20,24 @@ const harness = @import("harness.zig");
 const Function = ir.function.Function;
 const Value = ir.function.Value;
 
-/// Compile `func` through the shared Wimmer allocator (mutates `func`: it splits critical edges) and
-/// run it under qemu with integer args, returning the low byte of rax.
+/// Compiles `func` through the shared Wimmer allocator. This mutates `func`, because the allocator
+/// splits critical edges. Runs the function under qemu with integer args. Returns the low byte of rax.
 fn runWimmer(io: std.Io, allocator: std.mem.Allocator, func: *Function, args: []const i64) !u8 {
     var compiled = try isel.compileFunctionWimmerX86(allocator, func);
     defer compiled.deinit(allocator);
     return harness.runCodeInt(io, allocator, compiled.code, args, harness.qemu);
 }
 
-/// Run the reference (`selectFunction`) and the Wimmer differential path on two freshly-built copies
-/// of the same function for every input, asserting BOTH match the hand-computed GROUND-TRUTH
-/// `expected` (checked mod 256, the process exit code). `build` takes only the allocator so each side
-/// gets its own untouched function (the Wimmer path mutates the IR in place).
+/// Runs the reference path (`selectFunction`) and the Wimmer differential path on two freshly built
+/// copies of the same function, for every input. Checks that both results match the hand-computed
+/// ground truth `expected` (checked mod 256, the process exit code). `build` takes only the allocator,
+/// so each side gets its own untouched function. The Wimmer path mutates the IR in place.
 ///
-/// After the SP2 production flip `selectFunction` IS the shared Wimmer allocator (with fold on), so a
-/// bare `ref == got` would compare Wimmer-fold against Wimmer-nofold and a bug SHARED by both would
-/// pass. Asserting each side against an independent Zig-computed ground truth keeps the guardrail
-/// real: a miscompile in the shared allocator now diverges from `expected` and fails. `expected` is
-/// parallel to `inputs`, one i64 per input tuple.
+/// `selectFunction` now uses the shared Wimmer allocator itself, with fold on. A bare `ref == got`
+/// check would compare Wimmer-fold against Wimmer-nofold, so a bug shared by both paths would pass
+/// unnoticed. Checking each side against an independent, Zig-computed ground truth keeps the test
+/// honest: a miscompile in the shared allocator now diverges from `expected` and fails the test.
+/// `expected` is parallel to `inputs`, one i64 value per input tuple.
 fn expectIntMatch(io: std.Io, comptime build: fn (std.mem.Allocator) anyerror!Function, inputs: []const []const i64, expected: []const i64) !void {
     const allocator = std.testing.allocator;
     std.debug.assert(inputs.len == expected.len);
@@ -63,8 +65,9 @@ fn expectIntMatch(io: std.Io, comptime build: fn (std.mem.Allocator) anyerror!Fu
 // 1. Straight-line integer arithmetic.
 // ---------------------------------------------------------------------------
 
-/// f(a, b, c) = (a + b) * (b + c) - (a * c). A handful of simultaneously-live temps, no spilling: the
-/// baseline that the prologue, the ABI-register param moves, and the int arithmetic translate right.
+/// f(a, b, c) = (a + b) * (b + c) - (a * c). A few temporary values stay live at once, and none spill.
+/// This is the baseline case: it checks the prologue, the ABI register param moves, and the integer
+/// arithmetic all translate correctly.
 fn buildStraightLine(allocator: std.mem.Allocator) anyerror!Function {
     var func = Function.init(allocator);
     errdefer func.deinit();
@@ -78,13 +81,13 @@ fn buildStraightLine(allocator: std.mem.Allocator) anyerror!Function {
     const ac = try func.appendInst(entry, i64_t, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = c } });
     const prod = try func.appendInst(entry, i64_t, .{ .arith = .{ .op = .mul, .lhs = ab, .rhs = bc } });
     const res = try func.appendInst(entry, i64_t, .{ .arith = .{ .op = .sub, .lhs = prod, .rhs = ac } });
-    func.setTerminator(entry, .{ .ret = res });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(res) });
     return func;
 }
 
 test "wimmer-x86: straight-line int arithmetic matches" {
     const inputs = [_][]const i64{ &.{ 1, 2, 3 }, &.{ 0, 0, 0 }, &.{ -5, 7, -9 }, &.{ 100, -20, 30 }, &.{ 123456, -1, 2 } };
-    // Ground truth: (a + b) * (b + c) - (a * c), i64 wrapping, mirroring the IR exactly.
+    // Ground truth: (a + b) * (b + c) - (a * c), with i64 wrapping. This mirrors the IR exactly.
     var expected: [inputs.len]i64 = undefined;
     for (inputs, 0..) |in, i| {
         const a = in[0];
@@ -101,9 +104,10 @@ test "wimmer-x86: straight-line int arithmetic matches" {
 
 const n_fan = 30;
 
-/// f(n) = sum_k (n*(k+1) + k) for k in 0..30. All 30 terms are created before any is consumed, so far
-/// more integer values are live at once than the 12 allocatable gpr registers: the shared allocator
-/// must spill and tail-split. The reduction reloads every operand, so a wrong split/spill diverges.
+/// f(n) = sum_k (n*(k+1) + k) for k in 0..30. The code creates all 30 terms before it consumes any of
+/// them. This makes far more integer values live at once than the 12 allocatable gpr registers, so the
+/// shared allocator must spill values and split live ranges. The reduction reloads every operand, so a
+/// wrong split or spill causes a mismatch.
 fn buildIntPressure(allocator: std.mem.Allocator) anyerror!Function {
     var func = Function.init(allocator);
     errdefer func.deinit();
@@ -122,14 +126,14 @@ fn buildIntPressure(allocator: std.mem.Allocator) anyerror!Function {
         k -= 1;
         sum = try func.appendInst(entry, i64_t, .{ .arith = .{ .op = .add, .lhs = sum, .rhs = a[k] } });
     }
-    func.setTerminator(entry, .{ .ret = sum });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(sum) });
     return func;
 }
 
 test "wimmer-x86: int register pressure spills/splits and matches" {
     const inputs = [_][]const i64{ &.{0}, &.{1}, &.{7}, &.{-3}, &.{100}, &.{-1000}, &.{123456} };
-    // Ground truth: sum_{k=0..29} (n*(k+1) + k), i64 wrapping (integer add is associative, so the
-    // reverse reduction order in the IR yields the same value).
+    // Ground truth: sum_{k=0..29} (n*(k+1) + k), with i64 wrapping. Integer add is associative, so the
+    // reverse reduction order in the IR gives the same value.
     var expected: [inputs.len]i64 = undefined;
     for (inputs, 0..) |in, i| {
         const n = in[0];
@@ -141,11 +145,11 @@ test "wimmer-x86: int register pressure spills/splits and matches" {
 }
 
 // ---------------------------------------------------------------------------
-// 3. A value live across a call survives in a callee-saved register (the NEW push/pop prologue).
+// 3. A value live across a call survives in a callee-saved register (the push/pop prologue).
 // ---------------------------------------------------------------------------
 
-/// The leaf callee `g(x) = x + 2`. Built as its own function so the caller's `call` is a real
-/// inter-function call that clobbers every caller-saved register.
+/// The leaf callee `g(x) = x + 2`. This is built as its own function, so the caller's `call`
+/// instruction is a real inter-function call that clobbers every caller-saved register.
 fn buildAddTwoCallee(allocator: std.mem.Allocator) anyerror!Function {
     var func = Function.init(allocator);
     errdefer func.deinit();
@@ -153,14 +157,15 @@ fn buildAddTwoCallee(allocator: std.mem.Allocator) anyerror!Function {
     const blk = try func.appendBlock();
     const x = try func.appendBlockParam(blk, i64_t);
     const r = try func.appendArithImm(blk, i64_t, .add, x, 2);
-    func.setTerminator(blk, .{ .ret = r });
+    func.setTerminator(blk, .{ .ret = ir.function.Ret.one(r) });
     return func;
 }
 
-/// The caller `f(a)`: t = a + 1 (defined BEFORE the call), cr = g(10), return t + cr = a + 13. `t` is
-/// live ACROSS the call. Every caller-saved register is clobbered by the call, so the shared allocator
-/// keeps `t` in a CALLEE-SAVED register (rbx/r12..r15) instead of spilling, which fires the new
-/// push/pop prologue. The reference native path spills `t` across the call; both compute a + 13.
+/// The caller `f(a)`: t = a + 1 (defined before the call), cr = g(10), return t + cr = a + 13. `t`
+/// stays live across the call. The call clobbers every caller-saved register, so the shared allocator
+/// keeps `t` in a callee-saved register (rbx or r12 to r15) instead of spilling it. This triggers the
+/// push/pop prologue. The reference native path spills `t` across the call instead. Both paths compute
+/// a + 13.
 fn buildAcrossCall(allocator: std.mem.Allocator) anyerror!Function {
     var func = Function.init(allocator);
     errdefer func.deinit();
@@ -171,13 +176,13 @@ fn buildAcrossCall(allocator: std.mem.Allocator) anyerror!Function {
     const ten = try func.appendInst(entry, i64_t, .{ .iconst = 10 });
     const cr = try func.appendCall(entry, i64_t, "callee", &.{ten});
     const r = try func.appendInst(entry, i64_t, .{ .arith = .{ .op = .add, .lhs = t, .rhs = cr } });
-    func.setTerminator(entry, .{ .ret = r });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(r) });
     return func;
 }
 
-/// Concatenate `caller_c` (entry, at offset 0) and `callee_c`, patch every call relocation in the
-/// caller (all target "callee") into an intra-image rel32, and run under qemu with integer args. The
-/// caller may be compiled through whichever pipeline the test chose (Wimmer or reference).
+/// Concatenates `caller_c` (the entry, at offset 0) with `callee_c`. Patches every call relocation in
+/// the caller (all target "callee") into an intra-image rel32. Runs the combined code under qemu with
+/// integer args. The caller may come from either compile pipeline the test chose, Wimmer or reference.
 fn linkRunInt(io: std.Io, allocator: std.mem.Allocator, caller_c: *const isel.Compiled, callee_c: *const isel.Compiled, args: []const i64) !u8 {
     const code = try allocator.alloc(u8, caller_c.code.len + callee_c.code.len);
     defer allocator.free(code);
@@ -186,17 +191,17 @@ fn linkRunInt(io: std.Io, allocator: std.mem.Allocator, caller_c: *const isel.Co
     const callee_start = caller_c.code.len;
     for (caller_c.relocs) |reloc| {
         std.debug.assert(std.mem.eql(u8, reloc.symbol, "callee"));
-        // rel32 for `call` (E8 disp): target - (site + 4), both within the code (equal stub shift).
+        // rel32 for `call` (E8 disp): target minus (site + 4). Both addresses sit inside the same code.
         const rel: i32 = @intCast(@as(i64, @intCast(callee_start)) - @as(i64, @intCast(reloc.offset + 4)));
         std.mem.writeInt(u32, code[reloc.offset..][0..4], @bitCast(rel), .little);
     }
     return harness.runCodeInt(io, allocator, code, args, harness.qemu);
 }
 
-/// True iff `code` begins with a `push r64` of a callee-saved GPR (rbx=0x53, r12..r15 = 0x41 0x54..
-/// 0x57). The Wimmer prologue pushes the used callee-saved registers FIRST (before `sub rsp`), so a
-/// push at code[0] proves a value was placed in a callee-saved register, exercising the push/pop
-/// prologue rather than a spill.
+/// Returns true only if `code` begins with a `push r64` of a callee-saved GPR (rbx = 0x53, r12 to r15
+/// = 0x41 0x54 to 0x57). The Wimmer prologue pushes the used callee-saved registers first, before
+/// `sub rsp`. So a push at code[0] proves the allocator placed a value in a callee-saved register, and
+/// used the push/pop prologue instead of a spill.
 fn startsWithCalleeSavedPush(code: []const u8) bool {
     if (code.len >= 1 and code[0] == 0x53) return true; // push rbx
     if (code.len >= 2 and code[0] == 0x41 and code[1] >= 0x54 and code[1] <= 0x57) return true; // push r12..r15
@@ -208,7 +213,7 @@ test "wimmer-x86: a value live across a call survives in a callee-saved register
     const io = std.testing.io;
     const inputs = [_]i64{ 0, 1, 7, -3, 100, -1000, 123456 };
 
-    // Compile the callee once (leaf, no calls). Shared by both the reference and the Wimmer caller.
+    // Compile the callee once (leaf, no calls). Both the reference and the Wimmer caller share it.
     var callee = try buildAddTwoCallee(allocator);
     defer callee.deinit();
     var callee_c = isel.compile(allocator, &callee) catch |e| switch (e) {
@@ -217,7 +222,7 @@ test "wimmer-x86: a value live across a call survives in a callee-saved register
     };
     defer callee_c.deinit(allocator);
 
-    // The Wimmer caller MUST place `t` in a callee-saved register and emit the push/pop prologue.
+    // The Wimmer caller must place `t` in a callee-saved register and emit the push/pop prologue.
     var probe = try buildAcrossCall(allocator);
     defer probe.deinit();
     var probe_c = try isel.compileFunctionWimmerX86(allocator, &probe);
@@ -252,10 +257,11 @@ test "wimmer-x86: a value live across a call survives in a callee-saved register
 // 4. A div and a shift function (fixed-register clobbers rax/rdx/rcx per position).
 // ---------------------------------------------------------------------------
 
-/// f(a, b, c) = (a / b) + (a % b) + (c << 3) + (a >> 1). Exercises the div/rem (rax+rdx clobber) and
-/// the shl/shr (rcx clobber) per-position fixed intervals: the shared allocator may place operands in
-/// the clobbered registers (unlike the native pool exclusion), which the div/shift lowering stages out
-/// defensively. `b` is nonzero in every input so the divide is defined.
+/// f(a, b, c) = (a / b) + (a % b) + (c << 3) + (a >> 1). This checks the div/rem instructions (which
+/// clobber rax and rdx) and the shl/shr instructions (which clobber rcx). These fixed intervals mean
+/// the shared allocator may place operands in the clobbered registers, unlike the native pool
+/// exclusion. The div/shift lowering code stages operands out of those registers defensively. `b` is
+/// nonzero in every input, so the divide is always defined.
 fn buildDivShift(allocator: std.mem.Allocator) anyerror!Function {
     var func = Function.init(allocator);
     errdefer func.deinit();
@@ -273,15 +279,15 @@ fn buildDivShift(allocator: std.mem.Allocator) anyerror!Function {
     const s1 = try func.appendInst(entry, i64_t, .{ .arith = .{ .op = .add, .lhs = q, .rhs = rem } });
     const s2 = try func.appendInst(entry, i64_t, .{ .arith = .{ .op = .add, .lhs = s1, .rhs = shl } });
     const s3 = try func.appendInst(entry, i64_t, .{ .arith = .{ .op = .add, .lhs = s2, .rhs = shr } });
-    func.setTerminator(entry, .{ .ret = s3 });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(s3) });
     return func;
 }
 
 test "wimmer-x86: a div and a shift function matches (fixed-reg clobbers)" {
     const inputs = [_][]const i64{ &.{ 100, 7, 3 }, &.{ 40, 6, 1 }, &.{ -50, 8, 2 }, &.{ 12345, 11, -4 }, &.{ 7, 2, 5 } };
-    // Ground truth: (a / b) + (a % b) + (c << 3) + (a >> 1). Signed div/rem truncate toward zero
-    // (idiv), the left shift is `c * 8` (wrapping), the right shift is arithmetic (sar on a signed
-    // value). i64 wrapping adds.
+    // Ground truth: (a / b) + (a % b) + (c << 3) + (a >> 1). Signed div and rem truncate toward zero
+    // (idiv). The left shift is `c * 8` with wrapping. The right shift is arithmetic (sar on a signed
+    // value). The adds use i64 wrapping.
     var expected: [inputs.len]i64 = undefined;
     for (inputs, 0..) |in, i| {
         const a = in[0];
@@ -298,11 +304,12 @@ test "wimmer-x86: a div and a shift function matches (fixed-reg clobbers)" {
 
 const n_body = 20;
 
-/// f(n): acc=0; for i in 0..n: { t[k] = (i+1)*(k+1) for k in 0..20 (all live at once); acc += sum(t) };
-/// return acc. Three integers cross the loop as block params (i, n, acc), so the back-edge jump is a
-/// reg->reg parallel move (the cross-block Wimmer edge-move path), while the body creates 20
-/// simultaneously-live temporaries (past the 12 allocatable gpr registers), so the shared allocator
-/// spills and tail-splits INSIDE the body. A wrong intra-block split or a wrong back-edge move diverges.
+/// f(n): acc = 0; for i in 0..n: { t[k] = (i+1)*(k+1) for k in 0..20, all live at once; acc += sum(t) };
+/// return acc. Three integers cross the loop as block params (i, n, acc), so the back-edge jump needs a
+/// reg-to-reg parallel move, the cross-block Wimmer edge-move path. The body creates 20 temporaries
+/// that are all live at once, past the 12 allocatable gpr registers, so the shared allocator spills and
+/// splits live ranges inside the body. A wrong intra-block split or a wrong back-edge move causes a
+/// mismatch.
 fn buildLoopSum(allocator: std.mem.Allocator) anyerror!Function {
     var func = Function.init(allocator);
     errdefer func.deinit();
@@ -345,14 +352,14 @@ fn buildLoopSum(allocator: std.mem.Allocator) anyerror!Function {
     try func.setJump(body, header, &.{ next_i, b_n, next_acc });
 
     const e_acc = try func.appendBlockParam(exit, i64_t);
-    func.setTerminator(exit, .{ .ret = e_acc });
+    func.setTerminator(exit, .{ .ret = ir.function.Ret.one(e_acc) });
     return func;
 }
 
 test "wimmer-x86: a loop-carried sum + a diamond match (cross-block edge moves)" {
     const inputs = [_][]const i64{ &.{0}, &.{1}, &.{3}, &.{7}, &.{12} };
     // Ground truth: acc = 0; for i in 0..n: acc += sum_{k=0..19} ((i+1)*(k+1)); return acc. A
-    // non-positive n never enters the loop, so acc stays 0. i64 wrapping.
+    // non-positive n never enters the loop, so acc stays 0. Uses i64 wrapping.
     var expected: [inputs.len]i64 = undefined;
     for (inputs, 0..) |in, idx| {
         const n = in[0];
@@ -368,9 +375,10 @@ test "wimmer-x86: a loop-carried sum + a diamond match (cross-block edge moves)"
     try expectIntMatch(std.testing.io, buildLoopSum, &inputs, &expected);
 }
 
-/// f(n): c = n*3 (live on BOTH arms and the join); if n > 0 -> a else b; a: va = c + 10; b: vb = c +
-/// 20; m(p): return p + c. The join `m` takes a phi `p` (va from a, vb from b) resolved by moves on the
-/// jump edges a->m / b->m, while `c` is defined in the entry and stays live across both arms into `m`.
+/// f(n): c = n*3, live on both arms and at the join; if n > 0 then a else b; a: va = c + 10; b: vb =
+/// c + 20; m(p): return p + c. The join block `m` takes a phi `p` (va from a, vb from b), resolved by
+/// moves on the jump edges a to m and b to m. `c` is defined in the entry block and stays live across
+/// both arms into `m`.
 fn buildDiamond(allocator: std.mem.Allocator) anyerror!Function {
     var func = Function.init(allocator);
     errdefer func.deinit();
@@ -397,13 +405,13 @@ fn buildDiamond(allocator: std.mem.Allocator) anyerror!Function {
 
     const p = try func.appendBlockParam(m_blk, i64_t);
     const r = try func.appendInst(m_blk, i64_t, .{ .arith = .{ .op = .add, .lhs = p, .rhs = c } });
-    func.setTerminator(m_blk, .{ .ret = r });
+    func.setTerminator(m_blk, .{ .ret = ir.function.Ret.one(r) });
     return func;
 }
 
 test "wimmer-x86: a diamond with an int value live on both paths matches" {
     const inputs = [_][]const i64{ &.{0}, &.{1}, &.{-1}, &.{5}, &.{-9}, &.{40} };
-    // Ground truth: c = n*3; p = (n > 0) ? c + 10 : c + 20; return p + c. i64 wrapping.
+    // Ground truth: c = n*3; p = (n > 0) ? c + 10 : c + 20; return p + c. Uses i64 wrapping.
     var expected: [inputs.len]i64 = undefined;
     for (inputs, 0..) |in, i| {
         const n = in[0];
@@ -420,10 +428,11 @@ test "wimmer-x86: a diamond with an int value live on both paths matches" {
 
 const n_flive = 20;
 
-/// f(a) = sum_i (a + i) for i in 0..20, f32. All 20 sums are live at once, exceeding the 13
-/// allocatable xmm registers, so the shared allocator spills/splits scalar floats (the class-1
-/// store/reload actions through movups). Every intermediate is an exact small integer in f32, so the
-/// dependency-chain reduction is order-independent and must match the reference bit-for-bit.
+/// f(a) = sum_i (a + i) for i in 0..20, in f32. All 20 sums are live at once, more than the 13
+/// allocatable xmm registers, so the shared allocator spills and splits scalar floats. This uses the
+/// class-1 store and reload actions through movups. Every intermediate value is an exact small integer
+/// in f32, so the reduction order does not affect the result, and it must match the reference
+/// bit-for-bit.
 fn buildFloatPressure(allocator: std.mem.Allocator) anyerror!Function {
     var func = Function.init(allocator);
     errdefer func.deinit();
@@ -439,7 +448,7 @@ fn buildFloatPressure(allocator: std.mem.Allocator) anyerror!Function {
     }
     var acc = vals[0];
     for (vals[1..]) |v| acc = try func.appendInst(entry, f32_t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = v } });
-    func.setTerminator(entry, .{ .ret = acc });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(acc) });
     return func;
 }
 
@@ -478,17 +487,17 @@ test "wimmer-x86: an xmm float pressure kernel matches" {
 // 7. SIMD vectors (128-bit xmm and 256-bit ymm) through the shared allocator.
 // ---------------------------------------------------------------------------
 
-/// Run the reference (`selectFunction`) and the Wimmer differential path on two fresh copies of the
-/// same function for every f32 input tuple, asserting BOTH match the hand-computed GROUND-TRUTH
-/// `expected` (the low byte of the result's bits, the process exit code). `build` takes only the
-/// allocator so each side gets its own untouched function (the Wimmer path mutates the IR in place).
-/// Skips (not fails) when qemu is unavailable.
+/// Runs the reference path (`selectFunction`) and the Wimmer differential path on two fresh copies of
+/// the same function, for every f32 input tuple. Checks that both results match the hand-computed
+/// ground truth `expected` (the low byte of the result's bits, the process exit code). `build` takes
+/// only the allocator, so each side gets its own untouched function. The Wimmer path mutates the IR in
+/// place. Skips the test, rather than failing it, when qemu is unavailable.
 ///
-/// The ground truth is computed in Zig `f32` in the EXACT lane/reduction order the IR specifies:
-/// addps/mulss round to nearest-even like Zig's `+`/`*`, and an f32 `fconst` emits
+/// The ground truth is computed in Zig `f32`, in the exact lane and reduction order the IR specifies.
+/// addps and mulss round to nearest-even, like Zig's `+` and `*`. An f32 `fconst` emits
 /// `@as(f32, @floatCast(val))` bits, so a Zig `@floatCast` of the same constant is bit-identical.
-/// After the SP2 flip `selectFunction` is itself Wimmer, so this independent oracle (not `ref == got`)
-/// is what keeps a shared-allocator miscompile from slipping through. `expected` parallels `inputs`.
+/// `selectFunction` now uses Wimmer itself, so this independent oracle, not a bare `ref == got` check,
+/// is what catches a shared-allocator miscompile. `expected` is parallel to `inputs`.
 fn expectFloatMatch(io: std.Io, comptime build: fn (std.mem.Allocator) anyerror!Function, inputs: []const []const f32, expected: []const f32) !void {
     const allocator = std.testing.allocator;
     std.debug.assert(inputs.len == expected.len);
@@ -514,9 +523,10 @@ fn expectFloatMatch(io: std.Io, comptime build: fn (std.mem.Allocator) anyerror!
     }
 }
 
-/// f(a0..3, b0..3): va=<a>, vb=<b>, vc = va + vb, vd = vc * va (both a 128-bit addps and mulps), then
-/// extract the four lanes and reduce to a scalar. Eight f32 params fit in xmm0..xmm7, so no stack args.
-/// Exercises 128-bit vector values living in and moving between xmm registers on the shared path.
+/// f(a0..3, b0..3): va = <a>, vb = <b>, vc = va + vb, vd = vc * va (a 128-bit addps then a 128-bit
+/// mulps), then extract the four lanes and reduce to a scalar. Eight f32 params fit in xmm0 to xmm7,
+/// so the function needs no stack args. This checks 128-bit vector values that live in and move
+/// between xmm registers on the shared path.
 fn build128Arith(allocator: std.mem.Allocator) anyerror!Function {
     var func = Function.init(allocator);
     errdefer func.deinit();
@@ -536,7 +546,7 @@ fn build128Arith(allocator: std.mem.Allocator) anyerror!Function {
     const s01 = try func.appendInst(entry, t, .{ .arith = .{ .op = .add, .lhs = c[0], .rhs = c[1] } });
     const s012 = try func.appendInst(entry, t, .{ .arith = .{ .op = .add, .lhs = s01, .rhs = c[2] } });
     const s = try func.appendInst(entry, t, .{ .arith = .{ .op = .add, .lhs = s012, .rhs = c[3] } });
-    func.setTerminator(entry, .{ .ret = s });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(s) });
     return func;
 }
 
@@ -560,9 +570,10 @@ test "wimmer-x86: a 128-bit vector arithmetic function matches" {
     try expectFloatMatch(std.testing.io, build128Arith, &inputs, &expected);
 }
 
-/// A 256-bit (AVX) counterpart of `build128Arith`. Eight lanes need sixteen scalars, more than the
-/// eight xmm arg registers, so the two <8 x f32> vectors are built from fconsts (no stack args). One
-/// 256-bit vaddps then vmulps, extract all eight lanes (the high four via vextractf128), reduce.
+/// The 256-bit (AVX) counterpart of `build128Arith`. Eight lanes need sixteen scalars, more than the
+/// eight xmm arg registers, so the code builds the two `<8 x f32>` vectors from fconsts instead, with
+/// no stack args. One 256-bit vaddps runs, then vmulps. The code extracts all eight lanes, the high
+/// four through vextractf128, then reduces them.
 fn build256Arith(allocator: std.mem.Allocator) anyerror!Function {
     var func = Function.init(allocator);
     errdefer func.deinit();
@@ -583,14 +594,14 @@ fn build256Arith(allocator: std.mem.Allocator) anyerror!Function {
     for (0..8) |i| e[i] = try func.appendInst(entry, t, .{ .extract = .{ .aggregate = vd, .index = @intCast(i) } });
     var s = e[0];
     for (1..8) |i| s = try func.appendInst(entry, t, .{ .arith = .{ .op = .add, .lhs = s, .rhs = e[i] } });
-    func.setTerminator(entry, .{ .ret = s });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(s) });
     return func;
 }
 
 test "wimmer-x86: a 256-bit vector arithmetic function matches" {
-    // No inputs: the vectors are constants (256-bit needs 16 lanes > 8 xmm arg regs). Runs under
-    // qemu -cpu max, which exposes AVX. Ground truth mirrors the builder's ca/da constants:
-    // e[i] = (ca[i] + da[i]) * ca[i]; s = e[0] + e[1] + ... + e[7].
+    // No inputs: the vectors are constants, since 256-bit needs 16 lanes, more than the 8 xmm arg
+    // registers. Runs under qemu -cpu max, which exposes AVX. Ground truth mirrors the builder's ca/da
+    // constants: e[i] = (ca[i] + da[i]) * ca[i]; s = e[0] + e[1] + ... + e[7].
     const ca = [8]f32{ 1.1, 2.2, 3.3, 4.4, 5.5, 6.6, 7.7, 8.8 };
     const da = [8]f32{ 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0 };
     var s: f32 = (ca[0] + da[0]) * ca[0];
@@ -599,12 +610,13 @@ test "wimmer-x86: a 256-bit vector arithmetic function matches" {
     try expectFloatMatch(std.testing.io, build256Arith, &.{&.{}}, &expected);
 }
 
-/// Build a register-pressure vector kernel of `lanes`-wide vectors: `count` vectors (each a broadcast
-/// of a distinct constant) are all live before any is consumed, exceeding the 13 allocatable xmm
-/// registers, so the shared allocator SPLITS a vector to a spill slot and reloads it. The slot store
-/// and reload pick their width from the value's IR type (movups for 128-bit, vmovups for the 256-bit
-/// ymm), both UNALIGNED, so the existing 32-byte slot area suffices. The vectors are summed, then all
-/// lanes are extracted and reduced. A wrong-width spill or reload drops lanes and diverges.
+/// Builds a register-pressure vector kernel of `lanes`-wide vectors. `count` vectors, each a broadcast
+/// of a distinct constant, are all live before the code consumes any of them. This is more than the 13
+/// allocatable xmm registers, so the shared allocator splits a vector to a spill slot and reloads it.
+/// The slot store and reload pick their width from the value's IR type, movups for 128-bit or vmovups
+/// for the 256-bit ymm. Both are unaligned, so the existing 32-byte slot area is large enough. The
+/// code sums the vectors, then extracts and reduces all lanes. A wrong-width spill or reload drops
+/// lanes and causes a mismatch.
 fn buildVecPressure(allocator: std.mem.Allocator, comptime lanes: u32, comptime count: usize) anyerror!Function {
     var func = Function.init(allocator);
     errdefer func.deinit();
@@ -624,7 +636,7 @@ fn buildVecPressure(allocator: std.mem.Allocator, comptime lanes: u32, comptime 
     for (0..lanes) |k| e[k] = try func.appendInst(entry, t, .{ .extract = .{ .aggregate = acc, .index = @intCast(k) } });
     var s = e[0];
     for (1..lanes) |k| s = try func.appendInst(entry, t, .{ .arith = .{ .op = .add, .lhs = s, .rhs = e[k] } });
-    func.setTerminator(entry, .{ .ret = s });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(s) });
     return func;
 }
 
@@ -637,8 +649,8 @@ fn build256Pressure(allocator: std.mem.Allocator) anyerror!Function {
 
 /// Ground truth for `buildVecPressure`: each vector `vs[i]` is a broadcast of the constant
 /// `L_i = f32(f64(i) + 0.1)`, so every lane of `acc = vs[0] + vs[1] + ... + vs[count-1]` holds the
-/// same running sum. Extracting the `lanes` (equal) lanes and summing them adds that lane value
-/// `lanes` times. All computed in `f32` in the IR's order.
+/// same running sum. Extracting the `lanes` equal lanes and summing them adds that lane value `lanes`
+/// times. The code computes all of this in `f32`, in the IR's order.
 fn vecPressureExpected(comptime lanes: u32, comptime count: usize) f32 {
     var lane: f32 = 0;
     for (0..count) |i| {
@@ -656,8 +668,8 @@ test "wimmer-x86: vector register pressure spills a vector to a slot and reloads
     try expectFloatMatch(std.testing.io, build256Pressure, &.{&.{}}, &.{vecPressureExpected(8, 16)});
 }
 
-/// The leaf callee `g(x) = x + x`, f32. A real inter-function call so the caller's `call` clobbers
-/// every caller-saved register, including all xmm.
+/// The leaf callee `g(x) = x + x`, in f32. A real inter-function call, so the caller's `call`
+/// instruction clobbers every caller-saved register, including all xmm registers.
 fn buildDoubleCallee(allocator: std.mem.Allocator) anyerror!Function {
     var func = Function.init(allocator);
     errdefer func.deinit();
@@ -665,14 +677,15 @@ fn buildDoubleCallee(allocator: std.mem.Allocator) anyerror!Function {
     const blk = try func.appendBlock();
     const x = try func.appendBlockParam(blk, t);
     const r = try func.appendInst(blk, t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = x } });
-    func.setTerminator(blk, .{ .ret = r });
+    func.setTerminator(blk, .{ .ret = ir.function.Ret.one(r) });
     return func;
 }
 
-/// The caller `f(a,b,c,d)`: v = <a,b,c,d> (a 128-bit vector) is defined BEFORE a call and used AFTER
-/// it, so v is live ACROSS the call. xmm has NO callee-saved register, so the shared allocator must
-/// SPILL v to a 32-byte slot (store before the call, reload after) rather than keep it in a register.
-/// cr = g(a); return reduce(v lanes) + cr. Exercises the vector spill/reload forced by a call clobber.
+/// The caller `f(a,b,c,d)`: v = <a,b,c,d>, a 128-bit vector, is defined before a call and used after
+/// it, so v stays live across the call. xmm has no callee-saved register, so the shared allocator must
+/// spill v to a 32-byte slot, storing it before the call and reloading it after, instead of keeping it
+/// in a register. cr = g(a); return reduce(v lanes) + cr. This checks the vector spill and reload that
+/// a call clobber forces.
 fn buildVecAcrossCall(allocator: std.mem.Allocator) anyerror!Function {
     var func = Function.init(allocator);
     errdefer func.deinit();
@@ -689,13 +702,13 @@ fn buildVecAcrossCall(allocator: std.mem.Allocator) anyerror!Function {
     const s012 = try func.appendInst(entry, t, .{ .arith = .{ .op = .add, .lhs = s01, .rhs = c[2] } });
     const s0123 = try func.appendInst(entry, t, .{ .arith = .{ .op = .add, .lhs = s012, .rhs = c[3] } });
     const s = try func.appendInst(entry, t, .{ .arith = .{ .op = .add, .lhs = s0123, .rhs = cr } });
-    func.setTerminator(entry, .{ .ret = s });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(s) });
     return func;
 }
 
-/// Concatenate `caller_c` (entry, at offset 0) and `callee_c`, patch the caller's "callee" relocations
-/// into intra-image rel32s, and run under qemu with f32 args (result read from xmm0). The float
-/// analogue of `linkRunInt`.
+/// Concatenates `caller_c` (the entry, at offset 0) with `callee_c`. Patches the caller's "callee"
+/// relocations into intra-image rel32 values. Runs the combined code under qemu with f32 args, and
+/// reads the result from xmm0. The float analogue of `linkRunInt`.
 fn linkRunFloat(io: std.Io, allocator: std.mem.Allocator, caller_c: *const isel.Compiled, callee_c: *const isel.Compiled, fargs: []const f32) !u8 {
     const code = try allocator.alloc(u8, caller_c.code.len + callee_c.code.len);
     defer allocator.free(code);
@@ -719,7 +732,8 @@ test "wimmer-x86: a vector live across a call survives (callee-saved not availab
         &.{ 0.5, 0.25, 100.0, -3.0 },
     };
 
-    // The callee is a leaf (no calls). Compile it once, shared by the reference and Wimmer callers.
+    // The callee is a leaf, with no calls. Compile it once, and share it between the reference and
+    // Wimmer callers.
     var callee = try buildDoubleCallee(allocator);
     defer callee.deinit();
     var callee_c = isel.compile(allocator, &callee) catch |e| switch (e) {
@@ -763,13 +777,14 @@ test "wimmer-x86: a vector live across a call survives (callee-saved not availab
     }
 }
 
-/// A loop that carries a `lanes`-wide vector accumulator ACROSS block edges (entry->header and the
-/// body->header back-edge), with `count` simultaneously-live vectors in the body creating register
-/// pressure. The carried vector is used at the END of the body, so it is live across the whole
-/// pressured region and the shared allocator SPLITS it, making the block-param/back-edge shuffle a
-/// class-1 (xmm) EDGE move whose width is picked from the value's IR type (movups for 128-bit, vmovups
-/// for the 256-bit ymm). A wrong-width edge move drops the upper lanes and diverges from the reference.
-/// The trip count is a constant so no gpr argument is needed (the float stub loads only xmm args).
+/// A loop that carries a `lanes`-wide vector accumulator across block edges, entry to header and the
+/// body to header back-edge. `count` vectors stay live at once in the body, creating register
+/// pressure. The carried vector is used at the end of the body, so it stays live across the whole
+/// pressured region, and the shared allocator splits it. This makes the block-param and back-edge
+/// shuffle a class-1 (xmm) edge move, whose width comes from the value's IR type, movups for 128-bit
+/// or vmovups for the 256-bit ymm. A wrong-width edge move drops the upper lanes and causes a mismatch
+/// with the reference. The trip count is a constant, so the function needs no gpr argument, since the
+/// float stub loads only xmm args.
 fn buildVecLoopPressure(allocator: std.mem.Allocator, comptime lanes: u32, comptime count: usize) anyerror!Function {
     var func = Function.init(allocator);
     errdefer func.deinit();
@@ -799,8 +814,8 @@ fn buildVecLoopPressure(allocator: std.mem.Allocator, comptime lanes: u32, compt
     const cond = try func.appendInst(header, bool_t, .{ .icmp = .{ .op = .lt, .lhs = h_i, .rhs = h_n } });
     try func.appendIf(header, cond, .{ .target = body, .args = &.{ h_v, h_i, h_n } }, .{ .target = exit, .args = &.{h_v} });
 
-    // body(vacc, i, n): build `count` live vectors, reduce them, ADD the carried vacc LAST (so vacc is
-    // live across the whole pressured body), i+1, jump header.
+    // body(vacc, i, n): build `count` live vectors, reduce them, add the carried vacc last so vacc stays
+    // live across the whole pressured body, then i+1, jump header.
     const b_v = try func.appendBlockParam(body, vt);
     const b_i = try func.appendBlockParam(body, i32_t);
     const b_n = try func.appendBlockParam(body, i32_t);
@@ -823,7 +838,7 @@ fn buildVecLoopPressure(allocator: std.mem.Allocator, comptime lanes: u32, compt
     for (0..lanes) |k| e[k] = try func.appendInst(exit, t, .{ .extract = .{ .aggregate = e_v, .index = @intCast(k) } });
     var s = e[0];
     for (1..lanes) |k| s = try func.appendInst(exit, t, .{ .arith = .{ .op = .add, .lhs = s, .rhs = e[k] } });
-    func.setTerminator(exit, .{ .ret = s });
+    func.setTerminator(exit, .{ .ret = ir.function.Ret.one(s) });
     return func;
 }
 
@@ -834,10 +849,10 @@ fn build256LoopPressure(allocator: std.mem.Allocator) anyerror!Function {
     return buildVecLoopPressure(allocator, 8, 16);
 }
 
-/// Ground truth for `buildVecLoopPressure`: the seed lane is `f32(0.1)`; each of the 5 loop
+/// Ground truth for `buildVecLoopPressure`: the seed lane is `f32(0.1)`. Each of the 5 loop
 /// iterations sets `vacc = red + vacc`, where `red = L_0 + L_1 + ... + L_{count-1}` and
-/// `L_j = f32(f64(j) + 0.1)`. All lanes stay equal (broadcasts), so the exit sums the final lane
-/// `lanes` times. All computed in `f32` in the IR's order.
+/// `L_j = f32(f64(j) + 0.1)`. All lanes stay equal, since they are broadcasts, so the exit sums the
+/// final lane `lanes` times. The code computes all of this in `f32`, in the IR's order.
 fn vecLoopExpected(comptime lanes: u32, comptime count: usize) f32 {
     var red: f32 = 0;
     for (0..count) |j| {
@@ -852,48 +867,49 @@ fn vecLoopExpected(comptime lanes: u32, comptime count: usize) f32 {
 }
 
 test "wimmer-x86: a wide vector carried across loop edges under pressure uses width-correct edge moves" {
-    // The carried vector crosses the entry and back edges as a class-1 edge move; 128-bit (movups) and
-    // 256-bit (vmovups) must each move the full width or the reduced result diverges.
+    // The carried vector crosses the entry and back edges as a class-1 edge move. 128-bit (movups) and
+    // 256-bit (vmovups) must each move the full width, or the reduced result diverges.
     try expectFloatMatch(std.testing.io, build128LoopPressure, &.{&.{}}, &.{vecLoopExpected(4, 16)});
     try expectFloatMatch(std.testing.io, build256LoopPressure, &.{&.{}}, &.{vecLoopExpected(8, 16)});
 }
 
 // ---------------------------------------------------------------------------
-// 8. Task 1 (SP2): a same-position store/reload cluster at a block-param boundary, exercising the
-//    bridge's retired `wimmerHasSamePosRegHazard` bail (replaced by consuming the shared allocator's
-//    already-ordered `walloc.actions`).
+// 8. A same-position store/reload cluster at a block-param boundary. This exercises the bridge code
+//    path that replaced the retired `wimmerHasSamePosRegHazard` bail. Instead of that detector, the
+//    bridge now consumes the shared allocator's already-ordered `walloc.actions` directly.
 //
-// A "spill-across-a-call" framing (mirroring the aarch64 SP1 shape) turns out NOT to reach this
-// hazard on x86: the shared scan's `allocateBlockedReg` deliberately avoids handing a
-// call-clobbered (caller-saved) register to any value whose live range spans the call (an idle
-// caller-saved register's `next_use` is pinned at the near clobber point, always LOSING to a
-// busy callee-saved occupant's real, farther-off next use), so a value spanning a call only ever
-// cycles through the 5 callee-saved registers or spills straight to memory, never landing two
-// conflicting register touches on one position. Confirmed empirically: a 40-value "many locals
-// live across a call" shape (the direct x86 analogue of the aarch64 gap #6 test, args 0-13
-// reduced in reverse order, arg0 as the call argument) never produces two actions sharing an
-// `at`, at any size tried (14, 20, 40).
+// A "spill across a call" shape, similar to the matching aarch64 case, turns out not to reach this
+// hazard on x86. The shared scan's `allocateBlockedReg` deliberately avoids handing a
+// call-clobbered (caller-saved) register to any value whose live range spans the call. An idle
+// caller-saved register's `next_use` is pinned at the near clobber point, so it always loses to a
+// busy callee-saved occupant's real, farther-off next use. So a value that spans a call only ever
+// cycles through the 5 callee-saved registers, or spills straight to memory. It never produces two
+// conflicting register touches at one position. This was confirmed empirically: a 40-value "many
+// locals live across a call" shape, the x86 analogue of the matching aarch64 test, with args 0-13
+// reduced in reverse order and arg0 as the call argument, never produces two actions that share an
+// `at` value, at any size tried (14, 20, 40).
 //
-// A genuine same-position cluster DOES arise at a block-parameter boundary: `n_pre` values stay
-// ACTIVE (live, in registers) from the entry block into the loop body, while the body's OWN
-// `n_hdr` carried params arrive at that SAME shared param-row position. `n_pre + n_hdr + 2` (seed,
-// iter) exceeds the 12-register gpr pool, so entering the body for the first time must evict
-// several `n_pre` occupants at that ONE position while simultaneously placing the arriving body
-// params, producing a store (evicting an occupant) and a reload (placing an arrival) that target
-// the SAME physical register at the SAME position, exactly the hazard the retired detector bailed
-// on. Confirmed via `wimmer.allocate` directly: this shape's `walloc.actions` contains several
-// `at`-duplicate pairs, each a store+reload pair on one register (e.g. `store reg=15 -> slot`
-// immediately followed by `reload slot -> reg=15` at the identical `at`).
+// A genuine same-position cluster does arise at a block-parameter boundary. `n_pre` values stay
+// active, live in registers, from the entry block into the loop body, while the body's own `n_hdr`
+// carried params arrive at that same shared param-row position. `n_pre + n_hdr + 2` (seed, iter)
+// is more than the 12-register gpr pool, so entering the body for the first time must evict several
+// `n_pre` occupants at that one position while it places the arriving body params. This produces a
+// store, which evicts an occupant, and a reload, which places an arrival, that target the same
+// physical register at the same position. This is confirmed directly through `wimmer.allocate`: this
+// shape's `walloc.actions` contains several `at`-duplicate pairs, each a store-and-reload pair on one
+// register, for example a `store reg=15 -> slot` immediately followed by a `reload slot -> reg=15` at
+// the identical `at`.
 // ---------------------------------------------------------------------------
 
 const n_pre = 10;
 const n_hdr = 8;
 
-/// Pre-loop: n_pre temporaries defined and used only deep inside the loop body (so they are ACTIVE,
-/// occupying registers, when the loop body's param row is reached). Header/body: n_hdr loop-carried
-/// params (a SHARED start position for all of them, each block's own param row) plus a running total
-/// and the iteration counter. `n_pre + n_hdr + 2 > 12` (the gpr pool), so reaching the body for the
-/// FIRST time must evict several of the n_pre occupants right at the body's shared param position.
+/// Pre-loop: `n_pre` temporaries are defined and used only deep inside the loop body, so they stay
+/// active, occupying registers, when the loop body's param row is reached. Header and body: `n_hdr`
+/// loop-carried params share one start position, each block's own param row, plus a running total and
+/// the iteration counter. `n_pre + n_hdr + 2 > 12`, more than the gpr pool, so reaching the body for
+/// the first time must evict several of the `n_pre` occupants right at the body's shared param
+/// position.
 fn buildHeaderEvictsPreLoop(allocator: std.mem.Allocator) anyerror!Function {
     var func = Function.init(allocator);
     errdefer func.deinit();
@@ -934,9 +950,9 @@ fn buildHeaderEvictsPreLoop(allocator: std.mem.Allocator) anyerror!Function {
     for (0..n_hdr) |k| b[k] = try func.appendBlockParam(body, i64_t);
     const b_total = try func.appendBlockParam(body, i64_t);
     const b_iter = try func.appendBlockParam(body, i64_t);
-    // Deep in the body, consume the n_pre pre-loop values AND the header-carried params together:
-    // this shared read point is exactly where the n_pre occupants (still active from the entry
-    // block) collide with the freshly-arrived body params for the gpr pool.
+    // Deep in the body, consume the n_pre pre-loop values and the header-carried params together.
+    // This shared read point is exactly where the n_pre occupants, still active from the entry
+    // block, collide with the freshly arrived body params for the gpr pool.
     var acc = pre[0];
     for (1..n_pre) |k| acc = try func.appendInst(body, i64_t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = pre[k] } });
     for (0..n_hdr) |k| acc = try func.appendInst(body, i64_t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = b[k] } });
@@ -949,15 +965,15 @@ fn buildHeaderEvictsPreLoop(allocator: std.mem.Allocator) anyerror!Function {
     try func.setJump(body, header, &back_args);
 
     const e_total = try func.appendBlockParam(exit, i64_t);
-    func.setTerminator(exit, .{ .ret = e_total });
+    func.setTerminator(exit, .{ .ret = ir.function.Ret.one(e_total) });
     return func;
 }
 
 test "wimmer-x86: a header/body param cluster forces a same-position store/reload and matches" {
     const inputs = [_][]const i64{ &.{0}, &.{1}, &.{-1}, &.{5}, &.{-9}, &.{100}, &.{-1000} };
-    // Ground truth: the n_hdr carried params stay = hseed[k] = seed+100+k across the 3 iterations
-    // (the back-edge forwards them unchanged), so each body computes acc = sum_{k=0..9}(seed+k) +
-    // sum_{k=0..7}(seed+100+k) and total += acc for 3 iterations. i64 wrapping.
+    // Ground truth: the n_hdr carried params stay at hseed[k] = seed+100+k across the 3 iterations,
+    // since the back-edge forwards them unchanged. So each body computes acc = sum_{k=0..9}(seed+k) +
+    // sum_{k=0..7}(seed+100+k), and total += acc for 3 iterations. Uses i64 wrapping.
     var expected: [inputs.len]i64 = undefined;
     for (inputs, 0..) |in, i| {
         const seed = in[0];
@@ -973,31 +989,33 @@ test "wimmer-x86: a header/body param cluster forces a same-position store/reloa
 }
 
 // ---------------------------------------------------------------------------
-// 9. Task 2 (SP2): ADDRESS-FOLD under register pressure through the fold-aware Wimmer pipeline
-//    (`compileFunctionWimmerX86Fold`: analyze -> applyFoldRewriteX86 -> shared allocate -> emit).
+// 9. Address folding under register pressure, through the fold-aware Wimmer pipeline
+//    (`compileFunctionWimmerX86Fold`: analyze, then `applyFoldRewriteX86`, then shared allocate, then
+//    emit).
 //
-// The shared allocator is fold-BLIND: it reads only the raw IR operands. A foldable
-// `p = arith_imm.add(base, imm); load/store(p)` presents `base` used only at the add, so a naive
-// fold-on Wimmer compile would let `base` die at the add and reuse its register across the pressured
-// region, then emit `[base + disp32]` reading the STALE register (the exact aarch64 SP1 trap).
-// `applyFoldRewriteX86` repoints each folded mem op's ptr to `base` and DCEs the dead adds BEFORE the
-// scan, so `base` stays live to the load/store, while the analysis (keyed by the surviving mem inst)
-// still drives the `[base + disp32]` emission. This test builds the fold-under-pressure shape, compiles
-// it through the fold-aware Wimmer pipeline AND the fold-on reference (`selectFunction`), runs both
-// under qemu, and asserts (a) the results are bit-identical and (b) the fold actually FIRED (a
-// disassembled `[base + disp]` off a non-rsp register, which vanishes if the rewrite ever elides the
-// fold or the allocator is left fold-blind).
+// The shared allocator is fold-blind: it reads only the raw IR operands. A foldable
+// `p = arith_imm.add(base, imm); load/store(p)` shape uses `base` only at the add. So a naive
+// fold-on Wimmer compile would let `base` die at the add, reuse its register across the pressured
+// region, then emit `[base + disp32]` that reads the stale register. This is the same trap seen on
+// aarch64. `applyFoldRewriteX86` repoints each folded memory op's pointer to `base` and removes the
+// dead adds as dead code before the scan, so `base` stays live to the load or store. The analysis,
+// keyed by the surviving memory instruction, still drives the `[base + disp32]` emission. This test
+// builds the fold-under-pressure shape, compiles it through the fold-aware Wimmer pipeline and the
+// fold-on reference (`selectFunction`), runs both under qemu, and checks two things: (a) the results
+// are bit-identical, and (b) the fold actually fired, shown by a disassembled `[base + disp]` off a
+// non-rsp register. This check vanishes if the rewrite ever elides the fold or leaves the allocator
+// fold-blind.
 // ---------------------------------------------------------------------------
 
 const fold_pressure = 8;
 
-/// f(arg, cond): in ENTRY, three consecutive i64 allocas buf0/buf1/buf2 (so buf0+8 = buf1, buf0+16 =
-/// buf2), buf1 initialized to `arg`, and two DEAD address-adds off buf0 (`pl = buf0+8`, `ps = buf0+16`,
-/// each used ONLY by a successor mem op, so both fold). On cond > 0, `then_b` first builds
-/// `fold_pressure` live temporaries (more than enough to make a fold-blind allocator reuse buf0's
-/// register), then does a FOLDED store to `ps` (= buf2) and a FOLDED load from `pl` (= buf1 = arg),
+/// f(arg, cond): in the entry block, three consecutive i64 allocas buf0, buf1, buf2 give buf0+8 = buf1
+/// and buf0+16 = buf2. buf1 is initialized to `arg`. Two dead address-adds off buf0 (`pl = buf0+8`,
+/// `ps = buf0+16`) are each used only by a successor memory op, so both fold. On cond > 0, `then_b`
+/// first builds `fold_pressure` live temporaries, enough to make a fold-blind allocator reuse buf0's
+/// register. It then does a folded store to `ps` (= buf2) and a folded load from `pl` (= buf1 = arg),
 /// reads buf2 back through its own pointer, and reduces the loaded values together with the still-live
-/// pressure temporaries (so they span the folded mem ops). buf0 must stay live across the whole
+/// pressure temporaries, so they span the folded memory ops. buf0 must stay live across the whole
 /// pressured region for both folded accesses to read the right slot. Expected(cond>0) = arg + cond +
 /// sum_{k=1..P}(cond + k); Expected(cond<=0) = cond.
 fn buildFoldUnderPressure(allocator: std.mem.Allocator) anyerror!Function {
@@ -1015,16 +1033,16 @@ fn buildFoldUnderPressure(allocator: std.mem.Allocator) anyerror!Function {
     const buf0 = try func.appendInst(entry, ptr_t, .{ .alloca = .{ .elem = i64_t } });
     const buf1 = try func.appendInst(entry, ptr_t, .{ .alloca = .{ .elem = i64_t } });
     const buf2 = try func.appendInst(entry, ptr_t, .{ .alloca = .{ .elem = i64_t } });
-    try func.appendStore(entry, arg, buf1); // buf1 = arg (own pointer, off 0, references buf1)
-    // Two DEAD adds off buf0: each result feeds ONLY a successor mem op, so buf0's successor liveness
-    // flows solely through the folded accesses' base.
+    try func.appendStore(entry, arg, buf1); // buf1 = arg (own pointer, offset 0, references buf1)
+    // Two dead adds off buf0: each result feeds only a successor memory op, so buf0's successor
+    // liveness flows solely through the folded accesses' base.
     const pl = try func.appendInst(entry, ptr_t, .{ .arith_imm = .{ .op = .add, .lhs = buf0, .imm = 8 } }); // = buf1
     const ps = try func.appendInst(entry, ptr_t, .{ .arith_imm = .{ .op = .add, .lhs = buf0, .imm = 16 } }); // = buf2
     const zero = try func.appendInst(entry, i64_t, .{ .iconst = 0 });
     const c = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .gt, .lhs = cond, .rhs = zero } });
     try func.appendIf(entry, c, .{ .target = then_b, .args = &.{} }, .{ .target = else_b, .args = &.{} });
 
-    // then_b: build the pressure temporaries FIRST, then the folded store/load, so a fold-blind
+    // then_b: build the pressure temporaries first, then the folded store and load. A fold-blind
     // allocator would already have handed buf0's register to a temp by the time the folded accesses run.
     var vals: [fold_pressure]Value = undefined;
     for (0..fold_pressure) |k| {
@@ -1035,16 +1053,16 @@ fn buildFoldUnderPressure(allocator: std.mem.Allocator) anyerror!Function {
     const rb = try func.appendInst(then_b, i64_t, .{ .load = .{ .ptr = buf2 } }); // read buf2 back (own ptr) = cond
     var acc = try func.appendInst(then_b, i64_t, .{ .arith = .{ .op = .add, .lhs = w, .rhs = rb } }); // arg + cond
     for (0..fold_pressure) |k| acc = try func.appendInst(then_b, i64_t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = vals[k] } });
-    func.setTerminator(then_b, .{ .ret = acc });
-    func.setTerminator(else_b, .{ .ret = cond });
+    func.setTerminator(then_b, .{ .ret = ir.function.Ret.one(acc) });
+    func.setTerminator(else_b, .{ .ret = ir.function.Ret.one(cond) });
     return func;
 }
 
-/// Count memory accesses in raw compiled `code` that carry a NONZERO displacement off a base register
-/// other than rsp: a folded `[base + off]` (off != 0, base != rsp). Spill/alloca/frame accesses address
-/// off rsp, so requiring base != rsp isolates the folds. Zero unless address folding fired. Mirrors the
-/// `foldedMemOps` disasm probe in `tests/addrfold.zig`, but works on already-compiled bytes so it can
-/// inspect the Wimmer-fold output directly.
+/// Counts memory accesses in raw compiled `code` that carry a nonzero displacement off a base register
+/// other than rsp, a folded `[base + off]` where off != 0 and base != rsp. Spill, alloca, and frame
+/// accesses address off rsp, so requiring base != rsp isolates the folds. This stays zero unless
+/// address folding fired. It mirrors the `foldedMemOps` disasm probe in `tests/addrfold.zig`, but it
+/// works on already-compiled bytes, so it can inspect the Wimmer-fold output directly.
 fn foldedMemOpsInCode(allocator: std.mem.Allocator, code: []const u8) !usize {
     const text = try disasm.format(allocator, code);
     defer allocator.free(text);
@@ -1055,7 +1073,7 @@ fn foldedMemOpsInCode(allocator: std.mem.Allocator, code: []const u8) !usize {
         const rb = std.mem.indexOfScalarPos(u8, line, lb, ']') orelse continue;
         const inner = line[lb + 1 .. rb];
         const base_end = std.mem.indexOfScalar(u8, inner, ' ') orelse inner.len;
-        if (std.mem.eql(u8, inner[0..base_end], "rsp")) continue; // spill / alloca / frame, not a fold
+        if (std.mem.eql(u8, inner[0..base_end], "rsp")) continue; // a spill, alloca, or frame access, not a fold
         if (std.mem.indexOf(u8, inner, " + ") != null or std.mem.indexOf(u8, inner, " - ") != null) count += 1;
     }
     return count;
@@ -1065,9 +1083,9 @@ test "wimmer-x86: address fold under register pressure matches the reference and
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    // The fold MUST fire in the fold-aware Wimmer output: at least the folded load and the folded store
-    // survive as `[base + disp]` off a non-rsp register. A zero here means the rewrite elided the fold or
-    // the pipeline stayed fold-blind.
+    // The fold must fire in the fold-aware Wimmer output: at least the folded load and the folded store
+    // survive as `[base + disp]` off a non-rsp register. A zero here means the rewrite elided the fold,
+    // or the pipeline stayed fold-blind.
     var probe = try buildFoldUnderPressure(allocator);
     defer probe.deinit();
     var probe_c = try isel.compileFunctionWimmerX86Fold(allocator, &probe);
@@ -1081,9 +1099,9 @@ test "wimmer-x86: address fold under register pressure matches the reference and
         var wim_func = try buildFoldUnderPressure(allocator);
         defer wim_func.deinit();
 
-        // Ground truth: on cond > 0 the folded load reads arg and the folded store/read-back gives
-        // cond, then the P=fold_pressure temporaries (cond+k, k=1..P) are summed in: arg + cond +
-        // sum_{k=1..P}(cond + k). On cond <= 0 the else arm returns cond. i64 wrapping, mod 256.
+        // Ground truth: on cond > 0, the folded load reads arg, and the folded store and read-back give
+        // cond. Then the P=fold_pressure temporaries (cond+k, k=1..P) sum in: arg + cond +
+        // sum_{k=1..P}(cond + k). On cond <= 0, the else arm returns cond. Uses i64 wrapping, mod 256.
         const arg = args[0];
         const cond = args[1];
         var exp: i64 = cond;

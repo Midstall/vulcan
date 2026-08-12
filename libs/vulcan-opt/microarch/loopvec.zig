@@ -168,8 +168,8 @@ fn remapOp(func: *Function, op: Opcode, vmap: *const std.AutoHashMapUnmanaged(Va
         .convert => |c| .{ .convert = .{ .value = rv(vmap, c.value) } },
         .unary => |u| .{ .unary = .{ .op = u.op, .value = rv(vmap, u.value) } },
         .extract => |e| .{ .extract = .{ .aggregate = rv(vmap, e.aggregate), .index = e.index } },
-        .load => |l| .{ .load = .{ .ptr = rv(vmap, l.ptr) } },
-        .store => |s| .{ .store = .{ .value = rv(vmap, s.value), .ptr = rv(vmap, s.ptr) } },
+        .load => |l| .{ .load = .{ .ptr = rv(vmap, l.ptr), .@"volatile" = l.@"volatile" } },
+        .store => |s| .{ .store = .{ .value = rv(vmap, s.value), .ptr = rv(vmap, s.ptr), .@"volatile" = s.@"volatile" } },
         .prefetch => |p| .{ .prefetch = .{ .ptr = rv(vmap, p.ptr) } },
         .struct_new => |sn| blk: {
             var fields: std.ArrayList(Value) = .empty;
@@ -555,7 +555,7 @@ fn countUses(func: *const Function, block: Block, v: Value) usize {
         .jump => |j| for (func.blockArgs(j)) |a| {
             if (a == v) c += 1;
         },
-        .ret => |x| if (x) |xx| {
+        .ret => |r| for (r.slice()) |xx| {
             if (xx == v) c += 1;
         },
     };
@@ -696,7 +696,7 @@ fn buildSaxpy(func: *Function) !void {
     try func.appendStore(body, res, yaddr);
     const ni = try func.appendArithImm(body, i32_t, .add, bi, 1);
     try func.setJump(body, loop, &.{ni});
-    func.setTerminator(done, .{ .ret = null });
+    func.setTerminator(done, .{ .ret = ir.function.Ret.none() });
 }
 
 test "recognizes a saxpy map loop: two contiguous loads, one contiguous store, V lanes" {
@@ -745,7 +745,7 @@ test "declines a non-unit-stride access (a[2*i])" {
     _ = try func.appendInst(body, i32_t, .{ .load = .{ .ptr = addr } });
     const ni = try func.appendArithImm(body, i32_t, .add, bi, 1);
     try func.setJump(body, loop, &.{ni});
-    func.setTerminator(done, .{ .ret = null });
+    func.setTerminator(done, .{ .ret = ir.function.Ret.none() });
 
     var info = try loops.analyze(allocator, &func);
     defer info.deinit(allocator);

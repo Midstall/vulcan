@@ -1,18 +1,20 @@
-//! NATIVE f16 (Zfh) differentials, executed on `qemu-riscv64 -cpu max` (the oracle). A Zfh-capable
-//! model (here river-rc1.f, which sets `features.riscv64.zfh`) makes the riscv64 backend hold an f16
-//! natively in a float register (NaN-boxed into the low 16 bits) and lower every f16 op to a real
-//! half instruction: `flh`/`fsh` for load/store, `fadd.h`/`fsub.h`/`fmul.h`/`fdiv.h` for arithmetic,
-//! `fcvt.s.h`/`fcvt.h.s` (and the f64 / int siblings) for conversions, `feq.h`/`flt.h`/`fle.h` for
-//! compares, and `fmv.h.x` for an f16 constant. This is the alternative to the software emulation
-//! validated in f16.zig (held-as-f32 widening). Both must agree with Zig's own `@as(f16, ...)`.
+//! NATIVE f16 (Zfh) differential tests. The tests run on `qemu-riscv64 -cpu max` (the oracle).
+//! A Zfh-capable model (here river-rc1.f, which sets `features.riscv64.zfh`) makes the riscv64
+//! backend hold an f16 value natively in a float register (NaN-boxed into the low 16 bits).
+//! The backend lowers every f16 op to a real half instruction: `flh`/`fsh` for load and store,
+//! `fadd.h`/`fsub.h`/`fmul.h`/`fdiv.h` for arithmetic, `fcvt.s.h`/`fcvt.h.s` (and the f64 and int
+//! siblings) for conversions, `feq.h`/`flt.h`/`fle.h` for compares, and `fmv.h.x` for an f16
+//! constant. This native path is the alternative to the software emulation validated in f16.zig
+//! (held-as-f32 widening). Both paths must agree with Zig's own `@as(f16, ...)`.
 //!
-//! The default `qemu-riscv64` (RV64GC) has NO Zfh, so these run under `harness.qemu_user_cpumax`
-//! (`-cpu max`). All test IR uses the INTEGER ABI: f16 values enter/leave through memory (an `sd`
-//! of the raw pattern then an `flh`, and an `fsh` result reloaded as a zero-extended `u16`), so the
-//! host never has to NaN-box a half into a float-argument register. Slots that receive an i64 store
-//! are `alloca`d as i64 so the 8-byte `sd` stays in bounds.
+//! The default `qemu-riscv64` (RV64GC) has NO Zfh, so these tests run under
+//! `harness.qemu_user_cpumax` (`-cpu max`). All test IR uses the INTEGER ABI: f16 values enter
+//! and leave through memory. An `sd` writes the raw pattern, then an `flh` reads it, and an `fsh`
+//! result reloads as a zero-extended `u16`. This way the host never has to NaN-box a half into a
+//! float-argument register. Slots that receive an i64 store are `alloca`d as i64, so the 8-byte
+//! `sd` stays in bounds.
 //!
-//! Skips (not fails) when qemu-riscv64 is not on PATH.
+//! The test skips, it does not fail, when qemu-riscv64 is not on PATH.
 
 const std = @import("std");
 const ir = @import("vulcan-ir");
@@ -69,7 +71,7 @@ fn buildBinaryFn(func: *Function, op: ir.function.BinOp) !void {
     const r = try func.appendInst(b, f16_t, .{ .arith = .{ .op = op, .lhs = ha, .rhs = hb } });
     try func.appendStore(b, r, slot_a); // fsh: writes the low 2 bytes
     const bits = try func.appendInst(b, u16_t, .{ .load = .{ .ptr = slot_a } }); // lhu: zero-extended half
-    func.setTerminator(b, .{ .ret = bits });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(bits) });
 }
 
 fn runBinary(op: ir.function.BinOp, a: f16, b: f16) !?u16 {
@@ -98,12 +100,14 @@ test "native f16 add/sub/mul/div match Zig's per-op half rounding, bit-exact (qe
     }
 }
 
-// P4 (aarch64) proved native single-rounded `fdiv.h` agrees with `@as(f16, a/b)` for every finite
-// f16 pair, because f16's 10-bit mantissa is small enough that a divide through f32 never double-
-// rounds wrong. Confirm the same for native `fdiv.h` here: sweep EVERY one of the 65536 half
-// patterns as the dividend `a`, divide by a fixed `b`, fold each result's half bits into a rolling
-// checksum, and match it against the host's `@as(f16, a/b)` over the same 65536 values. One qemu
-// run per `b`. NaN/non-finite dividends fold 0, so the checksum is independent of the NaN payload.
+// A previous aarch64 test already proved that native single-rounded `fdiv.h` agrees with
+// `@as(f16, a/b)` for every finite f16 pair. f16's 10-bit mantissa is small enough that a divide
+// through f32 never double-rounds wrong. This test confirms the same result for native `fdiv.h`
+// here. It sweeps EVERY one of the 65536 half patterns as the dividend `a`, divides each by a
+// fixed `b`, and folds each result's half bits into a rolling checksum. It then matches the
+// checksum against the host's `@as(f16, a/b)` over the same 65536 values. The test runs qemu once
+// per `b`. NaN and non-finite dividends fold to 0, so the checksum stays independent of the NaN
+// payload.
 
 /// `f(b_bits: i64) -> i64`: loop `ai` over 0..65536, load the half whose bits are `ai` (`flh`),
 /// divide it by the half whose bits are `b_bits` (native `fdiv.h`), and fold the result's half bits
@@ -123,10 +127,11 @@ fn buildDivSweepFn(func: *Function) !void {
     const b_bits = try func.appendBlockParam(entry, i64_t);
     const i = try func.appendBlockParam(loop, i32_t);
     const acc = try func.appendBlockParam(loop, i32_t);
-    // Stack scratch and the divisor slot are threaded through the loop as block params (a value
-    // defined in the entry and used only inside the loop body would be live across the back-edge,
-    // which the riscv64 allocator does not keep resident - see f16.zig's sweep builders). `slot`
-    // holds one 4-byte word: the dividend pattern for `flh`, later rewritten to hold the quotient.
+    // Stack scratch and the divisor slot are threaded through the loop as block params. A value
+    // defined in the entry and used only inside the loop body would be live across the back-edge.
+    // The riscv64 allocator does not keep such a value resident (see f16.zig's sweep builders).
+    // `slot` holds one 4-byte word: the dividend pattern for `flh`, later rewritten to hold the
+    // quotient.
     const lslot = try func.appendBlockParam(loop, ptr_t);
     const lbslot = try func.appendBlockParam(loop, ptr_t);
     const bi = try func.appendBlockParam(body, i32_t);
@@ -155,7 +160,7 @@ fn buildDivSweepFn(func: *Function) !void {
     try func.appendStore(body, zw, slot); // sw: clears all 4 bytes
     try func.appendStore(body, q, slot); // fsh: overwrites the low 2 bytes
     const qbits = try func.appendInst(body, i32_t, .{ .load = .{ .ptr = slot } }); // [half | 0]
-    // NaN/non-finite dividend exclusion: absa = bi & 0x7fff; skip = absa > 0x7c00.
+    // NaN/non-finite dividend exclusion: absa = bi & 0x7fff, skip = absa > 0x7c00.
     const mask = try func.appendInst(body, i32_t, .{ .iconst = 0x7FFF });
     const absa = try func.appendInst(body, i32_t, .{ .arith = .{ .op = .bit_and, .lhs = bi, .rhs = mask } });
     const c7c00 = try func.appendInst(body, i32_t, .{ .iconst = 0x7C00 });
@@ -168,7 +173,7 @@ fn buildDivSweepFn(func: *Function) !void {
     const inext = try func.appendArithImm(body, i32_t, .add, bi, 1);
     try func.setJump(body, loop, &.{ inext, acc2, slot, bslot });
 
-    func.setTerminator(done, .{ .ret = racc });
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(racc) });
 }
 
 test "native f16 fdiv.h matches @as(f16, a/b) for ALL 65536 dividends, several divisors (qemu -cpu max)" {
@@ -190,7 +195,7 @@ test "native f16 fdiv.h matches @as(f16, a/b) for ALL 65536 dividends, several d
             const contrib: i64 = if (skip) 0 else @as(u16, @bitCast(a / bdiv));
             acc = acc *% 33 +% contrib;
         }
-        // The device checksum is an i32 sign-extended through the i64 return; compare the low 32.
+        // The device checksum is an i32 sign-extended through the i64 return. Compare the low 32 bits.
         const want_lo: u32 = @bitCast(@as(i32, @truncate(acc)));
         const got_lo: u32 = @truncate(@as(u64, @bitCast(got)));
         try std.testing.expectEqual(want_lo, got_lo);
@@ -213,7 +218,7 @@ fn buildF16ToF32Fn(func: *Function) !void {
     const f = try func.appendInst(b, f32_t, .{ .convert = .{ .value = h } });
     try func.appendStore(b, f, slot);
     const bits = try func.appendInst(b, i32_t, .{ .load = .{ .ptr = slot } });
-    func.setTerminator(b, .{ .ret = bits });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(bits) });
 }
 
 /// `f(x_bits: i64) -> i64`: load an f32 (`flw`), narrow to a native f16 (`fcvt.h.s`), store (`fsh`),
@@ -232,7 +237,7 @@ fn buildF32ToF16Fn(func: *Function) !void {
     const h = try func.appendInst(b, f16_t, .{ .convert = .{ .value = x } });
     try func.appendStore(b, h, slot);
     const bits = try func.appendInst(b, u16_t, .{ .load = .{ .ptr = slot } });
-    func.setTerminator(b, .{ .ret = bits });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(bits) });
 }
 
 test "native f16 <-> f32 convert bit-exact vs Zig (qemu -cpu max)" {
@@ -276,7 +281,7 @@ fn buildF16ToF64Fn(func: *Function) !void {
     const d = try func.appendInst(b, f64_t, .{ .convert = .{ .value = h } });
     try func.appendStore(b, d, dslot);
     const bits = try func.appendInst(b, i64_t, .{ .load = .{ .ptr = dslot } });
-    func.setTerminator(b, .{ .ret = bits });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(bits) });
 }
 
 test "native f16 -> f64 convert bit-exact vs Zig (qemu -cpu max)" {
@@ -302,7 +307,7 @@ fn buildIntToF16Fn(func: *Function) !void {
     const h = try func.appendInst(b, f16_t, .{ .convert = .{ .value = x } });
     try func.appendStore(b, h, slot); // fsh (2 bytes); u16 load reads exactly those
     const bits = try func.appendInst(b, u16_t, .{ .load = .{ .ptr = slot } });
-    func.setTerminator(b, .{ .ret = bits });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(bits) });
 }
 
 /// `f(a_bits: i64) -> i64`: load a native f16, truncate to a signed int (`fcvt.w.h`, rtz).
@@ -317,7 +322,7 @@ fn buildF16ToIntFn(func: *Function) !void {
     try func.appendStore(b, in, slot);
     const h = try func.appendInst(b, f16_t, .{ .load = .{ .ptr = slot } });
     const r = try func.appendInst(b, i32_t, .{ .convert = .{ .value = h } });
-    func.setTerminator(b, .{ .ret = r });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
 }
 
 test "native int <-> f16 conversions match Zig, bit-exact (qemu -cpu max)" {
@@ -353,7 +358,7 @@ fn buildFconstFn(func: *Function, val: f16) !void {
     const c = try func.appendInst(b, f16_t, .{ .fconst = val });
     try func.appendStore(b, c, slot); // fsh
     const bits = try func.appendInst(b, u16_t, .{ .load = .{ .ptr = slot } });
-    func.setTerminator(b, .{ .ret = bits });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(bits) });
 }
 
 test "native f16 fconst materializes the exact half bits (qemu -cpu max)" {
@@ -388,7 +393,7 @@ fn buildCmpFn(func: *Function, op: ir.function.CmpOp) !void {
     const one = try func.appendInst(b, i32_t, .{ .iconst = 1 });
     const zero = try func.appendInst(b, i32_t, .{ .iconst = 0 });
     const w = try func.appendInst(b, i32_t, .{ .select = .{ .cond = r, .then = one, .@"else" = zero } });
-    func.setTerminator(b, .{ .ret = w });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(w) });
 }
 
 test "native f16 compares (feq.h/flt.h/fle.h) match Zig (qemu -cpu max)" {
@@ -420,7 +425,7 @@ test "native Zfh path emits fewer words than the software emulation for the same
     const allocator = std.testing.allocator;
     // Compile the SAME f16 add both ways: native (Zfh model) vs the default emulation
     // (selectFunction). The native path drops every software widen/round, so it must be strictly
-    // shorter - proof the gate actually switches lowering rather than being a no-op.
+    // shorter. This is proof the gate actually switches lowering rather than being a no-op.
     var func = Function.init(allocator);
     defer func.deinit();
     try buildBinaryFn(&func, .add);

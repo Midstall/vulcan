@@ -7,7 +7,7 @@ const std = @import("std");
 const ir = @import("vulcan-ir");
 const isel = @import("isel.zig");
 const link = @import("link.zig");
-const ld = @import("ld.zig");
+const ld = @import("vulcan-link");
 const encode = @import("encode.zig");
 const dwarf = @import("../dwarf.zig");
 const harness = @import("tests/harness.zig");
@@ -51,6 +51,12 @@ pub const RelocType = enum(u32) {
     pcrel_hi20 = 23,
     /// `R_RISCV_PCREL_LO12_I`: the low 12 bits, for an I-type form.
     pcrel_lo12_i = 24,
+    /// `R_RISCV_GOT_HI20`: the high 20 bits of the PC-relative address of a symbol's GOT
+    /// entry (the `auipc` half of a GOT-indirect `auipc`/`ld` pair, a DATA import). The paired
+    /// `ld`'s low 12 bits reuse `pcrel_lo12_i` (its target is the `auipc` label, as for the
+    /// direct `addi` form). The dynamic linker synthesizes the GOT slot. The static path never
+    /// sees this reloc.
+    got_hi20 = 20,
 };
 
 /// A relocation applied to a `.text` offset against a symbol.
@@ -60,6 +66,28 @@ pub const Reloc = struct {
     /// Index into the `Object.symbols` array.
     symbol: u32,
     type: RelocType,
+    addend: i64 = 0,
+};
+
+/// `R_RISCV_64`: a 64-bit absolute address (`S + A`) written into a DATA section slot. This is
+/// the relocation a pointer-initialized global (`int *p = &g;`) carries in `.rela.data`/
+/// `.rela.rodata`: the 8-byte slot holding the pointer must be patched to the target symbol's
+/// runtime address. The linker turns it into a `R_RISCV_RELATIVE` dyn reloc (PIE/`.so`) or a
+/// direct absolute write (non-PIE exec). Mirrors `aarch64/object.zig`'s `R_AARCH64_ABS64` /
+/// `x86_64/object.zig`'s `R_X86_64_64`. Numerically the same code `arch/riscv64.zig` uses for
+/// the GOT `GLOB_DAT` role (both are the architectural "64-bit absolute" reloc), but this one
+/// lives in `.rela.data`/`.rela.rodata`, never `.rela.dyn`.
+pub const R_RISCV_64: u32 = 2;
+
+/// A relocation applied to a DATA section (`.data` or `.rodata`) slot against a symbol: at
+/// byte `offset` within `section`, an `R_RISCV_64` writes `symbol`'s runtime address plus
+/// `addend`. Emitted into `.rela.data`/`.rela.rodata` (keyed by `section`). This closes the
+/// long-deferred data-section-relocation gap on riscv64 (the last of the four arches): a data
+/// global's own pointer inits are now carried in the object, not dropped.
+pub const DataRelocEntry = struct {
+    section: SectionKind,
+    offset: u64,
+    symbol: u32,
     addend: i64 = 0,
 };
 
@@ -76,6 +104,9 @@ pub const Object = struct {
     bss_size: u64 = 0,
     symbols: []const Symbol,
     relocs: []const Reloc,
+    /// Relocations applied to the `.data`/`.rodata` sections themselves (pointer inits),
+    /// emitted as `.rela.data`/`.rela.rodata`. Empty for a code-only or const-only object.
+    data_relocs: []const DataRelocEntry = &.{},
     /// Extra PROGBITS metadata sections (DWARF) placed after the allocatable sections. Symbols do
     /// not reference them, so they need no section-index bookkeeping beyond the header count.
     debug: []const DebugSection = &.{},
@@ -175,6 +206,17 @@ pub fn write(allocator: std.mem.Allocator, obj: Object) Error![]u8 {
     const has_data = obj.data.len > 0;
     const has_bss = obj.bss_size > 0;
     const has_rela = obj.relocs.len > 0;
+    // Split the data-section relocations by the section they modify (`.rela.data` vs
+    // `.rela.rodata`). Each needs its own `SHT_RELA` header with `sh_info` naming its target.
+    var rela_data_count: usize = 0;
+    var rela_rodata_count: usize = 0;
+    for (obj.data_relocs) |dr| switch (dr.section) {
+        .data => rela_data_count += 1,
+        .rodata => rela_rodata_count += 1,
+        .text, .bss => {}, // a data reloc never lives in .text/.bss
+    };
+    const has_rela_data = rela_data_count > 0;
+    const has_rela_rodata = rela_rodata_count > 0;
     var next: u16 = 1;
     const text_ndx = next;
     next += 1;
@@ -191,6 +233,8 @@ pub fn write(allocator: std.mem.Allocator, obj: Object) Error![]u8 {
         break :blk next;
     } else 0;
     if (has_rela) next += 1; // .rela.text
+    if (has_rela_data) next += 1; // .rela.data
+    if (has_rela_rodata) next += 1; // .rela.rodata
     next += @intCast(obj.debug.len); // .debug_* metadata sections (no symbol references them)
     const symtab_ndx = next;
     next += 1;
@@ -256,6 +300,37 @@ pub fn write(allocator: std.mem.Allocator, obj: Object) Error![]u8 {
         putInt(e[16..24], i64, r.addend); // r_addend
     }
 
+    // `.rela.data` / `.rela.rodata`: the data-section pointer-init relocations, each an
+    // `R_RISCV_64` against the target symbol. Grouped by the section they modify so each group
+    // can name its target section in `sh_info`.
+    var rela_data = try allocator.alloc(u8, rela_data_count * relaentsize);
+    defer allocator.free(rela_data);
+    var rela_rodata = try allocator.alloc(u8, rela_rodata_count * relaentsize);
+    defer allocator.free(rela_rodata);
+    {
+        var di: usize = 0;
+        var ri: usize = 0;
+        for (obj.data_relocs) |dr| {
+            const dst = switch (dr.section) {
+                .data => blk: {
+                    const e = rela_data[di * relaentsize ..][0..relaentsize];
+                    di += 1;
+                    break :blk e;
+                },
+                .rodata => blk: {
+                    const e = rela_rodata[ri * relaentsize ..][0..relaentsize];
+                    ri += 1;
+                    break :blk e;
+                },
+                .text, .bss => continue,
+            };
+            const sym_index: u64 = @as(u64, dr.symbol) + 1; // null entry at 0
+            putInt(dst[0..8], u64, dr.offset); // r_offset
+            putInt(dst[8..16], u64, (sym_index << 32) | R_RISCV_64); // r_info
+            putInt(dst[16..24], i64, dr.addend); // r_addend
+        }
+    }
+
     // Section header strings, added in index order.
     var shstrtab = try StrTab.init(allocator);
     defer shstrtab.deinit(allocator);
@@ -268,6 +343,8 @@ pub fn write(allocator: std.mem.Allocator, obj: Object) Error![]u8 {
     if (has_data) try headers.append(allocator, .{ .name = ".data", .typ = SHT_PROGBITS, .flags = SHF_ALLOC | SHF_WRITE, .addralign = 8, .bytes = obj.data, .size = obj.data.len });
     if (has_bss) try headers.append(allocator, .{ .name = ".bss", .typ = SHT_NOBITS, .flags = SHF_ALLOC | SHF_WRITE, .addralign = 8, .bytes = null, .size = obj.bss_size });
     if (has_rela) try headers.append(allocator, .{ .name = ".rela.text", .typ = SHT_RELA, .flags = SHF_INFO_LINK, .addralign = 8, .entsize = relaentsize, .link = symtab_ndx, .info = text_ndx, .bytes = rela, .size = rela_bytes });
+    if (has_rela_data) try headers.append(allocator, .{ .name = ".rela.data", .typ = SHT_RELA, .flags = SHF_INFO_LINK, .addralign = 8, .entsize = relaentsize, .link = symtab_ndx, .info = data_ndx, .bytes = rela_data, .size = rela_data.len });
+    if (has_rela_rodata) try headers.append(allocator, .{ .name = ".rela.rodata", .typ = SHT_RELA, .flags = SHF_INFO_LINK, .addralign = 8, .entsize = relaentsize, .link = symtab_ndx, .info = rodata_ndx, .bytes = rela_rodata, .size = rela_rodata.len });
     // DWARF metadata sections (appended in the same order they were counted above).
     for (obj.debug) |d| try headers.append(allocator, .{ .name = d.name, .typ = SHT_PROGBITS, .flags = 0, .addralign = 1, .bytes = d.bytes, .size = d.bytes.len });
     try headers.append(allocator, .{ .name = ".symtab", .typ = SHT_SYMTAB, .flags = 0, .addralign = 8, .entsize = symentsize, .link = strtab_ndx, .info = first_global, .bytes = symtab, .size = sym_bytes });
@@ -345,8 +422,46 @@ fn putShdr(buf: []u8, shoff: u64, idx: u16, name: u32, typ: u32, flags: u64, off
 /// A relocation gathered during layout, before symbol indices are known. `name`
 /// is the target symbol (for jal/hi20). `pair` is the paired `auipc`'s byte
 /// offset (for lo12, whose target is a synthesized local label there).
-const PendingKind = enum { jal, hi20, lo12 };
+const PendingKind = enum { jal, hi20, lo12, got_hi20 };
 const PendingReloc = struct { offset: u64, kind: PendingKind, name: []const u8 = "", pair: u64 = 0 };
+
+/// A data-section pointer-init relocation before its target name is resolved to a symbol
+/// index: the section + byte offset of the slot, and the target symbol's name (mirrors
+/// `aarch64/object.zig`'s `PendingDataReloc`).
+const PendingDataReloc = struct { section: SectionKind, offset: u64, symbol: []const u8 };
+
+/// Lay out `module.data` into `.rodata`/`.data` byte buffers and a `.bss` size, appending an
+/// `STT_OBJECT` global (its section + offset) to `globals` for each. Each data global's own
+/// `DataReloc`s (pointer inits) are recorded in `data_relocs` at their absolute section offset
+/// (the global's placement plus the reloc's in-object offset). Shared by `writeModule` and
+/// `writeModuleWithDebug` so the data-reloc collection lives in exactly one place (not
+/// duplicated at both reconstruct sites). Returns the accumulated `.bss` size. `rodata`/`data`
+/// are grown in place.
+fn layoutData(allocator: std.mem.Allocator, module: *const link.Module, globals: *std.ArrayList(Symbol), rodata: *std.ArrayList(u8), data: *std.ArrayList(u8), data_relocs: *std.ArrayList(PendingDataReloc)) Error!u64 {
+    var bss_size: u64 = 0;
+    for (module.data.items) |d| {
+        const section: SectionKind, const value: u64 = switch (d.kind) {
+            .rodata => blk: {
+                const start = rodata.items.len;
+                try rodata.appendSlice(allocator, d.bytes);
+                break :blk .{ .rodata, start };
+            },
+            .data => blk: {
+                const start = data.items.len;
+                try data.appendSlice(allocator, d.bytes);
+                break :blk .{ .data, start };
+            },
+            .bss => blk: {
+                const start = bss_size;
+                bss_size += d.size;
+                break :blk .{ .bss, start };
+            },
+        };
+        for (d.relocs) |r| try data_relocs.append(allocator, .{ .section = section, .offset = value + r.off, .symbol = r.symbol });
+        try globals.append(allocator, .{ .name = d.name, .value = value, .size = d.size, .kind = .object, .defined = true, .section = section });
+    }
+    return bss_size;
+}
 
 /// Compile every function in `module` and serialize them, plus its data globals,
 /// into a single ELF relocatable object. Functions become defined `STT_FUNC`
@@ -380,6 +495,7 @@ pub fn writeModule(allocator: std.mem.Allocator, module: *const link.Module) Err
             switch (r.kind) {
                 .call => try pending.append(allocator, .{ .offset = off, .kind = .jal, .name = r.symbol }),
                 .pcrel_hi20 => try pending.append(allocator, .{ .offset = off, .kind = .hi20, .name = r.symbol }),
+                .got_hi20 => try pending.append(allocator, .{ .offset = off, .kind = .got_hi20, .name = r.symbol }),
                 .pcrel_lo12 => try pending.append(allocator, .{ .offset = off, .kind = .lo12, .pair = start + @as(u64, r.pair) * 4 }),
             }
         }
@@ -389,27 +505,9 @@ pub fn writeModule(allocator: std.mem.Allocator, module: *const link.Module) Err
     defer rodata.deinit(allocator);
     var data: std.ArrayList(u8) = .empty;
     defer data.deinit(allocator);
-    var bss_size: u64 = 0;
-    for (module.data.items) |d| {
-        const section: SectionKind, const value: u64 = switch (d.kind) {
-            .rodata => blk: {
-                const start = rodata.items.len;
-                try rodata.appendSlice(allocator, d.bytes);
-                break :blk .{ .rodata, start };
-            },
-            .data => blk: {
-                const start = data.items.len;
-                try data.appendSlice(allocator, d.bytes);
-                break :blk .{ .data, start };
-            },
-            .bss => blk: {
-                const start = bss_size;
-                bss_size += d.size;
-                break :blk .{ .bss, start };
-            },
-        };
-        try globals.append(allocator, .{ .name = d.name, .value = value, .size = d.size, .kind = .object, .defined = true, .section = section });
-    }
+    var pending_data: std.ArrayList(PendingDataReloc) = .empty;
+    defer pending_data.deinit(allocator);
+    const bss_size = try layoutData(allocator, module, &globals, &rodata, &data, &pending_data);
 
     // Synthesize a local label at each lo12's paired `auipc`. Locals must come
     // first in the symbol table, so build them up front. Their names are owned
@@ -447,8 +545,17 @@ pub fn writeModule(allocator: std.mem.Allocator, module: *const link.Module) Err
         relocs[i] = switch (p.kind) {
             .jal => .{ .offset = p.offset, .symbol = symbolIndex(symbols.items, p.name).?, .type = .jal },
             .hi20 => .{ .offset = p.offset, .symbol = symbolIndex(symbols.items, p.name).?, .type = .pcrel_hi20 },
+            .got_hi20 => .{ .offset = p.offset, .symbol = symbolIndex(symbols.items, p.name).?, .type = .got_hi20 },
             .lo12 => .{ .offset = p.offset, .symbol = localIndexAt(symbols.items, locals.items.len, p.pair), .type = .pcrel_lo12_i },
         };
+    }
+
+    // Resolve each data-section reloc's target name to a symbol index. The target of a
+    // pointer init is an internally defined data/function global (added above).
+    var data_relocs = try allocator.alloc(DataRelocEntry, pending_data.items.len);
+    defer allocator.free(data_relocs);
+    for (pending_data.items, 0..) |p, i| {
+        data_relocs[i] = .{ .section = p.section, .offset = p.offset, .symbol = symbolIndex(symbols.items, p.symbol) orelse return error.Unsupported };
     }
 
     return write(allocator, .{
@@ -458,6 +565,7 @@ pub fn writeModule(allocator: std.mem.Allocator, module: *const link.Module) Err
         .bss_size = bss_size,
         .symbols = symbols.items,
         .relocs = relocs,
+        .data_relocs = data_relocs,
     });
 }
 
@@ -496,10 +604,11 @@ pub fn writeModuleWithDebug(allocator: std.mem.Allocator, module: *const link.Mo
             switch (r.kind) {
                 .call => try pending.append(allocator, .{ .offset = off, .kind = .jal, .name = r.symbol }),
                 .pcrel_hi20 => try pending.append(allocator, .{ .offset = off, .kind = .hi20, .name = r.symbol }),
+                .got_hi20 => try pending.append(allocator, .{ .offset = off, .kind = .got_hi20, .name = r.symbol }),
                 .pcrel_lo12 => try pending.append(allocator, .{ .offset = off, .kind = .lo12, .pair = start + @as(u64, r.pair) * 4 }),
             }
         }
-        // Line rows are function-relative; shift to the module-relative .text offset.
+        // Line rows are function-relative. Shift them to the module-relative .text offset.
         for (compiled.lines) |e| try rows.append(allocator, .{ .address = start + e.offset, .line = e.line });
     }
 
@@ -508,27 +617,9 @@ pub fn writeModuleWithDebug(allocator: std.mem.Allocator, module: *const link.Mo
     defer rodata.deinit(allocator);
     var data: std.ArrayList(u8) = .empty;
     defer data.deinit(allocator);
-    var bss_size: u64 = 0;
-    for (module.data.items) |d| {
-        const section: SectionKind, const value: u64 = switch (d.kind) {
-            .rodata => blk: {
-                const s = rodata.items.len;
-                try rodata.appendSlice(allocator, d.bytes);
-                break :blk .{ .rodata, s };
-            },
-            .data => blk: {
-                const s = data.items.len;
-                try data.appendSlice(allocator, d.bytes);
-                break :blk .{ .data, s };
-            },
-            .bss => blk: {
-                const s = bss_size;
-                bss_size += d.size;
-                break :blk .{ .bss, s };
-            },
-        };
-        try globals.append(allocator, .{ .name = d.name, .value = value, .size = d.size, .kind = .object, .defined = true, .section = section });
-    }
+    var pending_data: std.ArrayList(PendingDataReloc) = .empty;
+    defer pending_data.deinit(allocator);
+    const bss_size = try layoutData(allocator, module, &globals, &rodata, &data, &pending_data);
 
     // Local labels for each lo12's paired auipc (locals must precede globals in .symtab).
     var locals: std.ArrayList(Symbol) = .empty;
@@ -562,6 +653,7 @@ pub fn writeModuleWithDebug(allocator: std.mem.Allocator, module: *const link.Mo
         relocs[i] = switch (p.kind) {
             .jal => .{ .offset = p.offset, .symbol = symbolIndex(symbols.items, p.name).?, .type = .jal },
             .hi20 => .{ .offset = p.offset, .symbol = symbolIndex(symbols.items, p.name).?, .type = .pcrel_hi20 },
+            .got_hi20 => .{ .offset = p.offset, .symbol = symbolIndex(symbols.items, p.name).?, .type = .got_hi20 },
             .lo12 => .{ .offset = p.offset, .symbol = localIndexAt(symbols.items, locals.items.len, p.pair), .type = .pcrel_lo12_i },
         };
     }
@@ -579,6 +671,16 @@ pub fn writeModuleWithDebug(allocator: std.mem.Allocator, module: *const link.Mo
     const line = try dwarf.emitLine(allocator, source_file, rows.items, text.items.len);
     defer allocator.free(line);
 
+    // Resolve each data-section reloc's target name to a symbol index, exactly as
+    // `writeModule` does (the debug variant must not drop a data global's own pointer inits -
+    // a second reconstruct site is exactly where an additive field like this one silently
+    // goes missing if it is not threaded through both).
+    var data_relocs = try allocator.alloc(DataRelocEntry, pending_data.items.len);
+    defer allocator.free(data_relocs);
+    for (pending_data.items, 0..) |p, i| {
+        data_relocs[i] = .{ .section = p.section, .offset = p.offset, .symbol = symbolIndex(symbols.items, p.symbol) orelse return error.Unsupported };
+    }
+
     return write(allocator, .{
         .text = text.items,
         .rodata = rodata.items,
@@ -586,6 +688,7 @@ pub fn writeModuleWithDebug(allocator: std.mem.Allocator, module: *const link.Mo
         .bss_size = bss_size,
         .symbols = symbols.items,
         .relocs = relocs,
+        .data_relocs = data_relocs,
         .debug = &.{
             .{ .name = ".debug_abbrev", .bytes = abbrev },
             .{ .name = ".debug_info", .bytes = info },
@@ -600,7 +703,11 @@ fn returnBaseType(func: *const Function) ?dwarf.BaseType {
     const ret_val = for (0..func.blocks.items.len) |bi| {
         const term = func.terminator(@enumFromInt(bi)) orelse continue;
         switch (term) {
-            .ret => |maybe| if (maybe) |v| break v else return null,
+            .ret => |r| switch (r.count) {
+                0 => return null,
+                1 => break r.values[0],
+                else => return null, // multi-value return not representable in DWARF yet
+            },
             else => {},
         }
     } else return null;
@@ -708,7 +815,7 @@ test "readelf accepts the object and sees its symbols and relocations" {
         const t = try callee.types.intern(i32k);
         const b = try callee.appendBlock();
         const x = try callee.appendBlockParam(b, t);
-        callee.setTerminator(b, .{ .ret = x });
+        callee.setTerminator(b, .{ .ret = ir.function.Ret.one(x) });
     }
     // caller: fn(x) -> external(callee(x)). One intra-module call, one external.
     var caller = Function.init(allocator);
@@ -719,7 +826,7 @@ test "readelf accepts the object and sees its symbols and relocations" {
         const x = try caller.appendBlockParam(b, t);
         const r = try caller.appendCall(b, t, "callee", &.{x});
         const r2 = try caller.appendCall(b, t, "external", &.{r});
-        caller.setTerminator(b, .{ .ret = r2 });
+        caller.setTerminator(b, .{ .ret = ir.function.Ret.one(r2) });
     }
 
     var module: link.Module = .{};
@@ -755,7 +862,7 @@ test "readelf shows separate .rodata, .data, and .bss sections" {
         const t = try entry.types.intern(i32k);
         const b = try entry.appendBlock();
         const x = try entry.appendBlockParam(b, t);
-        entry.setTerminator(b, .{ .ret = x });
+        entry.setTerminator(b, .{ .ret = ir.function.Ret.one(x) });
     }
     const ro = [_]u8{ 1, 0, 0, 0 };
     const da = [_]u8{ 2, 0, 0, 0 };
@@ -858,7 +965,7 @@ test "real ld.lld links the object to the same bytes as the in-memory linker" {
         const t = try callee.types.intern(i32k);
         const b = try callee.appendBlock();
         const x = try callee.appendBlockParam(b, t);
-        callee.setTerminator(b, .{ .ret = x });
+        callee.setTerminator(b, .{ .ret = ir.function.Ret.one(x) });
     }
     var caller = Function.init(allocator);
     defer caller.deinit();
@@ -867,7 +974,7 @@ test "real ld.lld links the object to the same bytes as the in-memory linker" {
         const b = try caller.appendBlock();
         const x = try caller.appendBlockParam(b, t);
         const r = try caller.appendCall(b, t, "callee", &.{x});
-        caller.setTerminator(b, .{ .ret = r });
+        caller.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
     }
     var module: link.Module = .{};
     defer module.deinit(allocator);
@@ -904,7 +1011,7 @@ test "lld resolves a call across two separately compiled objects" {
         const t = try callee.types.intern(i32k);
         const b = try callee.appendBlock();
         const x = try callee.appendBlockParam(b, t);
-        callee.setTerminator(b, .{ .ret = x });
+        callee.setTerminator(b, .{ .ret = ir.function.Ret.one(x) });
     }
     var callee_mod: link.Module = .{};
     defer callee_mod.deinit(allocator);
@@ -920,7 +1027,7 @@ test "lld resolves a call across two separately compiled objects" {
         const b = try caller.appendBlock();
         const x = try caller.appendBlockParam(b, t);
         const r = try caller.appendCall(b, t, "callee", &.{x});
-        caller.setTerminator(b, .{ .ret = r });
+        caller.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
     }
     var caller_mod: link.Module = .{};
     defer caller_mod.deinit(allocator);
@@ -962,7 +1069,7 @@ test "our PCREL global-data resolution matches lld byte for byte" {
         const b = try entry.appendBlock();
         const p = try entry.appendGlobalAddr(b, ptr_t, "K");
         const v = try entry.appendInst(b, t, .{ .load = .{ .ptr = p } });
-        entry.setTerminator(b, .{ .ret = v });
+        entry.setTerminator(b, .{ .ret = ir.function.Ret.one(v) });
     }
     const k_bytes = [_]u8{ 42, 0, 0, 0 };
     var module: link.Module = .{};
@@ -1032,7 +1139,7 @@ test "writeModuleWithDebug emits DWARF readelf reads (subprograms + CU line link
     const io = std.testing.io;
     const i32k = ir.types.TypeKind{ .int = .{ .signedness = .signed, .bits = 32 } };
 
-    // helper(x) -> x*3 ; main(x) -> helper(x). Two functions, a real intra-module call.
+    // helper(x) -> x*3. main(x) -> helper(x). Two functions, a real intra-module call.
     var helper = Function.init(allocator);
     defer helper.deinit();
     {
@@ -1040,7 +1147,7 @@ test "writeModuleWithDebug emits DWARF readelf reads (subprograms + CU line link
         const b = try helper.appendBlock();
         const x = try helper.appendBlockParam(b, t);
         const m = try helper.appendArithImm(b, t, .add, x, 5);
-        helper.setTerminator(b, .{ .ret = m });
+        helper.setTerminator(b, .{ .ret = ir.function.Ret.one(m) });
     }
     var main_f = Function.init(allocator);
     defer main_f.deinit();
@@ -1049,7 +1156,7 @@ test "writeModuleWithDebug emits DWARF readelf reads (subprograms + CU line link
         const b = try main_f.appendBlock();
         const x = try main_f.appendBlockParam(b, t);
         const r = try main_f.appendCall(b, t, "helper", &.{x});
-        main_f.setTerminator(b, .{ .ret = r });
+        main_f.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
     }
     var module: link.Module = .{};
     defer module.deinit(allocator);

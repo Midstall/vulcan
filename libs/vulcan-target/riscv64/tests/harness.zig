@@ -281,7 +281,7 @@ pub fn runCompiledFloat(io: std.Io, allocator: std.mem.Allocator, code: []const 
     const bytes = try emit.emitBytes(allocator, program);
     defer allocator.free(bytes);
     const user_base: u64 = 0x10000;
-    const elf = try (@import("../ld.zig")).writeElfExec(allocator, bytes, bytes.len, user_base, user_base);
+    const elf = try (@import("vulcan-link")).writeElfExec(.riscv64, allocator, bytes, bytes.len, user_base, user_base);
     defer allocator.free(elf);
 
     var tmp = std.testing.tmpDir(.{});
@@ -308,8 +308,8 @@ pub fn runCompiledFloat(io: std.Io, allocator: std.mem.Allocator, code: []const 
 /// Wrap a code image into a flat rv64 firmware ELF loaded at `entry`, entering at
 /// `entry`. Delegates to the linker's production ELF writer. Caller owns it.
 pub fn writeElf(allocator: std.mem.Allocator, code: []const u8, entry: u64) std.mem.Allocator.Error![]u8 {
-    const ld = @import("../ld.zig");
-    return ld.writeElfExec(allocator, code, code.len, entry, entry);
+    const ld = @import("vulcan-link");
+    return ld.writeElfExec(.riscv64, allocator, code, code.len, entry, entry);
 }
 
 /// Compile `func` through the full pipeline to RISC-V words (entry at word 0).
@@ -394,7 +394,7 @@ fn runProgram(io: std.Io, allocator: std.mem.Allocator, code: []const u32, args:
     // User-mode: a static ELF at a low base, entered at the stub. Firmware: flat image at DRAM base.
     const user_base: u64 = 0x10000;
     const elf = if (backend.user_mode)
-        try (@import("../ld.zig")).writeElfExec(allocator, bytes, bytes.len, user_base, user_base)
+        try (@import("vulcan-link")).writeElfExec(.riscv64, allocator, bytes, bytes.len, user_base, user_base)
     else
         try writeElf(allocator, bytes, load_address);
     defer allocator.free(elf);

@@ -256,7 +256,7 @@ fn flattenToSingleBlock(func: *Function) Error!void {
 
     const entry: Block = @enumFromInt(0);
     try func.setBlockInsts(entry, out_insts.items);
-    func.setTerminator(entry, .{ .ret = null });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
 
     // Neutralize every other block (empty insts + params + ret) so the widen pass below only
     // sees block0.
@@ -264,7 +264,7 @@ fn flattenToSingleBlock(func: *Function) Error!void {
     while (bi < nblocks) : (bi += 1) {
         try func.setBlockInsts(@enumFromInt(bi), &.{});
         try func.setBlockParams(@enumFromInt(bi), &.{});
-        func.setTerminator(@enumFromInt(bi), .{ .ret = null });
+        func.setTerminator(@enumFromInt(bi), .{ .ret = ir.function.Ret.none() });
     }
 }
 
@@ -484,6 +484,9 @@ fn widenFlattened(func: *Function) Error!void {
             .dot => return error.NotWidenable,
             // matmul is an et-soc tensor-tile op; a shader function never contains one either.
             .matmul => return error.NotWidenable,
+            // SM12 T3: `va_start`/`va_arg`/`va_end` are a C-frontend-only construct; a shader
+            // function never contains one, same reasoning as `dot`/`matmul` above.
+            .va_start, .va_arg, .va_end => return error.NotWidenable,
             .convert, .call, .global_addr, .@"if" => return error.NotWidenable,
         }
     }

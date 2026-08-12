@@ -1,9 +1,12 @@
-//! Emit portable C99 from a Vulcan IR function: a source-level backend. Each SSA
-//! value becomes a C variable declared once at the top of the function, blocks become
-//! labels, block parameters are assigned across control-flow edges (parallel copies via
-//! temporaries), and the non-terminating high-profile `if` lowers to a C `if/else` with
-//! `goto` edges. The output compiles with any C99 compiler, so it doubles as a
-//! portability path and a differential oracle against the native backends.
+//! Emit portable C99 from a Vulcan IR function. This is a source-level backend.
+//!
+//! Each SSA value becomes a C variable, declared once at the top of the function.
+//! Blocks become labels. Block parameters are assigned across control-flow edges,
+//! through temporaries (parallel copies). The non-terminating high-profile `if`
+//! lowers to a C `if`/`else` with `goto` edges.
+//!
+//! The output compiles with any C99 compiler. So it doubles as a portability path
+//! and as a differential oracle against the native backends.
 
 const std = @import("std");
 const ir = @import("vulcan-ir");
@@ -19,10 +22,11 @@ pub const Error = error{Unsupported} || std.mem.Allocator.Error;
 
 /// Emit `func` as a single C function named `name`. Caller owns the returned source.
 pub fn emitFunction(allocator: std.mem.Allocator, func: *const Function, name: []const u8) Error![]u8 {
-    // C has `_Float16` (GCC/Clang), so scalar f16 lowers directly: emit `_Float16`-typed
+    // C has `_Float16` (GCC/Clang). Scalar f16 lowers directly to it: emit `_Float16`-typed
     // locals and let the C compiler do the half-precision arithmetic and conversions. f16
-    // nested in a vector/aggregate has no tested emission path here (the aarch64/x86_64
-    // scalar-f16 backends draw the same line), so that composite case still rejects cleanly.
+    // nested in a vector or an aggregate has no tested emission path here. The aarch64 and
+    // x86_64 scalar-f16 backends draw the same line, so this composite case still rejects
+    // cleanly.
     if (ir.function.functionUsesCompositeF16(func)) return error.Unsupported;
 
     var e = Emitter{ .allocator = allocator, .func = func };
@@ -34,12 +38,13 @@ pub fn emitFunction(allocator: std.mem.Allocator, func: *const Function, name: [
 /// One named function in a module.
 pub const NamedFunc = struct { name: []const u8, func: *const Function };
 
-/// Emit a whole module: a forward prototype for every function, then every body, so the
-/// functions may call one another in any order. Caller owns the returned source.
+/// Emit a whole module: a forward prototype for every function, then every body. This
+/// lets the functions call one another in any order. Caller owns the returned source.
 pub fn emitModule(allocator: std.mem.Allocator, funcs: []const NamedFunc) Error![]u8 {
-    // Scalar f16 lowers to C `_Float16` (see emitFunction); only composite f16 (nested in a
-    // vector/aggregate) is unsupported. Checked for every function up front (before any
-    // output is built) so a module never emits a partial file when one function rejects.
+    // Scalar f16 lowers to C `_Float16` (see emitFunction). Only composite f16, nested in a
+    // vector or an aggregate, is unsupported. The check runs for every function up front,
+    // before any output is built, so a module never emits a partial file when one function
+    // rejects.
     for (funcs) |nf| {
         if (ir.function.functionUsesCompositeF16(nf.func)) return error.Unsupported;
     }
@@ -47,8 +52,8 @@ pub fn emitModule(allocator: std.mem.Allocator, funcs: []const NamedFunc) Error!
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
 
-    // Each function namespaces its aggregate typedefs with a `{name}_` prefix, so the
-    // typedefs of two functions never clash even for identical layouts.
+    // Each function namespaces its aggregate typedefs with a `{name}_` prefix. This keeps
+    // the typedefs of two functions from clashing, even for identical layouts.
     // 1) Every function's aggregate typedefs, once, at the very top.
     for (funcs) |nf| {
         const prefix = try std.fmt.allocPrint(allocator, "{s}_", .{nf.name});
@@ -153,14 +158,15 @@ const Emitter = struct {
         try self.signature(sym);
         try self.w(" {\n");
 
-        // Declare every value that is not an entry-block parameter (those are the C
-        // function parameters) at the top, so `goto` never jumps over a declaration.
+        // Declare every value at the top of the function, except entry-block parameters
+        // (the C function parameters already declare those). This way `goto` never jumps
+        // over a declaration.
         try self.emitDeclarations();
 
         for (0..func.blockCount()) |bi| {
             const block: Block = @enumFromInt(@as(u32, @intCast(bi)));
-            // A label only for blocks some edge jumps to; an empty statement follows so it
-            // stays legal even for an empty block.
+            // Add a label only for a block some edge jumps to. An empty statement follows
+            // it, so the label stays legal even for an empty block.
             if (self.is_target[bi]) try self.print("block{d}:;\n", .{bi});
             var branched = false;
             for (func.blockInsts(block)) |inst| {
@@ -214,8 +220,8 @@ const Emitter = struct {
         }
     }
 
-    /// Register every aggregate type used by a value, in dependency order (a struct's
-    /// aggregate fields are registered before the struct itself), so the typedefs compile.
+    /// Register every aggregate type used by a value, in dependency order. A struct's
+    /// aggregate fields register before the struct itself, so the typedefs compile.
     /// Array element types reach the IR only through an `alloca`, so scan those too.
     fn collectAggs(self: *Emitter) Error!void {
         const func = self.func;
@@ -280,8 +286,8 @@ const Emitter = struct {
     }
 
     /// Emit a C `typedef struct { ... }` for each registered aggregate. A struct keeps its
-    /// field types; a vector becomes N numbered fields of its element type, so `extract` and
-    /// `struct_new` treat both uniformly.
+    /// field types. A vector becomes N numbered fields of its element type. This lets
+    /// `extract` and `struct_new` treat both the same way.
     fn emitTypedefs(self: *Emitter) Error!void {
         if (self.aggs.items.len == 0) return;
         for (self.aggs.items, 0..) |ty, i| {
@@ -315,7 +321,7 @@ const Emitter = struct {
         for (0..self.func.blockCount()) |bi| {
             const block: Block = @enumFromInt(@as(u32, @intCast(bi)));
             if (self.func.terminator(block)) |term| switch (term) {
-                .ret => |v| if (v) |vv| return self.func.valueType(vv),
+                .ret => |r| if (r.count > 0) return self.func.valueType(r.values[0]),
                 .jump => {},
             };
         }
@@ -404,10 +410,14 @@ const Emitter = struct {
                 try self.print("*)v{d} = v{d};\n", .{ self.name(st.ptr), self.name(st.value) });
             },
             .prefetch => {}, // a hint, no C equivalent emitted, dropped
-            // dot is aarch64+dotprod-only in practice; the C backend has no lowering for it.
+            // dot is aarch64+dotprod-only in practice. The C backend has no lowering for it.
             .dot => return error.Unsupported,
-            // matmul is et-soc-only (a later task); the C backend has no lowering for it.
+            // matmul is et-soc-only (a later task). The C backend has no lowering for it.
             .matmul => return error.Unsupported,
+            // The IR ops exist already (frontend and IR construction only). This backend
+            // has no lowering for them yet. That is a later task, like `dot` and `matmul`
+            // above.
+            .va_start, .va_arg, .va_end => return error.Unsupported,
             .struct_new => |sn| {
                 // Build the aggregate with a positional compound literal.
                 try self.print("    v{d} = (", .{self.name(res.?)});
@@ -435,7 +445,11 @@ const Emitter = struct {
                 try self.w(");\n");
             },
             .global_addr => |ga| {
-                // The global is declared `extern char <sym>[];` above, so it decays to its
+                // GOT-indirect data addressing has no C-source rendering yet. Only
+                // aarch64's native instruction selection supports `via_got` today. Fail
+                // loudly, instead of silently emitting a direct-address expression for it.
+                if (ga.via_got) return error.Unsupported;
+                // The global is declared `extern char <sym>[];` above. So it decays to its
                 // base address.
                 try self.print("    v{d} = (void*)({s});\n", .{ self.name(res.?), func.symbolName(ga.symbol) });
             },
@@ -480,9 +494,9 @@ const Emitter = struct {
         // Every remaining op (sqrt/floor/ceil/trunc/nearest) is float-only, so `res` is
         // always a float type here.
         const kind: ir.types.FloatKind = self.func.types.type_kind(self.func.valueType(res)).float;
-        // libm has a `f`-suffixed single-precision variant of each of these but nothing for
-        // _Float16, so f16 also routes through the f32 call: compute in float, then cast the
-        // result back to _Float16, which re-rounds it to the correctly-rounded half value.
+        // libm has an `f`-suffixed single-precision variant of each of these, but none for
+        // _Float16. So f16 also routes through the f32 call. It computes in float, then
+        // casts the result back to _Float16, which re-rounds it to the correct half value.
         const use_f32_call = kind != .f64;
         const fname: []const u8 = switch (u.op) {
             .sqrt => if (use_f32_call) "sqrtf" else "sqrt",
@@ -500,11 +514,12 @@ const Emitter = struct {
     }
 
     fn emitFconst(self: *Emitter, res: Value, val: f64) Error!void {
-        // Scientific notation always carries a decimal point/exponent, so it is a valid C
-        // floating constant. An f32 result takes the `f` suffix to match its type. C has no
-        // literal suffix for `_Float16`, so an f16 result instead prints a `(_Float16)`-cast
-        // double literal; the value printed is first rounded to the nearest half in Zig
-        // (`@floatCast(f16)`) so the cast in C is exact, not a second re-rounding.
+        // Scientific notation always carries a decimal point or an exponent, so it is a
+        // valid C floating constant. An f32 result takes the `f` suffix to match its type.
+        // C has no literal suffix for `_Float16`. So an f16 result instead prints a
+        // `(_Float16)`-cast double literal. The value printed is first rounded to the
+        // nearest half in Zig (`@floatCast(f16)`), so the cast in C is exact, not a second
+        // re-rounding.
         const kind: ir.types.FloatKind = self.func.types.type_kind(self.func.valueType(res)).float;
         switch (kind) {
             .f16 => try self.print("    v{d} = (_Float16){e};\n", .{ self.name(res), @as(f64, @as(f16, @floatCast(val))) }),
@@ -519,10 +534,10 @@ const Emitter = struct {
             return;
         };
         switch (term) {
-            .ret => |v| if (v) |vv| {
-                try self.print("    return v{d};\n", .{self.name(vv)});
-            } else {
-                try self.w("    return;\n");
+            .ret => |r| switch (r.count) {
+                0 => try self.w("    return;\n"),
+                1 => try self.print("    return v{d};\n", .{self.name(r.values[0])}),
+                else => return error.Unsupported, // multi-value struct return not yet lowered
             },
             .jump => |j| try self.emitEdge(j.target, self.func.blockArgs(j), "    ", false),
         }
@@ -583,7 +598,7 @@ test "emits a function returning a constant" {
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const entry = try func.appendBlock();
     const v = try func.appendInst(entry, i32_t, .{ .iconst = 42 });
-    func.setTerminator(entry, .{ .ret = v });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(v) });
 
     const src = try emitFunction(std.testing.allocator, &func, "answer");
     defer std.testing.allocator.free(src);
@@ -607,7 +622,7 @@ test "emits params and arithmetic" {
     const a = try func.appendBlockParam(entry, i32_t);
     const b = try func.appendBlockParam(entry, i32_t);
     const sum = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .add, .lhs = a, .rhs = b } });
-    func.setTerminator(entry, .{ .ret = sum });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(sum) });
 
     const src = try emitFunction(std.testing.allocator, &func, "add");
     defer std.testing.allocator.free(src);
@@ -631,14 +646,14 @@ test "f16 add emits _Float16 locals; C does the half arithmetic natively" {
     const a = try func.appendBlockParam(entry, f16_t);
     const b = try func.appendBlockParam(entry, f16_t);
     const sum = try func.appendInst(entry, f16_t, .{ .arith = .{ .op = .add, .lhs = a, .rhs = b } });
-    func.setTerminator(entry, .{ .ret = sum });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(sum) });
 
     const src = try emitFunction(std.testing.allocator, &func, "add");
     defer std.testing.allocator.free(src);
 
-    // No width hardcoded in the arith emit: `v2 = v0 + v1` is the same statement C would emit
-    // for any other numeric type, and the `_Float16` operand types are what makes the C
-    // compiler perform half-precision rounding.
+    // No width is hardcoded in the arith emit. `v2 = v0 + v1` is the same statement C would
+    // emit for any other numeric type. The `_Float16` operand types are what make the C
+    // compiler do the half-precision rounding.
     try std.testing.expectEqualStrings(
         \\_Float16 add(_Float16 v0, _Float16 v1) {
         \\    _Float16 v2;
@@ -648,7 +663,8 @@ test "f16 add emits _Float16 locals; C does the half arithmetic natively" {
         \\
     , src);
 
-    // A module also accepts a scalar-f16 function now; only a composite f16 rejects (below).
+    // A module also accepts a scalar-f16 function now. Only a composite f16 rejects it
+    // (below).
     const named = [_]NamedFunc{.{ .name = "add", .func = &func }};
     const mod_src = try emitModule(std.testing.allocator, &named);
     defer std.testing.allocator.free(mod_src);
@@ -661,11 +677,11 @@ test "f16 fconst emits a (_Float16) cast of the value already rounded to the nea
 
     const f16_t = try func.types.intern(.{ .float = .f16 });
     const entry = try func.appendBlock();
-    // 0.1 is not exactly representable in f16 (or in f64): the printed literal must already be
-    // Zig's own round-to-nearest-even half of it, so the C `(_Float16)` cast is exact, not a
-    // second re-rounding of a different value.
+    // 0.1 is not exactly representable in f16 (or in f64). The printed literal must already
+    // be Zig's own round-to-nearest-even half of it. This way the C `(_Float16)` cast is
+    // exact, not a second re-rounding of a different value.
     const v = try func.appendInst(entry, f16_t, .{ .fconst = 0.1 });
-    func.setTerminator(entry, .{ .ret = v });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(v) });
 
     const src = try emitFunction(std.testing.allocator, &func, "tenth");
     defer std.testing.allocator.free(src);
@@ -693,7 +709,7 @@ test "f16 <-> f32 convert emits (_Float16)/(float) C casts" {
     const x = try func.appendBlockParam(entry, f32_t);
     const h = try func.appendInst(entry, f16_t, .{ .convert = .{ .value = x } });
     const back = try func.appendInst(entry, f32_t, .{ .convert = .{ .value = h } });
-    func.setTerminator(entry, .{ .ret = back });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(back) });
 
     const src = try emitFunction(std.testing.allocator, &func, "roundtrip");
     defer std.testing.allocator.free(src);
@@ -719,7 +735,7 @@ test "f16 <-> i16 bit reinterpret reuses the width-generic memcpy path" {
     const entry = try func.appendBlock();
     const bits = try func.appendBlockParam(entry, u16_t);
     const h = try func.appendInst(entry, f16_t, .{ .unary = .{ .op = .reinterpret, .value = bits } });
-    func.setTerminator(entry, .{ .ret = h });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(h) });
 
     const src = try emitFunction(std.testing.allocator, &func, "bitsToHalf");
     defer std.testing.allocator.free(src);
@@ -742,7 +758,7 @@ test "f16 unary (sqrt) routes through the f32 libm call and casts back to _Float
     const entry = try func.appendBlock();
     const a = try func.appendBlockParam(entry, f16_t);
     const r = try func.appendInst(entry, f16_t, .{ .unary = .{ .op = .sqrt, .value = a } });
-    func.setTerminator(entry, .{ .ret = r });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(r) });
 
     const src = try emitFunction(std.testing.allocator, &func, "half_sqrt");
     defer std.testing.allocator.free(src);
@@ -765,12 +781,23 @@ test "composite f16 (a vector of half) is still rejected cleanly" {
     const v2 = try func.types.intern(.{ .vector = .{ .len = 2, .elem = f16_t } });
     const entry = try func.appendBlock();
     const a = try func.appendBlockParam(entry, v2);
-    func.setTerminator(entry, .{ .ret = a });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(a) });
 
     try std.testing.expectError(error.Unsupported, emitFunction(std.testing.allocator, &func, "vh"));
 
     const named = [_]NamedFunc{.{ .name = "vh", .func = &func }};
     try std.testing.expectError(error.Unsupported, emitModule(std.testing.allocator, &named));
+}
+
+test "a via_got global_addr is rejected (no C-source rendering for GOT-indirect addressing)" {
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+    const ptr_t = try func.types.intern(.ptr);
+    const entry = try func.appendBlock();
+    const g = try func.appendGlobalAddrGot(entry, ptr_t, "G");
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(g) });
+
+    try std.testing.expectError(error.Unsupported, emitFunction(std.testing.allocator, &func, "getg"));
 }
 
 test "emits a struct typedef, construction, and extract" {
@@ -784,7 +811,7 @@ test "emits a struct typedef, construction, and extract" {
     const b = try func.appendInst(entry, i32_t, .{ .iconst = 9 });
     const s = try func.appendStructNew(entry, st, &.{ a, b });
     const x = try func.appendInst(entry, i32_t, .{ .extract = .{ .aggregate = s, .index = 1 } });
-    func.setTerminator(entry, .{ .ret = x });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(x) });
 
     const src = try emitFunction(std.testing.allocator, &func, "pick");
     defer std.testing.allocator.free(src);
@@ -820,7 +847,7 @@ test "emits an if/else diamond with a merge parameter" {
     const r = try func.appendBlockParam(merge, i32_t);
     const cond = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .gt, .lhs = a, .rhs = b } });
     try func.appendIf(entry, cond, .{ .target = merge, .args = &.{a} }, .{ .target = merge, .args = &.{b} });
-    func.setTerminator(merge, .{ .ret = r });
+    func.setTerminator(merge, .{ .ret = ir.function.Ret.one(r) });
 
     const src = try emitFunction(std.testing.allocator, &func, "maxi");
     defer std.testing.allocator.free(src);

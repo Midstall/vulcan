@@ -190,6 +190,9 @@ fn rewriteUses(func: *Function, subst: std.AutoHashMapUnmanaged(Value, Value)) v
                 st.ptr = sub(subst, st.ptr);
             },
             .prefetch => |*pf| pf.ptr = sub(subst, pf.ptr),
+            .va_start => |*vs| vs.list = sub(subst, vs.list),
+            .va_arg => |*va| va.list = sub(subst, va.list),
+            .va_end => |*ve| ve.list = sub(subst, ve.list),
             .dot => |*d| {
                 d.acc = sub(subst, d.acc);
                 d.a = sub(subst, d.a);
@@ -220,8 +223,8 @@ fn rewriteUses(func: *Function, subst: std.AutoHashMapUnmanaged(Value, Value)) v
     for (0..func.blockCount()) |bi| {
         const term = func.terminatorPtr(@enumFromInt(bi));
         if (term.*) |*t| switch (t.*) {
-            .ret => |*v| if (v.*) |vv| {
-                v.* = sub(subst, vv);
+            .ret => |*r| for (r.values[0..r.count]) |*vv| {
+                vv.* = sub(subst, vv.*);
             },
             .jump => |*j| for (func.valueListMut(j.args)) |*arg| {
                 arg.* = sub(subst, arg.*);
@@ -239,7 +242,7 @@ test "lowers an unsigned division to division-free IR" {
     const x = try func.appendBlockParam(b, u32t);
     const y = try func.appendBlockParam(b, u32t);
     const q = try func.appendInst(b, u32t, .{ .arith = .{ .op = .div, .lhs = x, .rhs = y } });
-    func.setTerminator(b, .{ .ret = q });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(q) });
 
     try std.testing.expect(try run(allocator, &func));
     // No div/rem instruction survives.

@@ -24,7 +24,7 @@ fn run(allocator: std.mem.Allocator) !void {
     const c3 = try func.appendInst(b, t, .{ .iconst = 3 });
     const sum = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = c2, .rhs = c3 } });
     const r = try func.appendInst(b, t, .{ .arith = .{ .op = .mul, .lhs = sum, .rhs = x } });
-    func.setTerminator(b, .{ .ret = r });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
     _ = try opt.optimize(allocator, &func);
     _ = try opt.lowerdiv.run(allocator, &func);
 

@@ -1,11 +1,12 @@
-//! riscv64 adoption Task 2: the SHARED Wimmer-Franz allocator produces EXECUTABLE riscv64 code. Each
-//! test builds TWO identical functions, compiles one through the backend's own `selectFunction` (the
-//! reference) and the other through `isel.compileFunctionWimmerRiscv` (the shared allocator + the
-//! same emission), runs BOTH under qemu-riscv64, and asserts the results are bit-identical across many
-//! inputs. Scope is the INT, scalar-FLOAT, and RVV VECTOR classes (RV-T3 added vectors; the et-soc VPU
-//! class is RV-T4). qemu is the execution oracle: a divergence means the shared allocation was
-//! translated or emitted wrong. The RVV cases execute real vle32/vse32/vfadd/vfmul under qemu's
-//! default RV64 CPU (which enables the V extension), the same way `fma_vector.zig` does.
+//! The SHARED Wimmer-Franz allocator produces EXECUTABLE riscv64 code. Each test builds TWO
+//! identical functions. One function compiles through the backend's own `selectFunction` (the
+//! reference). The other function compiles through `isel.compileFunctionWimmerRiscv` (the shared
+//! allocator with the same emission). Both functions run under qemu-riscv64, and the test asserts
+//! the results are bit-identical across many inputs. The scope covers the INT class, the
+//! scalar-FLOAT class, and the RVV VECTOR class (the et-soc VPU class is a separate scope). qemu is
+//! the execution oracle: a divergence means the shared allocation was translated or emitted wrong.
+//! The RVV cases execute real vle32/vse32/vfadd/vfmul under qemu's default RV64 CPU (which enables
+//! the V extension), the same way `fma_vector.zig` does.
 
 const std = @import("std");
 const ir = @import("vulcan-ir");
@@ -83,7 +84,7 @@ fn buildStraightLine(allocator: std.mem.Allocator) anyerror!Function {
     const ac = try func.appendInst(entry, i64_t, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = c } });
     const prod = try func.appendInst(entry, i64_t, .{ .arith = .{ .op = .mul, .lhs = ab, .rhs = bc } });
     const res = try func.appendInst(entry, i64_t, .{ .arith = .{ .op = .sub, .lhs = prod, .rhs = ac } });
-    func.setTerminator(entry, .{ .ret = res });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(res) });
     return func;
 }
 
@@ -130,7 +131,7 @@ fn buildIntPressure(allocator: std.mem.Allocator) anyerror!Function {
         k -= 1;
         sum = try func.appendInst(entry, i64_t, .{ .arith = .{ .op = .add, .lhs = sum, .rhs = a[k] } });
     }
-    func.setTerminator(entry, .{ .ret = sum });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(sum) });
     return func;
 }
 
@@ -172,7 +173,7 @@ fn buildFloatPressure(allocator: std.mem.Allocator) anyerror!Function {
     }
     var acc = vals[0];
     for (vals[1..]) |v| acc = try func.appendInst(entry, f32_t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = v } });
-    func.setTerminator(entry, .{ .ret = acc });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(acc) });
     return func;
 }
 
@@ -205,12 +206,12 @@ test "wimmer-rv: a float arithmetic + pressure kernel matches" {
 
 const n_body = 24;
 
-/// f(n): acc=0; for i in 0..n: { t[k] = (i+1)*(k+1) for k in 0..24 (all live at once); acc += sum(t) };
-/// return acc. Only three integers cross the loop as block params (acc, i, n), so the back-edge jump
-/// is a narrow reg->reg parallel move (the cross-block Wimmer edge-move path), while the body creates
-/// 24 simultaneously-live temporaries - far past the 17 allocatable integer registers - so the shared
-/// allocator spills and tail-splits INSIDE the body. A wrong intra-block split or a wrong back-edge
-/// move diverges from the reference.
+/// f(n): acc starts at 0. For each i in 0..n, the loop computes t[k] = (i+1)*(k+1) for k in 0..24
+/// (all live at once), then adds acc += sum(t), and returns acc. Only three integers cross the loop
+/// as block params (acc, i, n), so the back-edge jump is a narrow reg->reg parallel move (the
+/// cross-block Wimmer edge-move path). The body itself creates 24 simultaneously-live temporaries,
+/// far past the 17 allocatable integer registers, so the shared allocator spills and tail-splits
+/// INSIDE the body. A wrong intra-block split or a wrong back-edge move diverges from the reference.
 fn buildLoopSum(allocator: std.mem.Allocator) anyerror!Function {
     var func = Function.init(allocator);
     errdefer func.deinit();
@@ -253,7 +254,7 @@ fn buildLoopSum(allocator: std.mem.Allocator) anyerror!Function {
     try func.setJump(body, header, &.{ next_i, b_n, next_acc });
 
     const e_acc = try func.appendBlockParam(exit, i64_t);
-    func.setTerminator(exit, .{ .ret = e_acc });
+    func.setTerminator(exit, .{ .ret = ir.function.Ret.one(e_acc) });
     return func;
 }
 
@@ -276,10 +277,11 @@ test "wimmer-rv: a loop-carried int sum across a pressured body matches" {
 // 5. A diamond with an int value live on both paths.
 // ---------------------------------------------------------------------------
 
-/// f(n): c = n*3 (live on BOTH arms and the join); if n > 0 -> a else b; a: va = c + 10; b: vb = c +
-/// 20; m(p): return p + c. The join `m` takes a phi `p` (va from a, vb from b) resolved by moves on
-/// the jump edges a->m / b->m, while `c` is a value defined in the entry that stays live across both
-/// arms into `m`. Exercises a cross-block value live on both paths plus a jump-edge phi.
+/// f(n): c = n*3 (live on BOTH arms and the join). If n > 0, control goes to arm a, else arm b.
+/// Arm a computes va = c + 10, arm b computes vb = c + 20, and the join m(p) returns p + c. The join
+/// `m` takes a phi `p` (va from a, vb from b) resolved by moves on the jump edges a->m / b->m, while
+/// `c` is a value defined in the entry that stays live across both arms into `m`. This exercises a
+/// cross-block value live on both paths plus a jump-edge phi.
 fn buildDiamond(allocator: std.mem.Allocator) anyerror!Function {
     var func = Function.init(allocator);
     errdefer func.deinit();
@@ -306,7 +308,7 @@ fn buildDiamond(allocator: std.mem.Allocator) anyerror!Function {
 
     const p = try func.appendBlockParam(m_blk, i64_t);
     const r = try func.appendInst(m_blk, i64_t, .{ .arith = .{ .op = .add, .lhs = p, .rhs = c } });
-    func.setTerminator(m_blk, .{ .ret = r });
+    func.setTerminator(m_blk, .{ .ret = ir.function.Ret.one(r) });
     return func;
 }
 
@@ -324,10 +326,10 @@ test "wimmer-rv: a diamond with an int value live on both paths matches" {
 }
 
 // ---------------------------------------------------------------------------
-// 6. RVV VECTOR class (RV-T3): a <4 x f32> value flows through the shared allocator, exercising the
-//    class-2 translation, the vsetivli preamble, and (under pressure / across a call) the vector
+// 6. RVV VECTOR class: a <4 x f32> value flows through the shared allocator. This exercises the
+//    class-2 translation, the vsetivli preamble, and (under pressure or across a call) the vector
 //    spill/split path that GENERALIZES the old `error.Unsupported` bail on a vector live across a call.
-//    Each function returns a scalar lane (fa0) so the result is observable through the float ABI.
+//    Each function returns a scalar lane (fa0), so the result is observable through the float ABI.
 // ---------------------------------------------------------------------------
 
 /// Run the reference (`selectFunction`, via the full scheduler pipeline) and the shared Wimmer path on
@@ -359,11 +361,11 @@ fn expectFloatMatch(io: std.Io, comptime build: fn (std.mem.Allocator) anyerror!
 }
 
 /// f(a) = ((a, 2, 3, 4) + (5, 6, 7, 8)) * (2, 2, 2, 2), returning lane 0 = (a + 5) * 2. A handful of
-/// simultaneously-live <4 x f32> vectors, no spilling: the baseline that the class-2 register
-/// translation, the one-shot vsetivli preamble, and the RVV vfadd/vfmul arithmetic translate right.
-/// The lanes are built from `fconst`s and the fa0 param via `struct_new`; RVV has no vector ABI to
-/// carry a whole vector in, and nothing in this backend constant-folds float arithmetic, so this
-/// exercises the real hardware ops at qemu-execution time.
+/// simultaneously-live <4 x f32> vectors, with no spilling, is the baseline case that proves the
+/// class-2 register translation, the one-shot vsetivli preamble, and the RVV vfadd/vfmul arithmetic
+/// translate right. The lanes are built from `fconst`s and the fa0 param via `struct_new`. RVV has
+/// no vector ABI to carry a whole vector in, and nothing in this backend constant-folds float
+/// arithmetic, so this exercises the real hardware ops at qemu-execution time.
 fn buildVecArith(allocator: std.mem.Allocator) anyerror!Function {
     var func = Function.init(allocator);
     errdefer func.deinit();
@@ -393,7 +395,7 @@ fn buildVecArith(allocator: std.mem.Allocator) anyerror!Function {
 
     const vprod = try func.appendInst(entry, v4, .{ .arith = .{ .op = .mul, .lhs = vsum, .rhs = vc } });
     const lane0 = try func.appendInst(entry, f32_t, .{ .extract = .{ .aggregate = vprod, .index = 0 } });
-    func.setTerminator(entry, .{ .ret = lane0 });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(lane0) });
     return func;
 }
 
@@ -441,7 +443,7 @@ fn buildVecPressure(allocator: std.mem.Allocator) anyerror!Function {
     var acc = vals[0];
     for (vals[1..]) |v| acc = try func.appendInst(entry, v4, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = v } });
     const lane0 = try func.appendInst(entry, f32_t, .{ .extract = .{ .aggregate = acc, .index = 0 } });
-    func.setTerminator(entry, .{ .ret = lane0 });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(lane0) });
     return func;
 }
 
@@ -475,16 +477,16 @@ fn buildAddOneCallee(allocator: std.mem.Allocator) anyerror!Function {
     const x = try func.appendBlockParam(blk, f32_t);
     const one = try func.appendInst(blk, f32_t, .{ .fconst = 1.0 });
     const r = try func.appendInst(blk, f32_t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = one } });
-    func.setTerminator(blk, .{ .ret = r });
+    func.setTerminator(blk, .{ .ret = ir.function.Ret.one(r) });
     return func;
 }
 
 /// The caller `f(a)`: build vv = (a, 2, 3, 4) + (5, 6, 7, 8) BEFORE calling g(10), then AFTER the call
 /// read lane 0 of vv and add the call result, returning (a + 5) + 11 = a + 16. `vv` (a <4 x f32>) is
 /// defined before the call and used after it, so it is LIVE ACROSS the call. Every RVV register is
-/// caller-saved, so the shared allocator cannot keep vv in a register across the call: it must spill/
-/// split it to a 16-byte slot and reload it afterward. The OLD riscv64 Wimmer path bailed
-/// `error.Unsupported` on exactly this shape; the test asserts it now compiles and computes right.
+/// caller-saved, so the shared allocator cannot keep vv in a register across the call. It must spill
+/// or split it to a 16-byte slot and reload it afterward. The OLD riscv64 Wimmer path bailed with
+/// `error.Unsupported` on exactly this shape. The test asserts it now compiles and computes right.
 fn buildVecAcrossCall(allocator: std.mem.Allocator) anyerror!Function {
     var func = Function.init(allocator);
     errdefer func.deinit();
@@ -513,7 +515,7 @@ fn buildVecAcrossCall(allocator: std.mem.Allocator) anyerror!Function {
 
     const lane0 = try func.appendInst(entry, f32_t, .{ .extract = .{ .aggregate = vv, .index = 0 } });
     const r = try func.appendInst(entry, f32_t, .{ .arith = .{ .op = .add, .lhs = lane0, .rhs = cr } });
-    func.setTerminator(entry, .{ .ret = r });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(r) });
     return func;
 }
 
@@ -537,40 +539,41 @@ fn linkRunFloat(io: std.Io, allocator: std.mem.Allocator, caller_c: *const isel.
 }
 
 // ---------------------------------------------------------------------------
-// 7. SP3 Task 1: a same-position store/reload cluster at a block-param boundary, exercising the
-//    bridge's retired `hasSamePosRegHazard` bail (replaced by consuming the shared allocator's
-//    already-ordered `walloc.actions`).
+// 7. A same-position store/reload cluster at a block-param boundary. This exercises the bridge's
+//    retired `hasSamePosRegHazard` bail (replaced by consuming the shared allocator's already-ordered
+//    `walloc.actions`).
 //
 // `n_pre_rv` values stay ACTIVE (live, in registers) from `entry` across every iteration of a loop
 // BODY, while the body's OWN `n_hdr_rv` carried params arrive at its shared param-row position on
 // both the first entry (a plain jump) and the back edge (also a plain jump). `n_pre_rv + n_hdr_rv`
-// exceeds the 17-register allocatable int pool (`temp_regs` + `saved_regs`), so the accumulate loop
-// deep in the body - which reads every `pre[k]` and every `b[k]` together - forces the shared
-// allocator to evict some still-live `pre[k]` right where an arriving `b[k]` needs a register, an
+// exceeds the 17-register allocatable int pool (`temp_regs` + `saved_regs`). The accumulate loop deep
+// in the body reads every `pre[k]` and every `b[k]` together, so it forces the shared allocator to
+// evict some still-live `pre[k]` right where an arriving `b[k]` needs a register. This produces an
 // intra-block same-position store/reload pair.
 //
 // The loop TEST (`if`) sits at the body's OWN TAIL, after `pre[]`'s last use, so `pre[]` is fully
 // DEAD by the time control reaches the `if` and never crosses an if-edge. Only the body's own
 // loop-carried params (`b[]`, `total`, `iter`) cross the if-edge, and only as EXPLICIT args that
-// `splitCriticalEdges` moves onto a landing block's jump - the same shape `buildLoopSum` already
+// `splitCriticalEdges` moves onto a landing block's jump, the same shape `buildLoopSum` already
 // exercises successfully. This deliberately avoids putting `pre[]` across an `if`: riscv64's
 // `.@"if"` emission can only branch (it cannot host an edge move), so a value live across an
 // if-edge with a genuine location change is a SEPARATE, pre-existing bridge limitation
-// (`edgeMoveOnIfEdge`) this task does not touch. An earlier draft of this test put the loop test at
-// the block's TOP (a `header`/`body` split, mirroring x86_64 SP2's `buildHeaderEvictsPreLoop`
-// directly) and confirmed exactly that: `pre[]` stayed live across the header's own if-edge with a
-// location change, tripping `edgeMoveOnIfEdge` instead of (or in addition to) the intended hazard.
+// (`edgeMoveOnIfEdge`) this test does not touch. An earlier draft of this test put the loop test at
+// the block's TOP (a `header`/`body` split, mirroring an x86_64 differential's
+// `buildHeaderEvictsPreLoop` directly) and confirmed exactly that: `pre[]` stayed live across the
+// header's own if-edge with a location change, tripping `edgeMoveOnIfEdge` instead of (or in addition
+// to) the intended hazard.
 // ---------------------------------------------------------------------------
 
 const n_pre_rv = 16;
 const n_hdr_rv = 8;
 
-/// `pre[]`: defined in `entry`, used only deep inside `body`'s accumulate loop (so they are ACTIVE,
-/// occupying registers, across every entry into `body` and right up to that read point). `body`'s OWN
-/// `n_hdr_rv` carried params (`b[]`) plus a running total and iteration counter arrive at its shared
-/// param-row position on both the first entry (`entry -> body`) and the back edge
-/// (`landing_continue -> body`). `n_pre_rv + n_hdr_rv + 2 > 17` (the int pool), so the accumulate loop
-/// - which reads every `pre[k]` and every `b[k]` together - forces the shared allocator to evict some
+/// `pre[]`: defined in `entry`, used only deep inside `body`'s accumulate loop. This keeps them
+/// ACTIVE, occupying registers, across every entry into `body` and right up to that read point.
+/// `body`'s OWN `n_hdr_rv` carried params (`b[]`) plus a running total and iteration counter arrive
+/// at its shared param-row position on both the first entry (`entry -> body`) and the back edge
+/// (`landing_continue -> body`). `n_pre_rv + n_hdr_rv + 2 > 17` (the int pool). The accumulate loop
+/// reads every `pre[k]` and every `b[k]` together, so it forces the shared allocator to evict some
 /// still-live `pre[k]` right where an arriving `b[k]` needs a register, an intra-block same-position
 /// store/reload pair. The loop test (`if`) sits at the TAIL, after `pre[]`'s last use, so `pre[]`
 /// never crosses an if-edge (see the section comment above).
@@ -619,7 +622,7 @@ fn buildBodyEvictsPre(allocator: std.mem.Allocator) anyerror!Function {
     try func.appendIf(body, cond, .{ .target = body, .args = &back_args }, .{ .target = exit, .args = &.{new_total} });
 
     const e_total = try func.appendBlockParam(exit, i64_t);
-    func.setTerminator(exit, .{ .ret = e_total });
+    func.setTerminator(exit, .{ .ret = ir.function.Ret.one(e_total) });
     return func;
 }
 
@@ -645,11 +648,11 @@ test "wimmer-rv: a vector live across a call spills across the call (not an erro
     const io = std.testing.io;
     const a_vals = [_]f32{ 0.0, 1.0, 5.0, -3.0, 42.0 };
 
-    // A vector live across a call has NO native reference to diff against (the retired native allocator
-    // bailed `error.Unsupported` on it - every RVV register is caller-saved and it had no vector split -
-    // and `compileFunction` is now itself the shared Wimmer path, so it no longer bails). The oracle is
-    // therefore the mathematically-correct result, computed in f32 in the SAME op order the IR builds:
-    // lane 0 of vv = a + 5, plus the call result g(10) = 11.
+    // A vector live across a call has NO native reference to diff against. The retired native
+    // allocator bailed with `error.Unsupported` on it, because every RVV register is caller-saved and
+    // it had no vector split, and `compileFunction` is now itself the shared Wimmer path, so it no
+    // longer bails. The oracle is therefore the mathematically-correct result, computed in f32 in the
+    // SAME op order the IR builds: lane 0 of vv = a + 5, plus the call result g(10) = 11.
     for (a_vals) |a_val| {
         const fargs = [_]u64{@as(u32, @bitCast(a_val))};
         const lane0: f32 = a_val + 5.0;
@@ -677,22 +680,22 @@ test "wimmer-rv: a vector live across a call spills across the call (not an erro
 }
 
 // ---------------------------------------------------------------------------
-// 8. SP3 Task 2, Gap A: the entry-param ABI hint. A param LIVE ACROSS A CALL lands off its ABI
-//    register (a callee-saved register the shared allocator homes it in for the whole function), or -
-//    under enough post-call pressure - genuinely SPLITS (one home across the call, possibly another
-//    after it). Both bailed `error.Unsupported` before this task (translateAllocation's blanket
-//    is_eparam bail, then the int/float ABI-register-equality check).
+// 8. Gap A: the entry-param ABI hint. A param LIVE ACROSS A CALL lands off its ABI register (a
+//    callee-saved register the shared allocator homes it in for the whole function), or, under
+//    enough post-call pressure, genuinely SPLITS (one home across the call, possibly another after
+//    it). Both shapes used to bail with `error.Unsupported` (translateAllocation's blanket is_eparam
+//    bail, then the int/float ABI-register-equality check).
 //
 //    CRITICAL: for these tests to actually EXERCISE the fix, the callee must genuinely CLOBBER the
-//    caller's argument registers a1/a2 (fa1/fa2). A leaf callee `g(x)=x+1` does NOT touch a1/a2, so
-//    with the earlier (buggy) per-call clobber list - which omitted a0..a7/fa0..fa7 - the shared
-//    allocator wrongly believed a1/a2 survived the call and left `bp`/`cp` there, yet the leaf never
-//    overwrote them, so the wrong allocation still computed the right answer and the bug hid. Here the
-//    callee `g(x) = m(x, x+1, x+2)` makes its OWN 3-arg nested call to `m`, so `g` writes a0/a1/a2
-//    on the way in - clobbering exactly where `bp`/`cp` sit. With the clobber bug the differential
-//    DIVERGES (Wimmer reads a garbage a1/a2); with the fix `bp`/`cp` are moved to callee-saved
-//    registers in the prologue and the results match. Verified: reverting the arg-reg clobber makes
-//    these tests FAIL, the fix makes them PASS.
+//    caller's argument registers a1/a2 (fa1/fa2). A leaf callee `g(x)=x+1` does NOT touch a1/a2. With
+//    an earlier, buggy per-call clobber list that omitted a0..a7/fa0..fa7, the shared allocator
+//    wrongly believed a1/a2 survived the call and left `bp`/`cp` there. The leaf never overwrote
+//    them, so the wrong allocation still computed the right answer and the bug hid. Here the callee
+//    `g(x) = m(x, x+1, x+2)` makes its OWN 3-arg nested call to `m`, so `g` writes a0/a1/a2 on the
+//    way in, clobbering exactly where `bp`/`cp` sit. With the clobber bug the differential DIVERGES
+//    (Wimmer reads a garbage a1/a2). With the fix, `bp`/`cp` are moved to callee-saved registers in
+//    the prologue and the results match. Verified: reverting the arg-reg clobber makes these tests
+//    FAIL, the fix makes them PASS.
 // ---------------------------------------------------------------------------
 
 /// The int leaf `m(p, q, r) = p + q + r`. Named "leaf" so `buildNestedCalleeInt` calls it.
@@ -706,14 +709,14 @@ fn buildAdd3LeafInt(allocator: std.mem.Allocator) anyerror!Function {
     const r = try func.appendBlockParam(blk, i64_t);
     const pq = try func.appendInst(blk, i64_t, .{ .arith = .{ .op = .add, .lhs = p, .rhs = q } });
     const s = try func.appendInst(blk, i64_t, .{ .arith = .{ .op = .add, .lhs = pq, .rhs = r } });
-    func.setTerminator(blk, .{ .ret = s });
+    func.setTerminator(blk, .{ .ret = ir.function.Ret.one(s) });
     return func;
 }
 
 /// The NON-LEAF int callee `g(x) = m(x, x+1, x+2) = 3x + 3`. Because it sets up a 3-argument call it
 /// writes a0/a1/a2 on the way into `m`, so it CLOBBERS the caller's `bp`/`cp` argument registers
-/// (a1/a2) - the property that makes the Gap A tests actually catch the missing-clobber bug. Named
-/// "callee" so the Gap A callers call it; it calls "leaf".
+/// (a1/a2). This is the property that makes the Gap A tests actually catch the missing-clobber bug.
+/// Named "callee" so the Gap A callers call it, and it in turn calls "leaf".
 fn buildNestedCalleeInt(allocator: std.mem.Allocator) anyerror!Function {
     var func = Function.init(allocator);
     errdefer func.deinit();
@@ -723,7 +726,7 @@ fn buildNestedCalleeInt(allocator: std.mem.Allocator) anyerror!Function {
     const x1 = try func.appendArithImm(b, i64_t, .add, x, 1);
     const x2 = try func.appendArithImm(b, i64_t, .add, x, 2);
     const r = try func.appendCall(b, i64_t, "leaf", &.{ x, x1, x2 });
-    func.setTerminator(b, .{ .ret = r });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
     return func;
 }
 
@@ -787,8 +790,8 @@ fn compileLinkRunInt(io: std.Io, allocator: std.mem.Allocator, caller: *Function
 /// Gap A: a non-leaf caller `f(a, bp, cp) = g(a) + bp + cp`. `bp`/`cp` are entry params LIVE ACROSS
 /// the call while sitting in their ABI arg registers (a1/a2), which the call clobbers (`g` writes
 /// a0/a1/a2 to set up its own 3-arg call). The shared allocator must home them in a callee-saved
-/// register (x9/x18..x27) for the whole function - a whole-life entry param placed off its ABI arg
-/// register - or `bp`/`cp` are read back as garbage. `a` merely feeds the call and dies there.
+/// register (x9/x18..x27) for the whole function, a whole-life entry param placed off its ABI arg
+/// register, or `bp`/`cp` are read back as garbage. `a` merely feeds the call and dies there.
 fn buildIntParamAcrossCall(allocator: std.mem.Allocator) anyerror!Function {
     var func = Function.init(allocator);
     errdefer func.deinit();
@@ -800,11 +803,11 @@ fn buildIntParamAcrossCall(allocator: std.mem.Allocator) anyerror!Function {
     const called = try func.appendCall(b, i64_t, "callee", &.{a});
     const s1 = try func.appendInst(b, i64_t, .{ .arith = .{ .op = .add, .lhs = called, .rhs = bp } });
     const s2 = try func.appendInst(b, i64_t, .{ .arith = .{ .op = .add, .lhs = s1, .rhs = cp } });
-    func.setTerminator(b, .{ .ret = s2 });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(s2) });
     return func;
 }
 
-test "wimmer-rv: a non-leaf function whose int param crosses a call is homed off its ABI register (Gap A)" {
+test "wimmer-rv: a non-leaf function whose int param crosses a call is homed off its ABI register" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     // f(a,bp,cp) = g(a) + bp + cp = (3a+3) + bp + cp. `bp`/`cp` sit in a1/a2, which g clobbers.
@@ -825,7 +828,7 @@ test "wimmer-rv: a non-leaf function whose int param crosses a call is homed off
         try std.testing.expectEqual(want, ref);
 
         // Wimmer: the caller through the SHARED allocator. With the arg-reg clobber fix, `bp`/`cp` are
-        // moved off a1/a2 in the prologue and survive g's clobber; without it they read garbage.
+        // moved off a1/a2 in the prologue and survive g's clobber. Without it they read garbage.
         var wim_caller = try buildIntParamAcrossCall(allocator);
         defer wim_caller.deinit();
         const got = compileLinkRunInt(io, allocator, &wim_caller, true, &args) catch |e| switch (e) {
@@ -847,12 +850,12 @@ fn buildAdd3LeafFloat(allocator: std.mem.Allocator) anyerror!Function {
     const r = try func.appendBlockParam(blk, f32_t);
     const pq = try func.appendInst(blk, f32_t, .{ .arith = .{ .op = .add, .lhs = p, .rhs = q } });
     const s = try func.appendInst(blk, f32_t, .{ .arith = .{ .op = .add, .lhs = pq, .rhs = r } });
-    func.setTerminator(blk, .{ .ret = s });
+    func.setTerminator(blk, .{ .ret = ir.function.Ret.one(s) });
     return func;
 }
 
 /// The NON-LEAF f32 callee `g(x) = m(x, x+1, x+2)`. Writes fa0/fa1/fa2 for its 3-arg call, CLOBBERING
-/// the caller's `bp`/`cp` float-argument registers (fa1/fa2). Named "callee"; calls "leaf".
+/// the caller's `bp`/`cp` float-argument registers (fa1/fa2). Named "callee", and it calls "leaf".
 fn buildNestedCalleeFloat(allocator: std.mem.Allocator) anyerror!Function {
     var func = Function.init(allocator);
     errdefer func.deinit();
@@ -864,7 +867,7 @@ fn buildNestedCalleeFloat(allocator: std.mem.Allocator) anyerror!Function {
     const x1 = try func.appendInst(b, f32_t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = one } });
     const x2 = try func.appendInst(b, f32_t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = two } });
     const r = try func.appendCall(b, f32_t, "leaf", &.{ x, x1, x2 });
-    func.setTerminator(b, .{ .ret = r });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
     return func;
 }
 
@@ -929,11 +932,11 @@ fn buildFloatParamAcrossCall(allocator: std.mem.Allocator) anyerror!Function {
     const called = try func.appendCall(b, f32_t, "callee", &.{a});
     const s1 = try func.appendInst(b, f32_t, .{ .arith = .{ .op = .add, .lhs = called, .rhs = bp } });
     const s2 = try func.appendInst(b, f32_t, .{ .arith = .{ .op = .add, .lhs = s1, .rhs = cp } });
-    func.setTerminator(b, .{ .ret = s2 });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(s2) });
     return func;
 }
 
-test "wimmer-rv: a non-leaf function whose float param crosses a call is homed off its ABI register (Gap A)" {
+test "wimmer-rv: a non-leaf function whose float param crosses a call is homed off its ABI register" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     // Small integer-valued f32s keep every intermediate exact, so the differential is bit-exact.
@@ -969,8 +972,8 @@ const n_split_rv = 20;
 /// simultaneously live at once (each `bp OP cp` or `bp/cp + k`, defined before the reduction below
 /// consumes them one by one), overflowing the 17-register int pool. `bp`/`cp` have their next use in
 /// the FINAL result, later than any temporary's next use, so the shared allocator's Belady eviction
-/// heuristic is liable to evict them partway through - a genuinely SPLIT param (not just a whole-life
-/// off-ABI reassignment), exercising `translateAllocation`'s segments branch and
+/// heuristic is liable to evict them partway through. This is a genuinely SPLIT param, not just a
+/// whole-life off-ABI reassignment, and it exercises `translateAllocation`'s segments branch and
 /// `emitFromAllocation`'s first-segment establishment. Because `g` clobbers a1/a2, the FIRST segment
 /// (across the call) must be off the arg registers or the result is garbage.
 fn buildSplitParamRv(allocator: std.mem.Allocator) anyerror!Function {
@@ -995,7 +998,7 @@ fn buildSplitParamRv(allocator: std.mem.Allocator) anyerror!Function {
     const s1 = try func.appendInst(b, i64_t, .{ .arith = .{ .op = .add, .lhs = bp, .rhs = cp } });
     const s2 = try func.appendInst(b, i64_t, .{ .arith = .{ .op = .add, .lhs = s1, .rhs = acc } });
     const res = try func.appendInst(b, i64_t, .{ .arith = .{ .op = .add, .lhs = s2, .rhs = called } });
-    func.setTerminator(b, .{ .ret = res });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(res) });
     return func;
 }
 
@@ -1012,7 +1015,7 @@ fn splitParamRvExpected(a: i64, bp: i64, cp: i64) i64 {
     return (bp +% cp) +% acc +% nestedCalleeInt(a);
 }
 
-test "wimmer-rv: a param crossing a call is evicted by later pressure (Gap A split shape)" {
+test "wimmer-rv: a param crossing a call is evicted by later pressure (split shape)" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const cases = [_][3]i64{ .{ 0, 0, 0 }, .{ 1, 2, 3 }, .{ -5, 10, 2 }, .{ 100, -25, 4 }, .{ 7, -3, 9 } };
@@ -1039,12 +1042,12 @@ test "wimmer-rv: a param crossing a call is evicted by later pressure (Gap A spl
 }
 
 // ---------------------------------------------------------------------------
-// 9. SP3 Task 2, Gap B: SOFTWARE f16 (no Zfh). riscv64 has no hardware half, so an f16 is held as its
-//    f32 widening in a float register and every boundary rounds via the inline software routines in
+// 9. Gap B: SOFTWARE f16 (no Zfh). riscv64 has no hardware half, so an f16 is held as its f32
+//    widening in a float register, and every boundary rounds via the inline software routines in
 //    isel.zig (`emitHalfToFloat`/`emitFloatToHalf`), which need dedicated integer scratch (x28..x31).
-//    The Wimmer entry bailed on ANY f16 function before this task (`functionUsesF16` at the top of
-//    `compileFunctionWimmerRiscv`) because `riscv64RegDescription`'s class-0 pool always used the
-//    full `temp_regs`, including x28..x31 - had the entry bail been lifted without also shrinking the
+//    The Wimmer entry used to bail on ANY f16 function (`functionUsesF16` at the top of
+//    `compileFunctionWimmerRiscv`), because `riscv64RegDescription`'s class-0 pool always used the
+//    full `temp_regs`, including x28..x31. Had the entry bail been lifted without also shrinking the
 //    pool, a live value could have been placed in one of those registers and silently corrupted by
 //    the very next f16 conversion. These shapes reuse the differential style of `tests/f16.zig`.
 // ---------------------------------------------------------------------------
@@ -1057,14 +1060,14 @@ fn buildF16BinaryRv(func: *Function, op: ir.function.BinOp) !void {
     const a = try func.appendBlockParam(b, f16_t);
     const c = try func.appendBlockParam(b, f16_t);
     const r = try func.appendInst(b, f16_t, .{ .arith = .{ .op = op, .lhs = a, .rhs = c } });
-    func.setTerminator(b, .{ .ret = r });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
 }
 
 fn widenF16(x: f16) u32 {
     return @bitCast(@as(f32, x));
 }
 
-test "wimmer-rv: f16 add/sub/mul/div (software emulation, no Zfh) matches the reference (Gap B)" {
+test "wimmer-rv: f16 add/sub/mul/div (software emulation, no Zfh) matches the reference" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const ops = [_]ir.function.BinOp{ .add, .sub, .mul, .div };
@@ -1116,10 +1119,10 @@ fn buildF16SpillSumRv(func: *Function) !void {
     }
     var acc = vals[0];
     for (vals[1..]) |v| acc = try func.appendInst(b, f16_t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = v } });
-    func.setTerminator(b, .{ .ret = acc });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(acc) });
 }
 
-test "wimmer-rv: f16 register pressure spills and reloads bit-exact (Gap B)" {
+test "wimmer-rv: f16 register pressure spills and reloads bit-exact" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const a_vals = [_]f16{ 100.0, 0.0, -7.0, 42.0 };
@@ -1150,7 +1153,7 @@ const n_f16_int_mix = 20;
 /// Gap B, the scratch-exclusion shape: `f(a: f16, b: f16) -> i64`. Builds `n_f16_int_mix` (20) live
 /// integer temporaries derived from a seed (exceeding the f16-shrunk 13-register int pool, temp_regs_f16
 /// + saved_regs), keeps them ALL live across an f16 load-then-store round trip (which forces an
-/// `emitHalfToFloat` THEN an `emitFloatToHalf` through x28..x31 - see `f16_scratch_a`..`f16_scratch_d`),
+/// `emitHalfToFloat` THEN an `emitFloatToHalf` through x28..x31, see `f16_scratch_a`..`f16_scratch_d`),
 /// then reduces the integers and combines with the f16 round-trip result. If the shared allocator ever
 /// placed one of these 20 live integers in x28..x31 (the shrunk pool exists precisely to prevent that),
 /// the f16 conversion mid-function would silently clobber it and this would diverge from the reference.
@@ -1182,10 +1185,10 @@ fn buildF16IntMixRv(func: *Function) !void {
     var acc = ints[0];
     for (ints[1..]) |v| acc = try func.appendInst(b, i64_t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = v } });
     const result = try func.appendInst(b, i64_t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = hbits_out } });
-    func.setTerminator(b, .{ .ret = result });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(result) });
 }
 
-test "wimmer-rv: software f16 mixed with 20 live integers matches (Gap B scratch exclusion)" {
+test "wimmer-rv: software f16 mixed with 20 live integers matches (scratch exclusion)" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const cases = [_]struct { n: i64, half: f16 }{
@@ -1215,15 +1218,15 @@ test "wimmer-rv: software f16 mixed with 20 live integers matches (Gap B scratch
 }
 
 // ---------------------------------------------------------------------------
-// 10. SP3 Task 2 re-review: a 7th+ VPU float ENTRY param is a MATCHED SHARED LIMIT (bail, not
-//     miscompile). In vpu (et-soc) mode fa6/fa7 (f16/f17) sit inside the VPU vector partition
-//     (class 3), so pinning a 7th/8th scalar-float (class 1) param there would let the shared
-//     allocator land a scalar float on top of a live VPU vector - a silent alias. Both the shared
-//     Wimmer path (`riscv64RegDescription` / `translateAllocation`, `if (vpu and float_idx >= 6)`)
-//     and the native `allocateRegisters` (isel.zig `if (vpu and float_arg >= 6)`) REJECT this shape
-//     with `error.Unsupported`, so this is a feature-limit both paths decline identically, not a
-//     regression. No qemu differential is needed (there is nothing to run); the assertion is simply
-//     that BOTH compilers reject rather than emit.
+// 10. A 7th+ VPU float ENTRY param is a MATCHED SHARED LIMIT (bail, not miscompile). In vpu (et-soc)
+//     mode fa6/fa7 (f16/f17) sit inside the VPU vector partition (class 3), so pinning a 7th/8th
+//     scalar-float (class 1) param there would let the shared allocator land a scalar float on top
+//     of a live VPU vector, a silent alias. Both the shared Wimmer path (`riscv64RegDescription` /
+//     `translateAllocation`, `if (vpu and float_idx >= 6)`) and the native `allocateRegisters`
+//     (isel.zig `if (vpu and float_arg >= 6)`) REJECT this shape with `error.Unsupported`. This is a
+//     feature limit both paths decline identically, not a regression. No qemu differential is
+//     needed, because there is nothing to run. The assertion is simply that BOTH compilers reject
+//     rather than emit.
 // ---------------------------------------------------------------------------
 
 /// `f(a..g) = a + b + c + d + e + f + g`, SEVEN f32 params. Under vpu mode the 7th param (index 6)
@@ -1237,7 +1240,7 @@ fn buildSevenFloatParams(allocator: std.mem.Allocator) anyerror!Function {
     for (0..7) |i| ps[i] = try func.appendBlockParam(b, f32_t);
     var acc = ps[0];
     for (ps[1..]) |p| acc = try func.appendInst(b, f32_t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = p } });
-    func.setTerminator(b, .{ .ret = acc });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(acc) });
     return func;
 }
 
@@ -1258,7 +1261,7 @@ test "wimmer-rv: a 7th VPU float entry param bails (matched shared limit, not a 
     try std.testing.expectError(error.Unsupported, isel.compileFunction(allocator, &nat, .{ .vpu = true }));
 
     // Sanity: with SIX vpu float params (fa0..fa5, all outside the vector partition) the Wimmer path
-    // does NOT bail on this account - it compiles fine.
+    // does NOT bail on this account. It compiles fine.
     var six = Function.init(allocator);
     defer six.deinit();
     {
@@ -1268,7 +1271,7 @@ test "wimmer-rv: a 7th VPU float entry param bails (matched shared limit, not a 
         for (0..6) |i| ps[i] = try six.appendBlockParam(b, f32_t);
         var acc = ps[0];
         for (ps[1..]) |p| acc = try six.appendInst(b, f32_t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = p } });
-        six.setTerminator(b, .{ .ret = acc });
+        six.setTerminator(b, .{ .ret = ir.function.Ret.one(acc) });
     }
     try ir.legalize.legalize(allocator, &six);
     var compiled = try isel.compileFunctionWimmerRiscv(allocator, &six, true);
@@ -1276,17 +1279,18 @@ test "wimmer-rv: a 7th VPU float entry param bails (matched shared limit, not a 
 }
 
 // ---------------------------------------------------------------------------
-// N. Address-mode folding under register pressure (SP3 Task 3).
+// N. Address-mode folding under register pressure.
 //    The FOLD-AWARE Wimmer entry (`compileFunctionWimmerRiscvFold`) runs the pre-allocation IR
-//    rewrite (`applyFoldRewriteRiscv`) so folding is SOUND under the fold-blind shared allocator: it
-//    repoints each folded mem op's ptr to the fold base and DCEs the dead address-add BEFORE the scan,
-//    so `base` stays live to the load/store. Each shape keeps `base` live across a pressured region, so
-//    a fold-blind allocation that let `base` die at the add would reuse its register and the folded
-//    `off(base)` would read a stale register (the SP1/SP2 trap). We compile the same function through
-//    the fold-on reference (`selectFunction` via `harness.runFunc`) AND the fold-aware Wimmer path, run
-//    both under qemu-riscv64, assert bit-identical results, and prove the fold actually FIRED on the
-//    Wimmer-fold output via disassembly. The plain `compileFunctionWimmerRiscv` differential above
-//    stays on `empty_fold` (fold OFF) for byte-identity, so this is the only fold-on differential.
+//    rewrite (`applyFoldRewriteRiscv`) so folding is SOUND under the fold-blind shared allocator. It
+//    repoints each folded mem op's ptr to the fold base and DCEs the dead address-add BEFORE the
+//    scan, so `base` stays live to the load/store. Each shape keeps `base` live across a pressured
+//    region. A fold-blind allocation that let `base` die at the add would reuse its register, and the
+//    folded `off(base)` would then read a stale register, an earlier trap this rewrite avoids. We
+//    compile the same function through the fold-on reference (`selectFunction` via `harness.runFunc`)
+//    AND the fold-aware Wimmer path, run both under qemu-riscv64, assert bit-identical results, and
+//    prove the fold actually FIRED on the Wimmer-fold output via disassembly. The plain
+//    `compileFunctionWimmerRiscv` differential above stays on `empty_fold` (fold OFF) for
+//    byte-identity, so this is the only fold-on differential.
 // ---------------------------------------------------------------------------
 
 const fold_pressure = 24;
@@ -1372,8 +1376,8 @@ fn expectFoldMatch(io: std.Io, comptime build: fn (std.mem.Allocator) anyerror!F
 /// whose only use is the successor load). On cond > 0, then_b builds `fold_pressure` live temps BEFORE
 /// loading [p] (which folds to `8(buf0)`), so a fold-blind allocation that let buf0 die at the add
 /// would hand buf0's register to a temp and the folded load would read garbage. buf0's cross-branch
-/// liveness flows ONLY through the folded load's base, so the rewrite must reroute it. Expected(cond>0)
-/// = arg + sum_{k=1..P}(cond + k); Expected(cond<=0) = cond.
+/// liveness flows ONLY through the folded load's base, so the rewrite must reroute it.
+/// Expected(cond>0) = arg + sum_{k=1..P}(cond + k). Expected(cond<=0) = cond.
 fn buildFoldLoadPressure(allocator: std.mem.Allocator) anyerror!Function {
     var func = Function.init(allocator);
     errdefer func.deinit();
@@ -1401,8 +1405,8 @@ fn buildFoldLoadPressure(allocator: std.mem.Allocator) anyerror!Function {
     const w = try func.appendInst(then_b, i64_t, .{ .load = .{ .ptr = p } }); // folds to 8(buf0) = arg
     var acc = w;
     for (0..fold_pressure) |k| acc = try func.appendInst(then_b, i64_t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = vals[k] } });
-    func.setTerminator(then_b, .{ .ret = acc });
-    func.setTerminator(else_b, .{ .ret = cond });
+    func.setTerminator(then_b, .{ .ret = ir.function.Ret.one(acc) });
+    func.setTerminator(else_b, .{ .ret = ir.function.Ret.one(cond) });
     return func;
 }
 
@@ -1449,7 +1453,7 @@ fn buildFoldStorePressure(allocator: std.mem.Allocator) anyerror!Function {
     for (1..fold_pressure) |k| sum = try func.appendInst(e, i64_t, .{ .arith = .{ .op = .add, .lhs = sum, .rhs = vals[k] } });
     try func.appendStore(e, sum, p); // folds to 8(buf0) = buf1
     const r = try func.appendInst(e, i64_t, .{ .load = .{ .ptr = buf1 } }); // reads back (own pointer, off 0)
-    func.setTerminator(e, .{ .ret = r });
+    func.setTerminator(e, .{ .ret = ir.function.Ret.one(r) });
     return func;
 }
 

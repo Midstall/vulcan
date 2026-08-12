@@ -102,11 +102,11 @@ test "neutralizeUnreachable empties exactly the unreachable block" {
     const b2 = try func.appendBlock();
 
     try func.setJump(entry, b1, &.{});
-    func.setTerminator(b1, .{ .ret = null });
+    func.setTerminator(b1, .{ .ret = function.Ret.none() });
 
     _ = try func.appendBlockParam(b2, i32_t);
     _ = try func.appendInst(b2, i32_t, .{ .iconst = 7 });
-    func.setTerminator(b2, .{ .ret = null });
+    func.setTerminator(b2, .{ .ret = function.Ret.none() });
 
     const reachable = try neutralizeUnreachable(std.testing.allocator, &func);
     defer std.testing.allocator.free(reachable);
@@ -139,7 +139,7 @@ test "neutralizeUnreachable is a no-op for an all-reachable function" {
     const cond = try func.appendInst(entry, bool_t, .{ .iconst = 1 });
     try func.appendIf(entry, cond, .{ .target = a }, .{ .target = b });
     try func.setJump(a, b, &.{});
-    func.setTerminator(b, .{ .ret = null });
+    func.setTerminator(b, .{ .ret = function.Ret.none() });
 
     const reachable = try neutralizeUnreachable(std.testing.allocator, &func);
     defer std.testing.allocator.free(reachable);

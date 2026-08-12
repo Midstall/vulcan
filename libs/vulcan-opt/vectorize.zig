@@ -567,6 +567,15 @@ fn valueUseCount(func: *const Function, v: Value) usize {
                 .prefetch => |x| if (x.ptr == v) {
                     n += 1;
                 },
+                .va_start => |x| if (x.list == v) {
+                    n += 1;
+                },
+                .va_arg => |x| if (x.list == v) {
+                    n += 1;
+                },
+                .va_end => |x| if (x.list == v) {
+                    n += 1;
+                },
                 .dot => |x| {
                     if (x.acc == v) n += 1;
                     if (x.a == v) n += 1;
@@ -601,7 +610,7 @@ fn valueUseCount(func: *const Function, v: Value) usize {
             }
         }
         if (func.terminator(block)) |term| switch (term) {
-            .ret => |rv| if (rv) |vv| {
+            .ret => |r| for (r.slice()) |vv| {
                 if (vv == v) n += 1;
             },
             .jump => |j| for (func.blockArgs(j)) |arg| {
@@ -746,8 +755,8 @@ fn coalesceStoreRun(allocator: std.mem.Allocator, func: *Function, block: Block,
         if (!ok) continue;
         // Rewrite store 0 in place to store the whole vector to its (lane-0) address, and drop the
         // other `lanes-1` scalar stores. Their now-dead extracts fall to `cleanup`.
-        const ptr0 = func.opcode(insts[store_positions[0]]).store.ptr;
-        func.opcodeMut(insts[store_positions[0]]).* = .{ .store = .{ .value = vec, .ptr = ptr0 } };
+        const st0 = func.opcode(insts[store_positions[0]]).store;
+        func.opcodeMut(insts[store_positions[0]]).* = .{ .store = .{ .value = vec, .ptr = st0.ptr, .@"volatile" = st0.@"volatile" } };
         var drop: [MAX_LANES]Inst = undefined;
         for (1..lanes) |j| drop[j - 1] = insts[store_positions[j]];
         try removeInsts(allocator, func, block, drop[0 .. lanes - 1]);
@@ -810,6 +819,8 @@ fn isPure(op: ir.function.Opcode) bool {
     return switch (op) {
         .iconst, .fconst, .arith, .arith_imm, .icmp, .select, .struct_new, .extract, .convert, .unary, .alloca, .global_addr, .dot => true,
         .load, .store, .prefetch, .matmul, .@"if", .call, .call_indirect => false,
+        // SM12 T3: mutate/read the `va_list` object at `list`, like `load`/`store` above.
+        .va_start, .va_arg, .va_end => false,
     };
 }
 
@@ -846,6 +857,9 @@ fn countUses(func: *const Function, uses: []u32) void {
                     uses[@intFromEnum(x.ptr)] += 1;
                 },
                 .prefetch => |x| uses[@intFromEnum(x.ptr)] += 1,
+                .va_start => |x| uses[@intFromEnum(x.list)] += 1,
+                .va_arg => |x| uses[@intFromEnum(x.list)] += 1,
+                .va_end => |x| uses[@intFromEnum(x.list)] += 1,
                 .dot => |x| {
                     uses[@intFromEnum(x.acc)] += 1;
                     uses[@intFromEnum(x.a)] += 1;
@@ -874,7 +888,7 @@ fn countUses(func: *const Function, uses: []u32) void {
             }
         }
         if (func.terminator(block)) |term| switch (term) {
-            .ret => |v| if (v) |vv| {
+            .ret => |r| for (r.slice()) |vv| {
                 uses[@intFromEnum(vv)] += 1;
             },
             .jump => |j| for (func.blockArgs(j)) |arg| {
@@ -902,7 +916,7 @@ fn parallelAdds(n: usize) !Function {
         const c = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .add, .lhs = params_a[i], .rhs = params_b[i] } });
         if (first == null) first = c;
     }
-    func.setTerminator(block, .{ .ret = first.? });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(first.?) });
     return func;
 }
 
@@ -951,7 +965,7 @@ fn parallelIntOps(n: usize, op: BinOp) !Function {
         const c = try func.appendInst(block, i32_t, .{ .arith = .{ .op = op, .lhs = params_a[i], .rhs = params_b[i] } });
         if (first == null) first = c;
     }
-    func.setTerminator(block, .{ .ret = first.? });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(first.?) });
     return func;
 }
 
@@ -1139,7 +1153,7 @@ fn buildMemElementwise(op: BinOp, n: usize, store_between: bool) !Function {
         const addr = try func.appendArithImm(block, ptr_t, .add, ptr_out, @intCast(i * 4));
         try func.appendStore(block, cv[i], addr);
     }
-    func.setTerminator(block, .{ .ret = null });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.none() });
     return func;
 }
 
@@ -1250,6 +1264,6 @@ fn buildMemElementwiseInt(op: BinOp, n: usize) !Function {
         const addr = try func.appendArithImm(block, ptr_t, .add, ptr_out, @intCast(i * 4));
         try func.appendStore(block, cv[i], addr);
     }
-    func.setTerminator(block, .{ .ret = null });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.none() });
     return func;
 }

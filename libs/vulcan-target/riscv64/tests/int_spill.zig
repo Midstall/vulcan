@@ -1,24 +1,26 @@
 //! Integer register allocation under loop pressure, executed on qemu-riscv64 (the oracle). Two
 //! independent properties the riscv64 allocator gained:
 //!
-//!   1. SAME-POSITION REGISTER OVER-DEMAND LIMIT. After the SP3 Wimmer cutover, integer allocation is
-//!      the SHARED Wimmer-Franz allocator. A loop that parallel-moves more simultaneously-live integer
-//!      values into its header params at ONE position than the 17 allocatable integer registers exceeds
-//!      the shared allocator's must-have-register demand and is rejected with `error.Unsupported`, the
-//!      same limit aarch64 shares (the retired native riscv scan happened to spill this shape instead,
-//!      but the shared allocator does not, and it is not weakened to restore that). The first test
-//!      carries 26 loop-live int params and pins that documented over-demand rejection. Integer SPILL
-//!      of instruction results under pressure is covered by the fan-reduce/tail-split/re-home/decline
-//!      tests below, which spill and reload through the shared path and run bit-exact on qemu.
+//!   1. SAME-POSITION REGISTER OVER-DEMAND LIMIT. Integer allocation now uses the SHARED
+//!      Wimmer-Franz allocator, since this backend switched its register allocator over to it.
+//!      A loop that parallel-moves more simultaneously-live integer values into its header params
+//!      at ONE position than the 17 allocatable integer registers exceeds the shared allocator's
+//!      must-have-register demand and is rejected with `error.Unsupported`, the same limit
+//!      aarch64 shares (the retired native riscv scan happened to spill this shape instead, but
+//!      the shared allocator does not, and it is not weakened to restore that). The first test
+//!      carries 26 loop-live int params and pins that documented over-demand rejection. Integer
+//!      SPILL of instruction results under pressure is covered by the fan-reduce/tail-split/
+//!      re-home/decline tests below, which spill and reload through the shared path and run
+//!      bit-exact on qemu.
 //!
 //!   2. ACROSS-BACK-EDGE LIVENESS. A value defined in the entry block and read inside a loop body,
 //!      but NOT threaded as a loop block param, is live across the loop's back-edge. The old naive
 //!      forward liveness pass ended that value's live range at its textual use in the body, so the
-//!      register was freed and immediately reused by the next body temp (the free list is LIFO); the
-//!      next iteration then read that temp instead of the invariant, a silent miscompile.
+//!      register was freed and immediately reused by the next body temp (the free list is LIFO).
+//!      The next iteration then read that temp instead of the invariant, a silent miscompile.
 //!      `extendLiveRanges` (a live-in/out CFG fixpoint) now keeps the value live across the whole
-//!      body. The second test builds exactly that shape and checks it computes correctly - before the
-//!      fix it read garbage.
+//!      body. The second test builds exactly that shape and checks it computes correctly. Before
+//!      the fix it read garbage.
 
 const std = @import("std");
 const ir = @import("vulcan-ir");
@@ -36,7 +38,7 @@ const n_acc = 24;
 /// Build a single-loop function that threads `i`, `n`, and `n_acc` accumulators as block params
 /// (26 simultaneously-live integers) so the integer file is exhausted and the surplus params spill:
 ///
-///   f(n): a[k] = k+1 for k in 0..n_acc; for i in 0..n: a[k] += i; return sum(a)
+///   f(n): a[k] = k+1 for k in 0..n_acc. for i in 0..n: a[k] += i. return sum(a)
 ///
 /// Every accumulator is summed at the end, so all stay live across the loop (nothing can be dropped).
 /// The updates and the final reduction are pure `arith`/`icmp`, whose operands reload from spill slots
@@ -104,14 +106,14 @@ fn buildAccumNest(allocator: std.mem.Allocator) !Function {
     for (0..n_acc) |k| e_acc[k] = try func.appendBlockParam(exit, i64_t);
     var sum = e_acc[0];
     for (1..n_acc) |k| sum = try func.appendInst(exit, i64_t, .{ .arith = .{ .op = .add, .lhs = sum, .rhs = e_acc[k] } });
-    func.setTerminator(exit, .{ .ret = sum });
+    func.setTerminator(exit, .{ .ret = ir.function.Ret.one(sum) });
 
     return func;
 }
 
 test "int-spill: a 26-live-int-param loop nest exceeds the shared allocator's same-position register demand and is rejected" {
-    // After the SP3 Wimmer cutover, integer register allocation is the SHARED Wimmer-Franz allocator
-    // (wimmer.zig), the same one aarch64 and x86_64 flipped to. That allocator rejects a function whose
+    // Integer register allocation is the SHARED Wimmer-Franz allocator (wimmer.zig), since this
+    // backend switched over to it, the same one aarch64 and x86_64 also switched to. That allocator rejects a function whose
     // MUST-HAVE-REGISTER demand at a single position exceeds the class register pool: the back-edge here
     // parallel-moves all 26 loop-carried integers into the header params at one position, and 26 > 17
     // allocatable integer registers, so `spillCurrent` bails `error.Unsupported` (wimmer.zig, the
@@ -135,7 +137,7 @@ test "int-spill: a 26-live-int-param loop nest exceeds the shared allocator's sa
 /// Build a loop whose invariant `C` is defined in the entry block and read inside the body but is NOT
 /// threaded as a block param, so it is live across the back-edge:
 ///
-///   f(n): C = n + n; acc = 0; for i in 0..n: acc = (acc + C) + i; return acc
+///   f(n): C = n + n. acc = 0. for i in 0..n: acc = (acc + C) + i. return acc
 ///
 /// `C` derives from the runtime argument (so it cannot be folded into an immediate or a constant, and
 /// stays a real register value), and its only textual use is `acc + C` at the top of the body. Without
@@ -170,7 +172,7 @@ fn buildInvariantLoop(allocator: std.mem.Allocator) !Function {
     const b_i = try func.appendBlockParam(body, i64_t);
     const b_n = try func.appendBlockParam(body, i64_t);
     const b_acc = try func.appendBlockParam(body, i64_t);
-    // s = acc + C reads the across-back-edge invariant; acc1 = s + i is the temp that would reuse
+    // s = acc + C reads the across-back-edge invariant. acc1 = s + i is the temp that would reuse
     // C's register without the live-range extension.
     const s = try func.appendInst(body, i64_t, .{ .arith = .{ .op = .add, .lhs = b_acc, .rhs = c } });
     const acc1 = try func.appendInst(body, i64_t, .{ .arith = .{ .op = .add, .lhs = s, .rhs = b_i } });
@@ -178,7 +180,7 @@ fn buildInvariantLoop(allocator: std.mem.Allocator) !Function {
     try func.setJump(body, header, &.{ next_i, b_n, acc1 });
 
     const e_acc = try func.appendBlockParam(exit, i64_t);
-    func.setTerminator(exit, .{ .ret = e_acc });
+    func.setTerminator(exit, .{ .ret = ir.function.Ret.one(e_acc) });
 
     return func;
 }
@@ -215,7 +217,7 @@ const n_fan = 30;
 /// exhausting the integer file at instruction-RESULT sites (not block params) so eviction drives which
 /// value spills:
 ///
-///   f(n): a[k] = n*(k+1) + k for k in 0..n_fan; return sum_k a[k]
+///   f(n): a[k] = n*(k+1) + k for k in 0..n_fan. return sum_k a[k]
 ///
 /// Every `a[k]` is created before any is consumed (so all `n_fan` are live at once), then reduced in a
 /// staggered order that gives each a distinct next-use position, so the Belady victim genuinely differs
@@ -248,7 +250,7 @@ fn buildFanReduce(allocator: std.mem.Allocator) !Function {
         sum = try func.appendInst(entry, i64_t, .{ .arith = .{ .op = .add, .lhs = sum, .rhs = a[j] } });
         if (j == 1) break;
     }
-    func.setTerminator(entry, .{ .ret = sum });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(sum) });
 
     return func;
 }
@@ -289,7 +291,7 @@ const n_split = 24;
 /// tail-splits it (register prefix `[def, p)`, stack slot `[p, end)`) rather than whole-spilling. The
 /// late reduction then reads the tail from its slot, so a wrong store/reload diverges from the sum.
 ///
-///   f(n): a[k] = n*(k+1) + k for k in 0..n_split; return a[n_split-1] + a[n_split-2] + ... + a[0]
+///   f(n): a[k] = n*(k+1) + k for k in 0..n_split. return a[n_split-1] + a[n_split-2] + ... + a[0]
 fn buildTailSplit(allocator: std.mem.Allocator) !Function {
     var func = Function.init(allocator);
     errdefer func.deinit();
@@ -313,7 +315,7 @@ fn buildTailSplit(allocator: std.mem.Allocator) !Function {
         k -= 1;
         sum = try func.appendInst(entry, i64_t, .{ .arith = .{ .op = .add, .lhs = sum, .rhs = a[k] } });
     }
-    func.setTerminator(entry, .{ .ret = sum });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(sum) });
 
     return func;
 }
@@ -360,7 +362,7 @@ const n_rehome = 20;
 /// the terms the register pressure drops, so by `t0`'s late use a register is free again and
 /// second-chance RE-HOMES `t0` into it: its final use reads that register instead of reloading the slot.
 ///
-///   f(a, b): t0 = a*b; for k in 1..=20: term[k] = a*k + b; return sum(term) + t0
+///   f(a, b): t0 = a*b. for k in 1..=20: term[k] = a*k + b. return sum(term) + t0
 fn buildReHome(allocator: std.mem.Allocator) !Function {
     var func = Function.init(allocator);
     errdefer func.deinit();
@@ -382,7 +384,7 @@ fn buildReHome(allocator: std.mem.Allocator) !Function {
     for (1..n_rehome) |k| acc = try func.appendInst(entry, i64_t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = term[k] } });
     // The late use of t0: with second-chance it reads a re-homed register, not a per-use slot reload.
     const result = try func.appendInst(entry, i64_t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = t0 } });
-    func.setTerminator(entry, .{ .ret = result });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(result) });
 
     return func;
 }
@@ -401,7 +403,7 @@ test "int-spill: second-chance reload re-homes a spilled int value (qemu-riscv64
     defer func.deinit();
 
     // Meaningful-differential gate: a second-chance re-home MUST have fired (a `.reg` segment after a
-    // `.slot` segment). Without it this would only exercise the Task 6c tail-split + per-use reload.
+    // `.slot` segment). Without it, this would only exercise the tail-split plus per-use reload.
     try std.testing.expect(try isel.debugReHomeCount(allocator, &func) > 0);
 
     // Then execute on qemu across a sweep (zero, unit, negatives, and large magnitudes): a re-home
@@ -423,7 +425,7 @@ test "int-spill: second-chance reload re-homes a spilled int value (qemu-riscv64
 /// position, so before the terminator drain the reload was dropped and `ret` returned a stale register.
 /// The reduction's final `acc` is deliberately unreturned: it exists only to raise then relieve pressure.
 ///
-///   f(a, b): t0 = a*b; for k in 1..=20: term[k] = a*k + b; return t0
+///   f(a, b): t0 = a*b. for k in 1..=20: term[k] = a*k + b. return t0
 fn buildTerminatorReHome(allocator: std.mem.Allocator) !Function {
     var func = Function.init(allocator);
     errdefer func.deinit();
@@ -443,7 +445,7 @@ fn buildTerminatorReHome(allocator: std.mem.Allocator) !Function {
     var acc = term[0];
     for (1..n_rehome) |k| acc = try func.appendInst(entry, i64_t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = term[k] } });
     // Return t0 directly, so its sole use is the terminator and any re-home of it lands there.
-    func.setTerminator(entry, .{ .ret = t0 });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(t0) });
 
     return func;
 }
@@ -494,7 +496,7 @@ const n_decline_res = 12;
 /// given point). The split products are used late, bracketed by two reductions over the twice-used
 /// residents, so the file stays busy across their uses:
 ///
-///   f(a, b): sp[k] = a*(k+1); res[k] = b + (100+k); return sum(res) + sum(sp) + sum(res)
+///   f(a, b): sp[k] = a*(k+1). res[k] = b + (100+k). return sum(res) + sum(sp) + sum(res)
 fn buildDecline(allocator: std.mem.Allocator) !Function {
     var func = Function.init(allocator);
     errdefer func.deinit();
@@ -516,7 +518,7 @@ fn buildDecline(allocator: std.mem.Allocator) !Function {
     for (1..n_decline_res) |k| acc = try func.appendInst(entry, i64_t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = res[k] } });
     for (0..n_decline_split) |k| acc = try func.appendInst(entry, i64_t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = sp[k] } });
     for (0..n_decline_res) |k| acc = try func.appendInst(entry, i64_t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = res[k] } });
-    func.setTerminator(entry, .{ .ret = acc });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(acc) });
 
     return func;
 }
@@ -535,11 +537,11 @@ test "int-spill: second-chance declines when no register is free (qemu-riscv64)"
     var func = try buildDecline(allocator);
     defer func.deinit();
 
-    // Meaningful gate under the shared Wimmer allocator (the SP3 flip): this high-pressure kernel must
+    // Meaningful gate under the shared Wimmer allocator: this high-pressure kernel must
     // both SPLIT values (a register prefix plus a spill tail) AND RE-HOME at least one (a `.reg`
     // segment after a `.slot`, i.e. reloaded back into a register for its tail uses). The old
     // allocator's "decline" counter (a per-position second-chance book-keeping value) has no analog in
-    // the shared allocator, so it is dropped; the split + re-home gates plus the execution sweep below
+    // the shared allocator, so it is dropped. The split + re-home gates plus the execution sweep below
     // still prove the pressure shape lowers correctly, including the per-use slot reload path.
     const splits = try isel.splitCountForTest(allocator, &func);
     const rehomes = try isel.debugReHomeCount(allocator, &func);

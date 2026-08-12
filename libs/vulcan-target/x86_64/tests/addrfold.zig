@@ -1,23 +1,24 @@
-//! Address-mode folding (Task 7), executed on x86-64 (native in-process on an x86-64 host, and
-//! under qemu-x86_64 everywhere qemu is installed). A load or store whose pointer is a foldable
-//! `arith_imm.add(base, imm)` addresses `[base + disp32]` directly: the address-add is dropped and
-//! the mem op carries a signed-32 displacement. x86-64 has no load-pair, so the win is add-elision
-//! plus the folded displacement.
+//! Address-mode folding, executed on x86-64 (native in-process on an x86-64 host, and under
+//! qemu-x86_64 everywhere qemu is installed). A load or store whose pointer is a foldable
+//! `arith_imm.add(base, imm)` addresses `[base + disp32]` directly: the address-add is
+//! dropped, and the mem op carries a signed-32 displacement. x86-64 has no load-pair, so the
+//! win is add-elision plus the folded displacement.
 //!
-//! Every buffer lives IN THE GUEST as a run of consecutive `alloca` slots. `computeAllocaSlots` lays
-//! same-size, same-alignment allocas out back-to-back, so `buf0 + size*j` is exactly `buf_j`. Each
-//! alloca is kept alive by an instruction that references it (an init store, or the address-add whose
-//! base it is), so none is dropped before the frame is sized. Loads and stores stay in program order,
-//! so an init store always precedes the folded load that reads it back.
+//! Every buffer lives IN THE GUEST as a run of consecutive `alloca` slots. `computeAllocaSlots`
+//! lays same-size, same-alignment allocas out back-to-back, so `buf0 + size*j` is exactly
+//! `buf_j`. Each alloca is kept alive by an instruction that references it (an init store, or
+//! the address-add whose base it is), so none is dropped before the frame is sized. Loads and
+//! stores stay in program order, so an init store always precedes the folded load that reads
+//! it back.
 //!
-//! Each test also proves the fold FIRED: `foldedMemOps` disassembles the compiled code and counts
-//! memory accesses that carry a nonzero displacement off a base register other than rsp. A spill,
-//! alloca, or frame access addresses off rsp, so filtering base != rsp isolates the folded memory
-//! ops. Without folding every mem op addresses `[base]` (no displacement) and the count is zero, so a
-//! stuck assertion catches a fold that silently stopped firing.
+//! Each test also proves the fold FIRED: `foldedMemOps` disassembles the compiled code and
+//! counts memory accesses that carry a nonzero displacement off a base register other than
+//! rsp. A spill, alloca, or frame access addresses off rsp, so filtering base != rsp isolates
+//! the folded memory ops. Without folding, every mem op addresses `[base]` (no displacement),
+//! and the count is zero, so a stuck assertion catches a fold that silently stopped firing.
 //!
-//! Results are checked modulo 256 (a process exit code / native return is read as one byte), so the
-//! sweep values are chosen to differ in their low byte.
+//! Results are checked modulo 256 (a process exit code or native return is read as one byte),
+//! so the sweep values are chosen to differ in their low byte.
 
 const std = @import("std");
 const ir = @import("vulcan-ir");
@@ -33,11 +34,12 @@ const i32k = ir.types.TypeKind{ .int = .{ .signedness = .signed, .bits = 32 } };
 const i16k = ir.types.TypeKind{ .int = .{ .signedness = .signed, .bits = 16 } };
 const i8k = ir.types.TypeKind{ .int = .{ .signedness = .signed, .bits = 8 } };
 
-/// Count memory accesses in `func`'s compiled code that carry a NONZERO displacement off a base
-/// register other than rsp. A folded constant-index load/store disassembles as `mov rd, ptr [base +
-/// off]` / `movss xmm, [base + off]` and the like, with off != 0 and base != rsp. Spill, alloca, and
-/// frame accesses address off rsp (a lea also renders `[rsp + off]`), so requiring base != rsp
-/// excludes them. Zero unless address folding fired.
+/// Count memory accesses in `func`'s compiled code that carry a NONZERO displacement off a
+/// base register other than rsp. A folded constant-index load or store disassembles as
+/// `mov rd, ptr [base + off]` or `movss xmm, [base + off]`, and the like, with off != 0 and
+/// base != rsp. Spill, alloca, and frame accesses address off rsp (a lea also renders
+/// `[rsp + off]`), so requiring base != rsp excludes them. The count is zero unless address
+/// folding fired.
 fn foldedMemOps(allocator: std.mem.Allocator, func: *Function) !usize {
     const code = try isel.selectFunction(allocator, func);
     defer allocator.free(code);
@@ -49,11 +51,11 @@ fn foldedMemOps(allocator: std.mem.Allocator, func: *Function) !usize {
     while (lines.next()) |line| {
         const lb = std.mem.indexOfScalar(u8, line, '[') orelse continue;
         const rb = std.mem.indexOfScalarPos(u8, line, lb, ']') orelse continue;
-        const inner = line[lb + 1 .. rb]; // e.g. "rbx + 4" or "rsp + 8" or "rax"
+        const inner = line[lb + 1 .. rb]; // for example "rbx + 4" or "rsp + 8" or "rax"
         const base_end = std.mem.indexOfScalar(u8, inner, ' ') orelse inner.len;
         const base = inner[0..base_end];
         if (std.mem.eql(u8, base, "rsp")) continue; // spill / alloca / frame, not a fold
-        // A folded access carries a displacement (" + N" or " - N"); a plain `[base]` load does not.
+        // A folded access carries a displacement (" + N" or " - N"). A plain `[base]` load does not.
         if (std.mem.indexOf(u8, inner, " + ") != null or std.mem.indexOf(u8, inner, " - ") != null) count += 1;
     }
     return count;
@@ -128,7 +130,7 @@ fn buildCopy(allocator: std.mem.Allocator) !Function {
         const w = try func.appendInst(e, i64_t, .{ .load = .{ .ptr = rp } });
         acc = if (acc) |a| try func.appendInst(e, i64_t, .{ .arith = .{ .op = .add, .lhs = a, .rhs = w } }) else w;
     }
-    func.setTerminator(e, .{ .ret = acc.? });
+    func.setTerminator(e, .{ .ret = ir.function.Ret.one(acc.?) });
     return func;
 }
 
@@ -150,9 +152,9 @@ test "x86_64 addrfold: constant-index i64 copy folds and computes correctly" {
 // --- test 2: byte, halfword, word, and floating-point folds -----------------------------------------
 
 /// f(arg): buf[j] = arg + j (as an `elem`-typed slot) for j in 0..4; return sum of folded loads
-/// buf0 + size*j. `elem` is i8 (size 1) / i16 (size 2) / i32 (size 4), so a wrong displacement scale
-/// would read the wrong element. The sum is taken in i32 to avoid narrow overflow. Expected =
-/// sum(trunc(arg + j)).
+/// buf0 + size*j. `elem` is i8 (size 1), i16 (size 2), or i32 (size 4), so a wrong displacement
+/// scale would read the wrong element. The sum is taken in i32 to avoid narrow overflow.
+/// Expected = sum(trunc(arg + j)).
 fn buildNarrowSum(allocator: std.mem.Allocator, comptime kind: ir.types.TypeKind, comptime size: usize) !Function {
     var func = Function.init(allocator);
     errdefer func.deinit();
@@ -178,7 +180,7 @@ fn buildNarrowSum(allocator: std.mem.Allocator, comptime kind: ir.types.TypeKind
         const w = try func.appendInst(e, i32_t, .{ .convert = .{ .value = v } }); // sign-extend to i32
         acc = if (acc) |a| try func.appendInst(e, i32_t, .{ .arith = .{ .op = .add, .lhs = a, .rhs = w } }) else w;
     }
-    func.setTerminator(e, .{ .ret = acc.? });
+    func.setTerminator(e, .{ .ret = ir.function.Ret.one(acc.?) });
     return func;
 }
 
@@ -204,7 +206,7 @@ fn buildFpField(allocator: std.mem.Allocator, comptime kind: ir.types.TypeKind, 
     const p = try func.appendInst(e, ptr_t, .{ .arith_imm = .{ .op = .add, .lhs = s0, .imm = @intCast(size) } }); // = s1 addr
     const v = try func.appendInst(e, flt_t, .{ .load = .{ .ptr = p } }); // folds to size(s0)
     const r = try func.appendInst(e, i32_t, .{ .convert = .{ .value = v } }); // float -> i32
-    func.setTerminator(e, .{ .ret = r });
+    func.setTerminator(e, .{ .ret = ir.function.Ret.one(r) });
     return func;
 }
 
@@ -259,13 +261,13 @@ test "x86_64 addrfold: byte/half/word/fp constant-index loads fold and compute" 
 
 const xblock_pressure = 8;
 
-/// f(arg, cond): in ENTRY, buf1 = arg and `p = buf0 + 8` (= buf1's address, a DEAD add: its only use
-/// is the load in the successor). On cond > 0, `then_b` first builds several live values (so the free
-/// list would hand a temp `buf0`'s register if `buf0` were treated as dead after entry), then loads
-/// [p] (folds to `8(buf0)`) and reduces. The load's pointer use must be attributed to `buf0` in the
-/// SUCCESSOR block, so `buf0` stays live across the branch; miss the reroute and a temp steals its
-/// register and the folded load reads a garbage address. Expected(cond>0) = arg + sum(cond + k),
-/// k in 1..P; Expected(cond<=0) = cond.
+/// f(arg, cond): in ENTRY, buf1 = arg and `p = buf0 + 8` (= buf1's address, a DEAD add: its only
+/// use is the load in the successor). On cond > 0, `then_b` first builds several live values (so
+/// the free list would hand a temp `buf0`'s register if `buf0` were treated as dead after entry),
+/// then loads [p] (folds to `8(buf0)`) and reduces. The load's pointer use must be attributed to
+/// `buf0` in the SUCCESSOR block, so `buf0` stays live across the branch. Miss the reroute, and a
+/// temp steals its register, and the folded load reads a garbage address.
+/// Expected(cond>0) = arg + sum(cond + k), k in 1..P. Expected(cond<=0) = cond.
 fn buildCrossBlock(allocator: std.mem.Allocator) !Function {
     var func = Function.init(allocator);
     errdefer func.deinit();
@@ -296,8 +298,8 @@ fn buildCrossBlock(allocator: std.mem.Allocator) !Function {
     const w = try func.appendInst(then_b, i64_t, .{ .load = .{ .ptr = p } }); // folds to 8(buf0) = buf1 = arg
     var acc = w;
     for (0..xblock_pressure) |k| acc = try func.appendInst(then_b, i64_t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = vals[k] } });
-    func.setTerminator(then_b, .{ .ret = acc });
-    func.setTerminator(else_b, .{ .ret = cond });
+    func.setTerminator(then_b, .{ .ret = ir.function.Ret.one(acc) });
+    func.setTerminator(else_b, .{ .ret = ir.function.Ret.one(cond) });
     return func;
 }
 
@@ -344,7 +346,7 @@ fn buildLiveAdd(allocator: std.mem.Allocator) !Function {
     const v = try func.appendInst(e, i64_t, .{ .load = .{ .ptr = p } }); // folds to 8(buf0) = arg
     const d = try func.appendInst(e, i64_t, .{ .arith = .{ .op = .sub, .lhs = p, .rhs = buf0 } }); // = 8, keeps p live
     const r = try func.appendInst(e, i64_t, .{ .arith = .{ .op = .add, .lhs = v, .rhs = d } }); // arg + 8
-    func.setTerminator(e, .{ .ret = r });
+    func.setTerminator(e, .{ .ret = ir.function.Ret.one(r) });
     return func;
 }
 

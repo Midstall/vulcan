@@ -2559,16 +2559,16 @@ fn vectorElemType(module: *const Module, type_id: u32) ?Type {
 
 fn lowerTerminator(allocator: std.mem.Allocator, func: *Function, module: *const Module, value_of: []const ?Value, blocks: []const BlockInfo, bi: usize, insts: []const binary.Instruction, inst: binary.Instruction) Error!void {
     switch (inst.opcode) {
-        op.Return, op.Unreachable => func.setTerminator(blocks[bi].block, .{ .ret = null }),
+        op.Return, op.Unreachable => func.setTerminator(blocks[bi].block, .{ .ret = ir.function.Ret.none() }),
         op.Kill => {
             // discard: call the synthesized discard_fn (a CPU backend signals the kill;
             // a GPU/TGSI backend emits a KILL for the call), then end the block.
             const df = module.discard_fn orelse return error.MalformedModule;
             const void_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 0 } });
             _ = try func.appendCallIndirect(blocks[bi].block, void_t, df, &.{});
-            func.setTerminator(blocks[bi].block, .{ .ret = null });
+            func.setTerminator(blocks[bi].block, .{ .ret = ir.function.Ret.none() });
         },
-        op.ReturnValue => func.setTerminator(blocks[bi].block, .{ .ret = value_of[try idOperandAt(inst.operands, 0, value_of.len)] orelse return error.MalformedModule }),
+        op.ReturnValue => func.setTerminator(blocks[bi].block, .{ .ret = ir.function.Ret.one(value_of[try idOperandAt(inst.operands, 0, value_of.len)] orelse return error.MalformedModule) }),
         op.Branch => {
             const target = blockIndex(blocks, try operandAt(inst.operands, 0));
             const args = try phiArgs(allocator, module, value_of, blocks, target, blocks[bi].label, insts);

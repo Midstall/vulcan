@@ -40,7 +40,7 @@ fn doubles(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {
         const x = try f.appendBlockParam(b, t);
         const y = try f.appendBlockParam(b, t);
         const r = try f.appendInst(b, t, .{ .arith = .{ .op = c.op, .lhs = x, .rhs = y } });
-        f.setTerminator(b, .{ .ret = r });
+        f.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
         const expected: f64 = switch (c.op) {
             .add => c.x + c.y,
             .sub => c.x - c.y,
@@ -60,7 +60,7 @@ fn doubles(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {
         const one = try f.appendInst(b, t, .{ .fconst = 1.0 });
         const p = try f.appendInst(b, t, .{ .arith = .{ .op = .mul, .lhs = x, .rhs = two } });
         const s = try f.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = p, .rhs = one } });
-        f.setTerminator(b, .{ .ret = s });
+        f.setTerminator(b, .{ .ret = ir.function.Ret.one(s) });
         const xv: f64 = 3.3;
         try h.expectRunDouble(io, allocator, &f, &.{xv}, xv * 2.0 + 1.0, backend);
     }
@@ -76,7 +76,7 @@ fn doubles(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {
             const y = try f.appendBlockParam(b, t);
             const lt = try f.appendInst(b, bool_t, .{ .icmp = .{ .op = .lt, .lhs = x, .rhs = y } });
             const m = try f.appendInst(b, t, .{ .select = .{ .cond = lt, .then = x, .@"else" = y } });
-            f.setTerminator(b, .{ .ret = m });
+            f.setTerminator(b, .{ .ret = ir.function.Ret.one(m) });
             try h.expectRunDouble(io, allocator, &f, &.{ c.x, c.y }, @min(c.x, c.y), backend);
         }
     }
@@ -95,7 +95,7 @@ fn doubles(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {
         const i = try f.appendInst(b, i32_t, .{ .convert = .{ .value = scaled } }); // f64 -> int
         const back = try f.appendInst(b, t, .{ .convert = .{ .value = i } }); // int -> f64
         const r = try f.appendInst(b, t, .{ .arith = .{ .op = .div, .lhs = back, .rhs = c100 } });
-        f.setTerminator(b, .{ .ret = r });
+        f.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
         const xv: f64 = 1.234;
         const rt: f64 = @as(f32, @floatCast(xv)); // (double)(float)x
         const back_e: f64 = @floatFromInt(@as(i32, @intFromFloat(rt * 100.0)));
@@ -114,7 +114,7 @@ fn memory(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {
         const slot = try f.appendInst(b, ptr_t, .{ .alloca = .{ .elem = t } });
         try f.appendStore(b, x, slot);
         const r = try f.appendInst(b, t, .{ .load = .{ .ptr = slot } });
-        f.setTerminator(b, .{ .ret = r });
+        f.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
         try expectRun(io, allocator, &f, &.{0x5A}, 0x5A, backend); // round-trips the byte 0x5A
     }
     { // a float-typed integer constant (how the frontend zero-inits float locals):
@@ -127,7 +127,7 @@ fn memory(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {
         const x = try f.appendBlockParam(b, t);
         const z = try f.appendInst(b, t, .{ .iconst = 0 });
         const r = try f.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = z } });
-        f.setTerminator(b, .{ .ret = r });
+        f.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
         try h.expectRunFloat(io, allocator, &f, &.{@as(f32, 3.5)}, 3.5, backend);
     }
     { // a float slot: alloca f32, store x + y, load it back, return it.
@@ -142,7 +142,7 @@ fn memory(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {
         const slot = try f.appendInst(b, ptr_t, .{ .alloca = .{ .elem = t } });
         try f.appendStore(b, s, slot);
         const r = try f.appendInst(b, t, .{ .load = .{ .ptr = slot } });
-        f.setTerminator(b, .{ .ret = r });
+        f.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
         const xv: f32 = 1.7;
         const yv: f32 = 2.3;
         try h.expectRunFloat(io, allocator, &f, &.{ xv, yv }, xv + yv, backend); // f32-precision sum
@@ -159,7 +159,7 @@ fn memory(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {
         const slot = try f.appendInst(b, ptr_t, .{ .alloca = .{ .elem = t } });
         try f.appendStore(b, s, slot);
         const r = try f.appendInst(b, t, .{ .load = .{ .ptr = slot } });
-        f.setTerminator(b, .{ .ret = r });
+        f.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
         const xv: f64 = 1.7;
         const yv: f64 = 2.3;
         try h.expectRunDouble(io, allocator, &f, &.{ xv, yv }, xv + yv, backend);
@@ -186,7 +186,7 @@ fn vectors(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {
     const s01 = try f.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = c[0], .rhs = c[1] } });
     const s012 = try f.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = s01, .rhs = c[2] } });
     const s = try f.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = s012, .rhs = c[3] } });
-    f.setTerminator(b, .{ .ret = s });
+    f.setTerminator(b, .{ .ret = ir.function.Ret.one(s) });
 
     const av = [4]f32{ 1.1, 2.2, 3.3, 4.4 };
     const bv = [4]f32{ 5.5, 6.6, 7.7, 8.8 };
@@ -224,7 +224,7 @@ fn vectorSqrtSelect(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend
     const s01 = try f.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = c[0], .rhs = c[1] } });
     const s012 = try f.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = s01, .rhs = c[2] } });
     const s = try f.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = s012, .rhs = c[3] } });
-    f.setTerminator(b, .{ .ret = s });
+    f.setTerminator(b, .{ .ret = ir.function.Ret.one(s) });
 
     // Non-round lanes so every one flows through sqrtps + the mask select and the reduced sum
     // has a distinctive low byte (the harness compares only the low byte of the f32 result).
@@ -253,7 +253,7 @@ fn vectorParamCall(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend)
         const s01 = try fhelper.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = e[0], .rhs = e[1] } });
         const s012 = try fhelper.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = s01, .rhs = e[2] } });
         const s = try fhelper.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = s012, .rhs = e[3] } });
-        fhelper.setTerminator(b, .{ .ret = s });
+        fhelper.setTerminator(b, .{ .ret = ir.function.Ret.one(s) });
     }
     var fmain = Function.init(allocator);
     defer fmain.deinit();
@@ -265,7 +265,7 @@ fn vectorParamCall(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend)
         for (0..4) |i| p[i] = try fmain.appendBlockParam(b, t);
         const v = try fmain.appendInst(b, v4, .{ .struct_new = .{ .fields = try fmain.internValueList(&p) } });
         const called = try fmain.appendCall(b, t, "helper", &.{v});
-        fmain.setTerminator(b, .{ .ret = called });
+        fmain.setTerminator(b, .{ .ret = ir.function.Ret.one(called) });
     }
     var module: link.Module = .{};
     defer module.deinit(allocator);
@@ -302,7 +302,7 @@ fn widevectors(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !vo
     for (0..8) |i| e[i] = try f.appendInst(b, t, .{ .extract = .{ .aggregate = vc, .index = @intCast(i) } });
     var s = e[0];
     for (1..8) |i| s = try f.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = s, .rhs = e[i] } });
-    f.setTerminator(b, .{ .ret = s });
+    f.setTerminator(b, .{ .ret = ir.function.Ret.one(s) });
 
     var cc: [8]f32 = undefined;
     for (0..8) |i| cc[i] = ca[i] + da[i];
@@ -335,7 +335,7 @@ fn wideSpill(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void
     for (0..8) |i| e[i] = try f.appendInst(b, t, .{ .extract = .{ .aggregate = acc, .index = @intCast(i) } });
     var s = e[0];
     for (1..8) |i| s = try f.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = s, .rhs = e[i] } });
-    f.setTerminator(b, .{ .ret = s });
+    f.setTerminator(b, .{ .ret = ir.function.Ret.one(s) });
 
     var lane: f32 = @floatCast(@as(f64, 0.1)); // v_0
     for (1..N) |i| lane += @as(f32, @floatCast(@as(f64, @floatFromInt(i)) + 0.1));
@@ -364,7 +364,7 @@ fn autoWide(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void 
     for (0..8) |i| c[i] = try f.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = av[i], .rhs = bv[i] } }); // 8 parallel adds
     var s = c[0];
     for (1..8) |i| s = try f.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = s, .rhs = c[i] } });
-    f.setTerminator(b, .{ .ret = s });
+    f.setTerminator(b, .{ .ret = ir.function.Ret.one(s) });
 
     try std.testing.expect(try opt.vectorize.runLanes(allocator, &f, 8)); // fuse the eight adds
 
@@ -415,7 +415,7 @@ fn wideBlockEdge(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !
         for (0..8) |i| e[i] = try f.appendInst(merge, t, .{ .extract = .{ .aggregate = m, .index = @intCast(i) } });
         var s = e[0];
         for (1..8) |i| s = try f.appendInst(merge, t, .{ .arith = .{ .op = .add, .lhs = s, .rhs = e[i] } });
-        f.setTerminator(merge, .{ .ret = s });
+        f.setTerminator(merge, .{ .ret = ir.function.Ret.one(s) });
         try h.expectRunFloat(io, allocator, &f, &.{c.x}, c.want, backend);
     }
 }
@@ -441,7 +441,7 @@ fn vectorSpill(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !vo
     const s01 = try f.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = e[0], .rhs = e[1] } });
     const s012 = try f.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = s01, .rhs = e[2] } });
     const s = try f.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = s012, .rhs = e[3] } });
-    f.setTerminator(b, .{ .ret = s });
+    f.setTerminator(b, .{ .ret = ir.function.Ret.one(s) });
 
     var lane: f32 = @floatCast(@as(f64, 0.1)); // v_0
     for (1..N) |i| lane += @as(f32, @floatCast(@as(f64, @floatFromInt(i)) + 0.1));
@@ -464,7 +464,7 @@ fn floats(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {
         const x = try f.appendBlockParam(b, t);
         const y = try f.appendBlockParam(b, t);
         const r = try f.appendInst(b, t, .{ .arith = .{ .op = c.op, .lhs = x, .rhs = y } });
-        f.setTerminator(b, .{ .ret = r });
+        f.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
         // Compute the expected from the f32 operands (not comptime) so the rounding matches.
         const expected: f32 = switch (c.op) {
             .add => c.x + c.y,
@@ -484,7 +484,7 @@ fn floats(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {
         const y = try f.appendBlockParam(b, t);
         const s = try f.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = y } });
         const p = try f.appendInst(b, t, .{ .arith = .{ .op = .mul, .lhs = s, .rhs = x } });
-        f.setTerminator(b, .{ .ret = p });
+        f.setTerminator(b, .{ .ret = ir.function.Ret.one(p) });
         const xv: f32 = 1.1;
         const yv: f32 = 2.2;
         try h.expectRunFloat(io, allocator, &f, &.{ xv, yv }, (xv + yv) * xv, backend);
@@ -499,7 +499,7 @@ fn floats(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {
         const one = try f.appendInst(b, t, .{ .fconst = 1.0 });
         const p = try f.appendInst(b, t, .{ .arith = .{ .op = .mul, .lhs = x, .rhs = two } });
         const s = try f.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = p, .rhs = one } });
-        f.setTerminator(b, .{ .ret = s });
+        f.setTerminator(b, .{ .ret = ir.function.Ret.one(s) });
         const xv: f32 = 3.3;
         try h.expectRunFloat(io, allocator, &f, &.{xv}, xv * 2.0 + 1.0, backend);
     }
@@ -516,7 +516,7 @@ fn floats(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {
         }
         var s = temps[0];
         for (1..14) |i| s = try f.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = s, .rhs = temps[i] } });
-        f.setTerminator(b, .{ .ret = s });
+        f.setTerminator(b, .{ .ret = ir.function.Ret.one(s) });
 
         const xv: f32 = 1.1;
         var et: [14]f32 = undefined;
@@ -537,7 +537,7 @@ fn floats(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {
             const y = try f.appendBlockParam(b, t);
             const lt = try f.appendInst(b, bool_t, .{ .icmp = .{ .op = .lt, .lhs = x, .rhs = y } });
             const m = try f.appendInst(b, t, .{ .select = .{ .cond = lt, .then = x, .@"else" = y } });
-            f.setTerminator(b, .{ .ret = m });
+            f.setTerminator(b, .{ .ret = ir.function.Ret.one(m) });
             try h.expectRunFloat(io, allocator, &f, &.{ c.x, c.y }, @min(c.x, c.y), backend);
         }
     }
@@ -553,7 +553,7 @@ fn floats(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {
         const i = try f.appendInst(b, i32_t, .{ .convert = .{ .value = scaled } }); // float -> int (truncate)
         const back = try f.appendInst(b, t, .{ .convert = .{ .value = i } }); // int -> float
         const r = try f.appendInst(b, t, .{ .arith = .{ .op = .div, .lhs = back, .rhs = c100 } });
-        f.setTerminator(b, .{ .ret = r });
+        f.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
         const xv: f32 = 1.234;
         const scaled_e: f32 = xv * 100.0;
         const back_e: f32 = @floatFromInt(@as(i32, @intFromFloat(scaled_e)));
@@ -571,7 +571,7 @@ fn floats(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {
             const y = try f.appendBlockParam(b, t);
             const eq = try f.appendInst(b, bool_t, .{ .icmp = .{ .op = .eq, .lhs = x, .rhs = y } });
             const m = try f.appendInst(b, t, .{ .select = .{ .cond = eq, .then = x, .@"else" = y } });
-            f.setTerminator(b, .{ .ret = m });
+            f.setTerminator(b, .{ .ret = ir.function.Ret.one(m) });
             try h.expectRunFloat(io, allocator, &f, &.{ c.x, c.y }, if (c.x == c.y) c.x else c.y, backend);
         }
     }
@@ -586,7 +586,7 @@ fn floats(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {
             const a = try f.appendBlockParam(b, i32_t);
             const bb = try f.appendBlockParam(b, i32_t);
             const m = try f.appendInst(b, i32_t, .{ .select = .{ .cond = cp, .then = a, .@"else" = bb } });
-            f.setTerminator(b, .{ .ret = m });
+            f.setTerminator(b, .{ .ret = ir.function.Ret.one(m) });
             try expectRun(io, allocator, &f, &.{ cond, 0x42, 0x99 }, if (cond == 1) 0x42 else 0x99, backend);
         }
     }
@@ -608,7 +608,7 @@ fn floats(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {
             try f.appendIf(entry, lt, .{ .target = then_b, .args = &.{} }, .{ .target = else_b, .args = &.{} });
             f.setTerminator(then_b, .{ .jump = .{ .target = merge, .args = try f.internValueList(&.{x}) } });
             f.setTerminator(else_b, .{ .jump = .{ .target = merge, .args = try f.internValueList(&.{y}) } });
-            f.setTerminator(merge, .{ .ret = m });
+            f.setTerminator(merge, .{ .ret = ir.function.Ret.one(m) });
             try h.expectRunFloat(io, allocator, &f, &.{ c.x, c.y }, @min(c.x, c.y), backend);
         }
     }
@@ -624,7 +624,7 @@ fn arithmetic(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !voi
         const y = try f.appendBlockParam(b, t);
         const p = try f.appendInst(b, t, .{ .arith = .{ .op = .mul, .lhs = x, .rhs = y } });
         const s = try f.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = p, .rhs = x } });
-        f.setTerminator(b, .{ .ret = s });
+        f.setTerminator(b, .{ .ret = ir.function.Ret.one(s) });
         try expectRun(io, allocator, &f, &.{ 3, 4 }, 15, backend);
     }
     { // subtraction (negative result, low byte)
@@ -635,7 +635,7 @@ fn arithmetic(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !voi
         const x = try f.appendBlockParam(b, t);
         const y = try f.appendBlockParam(b, t);
         const d = try f.appendInst(b, t, .{ .arith = .{ .op = .sub, .lhs = x, .rhs = y } });
-        f.setTerminator(b, .{ .ret = d });
+        f.setTerminator(b, .{ .ret = ir.function.Ret.one(d) });
         try expectRun(io, allocator, &f, &.{ 3, 10 }, -7, backend);
     }
     inline for (.{ .{ .op = .div, .want = 6 }, .{ .op = .rem, .want = 2 } }) |c| { // signed div/rem
@@ -646,7 +646,7 @@ fn arithmetic(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !voi
         const x = try f.appendBlockParam(b, t);
         const y = try f.appendBlockParam(b, t);
         const r = try f.appendInst(b, t, .{ .arith = .{ .op = c.op, .lhs = x, .rhs = y } });
-        f.setTerminator(b, .{ .ret = r });
+        f.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
         try expectRun(io, allocator, &f, &.{ 20, 3 }, c.want, backend);
     }
     { // shift by a register count: x << k
@@ -657,7 +657,7 @@ fn arithmetic(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !voi
         const x = try f.appendBlockParam(b, t);
         const k = try f.appendBlockParam(b, t);
         const s = try f.appendInst(b, t, .{ .arith = .{ .op = .shl, .lhs = x, .rhs = k } });
-        f.setTerminator(b, .{ .ret = s });
+        f.setTerminator(b, .{ .ret = ir.function.Ret.one(s) });
         try expectRun(io, allocator, &f, &.{ 3, 4 }, 48, backend);
     }
 }
@@ -676,7 +676,7 @@ fn immediates(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !voi
         const b = try f.appendBlock();
         const x = try f.appendBlockParam(b, t);
         const r = try f.appendArithImm(b, t, c.op, x, c.imm);
-        f.setTerminator(b, .{ .ret = r });
+        f.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
         try expectRun(io, allocator, &f, &.{10}, c.want, backend);
     }
 }
@@ -694,7 +694,7 @@ fn controlFlow(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !vo
         const r = try f.appendBlockParam(merge, t);
         const c = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .gt, .lhs = a, .rhs = b } });
         try f.appendIf(entry, c, .{ .target = merge, .args = &.{a} }, .{ .target = merge, .args = &.{b} });
-        f.setTerminator(merge, .{ .ret = r });
+        f.setTerminator(merge, .{ .ret = ir.function.Ret.one(r) });
         try expectRun(io, allocator, &f, &.{ 3, 4 }, 4, backend);
         try expectRun(io, allocator, &f, &.{ 7, 2 }, 7, backend);
     }
@@ -720,7 +720,7 @@ fn controlFlow(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !vo
         const ob = try f.appendInst(body, t, .{ .iconst = 1 });
         const inext = try f.appendInst(body, t, .{ .arith = .{ .op = .add, .lhs = i, .rhs = ob } });
         try f.setJump(body, header, &.{ sum2, inext });
-        f.setTerminator(exit, .{ .ret = r });
+        f.setTerminator(exit, .{ .ret = ir.function.Ret.one(r) });
         try expectRun(io, allocator, &f, &.{5}, 15, backend);
         try expectRun(io, allocator, &f, &.{10}, 55, backend);
     }
@@ -742,7 +742,7 @@ fn fallthrough(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !vo
         const p = try f.appendBlockParam(next, t);
         const k = try f.appendArithImm(entry, t, .add, x, 100); // carried across the fall-through edge
         try f.setJump(entry, next, &.{k});
-        f.setTerminator(next, .{ .ret = p });
+        f.setTerminator(next, .{ .ret = ir.function.Ret.one(p) });
         for ([_]i32{ 0, 1, -1, 7, 55 }) |xv| {
             try expectRun(io, allocator, &f, &.{xv}, xv +% 100, backend);
         }
@@ -770,7 +770,7 @@ fn fallthrough(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !vo
             try f.appendIf(entry, cnd, .{ .target = then_b, .args = &.{a} }, .{ .target = else_b, .args = &.{b} });
             try f.setJump(then_b, merge, &.{pt});
             try f.setJump(else_b, merge, &.{pe});
-            f.setTerminator(merge, .{ .ret = r });
+            f.setTerminator(merge, .{ .ret = ir.function.Ret.one(r) });
             try expectRun(io, allocator, &f, &.{ c.a, c.b }, @max(c.a, c.b), backend);
         }
     }
@@ -797,7 +797,7 @@ fn fallthrough(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !vo
             try f.appendIf(entry, cnd, .{ .target = then_b, .args = &.{a} }, .{ .target = else_b, .args = &.{b} });
             try f.setJump(then_b, merge, &.{pt});
             try f.setJump(else_b, merge, &.{pe});
-            f.setTerminator(merge, .{ .ret = r });
+            f.setTerminator(merge, .{ .ret = ir.function.Ret.one(r) });
             try expectRun(io, allocator, &f, &.{ c.a, c.b }, @max(c.a, c.b), backend);
         }
     }
@@ -826,7 +826,7 @@ fn fallthrough(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !vo
         const ob = try f.appendInst(body, t, .{ .iconst = 1 });
         const inext = try f.appendInst(body, t, .{ .arith = .{ .op = .add, .lhs = i, .rhs = ob } });
         try f.setJump(body, header, &.{ sum2, inext }); // backward jump: a real jmp, not elided
-        f.setTerminator(exit, .{ .ret = r });
+        f.setTerminator(exit, .{ .ret = ir.function.Ret.one(r) });
         try expectRun(io, allocator, &f, &.{5}, 15, backend);
         try expectRun(io, allocator, &f, &.{10}, 55, backend);
     }
@@ -843,7 +843,7 @@ fn spilling(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void 
     for (0..8) |k| temps[k] = try f.appendArithImm(b, t, .add, a, @intCast(k + 1));
     var acc = temps[0];
     for (1..8) |k| acc = try f.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = temps[k] } });
-    f.setTerminator(b, .{ .ret = acc });
+    f.setTerminator(b, .{ .ret = ir.function.Ret.one(acc) });
     try expectRun(io, allocator, &f, &.{10}, 116, backend); // 8a + 36
     try intPressure(io, allocator, backend);
     try tailSplit(io, allocator, backend);
@@ -877,7 +877,7 @@ fn secondChanceReHome(io: std.Io, allocator: std.mem.Allocator, backend: h.Backe
     var j: usize = 1;
     while (j < terms.len) : (j += 1) acc = try f.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = terms[j] } });
     const res = try f.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = t0 } }); // t0's sole late use
-    f.setTerminator(b, .{ .ret = res });
+    f.setTerminator(b, .{ .ret = ir.function.Ret.one(res) });
 
     // Meaningful-differential gate: a second-chance re-home MUST have fired (a `.reg` segment after a
     // `.spill` segment). Without it this would only exercise the tail-split + per-use reload path.
@@ -925,7 +925,7 @@ fn secondChanceDecline(io: std.Io, allocator: std.mem.Allocator, backend: h.Back
     for (1..nres) |i| acc = try f.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = res[i] } });
     for (0..nspill) |i| acc = try f.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = sp[i] } });
     for (0..nres) |i| acc = try f.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = res[i] } });
-    f.setTerminator(b, .{ .ret = acc });
+    f.setTerminator(b, .{ .ret = ir.function.Ret.one(acc) });
 
     // Meaningful gate: under the shared Wimmer allocator this kernel both SPLITS values (spilled
     // under pressure) and RE-HOMES some (a spill slot reloaded back into a register for a later use,
@@ -980,7 +980,7 @@ fn terminatorReHome(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend
     // The reduction only exists to create then relieve pressure (its final `acc` is deliberately
     // unreturned). The RETURN value is t0 itself, so t0's last use is the terminator and any
     // second-chance re-home of it lands there.
-    f.setTerminator(b, .{ .ret = t0 });
+    f.setTerminator(b, .{ .ret = ir.function.Ret.one(t0) });
 
     // Meaningful-differential gate: t0 must actually tail-split, else a whole-life register would also
     // return the right value and the terminator drain would not be exercised.
@@ -1020,7 +1020,7 @@ fn tailSplit(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void
         var acc = terms[0];
         for (1..nterm) |k| acc = try f.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = terms[k] } });
         const res = try f.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = v } }); // v's sole use
-        f.setTerminator(b, .{ .ret = res });
+        f.setTerminator(b, .{ .ret = ir.function.Ret.one(res) });
 
         // The case must actually exercise the splitter, else it proves nothing about the store drain.
         try std.testing.expect(try isel.splitCountForTest(allocator, &f) > 0);
@@ -1052,7 +1052,7 @@ fn intPressure(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !vo
         }
         var acc = terms[0];
         for (1..12) |k| acc = try f.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = terms[k] } });
-        f.setTerminator(b, .{ .ret = acc });
+        f.setTerminator(b, .{ .ret = ir.function.Ret.one(acc) });
 
         var expected: i64 = 0;
         for (1..13) |k| expected += c.a * @as(i64, @intCast(k)) + c.b; // same order as the IR reduction
@@ -1070,7 +1070,7 @@ fn calls(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {
         const x = try helper.appendBlockParam(b, t);
         const d = try helper.appendInst(b, t, .{ .arith = .{ .op = .mul, .lhs = x, .rhs = x } });
         const r = try helper.appendArithImm(b, t, .add, d, 1);
-        helper.setTerminator(b, .{ .ret = r });
+        helper.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
     }
     var main = Function.init(allocator);
     defer main.deinit();
@@ -1079,7 +1079,7 @@ fn calls(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {
         const b = try main.appendBlock();
         const x = try main.appendBlockParam(b, t);
         const r = try main.appendCall(b, t, "helper", &.{x});
-        main.setTerminator(b, .{ .ret = r });
+        main.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
     }
     const link = @import("../link.zig");
     var module: link.Module = .{};
@@ -1098,7 +1098,7 @@ fn calls(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {
         const x = try helper2.appendBlockParam(b, t);
         const d = try helper2.appendInst(b, t, .{ .arith = .{ .op = .mul, .lhs = x, .rhs = x } });
         const r = try helper2.appendArithImm(b, t, .add, d, 1);
-        helper2.setTerminator(b, .{ .ret = r });
+        helper2.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
     }
     var main2 = Function.init(allocator);
     defer main2.deinit();
@@ -1108,7 +1108,7 @@ fn calls(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {
         const x = try main2.appendBlockParam(b, t);
         const called = try main2.appendCall(b, t, "helper", &.{x});
         const r = try main2.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = called, .rhs = x } });
-        main2.setTerminator(b, .{ .ret = r });
+        main2.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
     }
     var module2: link.Module = .{};
     defer module2.deinit(allocator);
@@ -1126,7 +1126,7 @@ fn calls(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {
         const a = try fhelper.appendBlockParam(b, t);
         const bb = try fhelper.appendBlockParam(b, t);
         const r = try fhelper.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = a, .rhs = bb } });
-        fhelper.setTerminator(b, .{ .ret = r });
+        fhelper.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
     }
     var fmain = Function.init(allocator);
     defer fmain.deinit();
@@ -1137,7 +1137,7 @@ fn calls(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {
         const y = try fmain.appendBlockParam(b, t);
         const called = try fmain.appendCall(b, t, "helper", &.{ x, y }); // x is live across the call
         const r = try fmain.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = called, .rhs = x } });
-        fmain.setTerminator(b, .{ .ret = r });
+        fmain.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
     }
     var fmodule: link.Module = .{};
     defer fmodule.deinit(allocator);

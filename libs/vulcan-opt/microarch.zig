@@ -105,7 +105,7 @@ fn buildStraightLine(func: *ir.function.Function) !void {
     const c1 = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .add, .lhs = a, .rhs = b } });
     const c2 = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .mul, .lhs = c1, .rhs = a } });
     const c3 = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .sub, .lhs = c2, .rhs = b } });
-    func.setTerminator(entry, .{ .ret = c3 });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(c3) });
 }
 
 test "optimize is a no-op for a straight-line function under a single-issue, no-prefetch, no-SLP model" {

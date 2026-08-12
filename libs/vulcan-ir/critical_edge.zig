@@ -125,7 +125,7 @@ test "critical edges: a diamond with a critical edge gets a forwarding block" {
     const cond = try func.appendInst(entry, bool_t, .{ .iconst = 1 });
     try func.appendIf(entry, cond, .{ .target = a }, .{ .target = b });
     try func.setJump(a, b, &.{});
-    func.setTerminator(b, .{ .ret = null });
+    func.setTerminator(b, .{ .ret = function.Ret.none() });
 
     const before = func.blockCount();
     try splitCriticalEdges(std.testing.allocator, &func);
@@ -167,7 +167,7 @@ test "critical edges: a CFG with no critical edge is unchanged" {
     try func.appendIf(entry, cond, .{ .target = a }, .{ .target = b });
     try func.setJump(a, m, &.{});
     try func.setJump(b, m, &.{});
-    func.setTerminator(m, .{ .ret = null });
+    func.setTerminator(m, .{ .ret = function.Ret.none() });
 
     const before = func.blockCount();
     try splitCriticalEdges(std.testing.allocator, &func);
@@ -197,7 +197,7 @@ test "critical edges: forwarding block forwards the original edge arguments" {
     const cond = try func.appendInst(entry, bool_t, .{ .iconst = 1 });
     try func.appendIf(entry, cond, .{ .target = a }, .{ .target = b, .args = &.{x} });
     try func.setJump(a, b, &.{x});
-    func.setTerminator(b, .{ .ret = p });
+    func.setTerminator(b, .{ .ret = function.Ret.one(p) });
 
     const before = func.blockCount();
     try splitCriticalEdges(std.testing.allocator, &func);
@@ -236,7 +236,7 @@ test "critical edges: splitting is idempotent" {
     const cond = try func.appendInst(entry, bool_t, .{ .iconst = 1 });
     try func.appendIf(entry, cond, .{ .target = a }, .{ .target = b });
     try func.setJump(a, b, &.{});
-    func.setTerminator(b, .{ .ret = null });
+    func.setTerminator(b, .{ .ret = function.Ret.none() });
 
     try splitCriticalEdges(std.testing.allocator, &func);
     const after_first = func.blockCount();

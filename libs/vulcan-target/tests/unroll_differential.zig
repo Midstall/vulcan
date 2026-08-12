@@ -42,7 +42,7 @@ fn buildCounted(func: *Function) anyerror!void {
     try func.appendIf(loop, cmp, .{ .target = body, .args = &.{i} }, .{ .target = done });
     const next = try func.appendArithImm(body, i32_t, .add, bi, 1);
     try func.setJump(body, loop, &.{next});
-    func.setTerminator(done, .{ .ret = i });
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(i) });
 }
 
 /// Shape 2: `s = 0; for (i = 0; i < n; i += 1) s += i;  return s`. Two carried
@@ -66,7 +66,7 @@ fn buildSum(func: *Function) anyerror!void {
     const ns = try func.appendInst(body, i32_t, .{ .arith = .{ .op = .add, .lhs = bs, .rhs = bi } });
     const ni = try func.appendArithImm(body, i32_t, .add, bi, 1);
     try func.setJump(body, loop, &.{ ni, ns });
-    func.setTerminator(done, .{ .ret = s });
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(s) });
 }
 
 /// Shape 3: a Fibonacci-style recurrence with two carried values that both
@@ -93,7 +93,7 @@ fn buildFib(func: *Function) anyerror!void {
     const nb = try func.appendInst(body, i32_t, .{ .arith = .{ .op = .add, .lhs = ba, .rhs = bb } });
     const ni = try func.appendArithImm(body, i32_t, .add, bi, 1);
     try func.setJump(body, loop, &.{ ni, bb, nb });
-    func.setTerminator(done, .{ .ret = av });
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(av) });
 }
 
 /// Shape 4: a side-effecting body. `slot` is a stack cell (alloca) holding the
@@ -125,7 +125,7 @@ fn buildMemAccum(func: *Function) anyerror!void {
     const next = try func.appendArithImm(body, i32_t, .add, bi, 1);
     try func.setJump(body, loop, &.{next});
     const final = try func.appendInst(done, i32_t, .{ .load = .{ .ptr = slot } });
-    func.setTerminator(done, .{ .ret = final });
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(final) });
 }
 
 /// Shape 5: a multi-block body with an internal diamond. The body entry tests
@@ -171,7 +171,7 @@ fn buildDiamond(func: *Function) anyerror!void {
     const else_acc = try func.appendArithImm(else_b, i32_t, .add, eacc, 3);
     try func.setJump(else_b, merge, &.{ ei, else_acc }); // else-arm: add a different amount
     try func.setJump(merge, loop, &.{ mi, macc });
-    func.setTerminator(done, .{ .ret = acc });
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(acc) });
 }
 
 /// Build two copies of `build`, unroll one under ampere-altra, JIT both, and

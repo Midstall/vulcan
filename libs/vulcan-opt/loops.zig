@@ -126,7 +126,7 @@ test "detects a natural loop and its preheader" {
     const bi = try func.appendBlockParam(body, i32_t);
     const next = try func.appendArithImm(body, i32_t, .add, bi, 1);
     try func.setJump(body, loop, &.{next});
-    func.setTerminator(done, .{ .ret = i });
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(i) });
 
     var info = try analyze(allocator, &func);
     defer info.deinit(allocator);

@@ -1,10 +1,10 @@
-//! Zba sh-add fusion (Task 6), executed on qemu-riscv64 with Zba enabled (the oracle). Builds
-//! `x + (b << k)` for k in {1, 2, 3} - the shl immediately preceding its single-use add, exactly the
-//! shape `fusesIntoNextShiftAdd` (isel.zig) folds into one `sh{k}add rd, b, x` - and checks that the
-//! qemu-executed result is correct AND that the fused instruction actually fired (the `sh{k}add` is
-//! present and the standalone `slli` is gone). The fold is gated on `caps.fuse_shift_add`, TRUE only
-//! for a Zba model: with the default caps (fuse_shift_add = false) the SAME function compiles to the
-//! plain `slli`+`add` path, proving strict gating.
+//! Zba sh-add fusion, executed on qemu-riscv64 with Zba enabled (the oracle). Builds
+//! `x + (b << k)` for k in {1, 2, 3}, with the shl immediately preceding its single-use add. This is
+//! exactly the shape `fusesIntoNextShiftAdd` (isel.zig) folds into one `sh{k}add rd, b, x`. It checks
+//! that the qemu-executed result is correct AND that the fused instruction actually fired (the
+//! `sh{k}add` is present and the standalone `slli` is gone). The fold is gated on
+//! `caps.fuse_shift_add`, TRUE only for a Zba model: with the default caps (fuse_shift_add = false)
+//! the SAME function compiles to the plain `slli`+`add` path, proving strict gating.
 //!
 //! sh1add/sh2add/sh3add are Zba instructions, so the fold tests run under `-cpu rv64,zba=true`
 //! (harness.qemu_user_zba). A CPU without Zba would reject them as illegal.
@@ -19,12 +19,12 @@ const Function = ir.function.Function;
 const Value = ir.function.Value;
 
 /// Caps with ONLY the Zba sh-add fold turned on (every other flag at its no-extension default). A
-/// Zba model would set this via `capsForModel`; a test flips it in isolation to compile the SAME
+/// Zba model would set this via `capsForModel`. A test flips it in isolation to compile the SAME
 /// function both folded and not.
 const zba_caps = isel.ModelCaps{ .fuse_shift_add = true };
 
 /// `f(x, b) = x + (b << k)` (or `(b << k) + x` when `shl_on_lhs`), all `bits`-wide signed integers,
-/// with the shl immediately preceding its single consuming add - exactly the shape
+/// with the shl immediately preceding its single consuming add, exactly the shape
 /// `fusesIntoNextShiftAdd` folds into one `sh{k}add`.
 fn buildShiftAdd(allocator: std.mem.Allocator, bits: u16, k: i64, shl_on_lhs: bool) !Function {
     var func = Function.init(allocator);
@@ -38,7 +38,7 @@ fn buildShiftAdd(allocator: std.mem.Allocator, bits: u16, k: i64, shl_on_lhs: bo
         try func.appendInst(blk, ty, .{ .arith = .{ .op = .add, .lhs = shl, .rhs = x } })
     else
         try func.appendInst(blk, ty, .{ .arith = .{ .op = .add, .lhs = x, .rhs = shl } });
-    func.setTerminator(blk, .{ .ret = add });
+    func.setTerminator(blk, .{ .ret = ir.function.Ret.one(add) });
     return func;
 }
 
@@ -113,7 +113,7 @@ test "riscv64 shift_add does NOT fold without Zba (default caps): plain slli+add
     var func = try buildShiftAdd(allocator, 64, 2, false);
     defer func.deinit();
 
-    // Default caps: fuse_shift_add is false, so the fold is declined - the shift materializes.
+    // Default caps: fuse_shift_add is false, so the fold is declined. The shift still materializes.
     const text = try disasmWithCaps(allocator, &func, .{});
     defer allocator.free(text);
     try std.testing.expect(std.mem.indexOf(u8, text, "slli") != null); // the shift is still materialized
@@ -142,7 +142,7 @@ test "riscv64 shift_add: a multi-use shift does NOT fold (plain slli+add, correc
     const r1 = try func.appendInst(blk, ty, .{ .arith = .{ .op = .add, .lhs = px, .rhs = shl } }); // fusible shape...
     const r2 = try func.appendInst(blk, ty, .{ .arith = .{ .op = .bit_or, .lhs = shl, .rhs = px } }); // ...but shl is reused here
     const ret = try func.appendInst(blk, ty, .{ .arith = .{ .op = .add, .lhs = r1, .rhs = r2 } });
-    func.setTerminator(blk, .{ .ret = ret });
+    func.setTerminator(blk, .{ .ret = ir.function.Ret.one(ret) });
 
     // Even with Zba enabled, the shl has two uses, so the fold is declined and the shift stays.
     const text = try disasmWithCaps(allocator, &func, zba_caps);
@@ -189,7 +189,7 @@ test "riscv64 shift_add: a 32-bit add does NOT fold (needs sh-add.uw, deferred; 
     var func = try buildShiftAdd(allocator, 32, 2, false);
     defer func.deinit();
 
-    // sh{k}add produces a 64-bit sum; a 32-bit result would need sh{k}add.uw, so the fold is declined.
+    // sh{k}add produces a 64-bit sum. A 32-bit result would need sh{k}add.uw, so the fold is declined.
     const text = try disasmWithCaps(allocator, &func, zba_caps);
     defer allocator.free(text);
     try std.testing.expect(std.mem.indexOf(u8, text, "sh2add") == null); // 32-bit add is not folded

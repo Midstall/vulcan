@@ -14,6 +14,11 @@ pub const Provider = platform.Provider;
 /// A W^X executable buffer that synchronizes the AArch64 instruction cache.
 pub const CodeBuffer = platform.Buffer(syncICache);
 
+/// A W^X reservation carrying code, rodata, data, and bss sections for one module
+/// image (see `jit_platform.MappedImage`), synchronizing the AArch64 instruction
+/// cache over the code span once `finalize` flips it to read+execute.
+pub const MappedImage = platform.MappedImage(syncICache);
+
 /// Synchronize the instruction stream with freshly written code: clean the D-cache
 /// and invalidate the I-cache to the point of unification (line sizes from `ctr_el0`).
 /// A no-op off aarch64 (the code could not run there anyway).

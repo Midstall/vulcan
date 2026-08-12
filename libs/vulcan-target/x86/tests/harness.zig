@@ -58,6 +58,98 @@ pub fn runModule(io: std.Io, allocator: std.mem.Allocator, module: *const link.M
     return runCode(io, allocator, linked.code, args, backend);
 }
 
+/// Like `runModule`, but `module` may also carry rodata/data/bss globals referenced from
+/// code via `global_addr` (see `link.Module.addData`/`addWritable`/`addBss`).
+///
+/// The qemu path lays out `linked.code` followed by the rodata and writable-data bytes
+/// (bss reserved as zeroed filler - no test here writes to one) as ONE flat blob, then
+/// resolves every carried-forward `.abs32` relocation against the blob's REAL runtime
+/// address: unlike x86-64's rip-relative `.pcrel_lea` (where only the relative shift
+/// between site and target matters, so the constant offset of the stub/ELF header
+/// cancels out), i386's `mov rd, imm32` needs the actual absolute address, so the site's
+/// known load address (`elf.load_addr + elf.code_offset + stub.len`, exactly where
+/// `elf.writeExec` places `stub ++ image`) is folded in here.
+///
+/// The native path (real only on an i386 host, essentially never true for this test
+/// suite's aarch64/x86-64 hosts) instead delegates to the shared `native.jitModuleData`,
+/// which already links against `link.zig`'s `applyGlobalReloc` generically - the
+/// harness's raw `runCode` has no data-section support and does not run this path.
+pub fn runModuleData(io: std.Io, allocator: std.mem.Allocator, module: *const link.Module, args: []const i64, backend: Backend) !u8 {
+    if (backend.native) {
+        if (builtin.cpu.arch != .x86) return error.SkipZigTest;
+        const native_target = @import("../../native.zig");
+        var funcs: std.ArrayList(native_target.ModuleFunction) = .empty;
+        defer funcs.deinit(allocator);
+        for (module.funcs.items) |e| try funcs.append(allocator, .{ .name = e.name, .func = e.func });
+        var datas: std.ArrayList(native_target.ModuleData) = .empty;
+        defer datas.deinit(allocator);
+        for (module.data.items) |d| try datas.append(allocator, .{ .name = d.name, .bytes = d.bytes, .kind = d.kind, .size = d.size, .relocs = d.relocs });
+
+        var jm = try native_target.jitModuleData(allocator, funcs.items, datas.items);
+        defer jm.deinit();
+        const f = jm.entry(*const fn () callconv(.c) i32, "main") orelse return error.UndefinedSymbol;
+        std.debug.assert(args.len == 0); // every current data test takes no arguments
+        return @truncate(@as(u32, @bitCast(f())));
+    }
+
+    var linked = try link.compileModule(allocator, module);
+    defer linked.deinit(allocator);
+    const entry = linked.addressOf("main") orelse return error.UndefinedSymbol;
+    std.debug.assert(entry == 0); // the stub calls the code at offset 0
+
+    // Each section's data starts right after the previous one, all within the same
+    // blob as the code (`rodata_base`/`data_base` below double as that section's
+    // starting byte offset within the final image).
+    var rodata_len: usize = 0;
+    var data_len: usize = 0;
+    var bss_len: usize = 0;
+    for (linked.data) |d| switch (d.kind) {
+        .rodata => rodata_len = @max(rodata_len, d.off + d.size),
+        .data => data_len = @max(data_len, d.off + d.size),
+        .bss => bss_len = @max(bss_len, d.off + d.size),
+    };
+    const rodata_base = linked.code.len;
+    const data_base = rodata_base + rodata_len;
+    const bss_base = data_base + data_len;
+    const image_len = bss_base + bss_len;
+
+    const image = try allocator.alloc(u8, image_len);
+    defer allocator.free(image);
+    @memset(image, 0);
+    @memcpy(image[0..linked.code.len], linked.code);
+    for (linked.data) |d| switch (d.kind) {
+        .rodata => @memcpy(image[rodata_base + d.off ..][0..d.size], d.bytes),
+        .data => @memcpy(image[data_base + d.off ..][0..d.size], d.bytes),
+        .bss => {},
+    };
+
+    const stub = try buildStub(allocator, args);
+    defer allocator.free(stub);
+    // The vaddr of `image[0]` once `stub ++ image` is wrapped by `elf.writeExec` and
+    // mapped at `elf.load_addr` (the whole file, `elf.code_offset` in).
+    const image_base: u32 = elf.load_addr + @as(u32, @intCast(elf.code_offset + stub.len));
+
+    for (linked.relocs) |r| {
+        const target_off = blk: {
+            for (linked.data) |d| if (std.mem.eql(u8, d.name, r.symbol)) break :blk switch (d.kind) {
+                .rodata => rodata_base + d.off,
+                .data => data_base + d.off,
+                .bss => bss_base + d.off,
+            };
+            if (linked.addressOf(r.symbol)) |off| break :blk off; // degenerate: names a function
+            return error.UndefinedSymbol;
+        };
+        const target_addr: u32 = image_base + @as(u32, @intCast(target_off));
+        std.mem.writeInt(u32, image[r.offset..][0..4], target_addr, .little);
+    }
+
+    const program = try allocator.alloc(u8, stub.len + image.len);
+    defer allocator.free(program);
+    @memcpy(program[0..stub.len], stub);
+    @memcpy(program[stub.len..], image);
+    return runProgram(io, allocator, program, backend);
+}
+
 fn runCode(io: std.Io, allocator: std.mem.Allocator, code: []const u8, args: []const i64, backend: Backend) !u8 {
     if (backend.native) {
         if (builtin.cpu.arch != .x86) return error.SkipZigTest;
@@ -78,6 +170,13 @@ fn runCode(io: std.Io, allocator: std.mem.Allocator, code: []const u8, args: []c
     defer allocator.free(program);
     @memcpy(program[0..stub.len], stub);
     @memcpy(program[stub.len..], code);
+    return runProgram(io, allocator, program, backend);
+}
+
+/// Wrap an already-built `stub ++ code` (or `stub ++ image`) program into a static ELF
+/// and run it under qemu, returning the process's exit code (the low byte of the
+/// callee's result). Shared by `runCode` and `runModuleData`.
+fn runProgram(io: std.Io, allocator: std.mem.Allocator, program: []const u8, backend: Backend) !u8 {
     const image = try elf.writeExec(allocator, program, 0);
     defer allocator.free(image);
 

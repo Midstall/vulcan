@@ -209,7 +209,7 @@ test "cross-module inlining then dead-function elimination" {
         const bb = try f.appendBlockParam(b, t);
         const prod = try f.appendInst(b, t, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = bb } });
         const sum = try f.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = prod, .rhs = a } });
-        f.setTerminator(b, .{ .ret = sum });
+        f.setTerminator(b, .{ .ret = ir.function.Ret.one(sum) });
         try module.add("helper", f);
     }
     // unit B: entry(x) = helper(x, x) + 1
@@ -220,7 +220,7 @@ test "cross-module inlining then dead-function elimination" {
         const x = try f.appendBlockParam(b, t);
         const call = try f.appendCall(b, t, "helper", &.{ x, x });
         const r = try f.appendArithImm(b, t, .add, call, 1);
-        f.setTerminator(b, .{ .ret = r });
+        f.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
         try module.add("entry", f);
     }
 
@@ -246,7 +246,7 @@ test "module round-trips through bitcode" {
         const b = try f.appendBlock();
         const x = try f.appendBlockParam(b, t);
         const r = try f.appendArithImm(b, t, .mul, x, 3);
-        f.setTerminator(b, .{ .ret = r });
+        f.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
         try module.add("triple", f);
     }
 

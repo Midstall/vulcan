@@ -259,7 +259,7 @@ fn buildDiamondMergeFirst(func: *Function) !struct { Block, Block, Block, Block 
     try func.setJump(then_b, merge, &.{x});
     const y = try func.appendInst(els_b, i32_t, .{ .iconst = 2 });
     try func.setJump(els_b, merge, &.{y});
-    func.setTerminator(merge, .{ .ret = mv });
+    func.setTerminator(merge, .{ .ret = ir.function.Ret.one(mv) });
     return .{ b0, merge, then_b, els_b };
 }
 
@@ -334,7 +334,7 @@ test "blocklayout: an already-optimal order is unchanged (identity, returns fals
     const w = try func.appendInst(b1, i32_t, .{ .iconst = 3 });
     try func.setJump(b1, b2, &.{});
     _ = v;
-    func.setTerminator(b2, .{ .ret = w });
+    func.setTerminator(b2, .{ .ret = ir.function.Ret.one(w) });
 
     const changed = try layout(allocator, &func, null);
     try testing.expect(!changed);
@@ -365,7 +365,7 @@ test "blocklayout: the reordered function verifies and is dominance-respecting (
     try func.setJump(b0, header, &.{});
     try func.appendIf(header, c0, .{ .target = exit }, .{ .target = body_a });
     const r = try func.appendInst(exit, i32_t, .{ .iconst = 7 });
-    func.setTerminator(exit, .{ .ret = r });
+    func.setTerminator(exit, .{ .ret = ir.function.Ret.one(r) });
     try func.appendIf(body_a, d0, .{ .target = t_a }, .{ .target = t_b });
     try func.setJump(t_a, latch, &.{});
     try func.setJump(t_b, latch, &.{});
@@ -407,7 +407,7 @@ test "blocklayout: single-block function is a no-op" {
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const entry = try func.appendBlock();
     const v = try func.appendBlockParam(entry, i32_t);
-    func.setTerminator(entry, .{ .ret = v });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(v) });
 
     const changed = try layout(allocator, &func, null);
     try testing.expect(!changed);

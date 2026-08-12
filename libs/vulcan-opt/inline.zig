@@ -72,10 +72,20 @@ fn scalar(func: *const Function, ty: Type) bool {
 
 /// Whether `callee` is simple enough for this pass to inline.
 fn inlinable(callee: *const Function) bool {
+    // SM12 T3: a variadic-defining callee's `va_start`/`va_arg` machinery reads the CALL
+    // SITE's own spilled unnamed arguments (a later task's backend concern) - inlining its
+    // body would need to rewire that plumbing too, which this pass does not do. `va_start`/
+    // `va_end` (no result) are already excluded by the result-less check below; `va_arg`
+    // (has a result) needs this explicit guard.
+    if (callee.is_variadic) return false;
     if (callee.blockCount() != 1) return false;
     const entry: Block = @enumFromInt(0);
     const term = callee.terminator(entry) orelse return false;
     if (term != .ret) return false;
+    // A multi-value return (SM14 M4d-a: a register-pair or HFA struct return) is not rewired
+    // by this pass yet. Refuse it, the same way every backend fails closed on it. This never
+    // fires today, since no frontend emits a multi-value return before M4d-c.
+    if (term.ret.count > 1) return false;
     for (callee.blockParams(entry)) |p| if (!scalar(callee, callee.valueType(p))) return false;
     for (callee.blockInsts(entry)) |inst| {
         const result = callee.instResult(inst) orelse return false; // store/if/void-call
@@ -141,8 +151,9 @@ fn inlineCall(allocator: std.mem.Allocator, caller: *Function, bi: u32, call_idx
 
     // The callee's returned value replaces the call's result everywhere.
     if (call_result) |r| {
-        if (callee.terminator(entry).?.ret) |ret_val| {
-            substituteValue(caller, r, vmap.get(ret_val).?);
+        const callee_ret = callee.terminator(entry).?.ret;
+        if (callee_ret.count == 1) {
+            substituteValue(caller, r, vmap.get(callee_ret.values[0]).?);
         }
     }
 
@@ -188,13 +199,15 @@ fn mapOpcode(caller: *Function, callee: *const Function, vmap: std.AutoHashMapUn
         .unary => |u| .{ .unary = .{ .op = u.op, .value = m(vmap, u.value) } },
         .load => |l| .{ .load = .{ .ptr = m(vmap, l.ptr) } },
         .alloca => |al| .{ .alloca = .{ .elem = try mapType(caller, callee, tmap, al.elem) } },
-        .global_addr => |ga| .{ .global_addr = .{ .symbol = try caller.internSymbol(callee.symbolName(ga.symbol)) } },
+        .global_addr => |ga| .{ .global_addr = .{ .symbol = try caller.internSymbol(callee.symbolName(ga.symbol)), .via_got = ga.via_got } },
         // dot is pure, like arith: remap its 3 operands. (Its vector operand types
         // fail the `scalar` gate today, so this is unreachable in practice, but the
         // remap is here so a future vector-aware inline path needs no new wiring.)
         .dot => |d| .{ .dot = .{ .acc = m(vmap, d.acc), .a = m(vmap, d.a), .b = m(vmap, d.b) } },
-        // Excluded by `inlinable`: these never reach here.
-        .extract, .struct_new, .store, .prefetch, .matmul, .call, .call_indirect, .@"if" => unreachable,
+        // Excluded by `inlinable`: these never reach here. `va_start`/`va_arg`/`va_end` are
+        // excluded by `inlinable`'s `callee.is_variadic` guard (SM12 T3) - a variadic callee
+        // is never considered inlinable at all, so these three never reach here either.
+        .extract, .struct_new, .store, .prefetch, .matmul, .call, .call_indirect, .@"if", .va_start, .va_arg, .va_end => unreachable,
     };
 }
 
@@ -233,6 +246,9 @@ fn substituteValue(func: *Function, from: Value, to: Value) void {
                 st.ptr = r(from, to, st.ptr);
             },
             .prefetch => |*pf| pf.ptr = r(from, to, pf.ptr),
+            .va_start => |*vs| vs.list = r(from, to, vs.list),
+            .va_arg => |*va| va.list = r(from, to, va.list),
+            .va_end => |*ve| ve.list = r(from, to, ve.list),
             .dot => |*d| {
                 d.acc = r(from, to, d.acc);
                 d.a = r(from, to, d.a);
@@ -263,8 +279,8 @@ fn substituteValue(func: *Function, from: Value, to: Value) void {
     for (0..func.blockCount()) |bi| {
         const term = func.terminatorPtr(@enumFromInt(bi));
         if (term.*) |*t| switch (t.*) {
-            .ret => |*v| if (v.*) |vv| {
-                v.* = r(from, to, vv);
+            .ret => |*ret| for (ret.values[0..ret.count]) |*vv| {
+                vv.* = r(from, to, vv.*);
             },
             .jump => |*j| for (func.valueListMut(j.args)) |*arg| {
                 arg.* = r(from, to, arg.*);
@@ -277,9 +293,16 @@ fn substituteValue(func: *Function, from: Value, to: Value) void {
 /// with scalar parameter and result types and no aggregate ops. Control flow, stores, loops, and
 /// multiple returns are fine, since each `ret` turns into a jump to a continuation block.
 fn inlinableMulti(callee: *const Function) bool {
+    // SM12 T3: see `inlinable`'s matching guard - never inline a variadic-defining callee.
+    if (callee.is_variadic) return false;
     for (0..callee.blockCount()) |bi| {
         const block: Block = @enumFromInt(bi);
         for (callee.blockParams(block)) |p| if (!scalar(callee, callee.valueType(p))) return false;
+        // A multi-value return in any block is not rewired by this pass (SM14 M4d-a). Refuse
+        // it, matching the backends' fail-closed stance. Never fires before M4d-c.
+        if (callee.terminator(block)) |term| {
+            if (term == .ret and term.ret.count > 1) return false;
+        }
         for (callee.blockInsts(block)) |inst| switch (callee.opcode(inst)) {
             .call, .call_indirect => return false, // keep it leaf, no nested inlining here
             .struct_new, .extract => return false, // aggregate type remap is not handled
@@ -476,8 +499,10 @@ fn inlineCallMulti(allocator: std.mem.Allocator, caller: *Function, bi: u32, cal
             continue;
         }
         if (callee.terminator(cblock)) |t| switch (t) {
-            .ret => |v| {
-                if (v) |rv| try caller.setJump(nb, cont, &.{mapV(vmap, rv)}) else try caller.setJump(nb, cont, &.{});
+            .ret => |r| {
+                var mapped: [4]Value = undefined;
+                for (r.slice(), 0..) |rv, i| mapped[i] = mapV(vmap, rv);
+                try caller.setJump(nb, cont, mapped[0..r.count]);
             },
             .jump => |j| {
                 const ja = try remapArgs(allocator, callee, vmap, j.args);
@@ -514,7 +539,7 @@ test "inlines a leaf helper and replaces the call result" {
         const bb = try callee.appendBlockParam(b, t);
         const prod = try callee.appendInst(b, t, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = bb } });
         const sum = try callee.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = prod, .rhs = a } });
-        callee.setTerminator(b, .{ .ret = sum });
+        callee.setTerminator(b, .{ .ret = ir.function.Ret.one(sum) });
     }
 
     // caller: f(x) = madd(x, x) + 1
@@ -525,7 +550,7 @@ test "inlines a leaf helper and replaces the call result" {
     const x = try caller.appendBlockParam(b, t);
     const call = try caller.appendCall(b, t, "madd", &.{ x, x });
     const r = try caller.appendArithImm(b, t, .add, call, 1);
-    caller.setTerminator(b, .{ .ret = r });
+    caller.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
 
     var lk = TestLookup{ .callee = &callee, .name = "madd" };
     const lookup = Lookup{ .context = &lk, .func = TestLookup.get };
@@ -555,8 +580,8 @@ test "inlines a multi-block, two-return callee (the call is replaced by cloned c
         const ev = try callee.appendBlockParam(eb, t);
         const cmp = try callee.appendInst(entry, bool_t, .{ .icmp = .{ .op = .gt, .lhs = a, .rhs = b } });
         try callee.appendIf(entry, cmp, .{ .target = tb, .args = &.{a} }, .{ .target = eb, .args = &.{b} });
-        callee.setTerminator(tb, .{ .ret = tv });
-        callee.setTerminator(eb, .{ .ret = ev });
+        callee.setTerminator(tb, .{ .ret = ir.function.Ret.one(tv) });
+        callee.setTerminator(eb, .{ .ret = ir.function.Ret.one(ev) });
     }
 
     // caller f(x): return max(x, 5) + 1
@@ -568,7 +593,7 @@ test "inlines a multi-block, two-return callee (the call is replaced by cloned c
     const c5 = try caller.appendInst(cb, ct, .{ .iconst = 5 });
     const m = try caller.appendCall(cb, ct, "max", &.{ x, c5 });
     _ = try caller.appendArithImm(cb, ct, .add, m, 1);
-    caller.setTerminator(cb, .{ .ret = m }); // the add stays separate, which is fine for a structural check
+    caller.setTerminator(cb, .{ .ret = ir.function.Ret.one(m) }); // the add stays separate, which is fine for a structural check
 
     var lk = TestLookup{ .callee = &callee, .name = "max" };
     try std.testing.expect(try run(allocator, &caller, .{ .context = &lk, .func = TestLookup.get }));
@@ -579,4 +604,42 @@ test "inlines a multi-block, two-return callee (the call is replaced by cloned c
         }
     }
     try std.testing.expect(caller.blockCount() > 1); // control flow was cloned in
+}
+
+test "inlined via_got global_addr keeps via_got=true (not reconstructed as false)" {
+    const allocator = std.testing.allocator;
+
+    // callee getg(): return &G (via GOT)
+    var callee = Function.init(allocator);
+    defer callee.deinit();
+    {
+        const ptr_t = try callee.types.intern(.ptr);
+        const b = try callee.appendBlock();
+        const g = try callee.appendGlobalAddrGot(b, ptr_t, "G");
+        callee.setTerminator(b, .{ .ret = ir.function.Ret.one(g) });
+    }
+
+    // caller f(): return getg()
+    var caller = Function.init(allocator);
+    defer caller.deinit();
+    const ptr_t = try caller.types.intern(.ptr);
+    const b = try caller.appendBlock();
+    const call = try caller.appendCall(b, ptr_t, "getg", &.{});
+    caller.setTerminator(b, .{ .ret = ir.function.Ret.one(call) });
+
+    var lk = TestLookup{ .callee = &callee, .name = "getg" };
+    try std.testing.expect(try run(allocator, &caller, .{ .context = &lk, .func = TestLookup.get }));
+
+    // The call is gone, replaced by the cloned global_addr. It must still carry
+    // via_got=true: `mapOpcode`'s `.global_addr` arm must forward the flag, not
+    // rebuild the op from just `.symbol` (which would silently default it false
+    // and turn GOT-indirect addressing into direct addressing).
+    var found = false;
+    for (caller.blockInsts(b)) |inst| {
+        if (caller.opcode(inst) == .global_addr) {
+            found = true;
+            try std.testing.expect(caller.opcode(inst).global_addr.via_got);
+        }
+    }
+    try std.testing.expect(found);
 }

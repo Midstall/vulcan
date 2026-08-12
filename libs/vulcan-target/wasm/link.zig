@@ -1,9 +1,9 @@
-//! Wasm module linking: compile a set of named functions, resolve intra-module
-//! calls, and produce a linked Wasm module with a symbol table.
+//! Wasm module linking. This file compiles a set of named functions, resolves
+//! intra-module calls, and produces a linked Wasm module with a symbol table.
 //!
-//! Unlike native targets, Wasm linking is simpler: it only resolves function
-//! call indices within the module. There are no relocations in the traditional
-//! sense, Wasm uses direct function indices.
+//! Wasm linking is simpler than native linking. It only resolves function call
+//! indices within the module. There are no relocations in the traditional sense.
+//! Wasm uses direct function indices instead.
 
 const std = @import("std");
 const ir = @import("vulcan-ir");
@@ -63,12 +63,12 @@ pub const Linked = struct {
     }
 };
 
-/// A Wasm function type signature (shared with isel, which resolves call_indirect
-/// type indices against the deduplicated type list this module builds).
+/// A Wasm function type signature. This is shared with isel, which resolves
+/// call_indirect type indices against the deduplicated type list this module builds.
 const Signature = isel.Signature;
 
-/// Intern `sig` into `unique` (deduplicating by params+results) and return its
-/// index. The interned copy is owned by `unique`, the caller keeps `sig`.
+/// Intern `sig` into `unique`, deduplicating by params and results, and return
+/// its index. The interned copy is owned by `unique`. The caller keeps `sig`.
 fn internSignature(allocator: std.mem.Allocator, unique: *std.ArrayList(Signature), sig: Signature) std.mem.Allocator.Error!u32 {
     for (unique.items, 0..) |u, i| {
         if (std.mem.eql(encode.ValType, sig.params, u.params) and
@@ -82,8 +82,8 @@ fn internSignature(allocator: std.mem.Allocator, unique: *std.ArrayList(Signatur
     return idx;
 }
 
-/// Compute the callee signature of a `call_indirect` instruction (its argument
-/// types map to params, its result type to a single result).
+/// Compute the callee signature of a `call_indirect` instruction. Its argument
+/// types map to params, and its result type maps to a single result.
 fn indirectSignature(allocator: std.mem.Allocator, func: *const Function, args: ir.function.ValueList, result: ?Value) Error!Signature {
     const types = &func.types;
     var params = std.ArrayList(encode.ValType).empty;
@@ -130,8 +130,9 @@ fn computeSignature(func: *const Function) Error!Signature {
         const block: Block = @enumFromInt(bi);
         if (func.terminator(block)) |t| {
             switch (t) {
-                .ret => |rv| {
-                    ret_value = rv;
+                .ret => |r| {
+                    if (r.count > 1) return error.Unsupported; // multi-value struct return not yet lowered
+                    if (r.count == 1) ret_value = r.values[0];
                     break;
                 },
                 else => {},
@@ -161,7 +162,7 @@ pub fn compileModule(allocator: std.mem.Allocator, module: *const Module) Error!
     errdefer symbols.deinit(allocator);
 
     // Build the deduplicated type section first: entry-function signatures, then
-    // any call_indirect callee signatures. Doing this before isel gives every
+    // any call_indirect callee signatures. Doing this before isel runs gives every
     // indirect call a stable type index to name.
     var unique_types = std.ArrayList(Signature).empty;
     defer {
@@ -204,8 +205,8 @@ pub fn compileModule(allocator: std.mem.Allocator, module: *const Module) Error!
         }
     }
 
-    // If any function allocates, the module gets a mutable i32 stack-pointer global
-    // (index 0) that framed functions carve their allocas from.
+    // If any function allocates, the module gets a mutable i32 stack-pointer global,
+    // at index 0, that framed functions carve their allocas from.
     var needs_stack = false;
     for (module.entries.items) |entry| {
         for (0..entry.func.blockCount()) |bi| {
@@ -244,10 +245,10 @@ pub fn compileModule(allocator: std.mem.Allocator, module: *const Module) Error!
     return result;
 }
 
-/// Reserve a fixed-width 5-byte LEB128 slot for a section length, returning its
-/// offset. Fixed width means the length can be backpatched without shifting the
-/// bytes that follow. Any decoder that does not require minimal LEB (the Wasm spec
-/// permits non-minimal) accepts it.
+/// Reserve a fixed-width 5-byte LEB128 slot for a section length, and return its
+/// offset. A fixed width means the length can be backpatched without shifting the
+/// bytes that follow. Any decoder that does not require a minimal LEB accepts it.
+/// The Wasm spec permits a non-minimal LEB.
 fn reserveSectionLen(buf: *std.ArrayList(u8), allocator: std.mem.Allocator) std.mem.Allocator.Error!usize {
     const at = buf.items.len;
     try buf.appendSlice(allocator, &[_]u8{ 0x80, 0x80, 0x80, 0x80, 0x00 });
@@ -266,8 +267,8 @@ fn patchSectionLen(buf: *std.ArrayList(u8), at: usize, len: u32) void {
 }
 
 /// Build a complete Wasm binary module from compiled function bodies. `unique_types`
-/// is the deduplicated type section and `type_indices[i]` names the type of
-/// function `i` (parallel to `functions`).
+/// is the deduplicated type section. `type_indices[i]` names the type of function
+/// `i`, in an array parallel to `functions`.
 fn buildWasmModule(
     allocator: std.mem.Allocator,
     functions: []const []u8,
@@ -345,7 +346,7 @@ fn buildWasmModule(
     // Memory (5), Export (7), Element (9), Code (10) follow the Function section.
 
     // Table section (id=4): every function is placed in one funcref table at its own
-    // index, so a `call_indirect` target value is just the callee's function index.
+    // index. So a `call_indirect` target value is just the callee's function index.
     if (n_funcs > 0) {
         try buf.append(allocator, 0x04); // table section id
         const len_at = try reserveSectionLen(&buf, allocator);

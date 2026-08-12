@@ -132,7 +132,7 @@ fn returnType(func: *const Function) ?Type {
     for (0..func.blockCount()) |bi| {
         const block: Block = @enumFromInt(@as(u32, @intCast(bi)));
         if (func.terminator(block)) |term| switch (term) {
-            .ret => |v| if (v) |vv| return func.valueType(vv),
+            .ret => |r| if (r.count > 0) return func.valueType(r.values[0]),
             .jump => {},
         };
     }
@@ -227,7 +227,7 @@ test "C backend: add two ints and run" {
     const a = try func.appendBlockParam(entry, i32_t);
     const b = try func.appendBlockParam(entry, i32_t);
     const sum = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .add, .lhs = a, .rhs = b } });
-    func.setTerminator(entry, .{ .ret = sum });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(sum) });
 
     const r = runCInt(std.testing.io, allocator, &func, &.{ .{ .int = 20 }, .{ .int = 22 } }) catch |err| switch (err) {
         error.NoCompiler => return error.SkipZigTest,
@@ -290,7 +290,7 @@ test "C backend: alloca, store, load round-trip" {
     try func.appendStore(entry, a, p);
     const x = try func.appendInst(entry, i32_t, .{ .load = .{ .ptr = p } });
     const sum = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = b } });
-    func.setTerminator(entry, .{ .ret = sum });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(sum) });
 
     const r = runCInt(std.testing.io, allocator, &func, &.{ .{ .int = 10 }, .{ .int = 5 } }) catch |err| switch (err) {
         error.NoCompiler => return error.SkipZigTest,
@@ -310,7 +310,7 @@ test "C backend: module with a cross-function call" {
     const gb = try g.appendBlock();
     const gx = try g.appendBlockParam(gb, gi);
     const gm = try g.appendInst(gb, gi, .{ .arith_imm = .{ .op = .mul, .lhs = gx, .imm = 3 } });
-    g.setTerminator(gb, .{ .ret = gm });
+    g.setTerminator(gb, .{ .ret = ir.function.Ret.one(gm) });
 
     // f(a, b) = g(a) + b
     var f = Function.init(allocator);
@@ -321,7 +321,7 @@ test "C backend: module with a cross-function call" {
     const fbparam = try f.appendBlockParam(fb, fi);
     const called = try f.appendCall(fb, fi, "g", &.{fa});
     const fsum = try f.appendInst(fb, fi, .{ .arith = .{ .op = .add, .lhs = called, .rhs = fbparam } });
-    f.setTerminator(fb, .{ .ret = fsum });
+    f.setTerminator(fb, .{ .ret = ir.function.Ret.one(fsum) });
 
     const module = try c.emitModule(allocator, &.{ .{ .name = "g", .func = &g }, .{ .name = "f", .func = &f } });
     defer allocator.free(module);
@@ -357,7 +357,7 @@ test "C backend: struct construction and extract" {
     // Build the pair (a, b), read both fields back, return f0*10 + f1.
     const scaled = try func.appendInst(entry, i32_t, .{ .arith_imm = .{ .op = .mul, .lhs = f0, .imm = 10 } });
     const sum = try func.appendInst(entry, i32_t, .{ .arith = .{ .op = .add, .lhs = scaled, .rhs = f1 } });
-    func.setTerminator(entry, .{ .ret = sum });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(sum) });
 
     const r = runCInt(std.testing.io, allocator, &func, &.{ .{ .int = 4 }, .{ .int = 5 } }) catch |err| switch (err) {
         error.NoCompiler => return error.SkipZigTest,
@@ -385,7 +385,7 @@ test "C backend: array alloca with computed pointer store/load" {
     const val = try func.appendArithImm(e, i32_t, .add, scaled, 1);
     try func.appendStore(e, val, p);
     const got = try func.appendInst(e, i32_t, .{ .load = .{ .ptr = p } });
-    func.setTerminator(e, .{ .ret = got });
+    func.setTerminator(e, .{ .ret = ir.function.Ret.one(got) });
 
     const r = runCInt(std.testing.io, allocator, &func, &.{.{ .int = 3 }}) catch |err| switch (err) {
         error.NoCompiler => return error.SkipZigTest,
@@ -410,7 +410,7 @@ test "C backend: slice construction and length extract" {
     const buf = try func.appendInst(e, ptr_t, .{ .alloca = .{ .elem = i32_t } });
     const s = try func.appendStructNew(e, slice_t, &.{ buf, n });
     const len = try func.appendInst(e, i64_t, .{ .extract = .{ .aggregate = s, .index = 1 } });
-    func.setTerminator(e, .{ .ret = len });
+    func.setTerminator(e, .{ .ret = ir.function.Ret.one(len) });
 
     const r = runCInt(std.testing.io, allocator, &func, &.{.{ .int = 42 }}) catch |err| switch (err) {
         error.NoCompiler => return error.SkipZigTest,
@@ -431,7 +431,7 @@ test "C backend: global_addr reads an external global" {
     const e = try func.appendBlock();
     const gp = try func.appendGlobalAddr(e, ptr_t, "g_value");
     const v = try func.appendInst(e, i32_t, .{ .load = .{ .ptr = gp } });
-    func.setTerminator(e, .{ .ret = v });
+    func.setTerminator(e, .{ .ret = ir.function.Ret.one(v) });
 
     const body = try c.emitFunction(allocator, &func, "f");
     defer allocator.free(body);
@@ -460,7 +460,7 @@ test "C backend: call_indirect through a function address" {
     const x = try func.appendBlockParam(e, i32_t);
     const fp = try func.appendGlobalAddr(e, ptr_t, "triple");
     const r = try func.appendCallIndirect(e, i32_t, fp, &.{x});
-    func.setTerminator(e, .{ .ret = r });
+    func.setTerminator(e, .{ .ret = ir.function.Ret.one(r) });
 
     const body = try c.emitFunction(allocator, &func, "f");
     defer allocator.free(body);
@@ -529,7 +529,7 @@ test "C backend: vector pack, element-wise add, and extract" {
     const x0 = try func.appendInst(entry, f32_t, .{ .extract = .{ .aggregate = vs, .index = 0 } });
     const x1 = try func.appendInst(entry, f32_t, .{ .extract = .{ .aggregate = vs, .index = 1 } });
     const r = try func.appendInst(entry, f32_t, .{ .arith = .{ .op = .add, .lhs = x0, .rhs = x1 } });
-    func.setTerminator(entry, .{ .ret = r });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(r) });
 
     const program = try wrapProgram(allocator, &func, &.{ .{ .float = 1.0 }, .{ .float = 2.0 }, .{ .float = 10.0 }, .{ .float = 20.0 } });
     defer allocator.free(program);
@@ -575,7 +575,7 @@ test "C backend: f16 multiply compiled+run with cc, bit-exact against Zig's own 
     const a = try func.appendBlockParam(entry, f16_t);
     const b = try func.appendBlockParam(entry, f16_t);
     const r = try func.appendInst(entry, f16_t, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = b } });
-    func.setTerminator(entry, .{ .ret = r });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(r) });
 
     const cases = [_]struct { a: f16, b: f16 }{
         .{ .a = 1.5, .b = 2.25 }, // exact in f16: a plain sanity case, no rounding involved

@@ -984,7 +984,7 @@ fn structPickFn(func: *ir.function.Function, index: u32) !void {
     const b = try func.appendBlockParam(b0, t_i32);
     const v = try func.appendStructNew(b0, st, &.{ a, b });
     const field = try func.appendInst(b0, t_i32, .{ .extract = .{ .aggregate = v, .index = index } });
-    func.setTerminator(b0, .{ .ret = field });
+    func.setTerminator(b0, .{ .ret = ir.function.Ret.one(field) });
 }
 
 test "wasm target: struct_new + extract lowers and round-trips" {
@@ -1028,7 +1028,7 @@ test "wasm target: if/else selection (max) round-trips" {
     const r = try f.appendBlockParam(merge, t);
     const c = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .gt, .lhs = a, .rhs = b } });
     try f.appendIf(entry, c, .{ .target = merge, .args = &.{a} }, .{ .target = merge, .args = &.{b} });
-    f.setTerminator(merge, .{ .ret = r });
+    f.setTerminator(merge, .{ .ret = ir.function.Ret.one(r) });
 
     var m = wtarget.link.Module.init(allocator);
     defer m.deinit();
@@ -1069,7 +1069,7 @@ test "wasm target: nested if/else (sign) round-trips" {
     const z2 = try f.appendInst(neg, t, .{ .iconst = 0 });
     try f.appendIf(neg, c2, .{ .target = merge, .args = &.{m1} }, .{ .target = merge, .args = &.{z2} });
 
-    f.setTerminator(merge, .{ .ret = r });
+    f.setTerminator(merge, .{ .ret = ir.function.Ret.one(r) });
 
     var m = wtarget.link.Module.init(allocator);
     defer m.deinit();
@@ -1115,7 +1115,7 @@ test "wasm target: loop (sum 1..n) round-trips" {
     const inext = try f.appendArithImm(body, t, .add, i, 1);
     try f.setJump(body, header, &.{ sum2, inext });
 
-    f.setTerminator(exit, .{ .ret = r });
+    f.setTerminator(exit, .{ .ret = ir.function.Ret.one(r) });
 
     var m = wtarget.link.Module.init(allocator);
     defer m.deinit();
@@ -1170,7 +1170,7 @@ test "wasm target: if nested inside a loop round-trips" {
     const inext = try f.appendArithImm(bmerge, t, .add, i, 1);
     try f.setJump(bmerge, header, &.{ acc3, inext });
 
-    f.setTerminator(exit, .{ .ret = accf });
+    f.setTerminator(exit, .{ .ret = ir.function.Ret.one(accf) });
 
     var m = wtarget.link.Module.init(allocator);
     defer m.deinit();
@@ -1193,7 +1193,7 @@ test "wasm target: i64 arithmetic round-trips" {
     const a = try f.appendBlockParam(entry, t);
     const b = try f.appendBlockParam(entry, t);
     const s = try f.appendInst(entry, t, .{ .arith = .{ .op = .add, .lhs = a, .rhs = b } });
-    f.setTerminator(entry, .{ .ret = s });
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.one(s) });
 
     var m = wtarget.link.Module.init(allocator);
     defer m.deinit();
@@ -1215,7 +1215,7 @@ test "wasm target: f64 arithmetic round-trips" {
     const a = try f.appendBlockParam(entry, t);
     const b = try f.appendBlockParam(entry, t);
     const s = try f.appendInst(entry, t, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = b } });
-    f.setTerminator(entry, .{ .ret = s });
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.one(s) });
 
     var m = wtarget.link.Module.init(allocator);
     defer m.deinit();
@@ -1239,7 +1239,7 @@ test "wasm target: narrow i8 store/load sign-extends round-trips" {
     const slot = try f.appendInst(b, ptr, .{ .alloca = .{ .elem = i8t } });
     try f.appendStore(b, x, slot);
     const r = try f.appendInst(b, i8t, .{ .load = .{ .ptr = slot } });
-    f.setTerminator(b, .{ .ret = r });
+    f.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
 
     var m = wtarget.link.Module.init(allocator);
     defer m.deinit();
@@ -1266,7 +1266,7 @@ test "wasm target: unary reinterpret (f64<->i64) and sqrt round-trip" {
         const x = try f_rt.appendBlockParam(b, f64t);
         const bits = try f_rt.appendInst(b, i64t, .{ .unary = .{ .op = .reinterpret, .value = x } });
         const back = try f_rt.appendInst(b, f64t, .{ .unary = .{ .op = .reinterpret, .value = bits } });
-        f_rt.setTerminator(b, .{ .ret = back });
+        f_rt.setTerminator(b, .{ .ret = ir.function.Ret.one(back) });
     }
     // sqrtd(x: f64) = sqrt(x).
     var f_sq = ir.function.Function.init(allocator);
@@ -1276,7 +1276,7 @@ test "wasm target: unary reinterpret (f64<->i64) and sqrt round-trip" {
         const b = try f_sq.appendBlock();
         const x = try f_sq.appendBlockParam(b, f64t);
         const r = try f_sq.appendInst(b, f64t, .{ .unary = .{ .op = .sqrt, .value = x } });
-        f_sq.setTerminator(b, .{ .ret = r });
+        f_sq.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
     }
 
     var m = wtarget.link.Module.init(allocator);
@@ -1306,7 +1306,7 @@ test "wasm target: unsigned vs signed compare round-trips" {
     const one = try f.appendInst(entry, u32t, .{ .iconst = 1 });
     const zero = try f.appendInst(entry, u32t, .{ .iconst = 0 });
     const r = try f.appendInst(entry, u32t, .{ .select = .{ .cond = c, .then = one, .@"else" = zero } });
-    f.setTerminator(entry, .{ .ret = r });
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.one(r) });
 
     var m = wtarget.link.Module.init(allocator);
     defer m.deinit();
@@ -1335,7 +1335,7 @@ test "wasm target: unsigned div and shr use the unsigned wasm ops" {
         const a = try f.appendBlockParam(b, u);
         const d = try f.appendBlockParam(b, u);
         const r = try f.appendInst(b, u, .{ .arith = .{ .op = .div, .lhs = a, .rhs = d } });
-        f.setTerminator(b, .{ .ret = r });
+        f.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
         var m = wtarget.link.Module.init(allocator);
         defer m.deinit();
         try m.addFunction("divu", &f);
@@ -1352,7 +1352,7 @@ test "wasm target: unsigned div and shr use the unsigned wasm ops" {
         const b = try f.appendBlock();
         const a = try f.appendBlockParam(b, u);
         const r = try f.appendArithImm(b, u, .shr, a, 1);
-        f.setTerminator(b, .{ .ret = r });
+        f.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
         var m = wtarget.link.Module.init(allocator);
         defer m.deinit();
         try m.addFunction("shru", &f);
@@ -1373,7 +1373,7 @@ test "wasm target: i32 -> i64 sign-extend conversion round-trips" {
     const b = try f.appendBlock();
     const x = try f.appendBlockParam(b, i32t);
     const w = try f.appendInst(b, i64t, .{ .convert = .{ .value = x } }); // i32 -> i64
-    f.setTerminator(b, .{ .ret = w });
+    f.setTerminator(b, .{ .ret = ir.function.Ret.one(w) });
 
     var m = wtarget.link.Module.init(allocator);
     defer m.deinit();
@@ -1396,7 +1396,7 @@ test "wasm target: i64 -> i32 wrap and f32 <-> f64 conversions round-trip" {
         const b = try f_wrap.appendBlock();
         const x = try f_wrap.appendBlockParam(b, i64t);
         const w = try f_wrap.appendInst(b, i32t, .{ .convert = .{ .value = x } }); // i64 -> i32 wrap
-        f_wrap.setTerminator(b, .{ .ret = w });
+        f_wrap.setTerminator(b, .{ .ret = ir.function.Ret.one(w) });
     }
     var f_pd = ir.function.Function.init(allocator);
     defer f_pd.deinit();
@@ -1410,7 +1410,7 @@ test "wasm target: i64 -> i32 wrap and f32 <-> f64 conversions round-trip" {
         const two = try f_pd.appendInst(b, f64t, .{ .fconst = 2.0 });
         const scaled = try f_pd.appendInst(b, f64t, .{ .arith = .{ .op = .mul, .lhs = wide, .rhs = two } });
         const narrow = try f_pd.appendInst(b, f32t, .{ .convert = .{ .value = scaled } }); // f64 -> f32
-        f_pd.setTerminator(b, .{ .ret = narrow });
+        f_pd.setTerminator(b, .{ .ret = ir.function.Ret.one(narrow) });
     }
 
     var m = wtarget.link.Module.init(allocator);
@@ -1903,7 +1903,7 @@ test "wasm target: f32 select (min) round-trips" {
     const b = try f.appendBlockParam(entry, ft);
     const lt = try f.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = a, .rhs = b } });
     const r = try f.appendInst(entry, ft, .{ .select = .{ .cond = lt, .then = a, .@"else" = b } });
-    f.setTerminator(entry, .{ .ret = r });
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.one(r) });
 
     var m = wtarget.link.Module.init(allocator);
     defer m.deinit();
@@ -1926,7 +1926,7 @@ test "wasm target: f32 arithmetic round-trips" {
     const a = try f.appendBlockParam(entry, ft);
     const b = try f.appendBlockParam(entry, ft);
     const sum = try f.appendInst(entry, ft, .{ .arith = .{ .op = .add, .lhs = a, .rhs = b } });
-    f.setTerminator(entry, .{ .ret = sum });
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.one(sum) });
 
     var m = wtarget.link.Module.init(allocator);
     defer m.deinit();
@@ -1957,14 +1957,14 @@ test "wasm target: direct call resolves by name not interning order" {
         const b = try fp.appendBlock();
         const x = try fp.appendBlockParam(b, t);
         const r = try fp.appendArithImm(b, t, .add, x, pair[1]);
-        fp.setTerminator(b, .{ .ret = r });
+        fp.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
     }
     {
         const t = try mainf.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
         const b = try mainf.appendBlock();
         const x = try mainf.appendBlockParam(b, t);
         const r = try mainf.appendCall(b, t, "target", &.{x});
-        mainf.setTerminator(b, .{ .ret = r });
+        mainf.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
     }
 
     var m = wtarget.link.Module.init(allocator);
@@ -1994,7 +1994,7 @@ test "wasm target: int->float convert with mixed-type locals round-trips" {
     const nf = try f.appendInst(entry, ft, .{ .convert = .{ .value = n } });
     const k = try f.appendInst(entry, ft, .{ .fconst = 2.5 });
     const r = try f.appendInst(entry, ft, .{ .arith = .{ .op = .mul, .lhs = nf, .rhs = k } });
-    f.setTerminator(entry, .{ .ret = r });
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.one(r) });
 
     var m = wtarget.link.Module.init(allocator);
     defer m.deinit();
@@ -2037,7 +2037,7 @@ test "wasm target: stack frame + control flow + cross-block alloca" {
     try f.setJump(pos, merge, &.{});
 
     const r = try f.appendInst(merge, t, .{ .load = .{ .ptr = slot } });
-    f.setTerminator(merge, .{ .ret = r });
+    f.setTerminator(merge, .{ .ret = ir.function.Ret.one(r) });
 
     var m = wtarget.link.Module.init(allocator);
     defer m.deinit();
@@ -2069,7 +2069,7 @@ test "wasm target: cross-call allocas do not alias (stack pointer)" {
         const seven = try callee.appendInst(b, t, .{ .iconst = 7 });
         try callee.appendStore(b, seven, slot);
         const r = try callee.appendInst(b, t, .{ .load = .{ .ptr = slot } });
-        callee.setTerminator(b, .{ .ret = r });
+        callee.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
     }
     // caller(): store 1000 into its own slot, call callee(), reload the slot, add.
     // With static offsets callee's store would clobber the slot (14). With a stack
@@ -2086,7 +2086,7 @@ test "wasm target: cross-call allocas do not alias (stack pointer)" {
         const c = try caller.appendCall(b, t, "callee", &.{});
         const reloaded = try caller.appendInst(b, t, .{ .load = .{ .ptr = slot } });
         const sum = try caller.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = reloaded, .rhs = c } });
-        caller.setTerminator(b, .{ .ret = sum });
+        caller.setTerminator(b, .{ .ret = ir.function.Ret.one(sum) });
     }
 
     var m = wtarget.link.Module.init(allocator);
@@ -2118,7 +2118,7 @@ test "wasm target: alloca + store/load through linear memory round-trips" {
     const x = try f.appendInst(entry, t, .{ .load = .{ .ptr = p } });
     const y = try f.appendInst(entry, t, .{ .load = .{ .ptr = q } });
     const sum = try f.appendInst(entry, t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = y } });
-    f.setTerminator(entry, .{ .ret = sum });
+    f.setTerminator(entry, .{ .ret = ir.function.Ret.one(sum) });
 
     var m = wtarget.link.Module.init(allocator);
     defer m.deinit();
@@ -2138,7 +2138,7 @@ fn scaleFn(func: *ir.function.Function, k: i64) !void {
     const b0 = try func.appendBlock();
     const x = try func.appendBlockParam(b0, t_i32);
     const r = try func.appendInst(b0, t_i32, .{ .arith_imm = .{ .op = .mul, .lhs = x, .imm = k } });
-    func.setTerminator(b0, .{ .ret = r });
+    func.setTerminator(b0, .{ .ret = ir.function.Ret.one(r) });
 }
 
 test "wasm target: call_indirect lowers and round-trips" {
@@ -2159,7 +2159,7 @@ test "wasm target: call_indirect lowers and round-trips" {
     const sel = try f_disp.appendBlockParam(b0, t_i32);
     const x = try f_disp.appendBlockParam(b0, t_i32);
     const r = try f_disp.appendCallIndirect(b0, t_i32, sel, &.{x});
-    f_disp.setTerminator(b0, .{ .ret = r });
+    f_disp.setTerminator(b0, .{ .ret = ir.function.Ret.one(r) });
 
     var m = wtarget.link.Module.init(allocator);
     defer m.deinit();
@@ -2223,7 +2223,7 @@ test "wasm vs aarch64: multiple allocas do not alias" {
     const lb = try f.appendInst(b, t, .{ .load = .{ .ptr = sb } });
     const prod = try f.appendInst(b, t, .{ .arith = .{ .op = .mul, .lhs = la, .rhs = lb } });
     const res = try f.appendInst(b, t, .{ .arith = .{ .op = .sub, .lhs = prod, .rhs = la } });
-    f.setTerminator(b, .{ .ret = res });
+    f.setTerminator(b, .{ .ret = ir.function.Ret.one(res) });
 
     for ([_]i32{ 0, 1, 4, -2, 10 }) |x_val| {
         try diffIRModule(allocator, &.{.{ .name = "f", .func = &f }}, "f", x_val);
@@ -2240,7 +2240,7 @@ test "wasm vs aarch64: nested calls with arguments" {
         const b = try add3.appendBlock();
         const p = try add3.appendBlockParam(b, t);
         const r = try add3.appendArithImm(b, t, .add, p, 3);
-        add3.setTerminator(b, .{ .ret = r });
+        add3.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
     }
     var dbl = ir.function.Function.init(allocator);
     defer dbl.deinit();
@@ -2249,7 +2249,7 @@ test "wasm vs aarch64: nested calls with arguments" {
         const b = try dbl.appendBlock();
         const p = try dbl.appendBlockParam(b, t);
         const r = try dbl.appendArithImm(b, t, .mul, p, 2);
-        dbl.setTerminator(b, .{ .ret = r });
+        dbl.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
     }
     var f = ir.function.Function.init(allocator);
     defer f.deinit();
@@ -2259,7 +2259,7 @@ test "wasm vs aarch64: nested calls with arguments" {
         const x = try f.appendBlockParam(b, t);
         const c1 = try f.appendCall(b, t, "add3", &.{x});
         const c2 = try f.appendCall(b, t, "dbl", &.{c1});
-        f.setTerminator(b, .{ .ret = c2 });
+        f.setTerminator(b, .{ .ret = ir.function.Ret.one(c2) });
     }
     const funcs = [_]native.ModuleFunction{
         .{ .name = "add3", .func = &add3 },
@@ -2280,7 +2280,7 @@ test "wasm vs aarch64: value live across a call and a memory slot" {
         const b = try helper.appendBlock();
         const p = try helper.appendBlockParam(b, t);
         const r = try helper.appendArithImm(b, t, .mul, p, 10);
-        helper.setTerminator(b, .{ .ret = r });
+        helper.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
     }
     var f = ir.function.Function.init(allocator);
     defer f.deinit();
@@ -2295,7 +2295,7 @@ test "wasm vs aarch64: value live across a call and a memory slot" {
         const c = try f.appendCall(b, t, "helper", &.{x});
         const lt = try f.appendInst(b, t, .{ .load = .{ .ptr = slot } });
         const res = try f.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = lt, .rhs = c } });
-        f.setTerminator(b, .{ .ret = res });
+        f.setTerminator(b, .{ .ret = ir.function.Ret.one(res) });
     }
     const funcs = [_]native.ModuleFunction{
         .{ .name = "helper", .func = &helper },
@@ -2325,7 +2325,7 @@ test "wasm target: f16 extend widens raw half bits to f32, bit-exact vs @as(f32,
     const slot = try f.appendInst(b, ptr, .{ .alloca = .{ .elem = f16t } });
     try f.appendStore(b, x, slot);
     const r = try f.appendInst(b, f16t, .{ .load = .{ .ptr = slot } });
-    f.setTerminator(b, .{ .ret = r });
+    f.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
 
     var m = wtarget.link.Module.init(allocator);
     defer m.deinit();
@@ -2365,7 +2365,7 @@ test "wasm target: f16 truncate rounds f32 to half bits (RNE), bit-exact vs @as(
     const slot = try f.appendInst(b, ptr, .{ .alloca = .{ .elem = f16t } });
     try f.appendStore(b, c, slot);
     const r = try f.appendInst(b, u16t, .{ .load = .{ .ptr = slot } });
-    f.setTerminator(b, .{ .ret = r });
+    f.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
 
     var m = wtarget.link.Module.init(allocator);
     defer m.deinit();
@@ -2407,7 +2407,7 @@ test "wasm target: f16 add rounds per-op, bit-exact vs @as(f16, af+bf)" {
     const a = try f.appendBlockParam(b, f16t);
     const bb = try f.appendBlockParam(b, f16t);
     const s = try f.appendInst(b, f16t, .{ .arith = .{ .op = .add, .lhs = a, .rhs = bb } });
-    f.setTerminator(b, .{ .ret = s });
+    f.setTerminator(b, .{ .ret = ir.function.Ret.one(s) });
 
     var m = wtarget.link.Module.init(allocator);
     defer m.deinit();
@@ -2440,7 +2440,7 @@ test "wasm target: f16 mul rounds a non-half-representable product, bit-exact vs
     const a = try f.appendBlockParam(b, f16t);
     const bb = try f.appendBlockParam(b, f16t);
     const s = try f.appendInst(b, f16t, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = bb } });
-    f.setTerminator(b, .{ .ret = s });
+    f.setTerminator(b, .{ .ret = ir.function.Ret.one(s) });
 
     var m = wtarget.link.Module.init(allocator);
     defer m.deinit();
@@ -2474,7 +2474,7 @@ test "wasm target: f16 store/load round-trips a representable half through memor
     const slot = try f.appendInst(b, ptr, .{ .alloca = .{ .elem = f16t } });
     try f.appendStore(b, x, slot);
     const r = try f.appendInst(b, f16t, .{ .load = .{ .ptr = slot } });
-    f.setTerminator(b, .{ .ret = r });
+    f.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
 
     var m = wtarget.link.Module.init(allocator);
     defer m.deinit();
@@ -2502,7 +2502,7 @@ test "wasm target: int<->f16 conversions go through f32, bit-exact vs Zig casts"
         const b = try f_i2h.appendBlock();
         const x = try f_i2h.appendBlockParam(b, i32t);
         const r = try f_i2h.appendInst(b, f16t, .{ .convert = .{ .value = x } });
-        f_i2h.setTerminator(b, .{ .ret = r });
+        f_i2h.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
     }
     // h2i(x: f16) -> i32 (truncate the held f32 toward zero).
     var f_h2i = ir.function.Function.init(allocator);
@@ -2513,7 +2513,7 @@ test "wasm target: int<->f16 conversions go through f32, bit-exact vs Zig casts"
         const b = try f_h2i.appendBlock();
         const x = try f_h2i.appendBlockParam(b, f16t);
         const r = try f_h2i.appendInst(b, i32t, .{ .convert = .{ .value = x } });
-        f_h2i.setTerminator(b, .{ .ret = r });
+        f_h2i.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
     }
 
     var m = wtarget.link.Module.init(allocator);

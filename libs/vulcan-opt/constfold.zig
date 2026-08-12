@@ -190,7 +190,7 @@ test "folds nested integer arithmetic to a constant" {
     const c3 = try func.appendInst(b, i32_t, .{ .iconst = 3 });
     const sum = try func.appendInst(b, i32_t, .{ .arith = .{ .op = .add, .lhs = c2, .rhs = c3 } });
     const prod = try func.appendInst(b, i32_t, .{ .arith = .{ .op = .mul, .lhs = sum, .rhs = c2 } });
-    func.setTerminator(b, .{ .ret = prod });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(prod) });
 
     var analyses = pass.Analyses{ .allocator = allocator, .func = &func };
     defer analyses.deinit();
@@ -211,7 +211,7 @@ test "folds an unsigned comparison to a bool constant" {
     const c200 = try func.appendInst(b, u8_t, .{ .iconst = 200 });
     const c100 = try func.appendInst(b, u8_t, .{ .iconst = 100 });
     const cmp = try func.appendInst(b, bool_t, .{ .icmp = .{ .op = .gt, .lhs = c200, .rhs = c100 } });
-    func.setTerminator(b, .{ .ret = cmp });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(cmp) });
 
     var analyses = pass.Analyses{ .allocator = allocator, .func = &func };
     defer analyses.deinit();

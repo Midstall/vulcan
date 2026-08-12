@@ -69,7 +69,7 @@ fn buildDotLoop(func: *Function, sign: std.builtin.Signedness) !void {
     const npb = try func.appendArithImm(body, ptr_t, .add, bpb, 1);
     try func.setJump(body, header, &.{ ni, nacc, npa, npb });
 
-    func.setTerminator(exit, .{ .ret = acc });
+    func.setTerminator(exit, .{ .ret = ir.function.Ret.one(acc) });
 }
 
 /// The lengths exercised, chosen to cover an empty loop, a sub-vector remainder, exact vector

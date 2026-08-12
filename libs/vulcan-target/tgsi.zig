@@ -1,19 +1,19 @@
 //! Lowers a graphics Vulcan IR function to TGSI text.
 //!
-//! TGSI (Tungsten Graphics Shader Infrastructure) is Gallium/virgl's textual
-//! shader form: `tgsi_text_translate` parses exactly this text, so the emitted
-//! bytes feed straight to a virgl shader-create command. GPU-paravirtual
-//! counterpart of the nvidia SASS backend: rather than selecting a native ISA, the
-//! graphics IR is rendered as TGSI declarations and opcodes.
+//! TGSI (Tungsten Graphics Shader Infrastructure) is Gallium's and virgl's textual
+//! shader form. `tgsi_text_translate` parses exactly this text, so the emitted
+//! bytes feed straight into a virgl shader-create command. This is the
+//! GPU-paravirtual counterpart of the nvidia SASS backend. Instead of selecting a
+//! native ISA, it renders the graphics IR as TGSI declarations and opcodes.
 //!
-//! The graphics IR carries the same `vulcan.gpu` attribute tags the SPIR-V
-//! graphics lowering produces and the nvidia isel reads:
+//! The graphics IR carries the same `vulcan.gpu` attribute tags that the SPIR-V
+//! graphics lowering produces and the nvidia instruction selector reads:
 //!   * entry-block params tagged `attr` = ATTR_GENERIC0 + loc*0x10 + comp*4
-//!     (a vertex/fragment input attribute slot), one per vector component.
-//!   * output stores whose pointer is a tag-carrier iconst tagged either
+//!     (a vertex or fragment input attribute slot), one per vector component.
+//!   * output stores whose pointer is a tag-carrier iconst, tagged either
 //!     `out_attr` (a vertex output: ATTR_POSITION for the clip-space position,
 //!     ATTR_GENERIC0 + loc*0x10 + comp*4 for a varying) or `color_out` (a
-//!     fragment render-target color component index 0..3).
+//!     fragment render-target color component index, 0 to 3).
 //!
 //! TGSI mapping:
 //!   VS inputs   -> `DCL IN[loc]`
@@ -21,12 +21,12 @@
 //!   VS varying  -> `DCL OUT[n], GENERIC[loc]`
 //!   FS input    -> `DCL IN[n], GENERIC[loc], PERSPECTIVE`
 //!   FS color    -> `DCL OUT[0], COLOR`
-//! plus one `MOV` per output register copying its source input register, then
+//! plus one `MOV` per output register, copying its source input register, then
 //! `END`.
 //!
-//! Only the passthrough class (output <- input, per register) is lowered. A shader
-//! with arithmetic in the body returns `error.Unsupported`. General TGSI expression
-//! lowering is future work.
+//! Only the passthrough class is lowered here (output <- input, per register). A
+//! shader with arithmetic in the body returns `error.Unsupported`. General TGSI
+//! expression lowering is future work.
 
 const std = @import("std");
 const ir = @import("vulcan-ir");
@@ -183,7 +183,7 @@ fn blockSuccIdx(func: *const Function, blk: Block, n: usize, buf: *[2]usize) []c
         buf[1] = @intFromEnum(c.@"else".target);
         return buf[0..2];
     }
-    switch (func.terminator(blk) orelse ir.function.Terminator{ .ret = null }) {
+    switch (func.terminator(blk) orelse ir.function.Terminator{ .ret = ir.function.Ret.none() }) {
         .ret => {
             buf[0] = n; // the virtual exit
             return buf[0..1];
@@ -406,7 +406,7 @@ const Planner = struct {
                 try self.arm(ifc.@"else".target, self.func.valueList(ifc.@"else".args), merge, loop);
                 try self.steps.append(self.allocator, .end_if);
                 c = merge;
-            } else switch (self.func.terminator(blk) orelse ir.function.Terminator{ .ret = null }) {
+            } else switch (self.func.terminator(blk) orelse ir.function.Terminator{ .ret = ir.function.Ret.none() }) {
                 .ret => return,
                 .jump => |j| {
                     if (try self.edge(j.target, self.func.valueList(j.args), stop, loop) == .done) return;
@@ -428,8 +428,8 @@ const Planner = struct {
 /// dword-padded (virglrenderer reads it as a token-aligned shader blob). The
 /// caller owns the returned slice (free with `allocator`).
 pub fn lower(allocator: std.mem.Allocator, func: *const Function) Error![]u8 {
-    // f16 not yet lowered on this backend (f16 roadmap Pn); reject cleanly rather than
-    // silently treat as f64.
+    // f16 is not yet lowered on this backend. Reject cleanly, rather than silently
+    // treating it as f64.
     if (ir.function.functionUsesF16(func)) return error.Unsupported;
 
     const stage = stageOf(func) orelse return error.Unsupported;
@@ -927,17 +927,18 @@ pub fn lower(allocator: std.mem.Allocator, func: *const Function) Error![]u8 {
                 try tex_addr.put(allocator, r, .{ .temp = t, .comp = 0 });
             },
             .call_indirect => |c| {
-                // A discard call `discard_fn()` -> KILL (unconditional at this point; the
-                // structurizer's UIF/ELSE already gates it for a conditional discard).
+                // A discard call `discard_fn()` -> KILL. This is unconditional at this
+                // point. The structurizer's UIF/ELSE already gates it for a conditional
+                // discard.
                 if (hasFlag(func, c.target, "discard_fn")) {
                     try body.print("  {d}: KILL\n", .{line});
                     line += 1;
                     continue;
                 }
                 // A sampler call `sampler_fn(desc, u, v, lod, out_ptr)` -> a TEX. Only the
-                // synthesized host-sampler pointer target is recognized here. The lod arg
-                // (args[3]) is not yet honored by this backend (always TEX = base level /
-                // implicit LOD); an explicit-LOD TXL is a virgl follow-up.
+                // synthesized host-sampler pointer target is recognized here. This backend
+                // does not yet honor the lod arg (args[3]). It always emits TEX (base
+                // level, implicit LOD). An explicit-LOD TXL is a virgl follow-up.
                 if (!hasFlag(func, c.target, "sampler_fn")) return error.Unsupported;
                 const args = func.valueList(c.args);
                 if (args.len != 5) return error.Unsupported; // {desc, u, v, lod, out_ptr}
@@ -1295,7 +1296,7 @@ test "lower a passthrough vertex shader to TGSI (position + color varying)" {
         try func.addAttr(.{ .value = ptr }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "out_attr", .value = .{ .int = ATTR_GENERIC0 + c * 4 } } });
         try func.appendStore(b, col_in[c], ptr);
     }
-    func.setTerminator(b, .{ .ret = null });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
 
     const tgsi = try lower(allocator, &func);
     defer allocator.free(tgsi);
@@ -1335,7 +1336,7 @@ test "lower a passthrough fragment shader to TGSI (interpolated varying -> color
         try func.addAttr(.{ .value = ptr }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "color_out", .value = .{ .int = c } } });
         try func.appendStore(b, col_in[c], ptr);
     }
-    func.setTerminator(b, .{ .ret = null });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
 
     const tgsi = try lower(allocator, &func);
     defer allocator.free(tgsi);
@@ -1374,7 +1375,7 @@ test "lower an arithmetic fragment shader (mul of two input components) to TGSI"
         try func.addAttr(.{ .value = ptr }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "color_out", .value = .{ .int = c } } });
         try func.appendStore(b, store_srcs[c], ptr);
     }
-    func.setTerminator(b, .{ .ret = null });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
 
     const tgsi = try lower(allocator, &func);
     defer allocator.free(tgsi);
@@ -1399,7 +1400,7 @@ test "an f16 function is rejected cleanly, not miscompiled as f64" {
     const x = try func.appendBlockParam(b, f16_t);
     const y = try func.appendBlockParam(b, f16_t);
     const sum = try func.appendInst(b, f16_t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = y } });
-    func.setTerminator(b, .{ .ret = sum });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(sum) });
 
     // No `stage` attr is set here on purpose: the f16 gate must fire before `stageOf`
     // is even consulted, so this proves the gate is the very first thing `lower` does.
@@ -1431,7 +1432,7 @@ test "lower an add-with-constant vertex shader (arith_imm + fconst pool) to TGSI
         try func.addAttr(.{ .value = ptr }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "out_attr", .value = .{ .int = ATTR_POSITION + c * 4 } } });
         try func.appendStore(b, out_srcs[c], ptr);
     }
-    func.setTerminator(b, .{ .ret = null });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
 
     const tgsi = try lower(allocator, &func);
     defer allocator.free(tgsi);
@@ -1470,7 +1471,7 @@ test "lower a UBO-reading fragment shader (uniform vec4 color) to TGSI CONST[]" 
         try func.addAttr(.{ .value = sptr }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "color_out", .value = .{ .int = c } } });
         try func.appendStore(b, val, sptr);
     }
-    func.setTerminator(b, .{ .ret = null });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
 
     const tgsi = try lower(allocator, &func);
     defer allocator.free(tgsi);
@@ -1515,7 +1516,7 @@ test "lower a UBO-transform vertex shader (uniform scale of position) to TGSI" {
         try func.addAttr(.{ .value = sptr }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "out_attr", .value = .{ .int = ATTR_POSITION + c * 4 } } });
         try func.appendStore(b, scaled, sptr);
     }
-    func.setTerminator(b, .{ .ret = null });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
 
     const tgsi = try lower(allocator, &func);
     defer allocator.free(tgsi);
@@ -1565,7 +1566,7 @@ test "lower a texturing fragment shader (sampler2D) to TGSI SAMP/TEX" {
         try func.addAttr(.{ .value = sptr }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "color_out", .value = .{ .int = c } } });
         try func.appendStore(b, texel, sptr);
     }
-    func.setTerminator(b, .{ .ret = null });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
 
     const tgsi = try lower(allocator, &func);
     defer allocator.free(tgsi);
@@ -1606,7 +1607,7 @@ test "lower a vertex shader reading gl_InstanceIndex to TGSI SV[] INSTANCEID" {
         try func.addAttr(.{ .value = ptr }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "out_attr", .value = .{ .int = ATTR_POSITION + c * 4 } } });
         try func.appendStore(b, outs[c], ptr);
     }
-    func.setTerminator(b, .{ .ret = null });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
 
     const tgsi = try lower(allocator, &func);
     defer allocator.free(tgsi);
@@ -1639,7 +1640,7 @@ test "lower a float remainder (mod) to the TGSI trunc-based sequence" {
         try func.addAttr(.{ .value = ptr }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "color_out", .value = .{ .int = c } } });
         try func.appendStore(b, outs[c], ptr);
     }
-    func.setTerminator(b, .{ .ret = null });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
 
     const tgsi = try lower(allocator, &func);
     defer allocator.free(tgsi);
@@ -1677,7 +1678,7 @@ test "lower a select/icmp fragment shader (ternary) to TGSI FSLT + UCMP" {
         try func.addAttr(.{ .value = ptr }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "color_out", .value = .{ .int = c } } });
         try func.appendStore(b, outs[c], ptr);
     }
-    func.setTerminator(b, .{ .ret = null });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
 
     const tgsi = try lower(allocator, &func);
     defer allocator.free(tgsi);
@@ -1724,7 +1725,7 @@ test "lower a per-instance UBO fetch (dynamic CONST index by gl_InstanceIndex) t
         try func.addAttr(.{ .value = sptr }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "out_attr", .value = .{ .int = ATTR_POSITION + c * 4 } } });
         try func.appendStore(b, sum, sptr);
     }
-    func.setTerminator(b, .{ .ret = null });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
 
     const tgsi = try lower(allocator, &func);
     defer allocator.free(tgsi);
@@ -1772,7 +1773,7 @@ test "lower a multi-block if/else diamond (branch + phi) to TGSI UIF/ELSE/ENDIF"
         try func.addAttr(.{ .value = ptr }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "color_out", .value = .{ .int = c } } });
         try func.appendStore(merge, outs[c], ptr);
     }
-    func.setTerminator(merge, .{ .ret = null });
+    func.setTerminator(merge, .{ .ret = ir.function.Ret.none() });
 
     const tgsi = try lower(allocator, &func);
     defer allocator.free(tgsi);
@@ -1835,7 +1836,7 @@ test "lower a while-loop (back edge + loop-carried phi) to TGSI BGNLOOP/BRK/ENDL
         try func.addAttr(.{ .value = ptr }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "color_out", .value = .{ .int = c } } });
         try func.appendStore(merge, outs[c], ptr);
     }
-    func.setTerminator(merge, .{ .ret = null });
+    func.setTerminator(merge, .{ .ret = ir.function.Ret.none() });
 
     const tgsi = try lower(allocator, &func);
     defer allocator.free(tgsi);
@@ -1878,7 +1879,7 @@ test "lower a vertex shader writing gl_PointSize to a TGSI PSIZE output" {
     const sptr = try func.appendInst(b, i32_t, .{ .iconst = @intCast(ATTR_POINT_SIZE) });
     try func.addAttr(.{ .value = sptr }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "out_attr", .value = .{ .int = ATTR_POINT_SIZE } } });
     try func.appendStore(b, size, sptr);
-    func.setTerminator(b, .{ .ret = null });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
 
     const tgsi = try lower(allocator, &func);
     defer allocator.free(tgsi);
@@ -1918,7 +1919,7 @@ test "lower a derivative (dFdx of a varying) to TGSI DDX" {
         try func.addAttr(.{ .value = ptr }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "color_out", .value = .{ .int = c } } });
         try func.appendStore(b, outs[c], ptr);
     }
-    func.setTerminator(b, .{ .ret = null });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
 
     const tgsi = try lower(allocator, &func);
     defer allocator.free(tgsi);
@@ -1955,7 +1956,7 @@ test "lower a fragment shader reading gl_FragCoord + gl_FrontFacing to TGSI POSI
         try func.addAttr(.{ .value = ptr }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "color_out", .value = .{ .int = c } } });
         try func.appendStore(b, srcs[c], ptr);
     }
-    func.setTerminator(b, .{ .ret = null });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
 
     const tgsi = try lower(allocator, &func);
     defer allocator.free(tgsi);
@@ -1992,7 +1993,7 @@ test "lower a fragment shader writing gl_FragDepth to a TGSI POSITION.z output" 
     const dptr = try func.appendInst(b, i32_t, .{ .iconst = 0 });
     try func.addAttr(.{ .value = dptr }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "frag_depth", .value = .{ .int = 0 } } });
     try func.appendStore(b, in[0], dptr);
-    func.setTerminator(b, .{ .ret = null });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
 
     const tgsi = try lower(allocator, &func);
     defer allocator.free(tgsi);
@@ -2029,13 +2030,13 @@ test "lower a fragment shader with a conditional discard to TGSI UIF/KILL/ENDIF"
     const cond = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = in[0], .rhs = in[1] } });
     try func.appendIf(entry, cond, .{ .target = kill }, .{ .target = merge });
     _ = try func.appendCallIndirect(kill, void_t, dfn, &.{});
-    func.setTerminator(kill, .{ .ret = null });
+    func.setTerminator(kill, .{ .ret = ir.function.Ret.none() });
     inline for (0..4) |c| {
         const ptr = try func.appendInst(merge, i32_t, .{ .iconst = @intCast(c) });
         try func.addAttr(.{ .value = ptr }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "color_out", .value = .{ .int = c } } });
         try func.appendStore(merge, in[c], ptr);
     }
-    func.setTerminator(merge, .{ .ret = null });
+    func.setTerminator(merge, .{ .ret = ir.function.Ret.none() });
 
     const tgsi = try lower(allocator, &func);
     defer allocator.free(tgsi);
@@ -2073,7 +2074,7 @@ test "lower an MRT fragment shader (two color targets) to TGSI OUT[0]/OUT[1] COL
         try func.addAttr(.{ .value = p1 }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "color_out", .value = .{ .int = 4 + c } } });
         try func.appendStore(b, t1[c], p1);
     }
-    func.setTerminator(b, .{ .ret = null });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
 
     const tgsi = try lower(allocator, &func);
     defer allocator.free(tgsi);

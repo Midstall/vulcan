@@ -1,21 +1,24 @@
-//! NVIDIA SASS instruction selection: lowers a Vulcan IR function to a compute
-//! kernel or graphics shader.
+//! NVIDIA SASS instruction selection. This module lowers a Vulcan IR function to
+//! a compute kernel or a graphics shader.
 //!
-//! Kernels are leaf (no call stack, inline before isel). ~255 GPRs, so allocation
-//! is naive: a pointer takes an even-aligned register pair, a boolean a predicate
-//! (P0..P5, P6 is the 64-bit-add carry). Kernel ABI: parameters arrive in constant
-//! bank 0 at `param_base`. A value-returning kernel reads a 64-bit output pointer
-//! first (its `ret` stores there), a void compute kernel has none. Each parameter
-//! is then sourced in order: the tagged invocation id from the hardware thread id
-//! (S2R), a pointer as a 64-bit constant-bank pair load, a scalar as a single load.
-//! Memory load/store are LDG/STG through a 64-bit pointer pair. Pointer arithmetic
-//! is a 64-bit IADD3 carry chain (low add carries out, high `.X` add carries in).
-//! Control flow is BRA with block-parameter edge moves. schedule.zig then assigns
-//! write barriers to the variable-latency ops (LDG/S2R) and waits to consumers.
+//! Kernels are leaf functions. The isel inlines calls before it runs, so there
+//! is no call stack. The GPU has about 255 GPRs, so register allocation stays
+//! simple: a pointer takes an even-aligned register pair, and a boolean takes a
+//! predicate register (P0 to P5, where P6 holds the 64-bit-add carry). Kernel
+//! ABI: parameters arrive in constant bank 0 at `param_base`. A kernel that
+//! returns a value reads a 64-bit output pointer first (its `ret` stores the
+//! result there). A void compute kernel has no output pointer. Each parameter
+//! then loads in order: the tagged invocation ID comes from the hardware thread
+//! ID (S2R), a pointer loads as a 64-bit pair from the constant bank, and a
+//! scalar loads as one value. Memory load and store use LDG and STG through a
+//! 64-bit pointer pair. Pointer arithmetic uses a 64-bit IADD3 carry chain: the
+//! low add carries out, and the high `.X` add carries in. Control flow uses BRA
+//! with block-parameter edge moves. schedule.zig then assigns write barriers to
+//! the variable-latency ops (LDG, S2R) and adds waits before their consumers.
 //!
-//! Validation is structural (the emitted instruction stream). Live execution is
-//! deferred to prism's compute dispatch. Unsupported IR (calls, aggregates, integer
-//! divide) returns `error.Unsupported`.
+//! Validation checks the structure of the emitted instruction stream. Live
+//! execution happens later, in prism's compute dispatch. Unsupported IR (calls,
+//! aggregates, integer divide) makes this module return `error.Unsupported`.
 
 const std = @import("std");
 const ir = @import("vulcan-ir");
@@ -31,40 +34,45 @@ const Inst = encode.Inst;
 pub const Error = std.mem.Allocator.Error || error{Unsupported};
 
 /// The constant-bank byte offset where kernel parameters begin. 0x160 is the
-/// Volta..Ampere kernel-param base. The dispatch side (prism's QMD) must match.
+/// kernel-param base for Volta through Ampere. The dispatch side (prism's QMD)
+/// must use the same offset.
 pub const param_base: u16 = 0x160;
 const bank0: u5 = 0;
 
-/// Graphics prologue padding: throwaway instructions emitted before the first
-/// attribute fetch / color write, to wait out the asynchronous hardware delivery
-/// of sysvals/barycentrics into the low registers (clean threshold 4, 6 for
-/// margin). Written to a dedicated high scratch register, not RZ: a write to RZ
-/// can retire instantly and not consume the cycles the delivery window needs.
-/// The register allocator excludes it from its pool (see assignLocs).
+/// Graphics prologue padding. These are throwaway instructions emitted before
+/// the first attribute fetch or color write. They wait out the asynchronous
+/// hardware delivery of sysvals and barycentrics into the low registers (a
+/// clean threshold of 4, with 6 used for margin). Each pad instruction writes
+/// to a dedicated high scratch register, not RZ, because a write to RZ can
+/// retire instantly and skip the cycles the delivery window needs. The register
+/// allocator excludes this register from its pool (see assignLocs).
 const graphics_prologue_pad: u32 = 6;
 const graphics_pad_reg: u8 = 40;
 
-/// Reserved registers: R0/R1 scratch, R2:R3 the 64-bit output pointer. Values are
-/// assigned GPRs from R4 up.
+/// Reserved registers: R0 and R1 are scratch, and R2:R3 hold the 64-bit output
+/// pointer. Values get GPRs starting at R4.
 const r_scratch: u8 = 0;
-const r_scratch2: u8 = 1; // second prologue scratch (invocation-id computation)
+const r_scratch2: u8 = 1; // second prologue scratch register, for invocation-ID computation
 const r_outptr: u8 = 2; // pair R2:R3
 const value_reg_base: u8 = 4;
 
-/// The GPR the ROP reads gl_FragDepth from at EXIT. NAK lays fragment outputs out as a
-/// FIXED contiguous block [RT0 c0..c3, ..., RT(N-1) c0..c3, sample-mask, depth] pinned to
-/// R0, R1, ... (OpRegOut src[i] -> R[i]). N color targets occupy R0..R[4N-1], the
-/// always-reserved sample-mask slot is R[4N], and the depth lands at R[4N+1]. A depth-writing
-/// FS reserves that register (excluded from the allocator pool) and moves the depth value
-/// into it; the SPH's OMAP_DEPTH tells the ROP to take the fragment depth from there (the ROP
-/// derives the same register from omap_targets, so MRT + gl_FragDepth compose correctly).
+/// The GPR the ROP reads gl_FragDepth from at EXIT. NAK lays out fragment
+/// outputs as a fixed contiguous block: [RT0 c0..c3, ..., RT(N-1) c0..c3,
+/// sample-mask, depth], pinned to R0, R1, and so on (OpRegOut src[i] maps to
+/// R[i]). N color targets occupy R0..R[4N-1], the always-reserved sample-mask
+/// slot is R[4N], and the depth value lands at R[4N+1]. A fragment shader that
+/// writes depth reserves that register, excluding it from the allocator pool,
+/// and moves the depth value into it. The SPH's OMAP_DEPTH flag tells the ROP
+/// to read the fragment depth from there. The ROP derives the same register
+/// from omap_targets, so MRT and gl_FragDepth work together correctly.
 fn fragDepthReg(func: *const Function) u8 {
     return 4 * colorTargetCount(func) + 1;
 }
 
 /// Whether the fragment shader stores gl_FragDepth (a store the frontend tagged
-/// `frag_depth`). Such a shader routes the depth into `frag_depth_out_reg` and sets the
-/// SPH OMAP_DEPTH so the ROP takes the depth from the shader instead of the interpolated z.
+/// `frag_depth`). Such a shader routes the depth into `frag_depth_out_reg` and
+/// sets SPH OMAP_DEPTH, so the ROP reads the depth from the shader instead of
+/// the interpolated z value.
 fn writesFragDepth(func: *const Function) bool {
     for (0..func.blockCount()) |bi| {
         for (func.blockInsts(@enumFromInt(bi))) |inst| {
@@ -74,12 +82,13 @@ fn writesFragDepth(func: *const Function) bool {
     return false;
 }
 
-/// The number of render targets a fragment shader writes (MRT). The frontend tags each color
-/// store `color_out` = target*4 + component, so the highest such tag gives the target count.
-/// The ROP reads target T's RGBA from R[T*4 .. T*4+3] (the fixed FS-output register block), so
-/// N targets occupy R0..R[4N-1]; those registers are RESERVED in assignLocs when N > 1 (for
-/// N == 1 the existing R0..R3 color path is unchanged). Returns 1 for a single-RT / non-fragment
-/// shader (the default), up to 8.
+/// The number of render targets a fragment shader writes (MRT). The frontend
+/// tags each color store `color_out` = target*4 + component, so the highest
+/// such tag gives the target count. The ROP reads target T's RGBA from
+/// R[T*4 .. T*4+3] (the fixed fragment-shader-output register block), so N
+/// targets occupy R0..R[4N-1]. assignLocs reserves those registers when N > 1.
+/// When N == 1, the existing R0..R3 color path stays unchanged. Returns 1 for a
+/// single-RT or non-fragment shader (the default), up to 8.
 fn colorTargetCount(func: *const Function) u8 {
     var max_comp: i32 = -1;
     for (0..func.blockCount()) |bi| {
@@ -99,13 +108,15 @@ fn colorTargetCount(func: *const Function) u8 {
 pub const Kernel = struct {
     code: []u32,
     reg_count: u32,
-    /// Whether a fragment shader writes gl_FragDepth (routes it to frag_depth_out_reg).
-    /// The nvidia pipeline sets the SPH OMAP_DEPTH bit when this is set so the ROP takes
-    /// the fragment depth from the shader. False for vertex shaders / non-depth FS.
+    /// Whether a fragment shader writes gl_FragDepth (this routes it to
+    /// frag_depth_out_reg). When true, the nvidia pipeline sets the SPH
+    /// OMAP_DEPTH bit, so the ROP reads the fragment depth from the shader.
+    /// False for vertex shaders and fragment shaders that do not write depth.
     writes_depth: bool = false,
-    /// The number of render targets a fragment shader writes (MRT); 1 for single-RT / VS.
-    /// The nvidia pipeline declares this many color targets in the SPH omap and binds that
-    /// many color surfaces to the ROP.
+    /// The number of render targets a fragment shader writes (MRT). 1 for a
+    /// single-RT shader or a vertex shader. The nvidia pipeline declares this
+    /// many color targets in the SPH omap and binds that many color surfaces
+    /// to the ROP.
     color_targets: u8 = 1,
 
     pub fn deinit(self: *Kernel, allocator: std.mem.Allocator) void {
@@ -117,33 +128,38 @@ pub const Kernel = struct {
 /// booleans produced by a compare).
 const Loc = union(enum) { gpr: u8, pred: u8 };
 
-/// A texture-sample result block: the alloca the SPIR-V image-sample lowering uses
-/// as the host-sampler out-pointer is given a 4-consecutive-register block (RGBA).
-/// The NVIDIA TEX writes its result there. The lowering's 4 reload `load`s resolve
-/// to those registers. Keyed by the alloca Value -> its base register.
+/// A texture-sample result block. The SPIR-V image-sample lowering uses an
+/// alloca as the host-sampler out-pointer. This gives that alloca a block of 4
+/// consecutive registers (RGBA). The NVIDIA TEX instruction writes its result
+/// there. The lowering's 4 reload `load`s resolve to those registers. Keyed by
+/// the alloca Value, mapped to its base register.
 const TexResult = struct { base: u8 };
 
-// A BRA to patch: `at` is the branch instruction's index. The destination is either a
-// BLOCK (`target`, resolved via block_start) or a direct INSTRUCTION index
-// (`target_inst`, an intra-emitIf local label). Exactly one is set. `is_bssy` marks a
-// BSSY convergence-barrier set-up (a forward branch to the reconvergence block, the
-// barrier register preserved from the original encoding).
+// A BRA to patch. `at` is the branch instruction's index. The destination is
+// either a block (`target`, resolved through block_start) or a direct
+// instruction index (`target_inst`, a local label inside emitIf). Exactly one
+// of the two is set. `is_bssy` marks a BSSY convergence-barrier setup: a
+// forward branch to the reconvergence block, with the barrier register kept
+// from the original encoding.
 const Fixup = struct { at: usize, target: u32 = 0, target_inst: ?usize = null, is_bssy: bool = false };
 
-/// Emit Volta+ convergence barriers (BSSY/BSYNC) around divergent `if` regions so a
-/// quad-dependent op (TEX / derivative SHFL) after the merge runs with the warp
-/// reconverged. See computeConvergence + encode.{bclear,bssy,bsync}.
+/// Emit Volta-and-later convergence barriers (BSSY/BSYNC) around divergent
+/// `if` regions. This lets a quad-dependent op (TEX or a derivative SHFL)
+/// after the merge run with the warp reconverged. See computeConvergence and
+/// encode.{bclear,bssy,bsync}.
 const emit_convergence_barriers = true;
 
-/// Convergence-barrier plan: for each block that ends in a DIVERGENT `if`, which
-/// reconvergence (post-dominator) block the warp must rendezvous at, and which
-/// hardware barrier register (B0..B15) to use. On Volta+ a divergent branch splits
-/// the warp. A quad-dependent op (TEX or a derivative SHFL) executed afterwards
-/// without reconverging reads garbage from the lanes that took the other path. NAK
-/// wraps every divergent region in BSSY (set a reconvergence point before the branch)
-/// + BSYNC (rendezvous at the join). We replicate that: for each `if` block we find
-/// its immediate post-dominator (the merge block both arms reach), emit BCLEAR+BSSY
-/// before the branch, and BSYNC at the start of the merge block.
+/// Convergence-barrier plan. For each block that ends in a divergent `if`,
+/// this records the reconvergence (post-dominator) block where the warp must
+/// meet, and which hardware barrier register (B0..B15) to use. On Volta and
+/// later, a divergent branch splits the warp. A quad-dependent op (TEX or a
+/// derivative SHFL) executed afterward, without reconverging, reads garbage
+/// from the lanes that took the other path. NAK wraps every divergent region
+/// in BSSY (set a reconvergence point before the branch) and BSYNC (meet at
+/// the join). This backend does the same: for each `if` block, it finds the
+/// immediate post-dominator (the merge block both arms reach), emits
+/// BCLEAR and BSSY before the branch, and emits BSYNC at the start of the
+/// merge block.
 const Convergence = struct {
     // bar_at_if[bi]: the barrier register if block bi ends in a divergent if (else null).
     bar_at_if: []?u4,
@@ -171,7 +187,7 @@ fn blockSuccessors(func: *const Function, bi: usize, buf: *[2]usize) []const usi
             return buf[0..2];
         }
     }
-    switch (func.terminator(block) orelse Terminator{ .ret = null }) {
+    switch (func.terminator(block) orelse Terminator{ .ret = ir.function.Ret.none() }) {
         .ret => return buf[0..0],
         .jump => |j| {
             buf[0] = @intFromEnum(j.target);
@@ -180,9 +196,9 @@ fn blockSuccessors(func: *const Function, bi: usize, buf: *[2]usize) []const usi
     }
 }
 
-/// Whether block bi ends in a divergent `if` (a conditional branch whose two arms
-/// reach different blocks). A degenerate `if` whose then and else target the same
-/// block is not divergent and needs no barrier.
+/// Whether block bi ends in a divergent `if` (a conditional branch whose two
+/// arms reach different blocks). A degenerate `if` whose then and else target
+/// the same block is not divergent and needs no barrier.
 fn divergentIf(func: *const Function, bi: usize) ?ir.function.If {
     const block: Block = @enumFromInt(bi);
     for (func.blockInsts(block)) |inst| {
@@ -195,13 +211,14 @@ fn divergentIf(func: *const Function, bi: usize) ?ir.function.If {
     return null;
 }
 
-/// Compute the convergence-barrier plan. Builds the block CFG, computes post-
-/// dominators by the standard iterative dataflow (reverse of the dominator
-/// algorithm), and finds each divergent `if`'s immediate post-dominator = its
-/// reconvergence block. Barrier registers are assigned by region nesting depth so
-/// nested divergent regions use distinct barriers (matching how NAK's allocator
-/// keeps overlapping convergence barriers in distinct Bar registers). Returns a
-/// plan with no barriers (all null) if there are no divergent ifs.
+/// Compute the convergence-barrier plan. This builds the block CFG, computes
+/// post-dominators with the standard iterative dataflow (the reverse of the
+/// dominator algorithm), and finds each divergent `if`'s immediate
+/// post-dominator, which is its reconvergence block. Barrier registers are
+/// assigned by region nesting depth, so nested divergent regions use distinct
+/// barriers. This matches how NAK's allocator keeps overlapping convergence
+/// barriers in distinct Bar registers. Returns a plan with no barriers (all
+/// null) when there are no divergent ifs.
 fn computeConvergence(allocator: std.mem.Allocator, func: *const Function) Error!Convergence {
     const n = func.blockCount();
     const bar_at_if = try allocator.alloc(?u4, n);
@@ -224,11 +241,12 @@ fn computeConvergence(allocator: std.mem.Allocator, func: *const Function) Error
     }
     if (!any or !emit_convergence_barriers) return .{ .bar_at_if = bar_at_if, .merge_of_if = merge_of_if, .syncs_at = syncs_at };
 
-    // Post-dominators: pdom[b] = set of blocks that post-dominate b. Exit blocks
-    // (no successors) post-dominate only themselves. Every other block's pdom set
-    // is {b} ∪ (∩ over successors s of pdom[s]). Iterate to a fixpoint. The block
-    // order from the frontend is a valid topological-ish order, so iterating in
-    // reverse converges quickly for these small (<~30 block) shaders.
+    // Post-dominators: pdom[b] is the set of blocks that post-dominate b. Exit
+    // blocks (no successors) post-dominate only themselves. Every other
+    // block's pdom set is {b} union the intersection, over successors s, of
+    // pdom[s]. Iterate to a fixpoint. The block order from the frontend is
+    // close to a topological order, so iterating in reverse converges quickly
+    // for these small shaders (under about 30 blocks).
     const word_count = (n + 63) / 64;
     const pdom = try allocator.alloc(u64, n * word_count);
     defer allocator.free(pdom);
@@ -274,19 +292,22 @@ fn computeConvergence(allocator: std.mem.Allocator, func: *const Function) Error
         }
     }
 
-    // Immediate post-dominator of an if block = the CLOSEST strict post-dominator
-    // (the merge block right after the if). Among the strict post-dominators of `bi`
-    // (its pdom set minus itself), the ipdom is the one that is post-dominated by
-    // every OTHER strict pdom - i.e. the one nearest `bi`. The closer a strict pdom
-    // `p` is to `bi`, the MORE blocks post-dominate-chain through it, so its own
-    // pdom set is the LARGEST (it includes itself plus every farther merge/exit it
-    // dominates the post-flow toward). So pick the strict pdom with the LARGEST
-    // pdom-set size. (For the diamond `if a else b -> merge -> ...`, the merge's
-    // pdom set is {merge} ∪ all later blocks = largest. The final exit's is {exit}
-    // = smallest. The earlier "smallest" pick wrongly chose the function exit, which
-    // over-extended every region to the final block and nested EXITs inside live
-    // barriers -> an Illegal-Instruction-Encoding warp fault.) Ties cannot occur in
-    // a reducible CFG's post-dominator tree.
+    // The immediate post-dominator of an if block is the closest strict
+    // post-dominator, the merge block right after the if. Among the strict
+    // post-dominators of `bi` (its pdom set minus itself), the ipdom is the one
+    // that every other strict pdom also post-dominates. In other words, it is
+    // the one nearest to `bi`. The closer a strict pdom `p` is to `bi`, the more
+    // blocks post-dominate-chain through it, so its own pdom set is the
+    // largest: it includes itself plus every farther merge or exit block it
+    // leads toward. So this code picks the strict pdom with the largest
+    // pdom-set size. For the diamond `if a else b -> merge -> ...`, the
+    // merge's pdom set is {merge} union all later blocks, which is the
+    // largest. The final exit's pdom set is {exit}, the smallest. An earlier
+    // version picked the smallest set and wrongly chose the function exit.
+    // That over-extended every region to the final block and nested EXIT
+    // instructions inside live barriers, causing an illegal-instruction-
+    // encoding warp fault. Ties cannot occur in a reducible CFG's
+    // post-dominator tree.
     var depth: u4 = 0;
     for (0..n) |bi| {
         if (divergentIf(func, bi) == null) continue;
@@ -306,9 +327,10 @@ fn computeConvergence(allocator: std.mem.Allocator, func: *const Function) Error
             }
         }
         if (best) |m| {
-            // Assign a barrier register. Cycle B0..B15 by the count of ifs seen
-            // (these regions are predominantly sequential in the inlined leaf
-            // shaders. A per-region distinct barrier is always safe vs reuse).
+            // Assign a barrier register. Cycle through B0..B15 by the count of
+            // ifs seen. These regions are mostly sequential in the inlined leaf
+            // shaders. A distinct barrier for each region is always safe, more
+            // so than reuse.
             bar_at_if[bi] = depth;
             depth = (depth + 1) & 0xf;
             merge_of_if[bi] = @enumFromInt(m);
@@ -343,17 +365,18 @@ pub fn compileKernel(allocator: std.mem.Allocator, func: *Function) Error!Kernel
 
 /// Lower `func` to a SASS shader for `stage`. The caller owns the result.
 pub fn compileShader(allocator: std.mem.Allocator, func: *Function, stage: Stage) Error!Kernel {
-    // f16 not yet lowered on this backend (f16 roadmap Pn); reject cleanly rather than
-    // silently treat as f64. Covers both this direct entry and compileKernel, which
-    // delegates here.
+    // This backend does not lower f16 yet. Reject it cleanly instead of
+    // silently treating it as f64. This check covers both this direct entry
+    // and compileKernel, which calls this function.
     if (ir.function.functionUsesF16(func)) return error.Unsupported;
 
     const nblocks = func.blockCount();
     if (nblocks == 0) return error.Unsupported;
 
-    // Fold constant arith operands into immediates BEFORE register allocation, so constants do
-    // not each pin a GPR for their whole live range (the difference between a heavy shader
-    // fitting the 251-GPR pool or exhausting it - the noise/terrain shaders need this).
+    // Fold constant arith operands into immediates before register allocation.
+    // This stops each constant from pinning a GPR for its whole live range.
+    // Heavy shaders (the noise and terrain shaders) need this to fit the
+    // 251-GPR pool instead of exhausting it.
     foldConstantsToImm(func);
 
     var loc = std.AutoHashMapUnmanaged(Value, Loc){};
@@ -361,34 +384,40 @@ pub fn compileShader(allocator: std.mem.Allocator, func: *Function, stage: Stage
     var max_reg: u8 = r_outptr + 1; // the output pointer pair is always live
     try assignLocs(allocator, func, &loc, &max_reg);
 
-    // Texture-sample lowering: the SPIR-V image-sample op becomes a host-sampler
-    // `call_indirect(sampler_fn, {desc, u, v, lod, out_ptr})` writing an RGBA vec4 into a
-    // stack alloca, then four reload `load`s of out_ptr+c*4. On the GPU there is no
-    // host stack: each such alloca gets a 4-consecutive-register block (the TEX result
-    // RGBA), the sampler call becomes a TEX into it, and the reload loads resolve to
-    // those registers. Build the alloca -> base-register map by allocating one fresh
-    // 4-reg block (above the watermark) per sampler call. `tex` also records the loads
-    // (and the element-pointer arith) that target each tex alloca so lowerInst maps
-    // them to the result registers instead of emitting LDG.
+    // Texture-sample lowering. The SPIR-V image-sample op becomes a
+    // host-sampler `call_indirect(sampler_fn, {desc, u, v, lod, out_ptr})`
+    // that writes an RGBA vec4 into a stack alloca, followed by four reload
+    // `load`s of out_ptr+c*4. The GPU has no host stack, so each such alloca
+    // instead gets a block of 4 consecutive registers (the TEX result RGBA).
+    // The sampler call becomes a TEX into that block, and the reload loads
+    // resolve to those registers. This builds the alloca-to-base-register map
+    // by allocating one fresh 4-register block, above the watermark, per
+    // sampler call. `tex` also records the loads (and the element-pointer
+    // arith) that target each tex alloca, so lowerInst maps them to the
+    // result registers instead of emitting LDG.
     var tex = TexLowering.init(allocator);
     defer tex.deinit();
     try tex.scan(func, &max_reg, stage);
 
-    // Screen-space-derivative lowering: a varying's dFdx/dFdy was lowered (shared with
-    // the software path) to a `grad_buf[index]` load. On the GPU there is no host
-    // gradient buffer. Each such load becomes an IPA of the varying + a quad SHFL +
-    // FSWZADD that differences the quad neighbour (the native 2x2-quad derivative).
-    // `deriv` records the grad_buf param (to skip in the prologue), the grad-pointer
-    // address arith (a tag carrier), and each grad load's (slot, axis) + scratch regs.
+    // Screen-space-derivative lowering. A varying's dFdx/dFdy was lowered
+    // (shared with the software path) to a `grad_buf[index]` load. The GPU has
+    // no host gradient buffer. Each such load instead becomes an IPA of the
+    // varying, plus a quad SHFL, plus an FSWZADD that differences the quad
+    // neighbour (the native 2x2-quad derivative). `deriv` records the
+    // grad_buf param (to skip in the prologue), the grad-pointer address
+    // arith (a tag carrier), and each grad load's slot, axis, and scratch
+    // registers.
     var deriv = DerivLowering.init(allocator);
     defer deriv.deinit();
     try deriv.scan(func, &max_reg);
 
-    // Host-math lowering: a transcendental (pow / exp / log / sin / cos) was lowered
-    // (shared with the software path) to a `math_fn(op, a, b)` call_indirect through a
-    // synthesized function pointer. On the GPU the special-function unit (MUFU)
-    // evaluates these natively. `math` records each call's op-code + a scratch register
-    // so lowerInst emits the MUFU sequence (and the prologue skips the math_fn param).
+    // Host-math lowering. A transcendental function (pow, exp, log, sin, or
+    // cos) was lowered (shared with the software path) to a
+    // `math_fn(op, a, b)` call_indirect through a synthesized function
+    // pointer. On the GPU, the special-function unit (MUFU) evaluates these
+    // natively. `math` records each call's op code and a scratch register, so
+    // lowerInst emits the MUFU sequence and the prologue skips the math_fn
+    // param.
     var math = MathLowering.init(allocator);
     defer math.deinit();
     try math.scan(func, &max_reg);
@@ -402,8 +431,9 @@ pub fn compileShader(allocator: std.mem.Allocator, func: *Function, stage: Stage
 
     const eparams = func.blockParams(@enumFromInt(0));
     if (stage == .compute) {
-        // A value-returning kernel reads an output pointer from the front of the
-        // constant bank (its `ret` stores there), a void compute kernel has none.
+        // A kernel that returns a value reads an output pointer from the front
+        // of the constant bank (its `ret` stores the result there). A void
+        // compute kernel has no output pointer.
         var cursor: u16 = param_base;
         if (returnsValue(func)) {
             try code.append(allocator, encode.ldc(r_outptr, bank0, cursor, .{})); // outptr lo
@@ -412,8 +442,9 @@ pub fn compileShader(allocator: std.mem.Allocator, func: *Function, stage: Stage
         }
         for (eparams) |p| {
             if (isInvocationId(func, p)) {
-                // gid.x = blockIdx.x * local_size_x + threadIdx.x (workgroup size is a
-                // compile-time constant, thread/block ids come from S2R).
+                // gid.x = blockIdx.x * local_size_x + threadIdx.x. The workgroup
+                // size is a compile-time constant. The thread and block IDs
+                // come from S2R.
                 const gid = gprOf(loc, p);
                 try code.append(allocator, encode.movImm(gid, localSizeX(func), .{}));
                 try code.append(allocator, encode.s2r(r_scratch, encode.SR_TID_X, .{})); // threadIdx.x
@@ -430,88 +461,108 @@ pub fn compileShader(allocator: std.mem.Allocator, func: *Function, stage: Stage
             }
         }
     } else {
-        // The SMs deliver the hardware-provided inputs (vertex-id / fragment
-        // barycentrics + sysvals) into the low registers asynchronously a few
-        // instructions into warp execution. An attribute fetch or color write
-        // issued before that window closes reads or is clobbered by zeros, so pad
-        // the prologue with throwaway MOVs (verified: clean threshold 4, 6 for
-        // margin) to a high scratch register before any ALD/IPA.
+        // The SMs deliver the hardware-provided inputs (vertex ID, fragment
+        // barycentrics, and sysvals) into the low registers asynchronously, a
+        // few instructions into warp execution. An attribute fetch or color
+        // write issued before that window closes reads zeros, or gets
+        // clobbered by them. To avoid this, pad the prologue with throwaway
+        // MOVs to a high scratch register before any ALD or IPA. Testing
+        // found a clean threshold of 4. This uses 6 for margin.
         var pad: u32 = 0;
         while (pad < graphics_prologue_pad) : (pad += 1) {
             try code.append(allocator, encode.movImm(graphics_pad_reg, pad, .{}));
         }
-        // Each parameter is sourced by kind, in declaration order:
-        //   - a buffer/UBO pointer (a `ptr`, e.g. a uniform-block base) is loaded as
-        //     a 64-bit address pair from constant bank 0. The dispatch side binds the
-        //     bound UBO's GPU virtual address into CB0 at `graphics_ubo_cb_base` +
-        //     slot*8, in the same buffer-declaration order the lowering appended the
-        //     pointer params. A following `.load` (LDG) then reads the std-layout
-        //     members through that pointer pair - reusing the compute load path.
-        //   - an input attribute scalar: a vertex shader fetches it (ALD), a fragment
-        //     shader interpolates it (IPA), at the parameter's `attr` slot.
-        // Pointer/attribute loads are variable-latency. The scoreboard pass adds the
-        // consumer waits.
+        // Each parameter loads by kind, in declaration order:
+        //   - A buffer or UBO pointer (a `ptr`, such as a uniform-block base)
+        //     loads as a 64-bit address pair from constant bank 0. The
+        //     dispatch side binds the bound UBO's GPU virtual address into
+        //     CB0 at `graphics_ubo_cb_base` + slot*8, in the same
+        //     buffer-declaration order the lowering appended the pointer
+        //     params. A following `.load` (LDG) then reads the std-layout
+        //     members through that pointer pair, reusing the compute load
+        //     path.
+        //   - An input attribute scalar: a vertex shader fetches it (ALD), a
+        //     fragment shader interpolates it (IPA), at the parameter's
+        //     `attr` slot.
+        // Pointer and attribute loads are variable-latency. The scoreboard
+        // pass adds the consumer waits.
         var ubo_slot: u16 = 0;
-        // Map each fragment-input attribute byte-slot to the register the prologue IPA'd
-        // it into. The screen-space-derivative lowering reuses these (instead of a body
-        // re-IPA) so the quad SHFL reads a value that has long since landed in EVERY
-        // lane: a freshly re-IPA'd value is variable-latency and a cross-lane SHFL cannot
-        // wait on the NEIGHBOUR lane's scoreboard, so shuffling it reads stale garbage.
-        // NAK shuffles the existing (single prologue IPA) SSA value for exactly this
-        // reason. (We record the base attr slot. Per-component grad slots index from it.)
+        // Map each fragment-input attribute byte-slot to the register the
+        // prologue IPA'd it into. The screen-space-derivative lowering reuses
+        // these registers, instead of a re-IPA in the body, so the quad SHFL
+        // reads a value that has long since landed in every lane. A freshly
+        // re-IPA'd value is variable-latency, and a cross-lane SHFL cannot
+        // wait on the neighbour lane's scoreboard, so shuffling it would read
+        // stale garbage. NAK shuffles the existing, single prologue IPA SSA
+        // value for exactly this reason. (This records the base attr slot.
+        // Per-component grad slots index from it.)
         for (eparams) |p| {
             const rd = gprOf(loc, p);
-            // gl_VertexIndex / gl_InstanceIndex: a synthesized i32 builtin param the
-            // frontend tagged. On Volta+ a vertex shader reads it from the ATTRIBUTE
-            // interface (ALD a[NAK_ATTR_VERTEX_ID/INSTANCE_ID]), NOT a special register:
-            // the fixed-function Data Assembler writes the per-vertex id into the
-            // attribute RAM (this is what NAK emits for SystemValue VertexId). With
-            // SET_VERTEX_ID_BASE = 0 (a non-indexed draw) the delivered value is exactly
-            // Vulkan's gl_VertexIndex. The shader then multiplies it by the array stride
-            // and adds it to the UBO base pointer (the dynamic-index OpAccessChain the
-            // frontend lowered) and LDG-loads, pulling its vertices from a UBO array with
-            // no vertex buffer. ALD is variable-latency: the scheduler drains it before
-            // its use. The pipeline's SPH must also declare the vertex-id sysval input.
+            // gl_VertexIndex / gl_InstanceIndex: a synthesized i32 builtin
+            // param the frontend tagged. On Volta and later, a vertex shader
+            // reads it from the attribute interface (ALD
+            // a[NAK_ATTR_VERTEX_ID/INSTANCE_ID]), not a special register. The
+            // fixed-function Data Assembler writes the per-vertex ID into the
+            // attribute RAM. This is what NAK emits for SystemValue VertexId.
+            // With SET_VERTEX_ID_BASE = 0 (a non-indexed draw), the delivered
+            // value equals Vulkan's gl_VertexIndex. The shader then
+            // multiplies it by the array stride, adds it to the UBO base
+            // pointer (the dynamic-index OpAccessChain the frontend
+            // lowered), and does an LDG load. This pulls its vertices from a
+            // UBO array with no vertex buffer. ALD is variable-latency: the
+            // scheduler drains it before its use. The pipeline's SPH must
+            // also declare the vertex-ID sysval input.
             if (builtinTag(func, p)) |bi| {
                 switch (bi) {
-                    // gl_FragCoord (BuiltIn 15): the window-space fragment position. Each
-                    // component is IPA'd (freq Pass) from the POSITION attribute a[0x70+c*4]
-                    // (NAK_ATTR_POSITION), tagged `bicomp` = component. The SPH declares the
-                    // position input as SCREEN_LINEAR (readsFragPosition) so the raster
-                    // delivers x/y in pixels, z the interpolated depth, w = 1/clip_w.
+                    // gl_FragCoord (BuiltIn 15): the window-space fragment
+                    // position. Each component is IPA'd (freq Pass) from the
+                    // POSITION attribute a[0x70+c*4] (NAK_ATTR_POSITION),
+                    // tagged `bicomp` = component. The SPH declares the
+                    // position input as SCREEN_LINEAR (readsFragPosition), so
+                    // the raster delivers x and y in pixels, z as the
+                    // interpolated depth, and w as 1/clip_w.
                     15 => {
                         const comp: u16 = attrTag(func, p, "bicomp") orelse 0;
                         try code.append(allocator, encode.ipa(rd, encode.ATTR_POSITION + comp * 4, .{}));
                         continue;
                     },
-                    // gl_FrontFacing (BuiltIn 17): the raster delivers a FLAT per-primitive
-                    // facing flag at a[0x3fc] (NAK_ATTR_FRONT_FACE) as an INTEGER mask
-                    // (all-ones for a front face, zero for back). The frontend types this as
-                    // an f32 param and compares it `!= 0` with a FLOAT set-predicate (FSETP),
-                    // but the integer all-ones bit-pattern reinterpreted as f32 is a NaN, and
-                    // FSETP.NE(NaN, 0) is FALSE - so a front face would wrongly read as back.
-                    // Convert the delivered integer to a clean ordered float with I2F right
-                    // after the flat IPA: any nonzero mask becomes a nonzero float (front),
-                    // zero stays 0.0 (back), so the downstream FSETP behaves. The raster
-                    // always delivers a[0x3fc]; no extra SPH imap is needed.
+                    // gl_FrontFacing (BuiltIn 17): the raster delivers a flat
+                    // per-primitive facing flag at a[0x3fc]
+                    // (NAK_ATTR_FRONT_FACE) as an integer mask: all-ones for
+                    // a front face, zero for back. The frontend types this as
+                    // an f32 param and compares it `!= 0` with a float
+                    // set-predicate (FSETP). But the integer all-ones bit
+                    // pattern, reinterpreted as f32, is a NaN, and
+                    // FSETP.NE(NaN, 0) is false, so a front face would
+                    // wrongly read as back. To fix this, convert the
+                    // delivered integer to a clean ordered float with I2F
+                    // right after the flat IPA: any nonzero mask becomes a
+                    // nonzero float (front), and zero stays 0.0 (back), so
+                    // the downstream FSETP behaves correctly. The raster
+                    // always delivers a[0x3fc], so no extra SPH imap entry is
+                    // needed.
                     17 => {
                         try code.append(allocator, encode.ipaConstant(rd, encode.ATTR_FRONT_FACE, .{}));
                         try code.append(allocator, encode.i2f(rd, rd, true, .{}));
                         continue;
                     },
-                    // gl_PointCoord (BuiltIn 16): a point sprite's s/t coord, running
-                    // 0..1 across the sprite quad. Each component is a normal IPA from
-                    // the point-sprite attribute a[0x2e0]+comp*4 (NAK_ATTR_POINT_SPRITE_S/T);
-                    // the SPH imap declares these two inputs as SCREEN_LINEAR (readsPointSprite)
-                    // so the raster delivers the perspective-free sprite-local coord, and the
-                    // draw-state enables SET_POINT_SPRITE (done once at channel init).
+                    // gl_PointCoord (BuiltIn 16): a point sprite's s/t
+                    // coordinate, running 0..1 across the sprite quad. Each
+                    // component is a normal IPA from the point-sprite
+                    // attribute a[0x2e0]+comp*4 (NAK_ATTR_POINT_SPRITE_S/T).
+                    // The SPH imap declares these two inputs as
+                    // SCREEN_LINEAR (readsPointSprite), so the raster
+                    // delivers the perspective-free sprite-local coordinate,
+                    // and the draw state enables SET_POINT_SPRITE (done once
+                    // at channel init).
                     16 => {
                         const comp: u16 = attrTag(func, p, "bicomp") orelse 0;
                         try code.append(allocator, encode.ipa(rd, encode.ATTR_POINT_SPRITE + comp * 4, .{}));
                         continue;
                     },
-                    // gl_VertexIndex (42) / gl_InstanceIndex (43): a vertex shader reads them
-                    // from the DA-delivered attribute interface (ALD), not IPA.
+                    // gl_VertexIndex (42) / gl_InstanceIndex (43): a vertex
+                    // shader reads them from the DA-delivered attribute
+                    // interface (ALD), not IPA.
                     else => {
                         const attr: u16 = if (bi == 43) encode.ATTR_INSTANCE_ID else encode.ATTR_VERTEX_ID;
                         try code.append(allocator, encode.ald(rd, attr, 1, .{}));
@@ -519,37 +570,47 @@ pub fn compileShader(allocator: std.mem.Allocator, func: *Function, stage: Stage
                     },
                 }
             }
-            // The host-sampler function pointer the SPIR-V image-sample lowering appends
-            // is meaningless on the GPU (TEX needs no host fn): it gets no constant-bank
-            // slot and the sampler `call_indirect` through it lowers to a TEX instead.
+            // The host-sampler function pointer the SPIR-V image-sample
+            // lowering appends is meaningless on the GPU, since TEX needs no
+            // host function. It gets no constant-bank slot, and the sampler
+            // `call_indirect` through it lowers to a TEX instead.
             if (isSamplerFn(func, p) or isSamplerVec3Fn(func, p) or isAnyShadowFn(func, p) or isSamplerGatherFn(func, p) or isSamplerFetchFn(func, p) or isSamplerFetch3Fn(func, p)) continue;
-            // The synthesized grad_buf pointer (the software path's per-triangle gradient
-            // buffer) has no GPU backing: the derivative lowering computes dFdx/dFdy from
-            // the live quad via SHFL instead. Source nothing for it - no constant-bank
-            // slot (it is not a bound UBO), no load.
+            // The synthesized grad_buf pointer (the software path's
+            // per-triangle gradient buffer) has no GPU backing. The
+            // derivative lowering computes dFdx/dFdy from the live quad
+            // through SHFL instead. Source nothing for it: no constant-bank
+            // slot, since it is not a bound UBO, and no load.
             if (hasGpuKey(func, p, "grad_buf")) continue;
-            // The host-math function pointer the transcendental lowering appends (pow /
-            // exp / log / sin / cos) is meaningless on the GPU: the special-function unit
-            // (MUFU) evaluates them natively, so the param gets no constant-bank slot and
-            // the math `call_indirect` through it lowers to MUFU (see the call_indirect arm).
+            // The host-math function pointer the transcendental lowering
+            // appends (pow, exp, log, sin, or cos) is meaningless on the
+            // GPU. The special-function unit (MUFU) evaluates these
+            // natively, so the param gets no constant-bank slot, and the
+            // math `call_indirect` through it lowers to MUFU (see the
+            // call_indirect arm).
             if (hasGpuKey(func, p, "math_fn")) continue;
-            // The discard function pointer (OpKill) is meaningless on the GPU: the discard
-            // call lowers to a KIL, so the param gets no constant-bank slot.
+            // The discard function pointer (OpKill) is meaningless on the
+            // GPU. The discard call lowers to a KIL, so the param gets no
+            // constant-bank slot.
             if (hasGpuKey(func, p, "discard_fn")) continue;
-            // A combined-image-sampler descriptor param: its constant-bank slot holds the
-            // 32-bit BINDLESS TEXTURE HANDLE (tic | tsc<<20) the dispatch binds, not a
-            // memory address. Load just the low dword (single LDC) into the value's
-            // register. The sampler `call_indirect` feeds it to TEX as the handle. It
-            // consumes a UBO/descriptor constant-bank slot in declaration order, exactly
-            // like a UBO pointer, so the dispatch writes the handle at the same offset.
+            // A combined-image-sampler descriptor param: its constant-bank
+            // slot holds the 32-bit bindless texture handle (tic | tsc<<20)
+            // the dispatch binds, not a memory address. Load just the low
+            // dword (a single LDC) into the value's register. The sampler
+            // `call_indirect` feeds it to TEX as the handle. It consumes a
+            // UBO or descriptor constant-bank slot in declaration order,
+            // exactly like a UBO pointer, so the dispatch writes the handle
+            // at the same offset.
             if (isSamplerDesc(func, p)) {
-                // Place the descriptor at its VULKAN BINDING slot (not a per-stage
-                // declaration-order slot): the constant bank is shared across the VS + FS,
-                // and the dispatch side writes each descriptor's handle/address at
-                // graphics_ubo_cb_base + binding*8. Using declaration order would collide
-                // (e.g. an FS sampler at binding 1 whose only-in-stage param is "slot 0"
-                // would read the VS UBO's pointer at slot 0). Falls back to ubo_slot when
-                // a shader carries no binding decoration (the hand-built isel tests).
+                // Place the descriptor at its Vulkan binding slot, not a
+                // per-stage declaration-order slot. The constant bank is
+                // shared across the vertex and fragment shaders, and the
+                // dispatch side writes each descriptor's handle or address
+                // at graphics_ubo_cb_base + binding*8. Using declaration
+                // order would collide: for example, a fragment shader
+                // sampler at binding 1, whose only-in-stage param is "slot
+                // 0", would read the vertex shader UBO's pointer at slot 0.
+                // Falls back to ubo_slot when a shader carries no binding
+                // decoration, as in the hand-built isel tests.
                 const slot = attrTag(func, p, "binding") orelse ubo_slot;
                 const off = encode.graphics_ubo_cb_base + slot * 8;
                 try code.append(allocator, encode.ldc(rd, encode.graphics_const_bank, off, .{})); // the bindless handle (root table 1)
@@ -569,28 +630,33 @@ pub fn compileShader(allocator: std.mem.Allocator, func: *Function, stage: Stage
                 encode.ald(rd, attr, 1, .{})
             else
                 encode.ipa(rd, attr, .{}));
-            // Remember which register holds this prologue-interpolated varying scalar so
-            // the derivative lowering can SHFL it directly (no body re-IPA). Each fragment
-            // input scalar is its own param IPA'd at its `attr`, so one (attr -> rd) entry.
+            // Remember which register holds this prologue-interpolated
+            // varying scalar, so the derivative lowering can SHFL it
+            // directly instead of re-IPA in the body. Each fragment input
+            // scalar is its own param, IPA'd at its `attr`, so this adds one
+            // (attr, rd) entry.
             if (stage == .fragment)
                 try deriv.prologue_reg.put(allocator, attr, rd);
         }
     }
 
-    // Convergence-barrier plan (Volta+): wrap each divergent `if` region in a
-    // BSSY/BSYNC pair so a TEX or derivative SHFL after the merge runs with the warp
-    // reconverged (quad uniformity restored). Without this, divergent branches +
-    // texture/derivative produce per-pixel noise (the lanes that took the other arm
-    // are inactive for the quad op). See computeConvergence + encode.{bssy,bsync}.
+    // Convergence-barrier plan (Volta and later): wrap each divergent `if`
+    // region in a BSSY/BSYNC pair, so a TEX or derivative SHFL after the
+    // merge runs with the warp reconverged and quad uniformity restored.
+    // Without this, divergent branches combined with texture or derivative
+    // ops produce per-pixel noise, because the lanes that took the other arm
+    // are inactive for the quad op. See computeConvergence and
+    // encode.{bssy,bsync}.
     var conv = try computeConvergence(allocator, func);
     defer conv.deinit(allocator);
 
     for (0..nblocks) |bi| {
         const block: Block = @enumFromInt(bi);
-        // Reconverge: emit a BSYNC for every divergent region whose join is this block.
-        // block_start[bi] points AT the BSYNC so that branches into the merge block (the
-        // arm BRAs, the BSSY) land on it and the warp rendezvouses on arrival, restoring
-        // quad uniformity before this block's code (which may contain a TEX/derivative).
+        // Reconverge: emit a BSYNC for every divergent region whose join is
+        // this block. block_start[bi] points at the BSYNC, so branches into
+        // the merge block (the arm BRAs, the BSSY) land on it. The warp then
+        // meets on arrival, restoring quad uniformity before this block's
+        // code, which may contain a TEX or a derivative op.
         block_start[bi] = code.items.len;
         for (conv.syncs_at[bi]) |bar| {
             try code.append(allocator, encode.bsync(bar, .{ .stall = 1 }));
@@ -600,10 +666,10 @@ pub fn compileShader(allocator: std.mem.Allocator, func: *Function, stage: Stage
         for (func.blockInsts(block)) |inst| {
             try lowerInst(allocator, func, &loc, &code, &tex, &deriv, &math, inst);
             if (func.opcode(inst) == .@"if") {
-                // Set up the convergence barrier just before the divergent branch:
-                // BCLEAR initializes the barrier register, BSSY records the
-                // reconvergence point (the merge block). The BSSY's forward offset is
-                // patched in the fixup pass.
+                // Set up the convergence barrier just before the divergent
+                // branch. BCLEAR initializes the barrier register, and BSSY
+                // records the reconvergence point, the merge block. The
+                // fixup pass patches the BSSY's forward offset.
                 if (conv.bar_at_if[bi]) |bar| {
                     try code.append(allocator, encode.bclear(bar, .{ .stall = 1 }));
                     const at = code.items.len;
@@ -615,11 +681,15 @@ pub fn compileShader(allocator: std.mem.Allocator, func: *Function, stage: Stage
             }
         }
 
-        if (!terminated) switch (func.terminator(block) orelse ir.function.Terminator{ .ret = null }) {
-            .ret => |v| {
-                if (v) |value| {
-                    const src = gprOf(loc, value);
-                    try code.append(allocator, encode.stgU32(r_outptr, src, .{}));
+        if (!terminated) switch (func.terminator(block) orelse ir.function.Terminator{ .ret = ir.function.Ret.none() }) {
+            .ret => |r| {
+                switch (r.count) {
+                    0 => {},
+                    1 => {
+                        const src = gprOf(loc, r.values[0]);
+                        try code.append(allocator, encode.stgU32(r_outptr, src, .{}));
+                    },
+                    else => return error.Unsupported, // multi-value struct return is not yet lowered
                 }
                 try code.append(allocator, encode.exit(.{ .stall = 1 }));
             },
@@ -627,32 +697,36 @@ pub fn compileShader(allocator: std.mem.Allocator, func: *Function, stage: Stage
         };
     }
 
-    // Scoreboard scheduling: write barriers on variable-latency ops (LDG/S2R) and
-    // waits on their consumers, so results are read only once ready. The block-start
-    // indices let the scheduler drain scoreboards at each basic-block boundary so its
-    // linear walk stays correct across the control flow inlining introduces.
+    // Scoreboard scheduling: add write barriers on variable-latency ops (LDG,
+    // S2R) and waits on their consumers, so code reads results only once
+    // they are ready. The block-start indices let the scheduler drain
+    // scoreboards at each basic-block boundary, so its linear walk stays
+    // correct across the control flow that inlining introduces.
     schedule.scheduleBlocks(code.items, block_start);
 
-    // Patch each control-flow op's relative displacement. The destination is a
-    // block start (resolved via block_start) or a direct instruction index (an
-    // emitIf local label). The offset is computed EXACTLY like NAK's get_rel_offset
-    // (sm70_encode.rs): `target_ip - cur_ip - 4` where `ip` counts in 32-bit WORDS
-    // and one 128-bit instruction = 4 words. So the encoded value is in word units:
-    // `(dst_inst - cur_inst)*4 - 4 = (dst_inst - next_inst)*4`. (The prior byte-unit
-    // `*16` convention was 4x too large and made every predicated branch land on the
-    // wrong instruction / run the warp off the end.)
+    // Patch each control-flow op's relative displacement. The destination is
+    // a block start (resolved through block_start) or a direct instruction
+    // index (a local label from emitIf). The offset is computed exactly like
+    // NAK's get_rel_offset (sm70_encode.rs): `target_ip - cur_ip - 4`, where
+    // `ip` counts in 32-bit words and one 128-bit instruction equals 4
+    // words. So the encoded value is in word units:
+    // `(dst_inst - cur_inst)*4 - 4 = (dst_inst - next_inst)*4`. An earlier
+    // version used a byte-unit `*16` convention, which was 4 times too
+    // large. That made every predicated branch land on the wrong
+    // instruction, or run the warp off the end.
     for (fixups.items) |f| {
         const cur: i64 = @intCast(f.at);
         const dst_inst: usize = f.target_inst orelse block_start[f.target];
         const off_words: i32 = @intCast((@as(i64, @intCast(dst_inst)) - cur) * 4 - 4);
         if (f.is_bssy) {
-            // BSSY uses the same get_rel_offset base (word units, `dst - cur - 1` instrs).
+            // BSSY uses the same get_rel_offset base: word units, `dst - cur - 1` instructions.
             const bar: u4 = @intCast(code.items[f.at][0] >> 16 & 0xf);
             code.items[f.at] = encode.bssy(bar, off_words, .{ .stall = 1 });
             continue;
         }
-        // The branch's taken condition lives at bits 87..89 (+ negate 90), i.e.
-        // word 2 bits 23..25 (+ bit 26) - NOT the 12..14 guard (which is PT).
+        // The branch's taken condition lives at bits 87..89, plus negate at
+        // bit 90, that is, word 2 bits 23..25, plus bit 26. This is not the
+        // 12..14 guard, which is PT.
         const pred = (code.items[f.at][2] >> 23) & 0x7;
         const neg = ((code.items[f.at][2] >> 26) & 1) == 1;
         code.items[f.at] = encode.bra(off_words, .{ .pred = @intCast(pred), .pred_neg = neg });
@@ -691,19 +765,21 @@ fn lessByStart(_: void, a: Interval, b: Interval) bool {
     return a.start < b.start;
 }
 
-/// Linear-scan register allocation with reuse: a register frees when its value's
-/// last use passes, so short-lived values (e.g. the 32 compares of a lowered
-/// integer division) share a small set of registers instead of each taking a fresh
-/// one. Pointers take even-aligned GPR pairs, booleans take predicates P0..P5 (P6
-/// is the 64-bit-add carry scratch). No spilling: a class running out is
-/// `error.Unsupported`, which a real kernel should never hit (250+ GPRs).
+/// Linear-scan register allocation with reuse. A register frees when its
+/// value's last use passes, so short-lived values (for example, the 32
+/// compares of a lowered integer division) share a small set of registers
+/// instead of each taking a fresh one. Pointers take even-aligned GPR pairs.
+/// Booleans take predicates P0..P5 (P6 is the 64-bit-add carry scratch).
+/// There is no spilling: a class running out returns `error.Unsupported`,
+/// which a real kernel should never hit, since it has 250 or more GPRs.
 fn assignLocs(allocator: std.mem.Allocator, func: *const Function, loc: *std.AutoHashMapUnmanaged(Value, Loc), max_reg: *u8) Error!void {
     const nval = func.valueCount();
     if (nval == 0) return;
     const nblocks = func.blockCount();
 
-    // Live intervals (def..last-use) over a block-order linearization, extended by
-    // backward liveness so loop-carried values stay live across the loop body.
+    // Live intervals (def to last use) over a block-order linearization,
+    // extended by backward liveness so loop-carried values stay live across
+    // the loop body.
     const def_pos = try allocator.alloc(u32, nval);
     defer allocator.free(def_pos);
     const last_use = try allocator.alloc(u32, nval);
@@ -714,9 +790,9 @@ fn assignLocs(allocator: std.mem.Allocator, func: *const Function, loc: *std.Aut
     for (last_use) |*l| l.* = 0;
 
     var pos: u32 = 0;
-    // The position of the LAST fragment color-output store, and the set of values that
-    // feed a color-output store (see the extension below). `last_color_pos == 0` means
-    // there were no color stores.
+    // The position of the last fragment color-output store, and the set of
+    // values that feed a color-output store (see the extension below).
+    // `last_color_pos == 0` means there were no color stores.
     var last_color_pos: u32 = 0;
     const feeds_color = try allocator.alloc(bool, nval);
     defer allocator.free(feeds_color);
@@ -731,14 +807,16 @@ fn assignLocs(allocator: std.mem.Allocator, func: *const Function, loc: *std.Aut
         for (func.blockInsts(block)) |inst| {
             forEachUse(func, inst, last_use, pos);
             if (func.instResult(inst)) |r| def_pos[@intFromEnum(r)] = pos;
-            // A fragment color-output store: its value lands in a ROP color register
-            // (R0..R3), all of which the ROP reads together at EXIT. So every color value
-            // must stay live until the LAST color store, not just its own - otherwise the
-            // allocator frees a color value's register after its own (possibly early)
-            // store and reuses it for a later color value's computation, clobbering the
-            // first color in its register before the final color move reads it (the
-            // dFdx-plus-multi-component-output corruption). Record which values feed a
-            // color store and the position of the last such store.
+            // A fragment color-output store: its value lands in a ROP color
+            // register (R0..R3), and the ROP reads all of them together at
+            // EXIT. So every color value must stay live until the last color
+            // store, not just its own. Otherwise the allocator frees a color
+            // value's register after its own, possibly early, store, and
+            // reuses it for a later color value's computation. This
+            // clobbers the first color in its register before the final
+            // color move reads it, causing corruption when dFdx combines
+            // with multi-component output. Record which values feed a color
+            // store, and the position of the last such store.
             if (func.opcode(inst) == .store) {
                 const st = func.opcode(inst).store;
                 if (attrTag(func, st.ptr, "color_out") != null) {
@@ -752,21 +830,24 @@ fn assignLocs(allocator: std.mem.Allocator, func: *const Function, loc: *std.Aut
         if (func.terminator(block)) |term| forEachTermUse(func, term, last_use, pos);
         pos += 1;
     }
-    // Extend every color-output value's live range to the last color store, so the four
-    // color components occupy four distinct registers that all stay live to EXIT.
+    // Extend every color-output value's live range to the last color store,
+    // so the four color components occupy four distinct registers that all
+    // stay live to EXIT.
     if (last_color_pos != 0) {
         for (0..nval) |v| {
             if (feeds_color[v] and last_use[v] < last_color_pos) last_use[v] = last_color_pos;
         }
     }
-    // Screen-space derivatives: the deriv lowering SHFLs the prologue-IPA'd varying
-    // register (sourced by REGISTER, not as a tracked SSA use), so the linear-scan
-    // allocator does not see that use and would free + reuse the varying register for a
-    // later value (e.g. the shader's `*16` immediate) BEFORE the SHFL reads it - the
-    // SHFL then shuffles garbage. Mirror the color-output fix: find the LAST grad_buf
-    // load (any `.load` whose pointer is the grad_buf param, or `add(grad_buf, k)`) and
-    // extend every fragment input-attribute entry param's live range to it, so the IPA'd
-    // varying registers the SHFL sources stay live until the last derivative.
+    // Screen-space derivatives: the deriv lowering SHFLs the prologue-IPA'd
+    // varying register, sourced by register, not as a tracked SSA use. So
+    // the linear-scan allocator does not see that use, and would free and
+    // reuse the varying register for a later value, such as the shader's
+    // `*16` immediate, before the SHFL reads it. The SHFL would then shuffle
+    // garbage. This mirrors the color-output fix: find the last grad_buf
+    // load, any `.load` whose pointer is the grad_buf param or
+    // `add(grad_buf, k)`, and extend every fragment input-attribute entry
+    // param's live range to it. This keeps the IPA'd varying registers the
+    // SHFL sources live until the last derivative.
     var grad_buf_param: ?Value = null;
     for (func.blockParams(@enumFromInt(0))) |p| {
         if (hasGpuKey(func, p, "grad_buf")) {
@@ -775,7 +856,8 @@ fn assignLocs(allocator: std.mem.Allocator, func: *const Function, loc: *std.Aut
         }
     }
     if (grad_buf_param) |gbp| {
-        // Pointers that address the grad buffer: the param itself, or add(param, iconst).
+        // Pointers that address the grad buffer: the param itself, or
+        // add(param, iconst).
         const is_grad_ptr = try allocator.alloc(bool, nval);
         defer allocator.free(is_grad_ptr);
         @memset(is_grad_ptr, false);
@@ -804,8 +886,9 @@ fn assignLocs(allocator: std.mem.Allocator, func: *const Function, loc: *std.Aut
         }
         if (last_grad_pos != 0) {
             for (func.blockParams(@enumFromInt(0))) |p| {
-                // A fragment input-attribute varying param (IPA'd in the prologue into the
-                // register the SHFL sources). Identified by the `attr` tag the frontend set.
+                // A fragment input-attribute varying param, IPA'd in the
+                // prologue into the register the SHFL sources. Identified by
+                // the `attr` tag the frontend set.
                 if (attrTag(func, p, "attr") != null) {
                     const idx = @intFromEnum(p);
                     if (last_use[idx] < last_grad_pos) last_use[idx] = last_grad_pos;
@@ -820,18 +903,20 @@ fn assignLocs(allocator: std.mem.Allocator, func: *const Function, loc: *std.Aut
     for (0..nval) |i| ivals[i] = .{ .value = @enumFromInt(i), .start = def_pos[i], .end = last_use[i] };
     std.mem.sort(Interval, ivals, {}, lessByStart);
 
-    // Free pools: GPRs R4..R254 (R0/R1 scratch, R2:R3 the output pointer), and
-    // predicates P0..P5.
+    // Free pools: GPRs R4..R254 (R0 and R1 are scratch, R2:R3 is the output
+    // pointer), and predicates P0..P5.
     var gpr_free = [_]bool{false} ** 256;
     for (value_reg_base..encode.RZ) |r| gpr_free[r] = true;
     gpr_free[graphics_pad_reg] = false; // reserved as the graphics prologue pad scratch
-    // gl_FragDepth: reserve the ROP depth-output register so no live value takes it; the
-    // frag_depth store moves the depth into it and it must stay untouched to EXIT. The
-    // register sits past all N color targets (fragDepthReg), so MRT + depth do not collide.
+    // gl_FragDepth: reserve the ROP depth-output register so no live value
+    // takes it. The frag_depth store moves the depth into it, and it must
+    // stay untouched until EXIT. The register sits past all N color targets
+    // (fragDepthReg), so MRT and depth do not collide.
     if (writesFragDepth(func)) gpr_free[fragDepthReg(func)] = false;
-    // MRT: for N > 1 render targets, reserve R4..R[4N-1] (RT0 uses the always-reserved
-    // R0..R3). Each color store moves its component into R[target*4+comp], read by the ROP
-    // at EXIT, so those registers must stay free of other live values. (N == 1 is unchanged.)
+    // MRT: for N > 1 render targets, reserve R4..R[4N-1] (RT0 uses the
+    // always-reserved R0..R3). Each color store moves its component into
+    // R[target*4+comp], which the ROP reads at EXIT, so those registers must
+    // stay free of other live values. N == 1 is unchanged.
     {
         const nt = colorTargetCount(func);
         if (nt > 1) {
@@ -846,7 +931,7 @@ fn assignLocs(allocator: std.mem.Allocator, func: *const Function, loc: *std.Aut
     defer active.deinit(allocator);
 
     for (ivals) |iv| {
-        // Expire intervals that ended before this one starts, freeing their regs.
+        // Expire intervals that ended before this one starts, freeing their registers.
         var w: usize = 0;
         for (active.items) |a| {
             if (a.end < iv.start) {
@@ -906,10 +991,11 @@ fn isBool(func: *const Function, v: Value) bool {
     return func.types.type_kind(func.valueType(v)) == .bool;
 }
 
-/// The 32-bit value/bit-pattern of a scalar constant value (an integer constant's value, or a
-/// float constant's IEEE-754 f32 bits), or null if `value` is not a constant. The nvidia
-/// `arith_imm` lowering materializes this with `movImm` into a scratch register, so any 32-bit
-/// constant - int OR float - can be an immediate operand.
+/// The 32-bit value or bit pattern of a scalar constant value: an integer
+/// constant's value, or a float constant's IEEE-754 f32 bits. Returns null if
+/// `value` is not a constant. The nvidia `arith_imm` lowering materializes
+/// this with `movImm` into a scratch register, so any 32-bit constant, int or
+/// float, can be an immediate operand.
 fn constBits(func: *const Function, value: Value) ?i64 {
     const inst = func.definingInst(value) orelse return null;
     return switch (func.opcode(inst)) {
@@ -926,15 +1012,19 @@ fn isCommutativeBinOp(op: ir.function.BinOp) bool {
     };
 }
 
-/// Fold a constant operand of an `arith` into `arith_imm`, so codegen materializes the constant
-/// as a scratch-register immediate (movImm) AT THE USE rather than holding it in an allocated
-/// GPR for its whole live range. The simplex-noise / terrain shaders define ~100+ float
-/// constants that otherwise pin that many registers and EXHAUST the GPR pool (the linear-scan
-/// allocator has no spilling). After folding, those constants are dead (each a [def,def]
-/// interval that reuses one register), so peak pressure drops to the real computation pressure.
-/// Skips div/rem (lowered specially, not via the arith_imm general movImm+arith path), pointer
-/// adds (64-bit carry) and bool ops (predicate combines). Non-commutative ops fold only the
-/// RIGHT operand (the arith_imm form computes `lhs op imm`).
+/// Fold a constant operand of an `arith` into `arith_imm`, so codegen
+/// materializes the constant as a scratch-register immediate (movImm) at the
+/// use, instead of holding it in an allocated GPR for its whole live range.
+/// The simplex-noise and terrain shaders define 100 or more float constants.
+/// Without this fold, those constants would each pin a register and exhaust
+/// the GPR pool, since the linear-scan allocator has no spilling. After
+/// folding, those constants are dead: each is a [def,def] interval that
+/// reuses one register, so peak pressure drops to the real computation
+/// pressure. This skips div and rem, since those are lowered specially and
+/// not through the general arith_imm movImm-plus-arith path, pointer adds
+/// (64-bit carry), and bool ops (predicate combines). Non-commutative ops
+/// fold only the right operand, since the arith_imm form computes
+/// `lhs op imm`.
 fn foldConstantsToImm(func: *Function) void {
     var i: usize = 0;
     while (i < func.instCount()) : (i += 1) {
@@ -961,8 +1051,8 @@ fn isPtr(func: *const Function, v: Value) bool {
     return func.types.type_kind(func.valueType(v)) == .ptr;
 }
 
-/// Whether `v` is the invocation-id parameter the frontend tagged (sourced from
-/// the hardware thread id, not a uniform kernel argument).
+/// Whether `v` is the invocation-ID parameter the frontend tagged. This value
+/// is sourced from the hardware thread ID, not a uniform kernel argument.
 fn isInvocationId(func: *const Function, v: Value) bool {
     var it = func.attributesOf(.{ .value = v });
     while (it.next()) |attr| switch (attr) {
@@ -972,9 +1062,10 @@ fn isInvocationId(func: *const Function, v: Value) bool {
     return false;
 }
 
-/// The `vulcan.gpu.builtin` integer value attached to `v` (the BuiltIn id the
-/// frontend tagged a synthesized param with: vertex_index=42, instance_index=43,
-/// global_invocation_id=28), or null if `v` is not a tagged builtin param.
+/// The `vulcan.gpu.builtin` integer value attached to `v`: the BuiltIn ID the
+/// frontend tagged a synthesized param with (vertex_index=42,
+/// instance_index=43, global_invocation_id=28). Returns null if `v` is not a
+/// tagged builtin param.
 fn builtinTag(func: *const Function, v: Value) ?u32 {
     var it = func.attributesOf(.{ .value = v });
     while (it.next()) |attr| switch (attr) {
@@ -989,7 +1080,7 @@ fn builtinTag(func: *const Function, v: Value) ?u32 {
     return null;
 }
 
-/// Whether `v` carries the named `vulcan.gpu` flag/attribute (any value form).
+/// Whether `v` carries the named `vulcan.gpu` flag or attribute, in any value form.
 fn hasGpuKey(func: *const Function, v: Value, key: []const u8) bool {
     var it = func.attributesOf(.{ .value = v });
     while (it.next()) |attr| switch (attr) {
@@ -999,17 +1090,19 @@ fn hasGpuKey(func: *const Function, v: Value, key: []const u8) bool {
     return false;
 }
 
-/// Whether `v` is the synthesized host-sampler function-pointer entry param the
-/// SPIR-V image-sample lowering appends (tagged `vulcan.gpu.sampler_fn`). The NVIDIA
-/// backend IGNORES it: a GPU TEX needs no host function pointer, so the param gets no
-/// constant-bank slot and the sampler `call_indirect` through it becomes a TEX.
+/// Whether `v` is the synthesized host-sampler function-pointer entry param
+/// the SPIR-V image-sample lowering appends, tagged `vulcan.gpu.sampler_fn`.
+/// The NVIDIA backend ignores it: a GPU TEX needs no host function pointer,
+/// so the param gets no constant-bank slot, and the sampler `call_indirect`
+/// through it becomes a TEX.
 fn isSamplerFn(func: *const Function, v: Value) bool {
     return hasGpuKey(func, v, "sampler_fn");
 }
 
-/// Whether `v` is the host VEC3-sampler param: a `samplerCube` (sampler_cube_fn), `sampler3D`
-/// (sampler_3d_fn), or `sampler2DArray` (sampler_2darray_fn). The GPU emits a TEX with the matching
-/// dimension + a 3-register coord group.
+/// Whether `v` is the host vec3-sampler param: a `samplerCube`
+/// (sampler_cube_fn), `sampler3D` (sampler_3d_fn), or `sampler2DArray`
+/// (sampler_2darray_fn). The GPU emits a TEX with the matching dimension and
+/// a 3-register coordinate group.
 fn isSamplerVec3Fn(func: *const Function, v: Value) bool {
     return hasGpuKey(func, v, "sampler_cube_fn") or hasGpuKey(func, v, "sampler_3d_fn") or hasGpuKey(func, v, "sampler_2darray_fn");
 }
@@ -1020,71 +1113,87 @@ fn samplerVec3Dim(func: *const Function, v: Value) u8 {
     return encode.TexDim.cube;
 }
 
-/// Whether `v` is the host DEPTH-COMPARE sampler param (tagged `vulcan.gpu.sampler_shadow_fn`): a
-/// `sampler2DShadow` sample (SPIR-V OpImageSampleDref). The GPU emits a TEX with z_cmpr (bit 78) that
-/// compares the shader dref against the stored depth (R) and returns a SCALAR pass fraction instead of a
-/// host call. The ABI is `f32 sampler_shadow_fn(desc, u, v, lod, dref)` (a direct scalar result, no out
-/// pointer); the dref is packed into src1 right after the handle (src1 = [handle, dref], NAK z_cmpr).
+/// Whether `v` is the host depth-compare sampler param, tagged
+/// `vulcan.gpu.sampler_shadow_fn`: a `sampler2DShadow` sample (SPIR-V
+/// OpImageSampleDref). The GPU emits a TEX with z_cmpr (bit 78) that compares
+/// the shader dref against the stored depth (R) and returns a scalar pass
+/// fraction instead of a host call. The ABI is
+/// `f32 sampler_shadow_fn(desc, u, v, lod, dref)`, a direct scalar result
+/// with no out pointer. The dref is packed into src1 right after the handle
+/// (src1 = [handle, dref], NAK z_cmpr).
 fn isSamplerShadowFn(func: *const Function, v: Value) bool {
     return hasGpuKey(func, v, "sampler_shadow_fn");
 }
 
-/// Whether `v` is the host CUBE depth-compare sampler param (`sampler_cube_shadow_fn`): a
-/// `samplerCubeShadow` sample. ABI `f32 sampler_cube_shadow_fn(desc, x, y, z, lod, dref)`. The GPU
-/// reuses the samplerCube atlas lowering (major-axis -> a 2D atlas u',v) then a 2D z_cmpr TEX.
+/// Whether `v` is the host cube depth-compare sampler param
+/// (`sampler_cube_shadow_fn`): a `samplerCubeShadow` sample. ABI
+/// `f32 sampler_cube_shadow_fn(desc, x, y, z, lod, dref)`. The GPU reuses the
+/// samplerCube atlas lowering (major-axis to a 2D atlas u, v), then does a
+/// 2D z_cmpr TEX.
 fn isSamplerCubeShadowFn(func: *const Function, v: Value) bool {
     return hasGpuKey(func, v, "sampler_cube_shadow_fn");
 }
 
-/// Whether `v` is the host 2D-ARRAY depth-compare sampler param (`sampler_2darray_shadow_fn`): a
-/// `sampler2DArrayShadow` sample. ABI `f32 sampler_2darray_shadow_fn(desc, u, v, layer, lod, dref)`.
-/// The GPU emits a native TWO_D_ARRAY z_cmpr TEX (coord = layer,u,v with the layer index first).
+/// Whether `v` is the host 2D-array depth-compare sampler param
+/// (`sampler_2darray_shadow_fn`): a `sampler2DArrayShadow` sample. ABI
+/// `f32 sampler_2darray_shadow_fn(desc, u, v, layer, lod, dref)`. The GPU
+/// emits a native TWO_D_ARRAY z_cmpr TEX, with coordinate = layer, u, v and
+/// the layer index first.
 fn isSampler2dArrayShadowFn(func: *const Function, v: Value) bool {
     return hasGpuKey(func, v, "sampler_2darray_shadow_fn");
 }
 
-/// Any depth-compare (shadow) sampler param: 2D / cube / 2D-array. All three lower to a z_cmpr TEX
-/// (encode.texShadow) that returns a SCALAR compare fraction with the dref in src1 (right after the
-/// handle); they differ only in the TEX dim + coord assembly.
+/// Any depth-compare (shadow) sampler param: 2D, cube, or 2D-array. All three
+/// lower to a z_cmpr TEX (encode.texShadow) that returns a scalar compare
+/// fraction with the dref in src1, right after the handle. They differ only
+/// in the TEX dimension and coordinate assembly.
 fn isAnyShadowFn(func: *const Function, v: Value) bool {
     return isSamplerShadowFn(func, v) or isSamplerCubeShadowFn(func, v) or isSampler2dArrayShadowFn(func, v);
 }
 
-/// Whether `v` is the host GATHER param (tagged `vulcan.gpu.sampler_gather_fn`): the
-/// `textureGather` idiom. The GPU emits a TLD4 (bindless gather) instead of a host call; the ABI is
-/// `sampler_gather_fn(desc, u, v, comp, out)` where `comp` (0..3) is a compile-time fconst.
+/// Whether `v` is the host gather param, tagged
+/// `vulcan.gpu.sampler_gather_fn`: the `textureGather` idiom. The GPU emits a
+/// TLD4 (bindless gather) instead of a host call. The ABI is
+/// `sampler_gather_fn(desc, u, v, comp, out)`, where `comp` (0..3) is a
+/// compile-time fconst.
 fn isSamplerGatherFn(func: *const Function, v: Value) bool {
     return hasGpuKey(func, v, "sampler_gather_fn");
 }
 
-/// Whether `v` is the host FETCH param (tagged `vulcan.gpu.sampler_fetch_fn`): the `texelFetch` idiom.
-/// The GPU emits a TLD (bindless texel fetch) instead of a host call; the ABI is
-/// `sampler_fetch_fn(desc, x:i32, y:i32, lod:i32, out)` - INTEGER coords + explicit LOD, no filter.
+/// Whether `v` is the host fetch param, tagged
+/// `vulcan.gpu.sampler_fetch_fn`: the `texelFetch` idiom. The GPU emits a TLD
+/// (bindless texel fetch) instead of a host call. The ABI is
+/// `sampler_fetch_fn(desc, x:i32, y:i32, lod:i32, out)`: integer
+/// coordinates, an explicit LOD, and no filter.
 fn isSamplerFetchFn(func: *const Function, v: Value) bool {
     return hasGpuKey(func, v, "sampler_fetch_fn");
 }
 
-/// Whether `v` is a 2D-ARRAY / 3D FETCH param (`sampler_fetch_array_fn` / `sampler_fetch_3d_fn`): a
-/// `texelFetch` on a layered/volume texture. ABI `fn(desc, x:i32, y:i32, z:i32, lod:i32, out)`.
-/// The GPU emits a TLD with the matching dim (Array2D vs 3D) + a 3-register INTEGER coord.
+/// Whether `v` is a 2D-array or 3D fetch param (`sampler_fetch_array_fn` or
+/// `sampler_fetch_3d_fn`): a `texelFetch` on a layered or volume texture. ABI
+/// `fn(desc, x:i32, y:i32, z:i32, lod:i32, out)`. The GPU emits a TLD with
+/// the matching dimension (Array2D or 3D) and a 3-register integer
+/// coordinate.
 fn isSamplerFetch3Fn(func: *const Function, v: Value) bool {
     return hasGpuKey(func, v, "sampler_fetch_array_fn") or hasGpuKey(func, v, "sampler_fetch_3d_fn");
 }
-/// The NAK TLD dim for a fetch3 param (2D-array vs 3D). The coord order also differs (see the emit).
+/// The NAK TLD dimension for a fetch3 param (2D-array or 3D). The coordinate
+/// order also differs. See the emit code.
 fn fetch3Dim(func: *const Function, v: Value) u8 {
     return if (hasGpuKey(func, v, "sampler_fetch_array_fn")) encode.TexDim.array_2d else encode.TexDim.dim_3d;
 }
 
-/// Whether `v` is a combined-image-sampler descriptor entry param (tagged
-/// `vulcan.gpu.sampler_desc`). On the NVIDIA backend it is NOT a memory pointer: its
-/// constant-bank slot holds the bindless texture HANDLE (tic | tsc<<20) the dispatch
-/// side binds, loaded with a single LDC and fed to TEX.
+/// Whether `v` is a combined-image-sampler descriptor entry param, tagged
+/// `vulcan.gpu.sampler_desc`. On the NVIDIA backend it is not a memory
+/// pointer: its constant-bank slot holds the bindless texture handle
+/// (tic | tsc<<20) the dispatch side binds, loaded with a single LDC and fed
+/// to TEX.
 fn isSamplerDesc(func: *const Function, v: Value) bool {
     return hasGpuKey(func, v, "sampler_desc");
 }
 
-/// A `vulcan.gpu` integer attribute named `key` attached to value `v` (a graphics
-/// attribute slot), or null if absent.
+/// A `vulcan.gpu` integer attribute named `key` attached to value `v` (a
+/// graphics attribute slot). Returns null if absent.
 fn attrTag(func: *const Function, v: Value, key: []const u8) ?u16 {
     var it = func.attributesOf(.{ .value = v });
     while (it.next()) |attr| switch (attr) {
@@ -1099,8 +1208,8 @@ fn attrTag(func: *const Function, v: Value, key: []const u8) ?u16 {
     return null;
 }
 
-/// The workgroup x dimension the frontend recorded (the LocalSize execution mode),
-/// used to fold the block offset into the invocation id. Defaults to 1.
+/// The workgroup x dimension the frontend recorded (the LocalSize execution
+/// mode), used to fold the block offset into the invocation ID. Defaults to 1.
 fn localSizeX(func: *const Function) u32 {
     var it = func.attributesOf(.func);
     while (it.next()) |attr| switch (attr) {
@@ -1118,49 +1227,64 @@ fn localSizeX(func: *const Function) u32 {
 fn returnsValue(func: *const Function) bool {
     for (0..func.blockCount()) |bi| {
         if (func.terminator(@enumFromInt(bi))) |t| switch (t) {
-            .ret => |v| if (v != null) return true,
+            .ret => |r| if (r.count != 0) return true,
             else => {},
         };
     }
     return false;
 }
 
-/// Per-function texture-sample lowering state for the NVIDIA backend: maps the
-/// SPIR-V image-sample idiom (a stack alloca written by a host-sampler call and
-/// reloaded component-by-component) onto a TEX result register block.
+/// Per-function texture-sample lowering state for the NVIDIA backend. This
+/// maps the SPIR-V image-sample idiom (a stack alloca written by a
+/// host-sampler call and reloaded component by component) onto a TEX result
+/// register block.
 const TexLowering = struct {
     allocator: std.mem.Allocator,
-    /// alloca Value (the sampler out-pointer) -> the base of its 4-register RGBA block.
+    /// Maps an alloca Value (the sampler out-pointer) to the base of its
+    /// 4-register RGBA block.
     out_base: std.AutoHashMapUnmanaged(Value, u8) = .empty,
-    /// An element-pointer value (the alloca itself or `alloca + c*4`) -> (out alloca,
-    /// component index). A reload `load` of one of these resolves to out_base+component.
+    /// Maps an element-pointer value (the alloca itself or `alloca + c*4`) to
+    /// its out alloca and component index. A reload `load` of one of these
+    /// resolves to out_base+component.
     elem: std.AutoHashMapUnmanaged(Value, Elem) = .empty,
-    /// A `call_indirect` Inst that is a sampler call -> its (out alloca, u, v, handle).
+    /// Maps a `call_indirect` Inst that is a sampler call to its out alloca,
+    /// u, v, and handle.
     calls: std.AutoHashMapUnmanaged(u32, Call) = .empty,
 
     const Elem = struct { alloca: Value, comp: u8 };
-    // `coord` is a reserved consecutive register PAIR (coord, coord+1) the TEX reads u/v
-    // from. It is reserved above the allocator's watermark, NOT the fixed R0/R1 scratch:
-    // when a shader has BOTH a texture and other low-register-pressure features (e.g.
-    // derivatives), the linear-scan allocator legitimately assigns live SSA values to
-    // R0/R1, and moving u/v into R0/R1 for the TEX would clobber them mid-shader.
-    // `w`/`dim`: a vec3 sampler (cube/3D) threads a 3rd coord (w) and a non-2D TEX dim; the
-    // reserved coord group is then a TRIPLE (coord, coord+1, coord+2). `w` is undefined for 2D.
-    // `scratch`: base of a reserved 12-register block the cube lowering uses for the branchless
-    // major-axis (direction -> face + face u,v) math (0 for non-cube calls, which need no scratch).
-    // `gather_comp` (non-null) marks a `textureGather` call: emit a TLD4 that fetches this component
-    // (0..3) of the 4-texel footprint instead of a filtered TEX. Null = an ordinary sample.
-    // `is_fetch` marks a `texelFetch` call: emit a TLD (integer coords + explicit LOD) into a QUAD
-    // coord group (x, y, handle, lod) instead of a filtered TEX.
-    // `is_shadow` marks a `sampler2DShadow` depth-compare sample (OpImageSampleDref): emit a TEX with
-    // z_cmpr (encode.texShadow) that returns a SCALAR into the call's SSA RESULT register (not a 4-reg
-    // out block - there is no out pointer). `dref` is the compare reference, packed into src1 right after
-    // the handle (src1 = [handle, dref]); the coord group is a QUAD (u, v, handle-copy, dref).
-    // `explicit_lod` marks a 2D sample whose LOD is explicit (textureLod, or ANY sample in a vertex
-    // shader - a VS has no derivatives so its `texture2D` lowered to explicit LOD-0). Emit a TEX.LL
-    // (encode.texLod) that reads the LOD from the (handle, lod) pair at coord+2, instead of the
-    // Auto-LOD TEX (which needs quad derivatives - undefined in a VS, and the wrong level for
-    // textureLod). Implicit 2D samples carry the LOD sentinel (-1e30) and keep the Auto-LOD TEX.
+    // `coord` is a reserved consecutive register pair (coord, coord+1) the
+    // TEX reads u and v from. It is reserved above the allocator's
+    // watermark, not the fixed R0/R1 scratch. When a shader has both a
+    // texture and other low-register-pressure features (for example,
+    // derivatives), the linear-scan allocator can legitimately assign live
+    // SSA values to R0/R1, and moving u/v into R0/R1 for the TEX would
+    // clobber them mid-shader.
+    // `w`/`dim`: a vec3 sampler (cube or 3D) threads a third coordinate (w)
+    // and a non-2D TEX dimension. The reserved coordinate group is then a
+    // triple (coord, coord+1, coord+2). `w` is undefined for 2D.
+    // `scratch`: the base of a reserved 12-register block the cube lowering
+    // uses for the branchless major-axis math (direction to face plus face
+    // u, v). This is 0 for non-cube calls, which need no scratch.
+    // `gather_comp`, when non-null, marks a `textureGather` call: emit a
+    // TLD4 that fetches this component (0..3) of the 4-texel footprint
+    // instead of a filtered TEX. Null means an ordinary sample.
+    // `is_fetch` marks a `texelFetch` call: emit a TLD (integer coordinates
+    // plus explicit LOD) into a quad coordinate group (x, y, handle, lod)
+    // instead of a filtered TEX.
+    // `is_shadow` marks a `sampler2DShadow` depth-compare sample
+    // (OpImageSampleDref): emit a TEX with z_cmpr (encode.texShadow) that
+    // returns a scalar into the call's SSA result register, not a 4-register
+    // out block, since there is no out pointer. `dref` is the compare
+    // reference, packed into src1 right after the handle (src1 = [handle,
+    // dref]). The coordinate group is a quad (u, v, handle-copy, dref).
+    // `explicit_lod` marks a 2D sample whose LOD is explicit: textureLod, or
+    // any sample in a vertex shader, since a vertex shader has no
+    // derivatives, so its `texture2D` lowered to explicit LOD-0. Emit a
+    // TEX.LL (encode.texLod) that reads the LOD from the (handle, lod) pair
+    // at coord+2, instead of the auto-LOD TEX. The auto-LOD TEX needs quad
+    // derivatives, which are undefined in a vertex shader and give the
+    // wrong level for textureLod. Implicit 2D samples carry the LOD
+    // sentinel (-1e30) and keep the auto-LOD TEX.
     const Call = struct { out: Value, u: Value, v: Value, w: Value, lod: Value, handle: Value, coord: u8, dim: u8, scratch: u8 = 0, gather_comp: ?u8 = null, is_fetch: bool = false, is_shadow: bool = false, explicit_lod: bool = false, dref: Value = undefined };
     const cube_scratch_regs: u8 = 12;
 
@@ -1178,18 +1302,21 @@ const TexLowering = struct {
         return self.calls.count() > 0;
     }
 
-    /// Scan the function for sampler `call_indirect`s (target tagged `sampler_fn`),
-    /// allocate a 4-register RGBA block per out-pointer alloca (above `max_reg`), and
-    /// record the element-pointer values + components so the reload loads resolve.
+    /// Scan the function for sampler `call_indirect`s whose target is tagged
+    /// `sampler_fn`. Allocate a 4-register RGBA block per out-pointer alloca,
+    /// above `max_reg`, and record the element-pointer values and components
+    /// so the reload loads resolve.
     fn scan(self: *TexLowering, func: *const Function, max_reg: *u8, stage: Stage) Error!void {
         const nblocks = func.blockCount();
-        // Map each iconst result value to its integer, so a texture element-pointer's
-        // static byte offset (`alloca + iconst`) can be recovered without a value->def
-        // index (the IR exposes no such lookup).
+        // Map each iconst result value to its integer, so a texture
+        // element-pointer's static byte offset (`alloca + iconst`) can be
+        // recovered without a value-to-def index, since the IR exposes no
+        // such lookup.
         var iconst_of = std.AutoHashMapUnmanaged(Value, i64){};
         defer iconst_of.deinit(self.allocator);
-        // The gather component reaches isel as an `fconst` call argument (the reader synthesizes
-        // `fconst(comp)`); map fconst results to their value so a gather call can recover its comp.
+        // The gather component reaches isel as an `fconst` call argument,
+        // since the reader synthesizes `fconst(comp)`. Map fconst results to
+        // their value so a gather call can recover its component.
         var fconst_of = std.AutoHashMapUnmanaged(Value, f64){};
         defer fconst_of.deinit(self.allocator);
         for (0..nblocks) |bi| {
@@ -1217,26 +1344,41 @@ const TexLowering = struct {
                 const is_shadow = isSamplerShadowFn(func, c.target) or is_cube_shadow or is_array_shadow;
                 if (!is_2d and !is_vec3 and !is_gather and !is_fetch and !is_fetch3 and !is_shadow) continue;
                 const args = func.valueList(c.args);
-                // Depth-compare samples (OpImageSampleDref) have NO out pointer - the call returns a scalar
-                // directly into its allocator-assigned result register - and the dref is the LAST arg,
-                // packed into src1 right after the handle (z_cmpr reads it from handle_reg+1). The three
-                // variants differ in coord assembly:
-                //   sampler2DShadow:       {desc, u, v, lod, dref}          -> coord QUAD (u, v, handle, dref)
-                //   samplerCubeShadow:     {desc, x, y, z, lod, dref}       -> atlas major-axis (reuses the
-                //                          samplerCube lowering) into a coord QUAD (u', v, handle, dref) + a
-                //                          12-reg scratch block; the emitted TEX is 2D over the 6-face atlas.
-                //   sampler2DArrayShadow:  {desc, u, v, layer, lod, dref}   -> native TWO_D_ARRAY: coord
-                //                          group (layer, u, v) 4-ALIGNED (a 3-reg coord faults Xid 13 if only
-                //                          2-aligned) + a (handle, dref) pair at coord+4/coord+5.
+                // Depth-compare samples (OpImageSampleDref) have no out
+                // pointer. The call returns a scalar directly into its
+                // allocator-assigned result register, and the dref is the
+                // last arg, packed into src1 right after the handle (z_cmpr
+                // reads it from handle_reg+1). The three variants differ in
+                // coordinate assembly:
+                //   sampler2DShadow:      {desc, u, v, lod, dref} becomes a
+                //                         coordinate quad (u, v, handle, dref).
+                //   samplerCubeShadow:    {desc, x, y, z, lod, dref} becomes
+                //                         atlas major-axis math (reusing the
+                //                         samplerCube lowering) into a
+                //                         coordinate quad (u', v, handle,
+                //                         dref) plus a 12-register scratch
+                //                         block. The emitted TEX is 2D over
+                //                         the 6-face atlas.
+                //   sampler2DArrayShadow: {desc, u, v, layer, lod, dref}
+                //                         becomes a native TWO_D_ARRAY: a
+                //                         4-aligned coordinate group (layer,
+                //                         u, v) (a 3-register coordinate
+                //                         faults Xid 13 if only 2-aligned)
+                //                         plus a (handle, dref) pair at
+                //                         coord+4/coord+5.
                 if (is_shadow) {
                     if (is_cube_shadow) {
                         if (args.len != 6) return error.Unsupported;
-                        // The emitted TEX is 2D over the 6-face atlas: it reads a 2-REGISTER coord
-                        // pair (u', v) at `coord` and a 2-register [handle, dref] pair at coord+2.
-                        // Both are power-of-2-sized vector operands, so `coord` MUST be even-aligned:
-                        // an ODD base faults the SM Xid 13 "Misaligned Register" (the samplerCubeShadow
-                        // wall - 2D shadow only survived because its watermark happened to land coord
-                        // even). alignForward to 2 keeps coord AND coord+2 even.
+                        // The emitted TEX is 2D over the 6-face atlas: it
+                        // reads a 2-register coordinate pair (u', v) at
+                        // `coord`, and a 2-register [handle, dref] pair at
+                        // coord+2. Both are power-of-2-sized vector
+                        // operands, so `coord` must be even-aligned. An odd
+                        // base faults the SM with Xid 13, "Misaligned
+                        // Register". The 2D shadow path only survived this
+                        // because its watermark happened to land coord
+                        // even. alignForward to 2 keeps coord and coord+2
+                        // even.
                         var coord: u8 = @intCast(@as(u32, max_reg.*) + 1);
                         coord = std.mem.alignForward(u8, coord, 2);
                         if (@as(u32, coord) + 4 - 1 >= encode.RZ) return error.Unsupported;
@@ -1277,11 +1419,14 @@ const TexLowering = struct {
                         });
                     } else {
                         if (args.len != 5) return error.Unsupported;
-                        // sampler2DShadow emits a 2D TEX reading a 2-register coord pair (u, v) at
-                        // `coord` + a 2-register [handle, dref] pair at coord+2. Even-align `coord`
-                        // so both power-of-2 vector operands are aligned (an odd base faults Xid 13
-                        // "Misaligned Register"; this path previously survived only when the watermark
-                        // happened to leave coord even).
+                        // sampler2DShadow emits a 2D TEX reading a
+                        // 2-register coordinate pair (u, v) at `coord`,
+                        // plus a 2-register [handle, dref] pair at coord+2.
+                        // Even-align `coord` so both power-of-2 vector
+                        // operands are aligned. An odd base faults with
+                        // Xid 13, "Misaligned Register". This path
+                        // previously survived only when the watermark
+                        // happened to leave coord even.
                         var coord: u8 = @intCast(@as(u32, max_reg.*) + 1);
                         coord = std.mem.alignForward(u8, coord, 2);
                         if (@as(u32, coord) + 4 - 1 >= encode.RZ) return error.Unsupported;
@@ -1301,8 +1446,9 @@ const TexLowering = struct {
                     }
                     continue;
                 }
-                // 2D: {desc, u, v, lod, out}. Cube/3D: {desc, u, v, w, lod, out}. Gather: {desc, u, v,
-                // comp, out}. Fetch: {desc, x, y, lod, out}. Fetch3 (array/3D): {desc, x, y, z, lod, out}.
+                // 2D: {desc, u, v, lod, out}. Cube/3D: {desc, u, v, w, lod,
+                // out}. Gather: {desc, u, v, comp, out}. Fetch: {desc, x, y,
+                // lod, out}. Fetch3 (array/3D): {desc, x, y, z, lod, out}.
                 if (is_2d and args.len != 5) return error.Unsupported;
                 if (is_vec3 and args.len != 6) return error.Unsupported;
                 if (is_gather and args.len != 5) return error.Unsupported;
@@ -1310,59 +1456,78 @@ const TexLowering = struct {
                 if (is_fetch3 and args.len != 6) return error.Unsupported;
                 const has_w = is_vec3 or is_fetch3; // a 3-register coordinate (u,v,w / x,y,z)
                 const out = if (has_w) args[5] else args[4];
-                // A gather's comp is the fconst at args[3], rounded to a 0..3 channel index.
+                // A gather's comp is the fconst at args[3], rounded to a
+                // 0..3 channel index.
                 const gather_comp: ?u8 = if (is_gather) blk: {
                     const cf = fconst_of.get(args[3]) orelse return error.Unsupported;
                     const ci: i64 = @intFromFloat(@round(cf));
                     break :blk @intCast(std.math.clamp(ci, 0, 3));
                 } else null;
-                // A VERTEX-stage 2D sample with an EXPLICIT LOD: the lod arg (args[3]) is a real value,
-                // not the implicit sentinel (-1e30). A vertex shader has NO derivatives, so it MUST
-                // emit a TEX.LL over a QUAD coord (u, v, handle, lod) rather than the Auto-LOD TEX
-                // (which is undefined with no quad neighbours). SCOPED TO THE VERTEX STAGE: a fragment
-                // shader keeps the Auto-LOD TEX for both implicit AND textureLod (the pre-existing
-                // behavior - the deferred fragment-textureLod-level bug stays deferred). The extra 2
-                // coord regs per sample would otherwise overflow a heavy fragment shader's register
-                // budget (glmark2 desktop blur has many taps) and fail the compile.
+                // A vertex-stage 2D sample with an explicit LOD: the lod arg
+                // (args[3]) is a real value, not the implicit sentinel
+                // (-1e30). A vertex shader has no derivatives, so it must
+                // emit a TEX.LL over a quad coordinate (u, v, handle, lod)
+                // rather than the auto-LOD TEX, which is undefined with no
+                // quad neighbours. This is scoped to the vertex stage: a
+                // fragment shader keeps the auto-LOD TEX for both implicit
+                // sampling and textureLod, the pre-existing behavior, so the
+                // deferred fragment-textureLod-level bug stays deferred. The
+                // extra 2 coordinate registers per sample would otherwise
+                // overflow a heavy fragment shader's register budget (the
+                // glmark2 desktop blur shader has many taps) and fail the
+                // compile.
                 const is_explicit_2d = is_2d and !is_gather and stage == .vertex and blk: {
                     const lc = fconst_of.get(args[3]);
                     break :blk (lc == null) or (lc.? > -1.0e29);
                 };
-                // Allocate the 4-reg RGBA result block above the watermark (even base
-                // not required for TEX, but kept tidy). One block per sampler call.
+                // Allocate the 4-register RGBA result block above the
+                // watermark. TEX does not require an even base, but this
+                // keeps it tidy. One block per sampler call.
                 const base: u8 = @intCast(@as(u32, max_reg.*) + 1);
                 if (@as(u32, base) + 3 >= encode.RZ) return error.Unsupported;
                 max_reg.* = base + 3;
-                // A dedicated, reserved coord group for this TEX - never the fixed R0/R1 (which the
-                // allocator may have given to live values). 2D = PAIR; 3D = TRIPLE. A cube samples the
-                // atlas as 2D-with-EXPLICIT-LOD: it needs coord, coord+1 = u',v AND a consecutive
-                // (handle, lod) pair at coord+2, coord+3 (NAK packs the explicit LOD as src1[1], i.e.
-                // handle_reg + 1), so reserve a QUAD.
+                // A dedicated, reserved coordinate group for this TEX, never
+                // the fixed R0/R1, which the allocator may have given to
+                // live values. 2D uses a pair, 3D uses a triple. A cube
+                // samples the atlas as 2D with an explicit LOD: it needs
+                // coord, coord+1 = u', v, plus a consecutive (handle, lod)
+                // pair at coord+2, coord+3 (NAK packs the explicit LOD as
+                // src1[1], that is, handle_reg + 1), so it reserves a quad.
                 const is_cube_call = is_vec3 and samplerVec3Dim(func, c.target) == encode.TexDim.cube;
-                // A 2D FETCH reserves a QUAD like the cube: coord, coord+1 = x, y (integer) AND a
-                // consecutive (handle, lod) pair at coord+2, coord+3 (the explicit LOD, Lod mode). A
-                // FETCH3 (array/3D) reserves 5: three integer coords + the (handle, lod) pair.
-                // A FETCH3 reserves 6: three integer coords at coord..coord+2 (4-aligned), a padding
-                // reg at coord+3, and the (handle, lod) pair at coord+4/coord+5. The pair MUST be even-
-                // aligned (a 2-reg Lod operand); coord is 4-aligned so coord+4 is even (coord+3 is odd).
-                // An explicit-LOD 2D sample reserves a QUAD like the cube/fetch: u, v at coord/coord+1
-                // and the (handle, lod) pair at coord+2/coord+3 (NAK packs the explicit LOD as src1[1]).
+                // A 2D fetch reserves a quad like the cube: coord, coord+1 =
+                // x, y (integer), plus a consecutive (handle, lod) pair at
+                // coord+2, coord+3 (the explicit LOD, Lod mode). A fetch3
+                // (array/3D) reserves 6: three integer coordinates at
+                // coord..coord+2 (4-aligned), a padding register at
+                // coord+3, and the (handle, lod) pair at coord+4/coord+5.
+                // That pair must be even-aligned, since it is a 2-register
+                // Lod operand. coord is 4-aligned, so coord+4 is even
+                // (coord+3 is odd).
+                // An explicit-LOD 2D sample reserves a quad like the cube or
+                // fetch: u, v at coord/coord+1, and the (handle, lod) pair
+                // at coord+2/coord+3 (NAK packs the explicit LOD as src1[1]).
                 const ncoord: u8 = if (is_fetch3) 6 else if (is_cube_call or is_fetch or is_explicit_2d) 4 else if (is_vec3) 3 else 2;
-                // A genuine 3D TEX (dim_3d) reads a 3-REGISTER coordinate. NAK allocates a 3-component
-                // tex-coord vector 4-register-ALIGNED (alloc_ssa_vec rounds the count up to a power of
-                // two), and the HW faults Xid 13 "Misaligned Register" if that base is only 2-aligned.
-                // 2D (a coord pair) and the cube path (its final emitted TEX is 2D) need only even
-                // alignment. A 3D/array FETCH also has a 3-register coord -> 4-align it too.
+                // A genuine 3D TEX (dim_3d) reads a 3-register coordinate.
+                // NAK allocates a 3-component tex-coordinate vector
+                // 4-register-aligned (alloc_ssa_vec rounds the count up to a
+                // power of two), and the hardware faults with Xid 13,
+                // "Misaligned Register", if that base is only 2-aligned. 2D
+                // (a coordinate pair) and the cube path (its final emitted
+                // TEX is 2D) need only even alignment. A 3D or array fetch
+                // also has a 3-register coordinate, so 4-align it too.
                 const is_3d_sample = is_vec3 and !is_cube_call;
                 var coord: u8 = @intCast(@as(u32, max_reg.*) + 1);
                 if (is_3d_sample or is_fetch3) coord = std.mem.alignForward(u8, coord, 4);
-                // The explicit-2D (handle, lod) pair at coord+2 is a 2-register Lod operand: coord must
-                // be EVEN so coord+2 is even (an odd base faults Xid 13 "Misaligned Register").
+                // The explicit-2D (handle, lod) pair at coord+2 is a
+                // 2-register Lod operand: coord must be even so coord+2 is
+                // even. An odd base faults with Xid 13, "Misaligned
+                // Register".
                 if (is_explicit_2d) coord = std.mem.alignForward(u8, coord, 2);
                 if (@as(u32, coord) + ncoord - 1 >= encode.RZ) return error.Unsupported;
                 max_reg.* = coord + ncoord - 1;
                 const dim = if (is_vec3) samplerVec3Dim(func, c.target) else if (is_fetch3) fetch3Dim(func, c.target) else encode.TexDim.dim_2d;
-                // Cube samples lower to major-axis math + a 3D TEX; reserve a scratch block for it.
+                // Cube samples lower to major-axis math plus a 3D TEX.
+                // Reserve a scratch block for it.
                 var scratch: u8 = 0;
                 if (dim == encode.TexDim.cube) {
                     scratch = @intCast(@as(u32, max_reg.*) + 1);
@@ -1388,8 +1553,9 @@ const TexLowering = struct {
                 try self.elem.put(self.allocator, out, .{ .alloca = out, .comp = 0 });
             }
         }
-        // A second pass records `alloca + c*4` element pointers as components. The
-        // lowering builds these as `arith add(out_ptr, iconst c*4)`. Match that shape.
+        // A second pass records `alloca + c*4` element pointers as
+        // components. The lowering builds these as
+        // `arith add(out_ptr, iconst c*4)`. Match that shape.
         for (0..nblocks) |bi| {
             const block: Block = @enumFromInt(bi);
             for (func.blockInsts(block)) |inst| {
@@ -1404,42 +1570,50 @@ const TexLowering = struct {
         }
     }
 
-    /// The (out alloca, component) a `load`'s pointer resolves to, if it is a reload
-    /// of a sampled-texture result, null for an ordinary memory load.
+    /// The (out alloca, component) a `load`'s pointer resolves to, if it is a
+    /// reload of a sampled-texture result. Returns null for an ordinary
+    /// memory load.
     fn loadComp(self: *const TexLowering, ptr: Value) ?Elem {
         return self.elem.get(ptr);
     }
 };
 
-/// Per-function screen-space-derivative lowering for the NVIDIA backend. The SPIR-V
-/// frontend lowers OpDPdx/OpDPdy/OpFwidth of a varying scalar to a LOAD of a
-/// synthesized `grad_buf[index]` (a per-(varying-slot, axis) gradient the software
-/// rasterizer fills). On the GPU there is no host gradient buffer: the warp shades
-/// 2x2 pixel QUADS whose four lanes are co-resident, so a derivative is computed
-/// NATIVELY by SHUFFLING the varying from the quad neighbour and differencing
-/// (NAK's nir_op_fddx/fddy = SHFL.BFLY + FSWZADD). This pass recognises each
-/// grad_buf load, recovers which varying attribute slot and axis it is (from the
-/// ordered `grad_slot` func attrs the frontend emitted), and records it so lowerInst
-/// emits IPA(slot) + SHFL + FSWZADD into the load's result register instead of LDG.
+/// Per-function screen-space-derivative lowering for the NVIDIA backend. The
+/// SPIR-V frontend lowers OpDPdx/OpDPdy/OpFwidth of a varying scalar to a
+/// load of a synthesized `grad_buf[index]`, a per-(varying-slot, axis)
+/// gradient the software rasterizer fills. The GPU has no host gradient
+/// buffer. The warp shades 2x2 pixel quads whose four lanes are co-resident,
+/// so a derivative is computed natively by shuffling the varying from the
+/// quad neighbour and differencing (NAK's nir_op_fddx/fddy, which is
+/// SHFL.BFLY plus FSWZADD). This pass recognizes each grad_buf load,
+/// recovers which varying attribute slot and axis it is from the ordered
+/// `grad_slot` func attrs the frontend emitted, and records it, so lowerInst
+/// emits IPA(slot) plus SHFL plus FSWZADD into the load's result register
+/// instead of LDG.
 const DerivLowering = struct {
     allocator: std.mem.Allocator,
-    /// The grad_buf pointer entry param (tagged `vulcan.gpu.grad_buf`), or null if the
-    /// function takes no derivatives. It is NOT a real memory buffer on the GPU, so the
-    /// prologue must not load a constant-bank slot for it.
+    /// The grad_buf pointer entry param, tagged `vulcan.gpu.grad_buf`, or
+    /// null if the function takes no derivatives. It is not a real memory
+    /// buffer on the GPU, so the prologue must not load a constant-bank slot
+    /// for it.
     grad_buf: ?Value = null,
-    /// Per buffer index, the (attribute byte slot, axis) of the varying derivative,
-    /// recovered from the `grad_slot` func attrs in append (index) order.
+    /// Per buffer index, the attribute byte slot and axis of the varying
+    /// derivative, recovered from the `grad_slot` func attrs in append
+    /// (index) order.
     descs: std.ArrayList(Desc) = .empty,
-    /// A pointer value that addresses `grad_buf[index]` (the grad_buf param itself for
-    /// index 0, or `add(grad_buf, iconst index*4)`) -> its buffer index. The address
-    /// arithmetic for these is a tag carrier (never emitted).
+    /// Maps a pointer value that addresses `grad_buf[index]`, the grad_buf
+    /// param itself for index 0, or `add(grad_buf, iconst index*4)`, to its
+    /// buffer index. The address arithmetic for these is a tag carrier and
+    /// is never emitted.
     grad_ptr: std.AutoHashMapUnmanaged(Value, u32) = .empty,
-    /// A `load` result value of a grad pointer -> its (slot, axis) + the two scratch
-    /// registers (the IPA'd varying, and the SHFL'd neighbour) the derivation uses.
+    /// Maps a `load` result value of a grad pointer to its slot and axis,
+    /// plus the two scratch registers (the IPA'd varying, and the SHFL'd
+    /// neighbour) the derivation uses.
     loads: std.AutoHashMapUnmanaged(Value, Load) = .empty,
-    /// Fragment varying attribute byte-slot -> the register the prologue IPA'd it into.
-    /// The derivative SHFLs this prologue value (long-since landed in every lane) rather
-    /// than a body re-IPA, which a cross-lane SHFL cannot scoreboard-wait on per lane.
+    /// Maps a fragment varying attribute byte-slot to the register the
+    /// prologue IPA'd it into. The derivative SHFLs this prologue value,
+    /// which has long since landed in every lane, rather than doing a body
+    /// re-IPA. A cross-lane SHFL cannot scoreboard-wait on a per-lane basis.
     prologue_reg: std.AutoHashMapUnmanaged(u16, u8) = .empty,
 
     const Desc = struct { slot: u16, axis: u1 }; // axis: 0 = x (dFdx), 1 = y (dFdy)
@@ -1459,8 +1633,9 @@ const DerivLowering = struct {
         return self.grad_buf != null;
     }
 
-    /// Find the grad_buf param + the (slot, axis) descriptor table, map each grad_buf
-    /// load to its derivative, and reserve two scratch registers per load.
+    /// Find the grad_buf param and the slot/axis descriptor table, map each
+    /// grad_buf load to its derivative, and reserve two scratch registers
+    /// per load.
     fn scan(self: *DerivLowering, func: *const Function, max_reg: *u8) Error!void {
         // The grad_buf entry param (tagged on the entry block's parameters).
         for (func.blockParams(@enumFromInt(0))) |p| {
@@ -1471,8 +1646,9 @@ const DerivLowering = struct {
         }
         if (self.grad_buf == null) return; // no derivatives in this function
 
-        // The (slot, axis) per buffer index, in the order the frontend appended the
-        // `grad_slot` func attrs (one per index): packed as (slot << 1 | axis).
+        // The slot and axis per buffer index, in the order the frontend
+        // appended the `grad_slot` func attrs (one per index), packed as
+        // (slot << 1 | axis).
         var it = func.attributesOf(.func);
         while (it.next()) |attr| switch (attr) {
             .custom => |c| if (std.mem.eql(u8, c.namespace, "vulcan.gpu") and std.mem.eql(u8, c.key, "grad_slot")) {
@@ -1489,8 +1665,9 @@ const DerivLowering = struct {
         };
 
         const nblocks = func.blockCount();
-        // Recover iconst values so a grad-pointer `add(grad_buf, iconst index*4)` can be
-        // decoded to its buffer index (mirrors TexLowering's iconst table).
+        // Recover iconst values so a grad-pointer
+        // `add(grad_buf, iconst index*4)` can be decoded to its buffer
+        // index. This mirrors TexLowering's iconst table.
         var iconst_of = std.AutoHashMapUnmanaged(Value, i64){};
         defer iconst_of.deinit(self.allocator);
         for (0..nblocks) |bi| {
@@ -1513,7 +1690,7 @@ const DerivLowering = struct {
                 try self.grad_ptr.put(self.allocator, result, @intCast(@divTrunc(off, 4)));
             }
         }
-        // Each grad_buf load -> its (slot, axis) + two reserved scratch registers.
+        // Each grad_buf load maps to its slot, axis, and two reserved scratch registers.
         for (0..nblocks) |bi| {
             for (func.blockInsts(@enumFromInt(bi))) |inst| {
                 if (func.opcode(inst) != .load) continue;
@@ -1538,17 +1715,17 @@ const DerivLowering = struct {
 };
 
 /// Whether `v` is the synthesized host-math function-pointer entry param the
-/// transcendental lowering appends (tagged `vulcan.gpu.math_fn`). The NVIDIA backend
-/// IGNORES it: the special-function unit (MUFU) evaluates pow/exp/log/sin/cos
-/// natively, so the param gets no constant-bank slot and the math `call_indirect`
-/// through it lowers to MUFU.
+/// transcendental lowering appends, tagged `vulcan.gpu.math_fn`. The NVIDIA
+/// backend ignores it: the special-function unit (MUFU) evaluates pow, exp,
+/// log, sin, and cos natively, so the param gets no constant-bank slot, and
+/// the math `call_indirect` through it lowers to MUFU.
 fn isMathFn(func: *const Function, v: Value) bool {
     return hasGpuKey(func, v, "math_fn");
 }
 
-// The host-math op selector codes the SPIR-V transcendental lowering passes as the
-// math_fn call's first argument (mirrors lower.zig MATH_*). The backend dispatches on
-// these to the MUFU special-function unit.
+// The host-math op selector codes the SPIR-V transcendental lowering passes
+// as the math_fn call's first argument (mirrors lower.zig MATH_*). The
+// backend dispatches these to the MUFU special-function unit.
 const MATH_POW: i64 = 0;
 const MATH_EXP: i64 = 1;
 const MATH_LOG: i64 = 2;
@@ -1557,13 +1734,15 @@ const MATH_LOG2: i64 = 4;
 const MATH_SIN: i64 = 5;
 const MATH_COS: i64 = 6;
 
-/// Per-function host-math lowering state for the NVIDIA backend: maps each math_fn
-/// `call_indirect(op, a, b)` to its (op-code, scratch register) so lowerInst emits the
-/// native MUFU sequence. pow/exp/log need a free scratch register for the intermediate
-/// (MUFU.LG2 -> FMUL -> MUFU.EX2). The unary ops (exp2/log2/sin/cos) need none.
+/// Per-function host-math lowering state for the NVIDIA backend. This maps
+/// each math_fn `call_indirect(op, a, b)` to its op code and scratch
+/// register, so lowerInst emits the native MUFU sequence. pow, exp, and log
+/// need a free scratch register for the intermediate value (MUFU.LG2, then
+/// FMUL, then MUFU.EX2). The unary ops (exp2, log2, sin, cos) need none.
 const MathLowering = struct {
     allocator: std.mem.Allocator,
-    /// A math_fn `call_indirect` Inst -> the op-code it carries + a reserved scratch reg.
+    /// Maps a math_fn `call_indirect` Inst to the op code it carries plus a
+    /// reserved scratch register.
     calls: std.AutoHashMapUnmanaged(u32, Call) = .empty,
 
     const Call = struct { op: i64, scratch: u8 };
@@ -1575,8 +1754,9 @@ const MathLowering = struct {
         self.calls.deinit(self.allocator);
     }
 
-    /// Find every math_fn `call_indirect`, decode its op-code constant (the first arg),
-    /// and reserve one scratch register per call for the intermediate value.
+    /// Find every math_fn `call_indirect`, decode its op-code constant, the
+    /// first arg, and reserve one scratch register per call for the
+    /// intermediate value.
     fn scan(self: *MathLowering, func: *const Function, max_reg: *u8) Error!void {
         const nblocks = func.blockCount();
         // Recover iconst values so a call's op-code argument can be decoded.
@@ -1606,13 +1786,17 @@ const MathLowering = struct {
     }
 };
 
-/// Emit the samplerCube atlas major-axis lowering shared by the non-shadow `samplerCube` sample and the
-/// `samplerCubeShadow` depth-compare sample. From the direction (x = call.u, y = call.v, z = call.w) it
-/// computes the GL cube (face, within-face u, v) branchlessly (the largest |component| picks the axis,
-/// its sign the face) and writes the 6-face-atlas coordinate u' = (face + u)/6 into `call.coord` and v
-/// into `call.coord + 1` - i.e. a 2D sample of the 6-face-WIDE atlas at column [face/6, (face+1)/6).
-/// Uses the reserved 12-register scratch block `call.scratch`. The caller then places the src1 operands
-/// (handle + lod for a plain sample, or handle + dref for the z_cmpr shadow) and emits the 2D TEX.
+/// Emit the samplerCube atlas major-axis lowering shared by the non-shadow
+/// `samplerCube` sample and the `samplerCubeShadow` depth-compare sample.
+/// From the direction (x = call.u, y = call.v, z = call.w), it computes the
+/// GL cube (face, within-face u, v) branchlessly: the largest absolute
+/// component picks the axis, and its sign picks the face. It writes the
+/// 6-face-atlas coordinate u' = (face + u)/6 into `call.coord`, and v into
+/// `call.coord + 1`. This is a 2D sample of the 6-face-wide atlas at column
+/// [face/6, (face+1)/6). It uses the reserved 12-register scratch block
+/// `call.scratch`. The caller then places the src1 operands (handle plus lod
+/// for a plain sample, or handle plus dref for the z_cmpr shadow) and emits
+/// the 2D TEX.
 fn emitCubeAtlasUv(allocator: std.mem.Allocator, code: *std.ArrayList(Inst), loc: *std.AutoHashMapUnmanaged(Value, Loc), call: TexLowering.Call) Error!void {
     const x = gprOf(loc.*, call.u);
     const y = gprOf(loc.*, call.v);
@@ -1625,7 +1809,7 @@ fn emitCubeAtlasUv(allocator: std.mem.Allocator, code: *std.ArrayList(Inst), loc
     }.base;
     const f_half: u32 = @bitCast(@as(f32, 0.5));
     const f_sixth: u32 = @bitCast(@as(f32, 1.0 / 6.0));
-    // |x|, |y|, |z| into s+1, s+3, s+5; sign predicates P0/P1/P2 = (comp >= 0).
+    // |x|, |y|, |z| go into s+1, s+3, s+5. Sign predicates P0/P1/P2 = (comp >= 0).
     try code.append(allocator, encode.fsub(s + 0, encode.RZ, x, .{})); // -x
     try code.append(allocator, encode.fsetp(0, x, encode.RZ, .ge, .{})); // P0 = x>=0
     try code.append(allocator, encode.sel(s + 1, x, s + 0, 0, .{})); // |x|
@@ -1635,7 +1819,7 @@ fn emitCubeAtlasUv(allocator: std.mem.Allocator, code: *std.ArrayList(Inst), loc
     try code.append(allocator, encode.fsub(s + 4, encode.RZ, z, .{}));
     try code.append(allocator, encode.fsetp(2, z, encode.RZ, .ge, .{})); // P2 = z>=0
     try code.append(allocator, encode.sel(s + 5, z, s + 4, 2, .{})); // |z|
-    // P3 = |x|>=|y|; maxxy = P3 ? |x| : |y|; P4 = maxxy >= |z|.
+    // P3 = |x|>=|y|. maxxy = P3 ? |x| : |y|. P4 = maxxy >= |z|.
     try code.append(allocator, encode.fsetp(3, s + 1, s + 3, .ge, .{}));
     try code.append(allocator, encode.sel(s + 6, s + 1, s + 3, 3, .{})); // max(|x|,|y|)
     try code.append(allocator, encode.fsetp(4, s + 6, s + 5, .ge, .{})); // P4 = xy wins vs z
@@ -1651,9 +1835,10 @@ fn emitCubeAtlasUv(allocator: std.mem.Allocator, code: *std.ArrayList(Inst), loc
     try code.append(allocator, encode.sel(s + 9, s + 9, s + 10, 2, .{})); // baseZ
     try code.append(allocator, encode.sel(s + 7, s + 7, s + 8, 3, .{})); // baseXY
     try code.append(allocator, encode.sel(s + 7, s + 7, s + 9, 4, .{})); // faceBase -> s+7
-    // Within-face u,v (GL convention, matching software cubeFaceUv): ma = winning |axis|;
-    // sc/tc the two other coords (signed per face); u=(sc/ma+1)/2, v=(tc/ma+1)/2.
-    // negx/negy/negz are still live in s+0/s+2/s+4 from the abs step above.
+    // Within-face u, v (GL convention, matching software cubeFaceUv): ma is
+    // the winning absolute axis value. sc/tc are the two other coordinates
+    // (signed per face). u=(sc/ma+1)/2, v=(tc/ma+1)/2. negx/negy/negz are
+    // still live in s+0/s+2/s+4 from the abs step above.
     try code.append(allocator, encode.sel(s + 8, s + 6, s + 5, 4, .{})); // ma = P4? maxxy : |z|
     try code.append(allocator, encode.sel(s + 9, s + 4, z, 0, .{})); // scX = P0? -z : z
     try code.append(allocator, encode.sel(s + 10, x, s + 0, 2, .{})); // scZ = P2? x : -x
@@ -1665,12 +1850,14 @@ fn emitCubeAtlasUv(allocator: std.mem.Allocator, code: *std.ArrayList(Inst), loc
     try code.append(allocator, encode.mufu(s + 11, s + 8, .rcp, .{})); // 1/ma
     try code.append(allocator, encode.movImm(s + 1, f_half, .{})); // 0.5
     try code.append(allocator, encode.movImm(s + 2, f_sixth, .{})); // 1/6
-    // u_within = sc/ma*0.5 + 0.5 ; then u' = u_within*(1/6) + faceBase.
+    // u_within = sc/ma*0.5 + 0.5. Then u' = u_within*(1/6) + faceBase.
     try code.append(allocator, encode.fmul(s + 3, s + 9, s + 11, .{})); // sc/ma
     try code.append(allocator, encode.ffma(s + 9, s + 3, s + 1, s + 1, .{})); // u_within
-    // Clamp u_within to [half_texel, 1-half_texel] (half_texel = 0.5/face_w, from CB0) so a
-    // LINEAR tap near a face edge stays inside this face's atlas column (per-face clamp-to-
-    // edge), instead of bleeding into the neighbour. Reuses P0/P1 (sign preds are dead here).
+    // Clamp u_within to [half_texel, 1-half_texel], where half_texel =
+    // 0.5/face_w, from CB0. This keeps a linear tap near a face edge inside
+    // this face's atlas column (a per-face clamp-to-edge), instead of
+    // bleeding into the neighbour. Reuses P0/P1, since the sign predicates
+    // are dead here.
     try code.append(allocator, encode.ldc(s + 3, encode.graphics_const_bank, encode.cube_halftexel_cb, .{})); // half_texel (root table 1)
     try code.append(allocator, encode.fsetp(0, s + 9, s + 3, .ge, .{})); // u_within >= ht
     try code.append(allocator, encode.sel(s + 9, s + 9, s + 3, 0, .{})); // max(u_within, ht)
@@ -1687,8 +1874,9 @@ fn emitCubeAtlasUv(allocator: std.mem.Allocator, code: *std.ArrayList(Inst), loc
 fn lowerInst(allocator: std.mem.Allocator, func: *const Function, loc: *std.AutoHashMapUnmanaged(Value, Loc), code: *std.ArrayList(Inst), tex: *const TexLowering, deriv: *const DerivLowering, math: *const MathLowering, inst: ir.function.Inst) Error!void {
     switch (func.opcode(inst)) {
         .iconst => |c| {
-            // A graphics output-attribute store pointer is a tag-carrier iconst
-            // (the slot), never a real value the SASS computes. Skip emitting it.
+            // A graphics output-attribute store pointer is a tag-carrier
+            // iconst (the slot), never a real value the SASS computes. Skip
+            // emitting it.
             const result = func.instResult(inst).?;
             if (attrTag(func, result, "out_attr") != null or attrTag(func, result, "color_out") != null or attrTag(func, result, "frag_depth") != null) return;
             const rd = gprOf(loc.*, result);
@@ -1701,38 +1889,43 @@ fn lowerInst(allocator: std.mem.Allocator, func: *const Function, loc: *std.Auto
         },
         .arith => |a| {
             const result = func.instResult(inst).?;
-            // A texture-result element pointer (`tex_alloca + c*4`) is a tag carrier:
-            // the reload load resolves straight to a TEX result register, so the address
-            // arithmetic is never emitted.
+            // A texture-result element pointer (`tex_alloca + c*4`) is a tag
+            // carrier: the reload load resolves straight to a TEX result
+            // register, so the address arithmetic is never emitted.
             if (tex.elem.contains(result)) return;
-            // A grad_buf element pointer (`grad_buf + index*4`) is likewise a tag carrier:
-            // the load is replaced by the SHFL-quad derivative, so its address arith is
-            // never emitted.
+            // A grad_buf element pointer (`grad_buf + index*4`) is likewise
+            // a tag carrier: the load is replaced by the SHFL-quad
+            // derivative, so its address arith is never emitted.
             if (deriv.grad_ptr.contains(result)) return;
             if (isPtr(func, result) and a.op == .add) {
-                // 64-bit pointer add: (dst:dst+1) = (base:base+1) + zext(offset). The
-                // low add produces a carry that the high add (`.X`) consumes.
+                // 64-bit pointer add: (dst:dst+1) = (base:base+1) +
+                // zext(offset). The low add produces a carry that the high
+                // add (`.X`) consumes.
                 const dlo = gprOf(loc.*, result);
                 const base = gprOf(loc.*, a.lhs); // pointer pair (lo:hi)
                 const offset = gprOf(loc.*, a.rhs); // 32-bit, zero-extended
                 try code.append(allocator, encode.iadd3CarryOut(dlo, base, offset, carry_pred, .{}));
                 try code.append(allocator, encode.iadd3CarryIn(dlo + 1, base + 1, encode.RZ, carry_pred, .{}));
             } else if (isBool(func, result)) {
-                // A boolean-valued bitwise op is a LOGICAL predicate combine (`a && b`,
-                // `a || b`, `a ^^ b` - the shared lowering emits SPIR-V LogicalAnd/Or/
-                // NotEqual as a bool-typed `.binary` bit_and/bit_or/bit_xor). The result
-                // lives in a PREDICATE register (the allocator gives bools predicates),
-                // so it combines the operand predicates with PLOP3, not GPR LOP3. glmark2's
-                // light-phong FS hits this (a comparison ANDed/ORed into another bool).
+                // A boolean-valued bitwise op is a logical predicate combine
+                // (`a && b`, `a || b`, `a ^^ b`). The shared lowering emits
+                // SPIR-V LogicalAnd/Or/NotEqual as a bool-typed `.binary`
+                // bit_and/bit_or/bit_xor. The result lives in a predicate
+                // register, since the allocator gives bools predicates, so
+                // it combines the operand predicates with PLOP3, not GPR
+                // LOP3. The glmark2 light-phong fragment shader hits this: a
+                // comparison ANDed or ORed into another bool.
                 const pd = predOf(loc.*, result);
                 const pa = predOf(loc.*, a.lhs);
                 const pb = predOf(loc.*, a.rhs);
                 try code.append(allocator, encode.plop3(pd, pa, pb, try lutOf(a.op), .{}));
             } else if (a.op == .div and isFloat(func, a.lhs)) {
-                // Float divide a/b = a * (1/b): the GPU has no FDIV, so reciprocate b on
-                // the multifunction unit (MUFU.RCP) then multiply. `normalize` rides this
-                // (its 1.0/sqrt(dot) reciprocal). The RCP result lands in a scratch reg
-                // (fixed latency, the default stall covers the FMUL dependency).
+                // Float divide a/b = a * (1/b): the GPU has no FDIV, so
+                // reciprocate b on the multifunction unit (MUFU.RCP), then
+                // multiply. `normalize` uses this path for its 1.0/sqrt(dot)
+                // reciprocal. The RCP result lands in a scratch register.
+                // MUFU has fixed latency, so the default stall covers the
+                // FMUL dependency.
                 const rd = gprOf(loc.*, result);
                 const ra = gprOf(loc.*, a.lhs);
                 const rb = gprOf(loc.*, a.rhs);
@@ -1746,12 +1939,15 @@ fn lowerInst(allocator: std.mem.Allocator, func: *const Function, loc: *std.Auto
             }
         },
         .unary => |u| {
-            // Float transcendentals on the multifunction unit. `sqrt` (used by
-            // `length`/`normalize`'s sqrt(dot)) maps to MUFU.SQRT. `reinterpret` is a
-            // bitcast - a register copy. The rounding ops (floor/ceil/trunc) have no direct
-            // F32->F32 instruction here, so they go via F2I (with the matching round mode)
-            // then I2F back - exact for any integer-representable value (the GLSL floor()/
-            // ceil()/trunc() the simplex-noise / terrain shaders need). `nearest` unmodeled.
+            // Float transcendentals on the multifunction unit. `sqrt`, used
+            // by `length` and `normalize`'s sqrt(dot), maps to MUFU.SQRT.
+            // `reinterpret` is a bitcast, so it is a register copy. The
+            // rounding ops (floor, ceil, trunc) have no direct F32-to-F32
+            // instruction here, so they go through F2I, with the matching
+            // round mode, then back through I2F. This is exact for any
+            // integer-representable value, which covers the GLSL floor(),
+            // ceil(), and trunc() the simplex-noise and terrain shaders
+            // need. `nearest` is not modeled.
             const rd = gprOf(loc.*, func.instResult(inst).?);
             const rs = gprOf(loc.*, u.value);
             switch (u.op) {
@@ -1771,47 +1967,57 @@ fn lowerInst(allocator: std.mem.Allocator, func: *const Function, loc: *std.Auto
         },
         .load => |l| {
             const rd = gprOf(loc.*, func.instResult(inst).?);
-            // A reload of a sampled-texture result: the four loads of the host-sampler
-            // out-pointer resolve to the TEX result block (out_base + component), so the
-            // load is a register copy, not an LDG. The TEX's write barrier (set when the
-            // sampler call lowered) already gates the read via the scheduler.
+            // A reload of a sampled-texture result: the four loads of the
+            // host-sampler out-pointer resolve to the TEX result block
+            // (out_base + component), so the load is a register copy, not
+            // an LDG. The TEX's write barrier, set when the sampler call
+            // lowered, already gates the read through the scheduler.
             if (tex.loadComp(l.ptr)) |e| {
                 const src = tex.out_base.get(e.alloca).? + e.comp;
                 try code.append(allocator, encode.movReg(rd, src, .{}));
                 return;
             }
-            // A grad_buf load: the screen-space derivative of a varying. Interpolate the
-            // varying into a scratch register (IPA at its attribute slot), SHUFFLE the
-            // varying from the quad neighbour (XOR the lane index with 1 for dFdx /
-            // horizontal, 2 for dFdy / vertical), then FSWZADD to difference them with the
-            // correct per-lane sign - the coarse per-quad gradient lands in `rd`. The
-            // varying IPA is variable-latency: the scheduler waits the SHFL (which reads it
-            // at srcA) on its scoreboard automatically.
+            // A grad_buf load: the screen-space derivative of a varying.
+            // Interpolate the varying into a scratch register (IPA at its
+            // attribute slot), shuffle the varying from the quad neighbour
+            // (XOR the lane index with 1 for dFdx/horizontal, 2 for
+            // dFdy/vertical), then use FSWZADD to difference them with the
+            // correct per-lane sign. The coarse per-quad gradient lands in
+            // `rd`. The varying IPA is variable-latency: the scheduler
+            // waits for the SHFL, which reads it at srcA, on its scoreboard
+            // automatically.
             if (deriv.loads.get(func.instResult(inst).?)) |gl| {
                 const scratch = gl.shfl_reg;
-                // Source the varying for the quad SHFL with a FRESH IPA into a private
-                // reserved register. The prologue-reused register is NOT safe here: the
-                // body re-uses it for FS values between the prologue interpolation and this
-                // grad load, so by the time the SHFL/FSWZADD read it `self` is a different
-                // (much larger) value than the actual varying - the derivative comes out
-                // saturated (proven on-GPU: a fresh-IPA SHFL gives the exact 1px-neighbour
-                // step + correct dFdx, the prologue-reg path gave a 2x+ saturated dFdx). A
-                // fresh IPA is variable-latency, but the scheduler scoreboards the IPA and
-                // the SHFL (both in isVariableLatency) so the cross-lane read waits until
-                // the value has landed in every lane.
+                // Source the varying for the quad SHFL with a fresh IPA into
+                // a private reserved register. The prologue-reused register
+                // is not safe here: the body reuses it for fragment-shader
+                // values between the prologue interpolation and this grad
+                // load, so by the time the SHFL/FSWZADD read it, `self` is a
+                // different, much larger, value than the actual varying. The
+                // derivative then comes out saturated. Proven on the GPU: a
+                // fresh-IPA SHFL gives the exact 1-pixel-neighbour step and
+                // the correct dFdx, while the prologue-reg path gave a
+                // 2x-or-more saturated dFdx. A fresh IPA is
+                // variable-latency, but the scheduler scoreboards both the
+                // IPA and the SHFL (both in isVariableLatency), so the
+                // cross-lane read waits until the value has landed in every
+                // lane.
                 try code.append(allocator, encode.ipa(gl.varying_reg, gl.slot, .{}));
                 const vary: u8 = gl.varying_reg;
                 const lane_xor: u5 = if (gl.axis == 0) 1 else 2;
                 try code.append(allocator, encode.shflBflyQuad(scratch, vary, lane_xor, .{}));
-                // dFdx: [SubLeft, SubRight, SubLeft, SubRight] (NAK's fddx pattern).
-                // dFdy: [SubLeft, SubLeft, SubRight, SubRight] (NAK's fddy pattern). This
-                // is the RAW NAK orientation: prism's nvidia viewport now uses a POSITIVE
-                // Y scale (setViewport: window_y = (ndc_y+1)/2*h, NDC y=-1 -> row 0), the
-                // SAME framebuffer Y-origin as the software driver, so the on-screen lane^2
-                // vertical quad neighbour matches NAK's assumed quad orientation - no sign
-                // compensation is needed (the earlier `[SubRight,SubRight,SubLeft,SubLeft]`
-                // negation existed only to cancel the OLD negative-Y-scale flip, reverted in
-                // lock-step with restoring the positive Y scale).
+                // dFdx: [SubLeft, SubRight, SubLeft, SubRight], NAK's fddx
+                // pattern. dFdy: [SubLeft, SubLeft, SubRight, SubRight],
+                // NAK's fddy pattern. This is the raw NAK orientation.
+                // prism's nvidia viewport now uses a positive Y scale
+                // (setViewport: window_y = (ndc_y+1)/2*h, NDC y=-1 maps to
+                // row 0), the same framebuffer Y-origin as the software
+                // driver, so the on-screen vertical quad neighbour matches
+                // NAK's assumed quad orientation. No sign compensation is
+                // needed. The earlier `[SubRight,SubRight,SubLeft,SubLeft]`
+                // negation existed only to cancel the old negative-Y-scale
+                // flip, and was reverted along with restoring the positive Y
+                // scale.
                 const ops: [4]encode.SwzOp = if (gl.axis == 0)
                     .{ .sub_left, .sub_right, .sub_left, .sub_right }
                 else
@@ -1819,42 +2025,50 @@ fn lowerInst(allocator: std.mem.Allocator, func: *const Function, loc: *std.Auto
                 try code.append(allocator, encode.fswzadd(rd, scratch, vary, ops, .{}));
                 return;
             }
-            // Otherwise an ordinary LDG from the 64-bit pointer pair into the 32-bit
-            // result register. Variable latency: the scoreboard scheduler assigns its
-            // write barrier and the wait on each consumer.
+            // Otherwise this is an ordinary LDG from the 64-bit pointer pair
+            // into the 32-bit result register. This is variable latency: the
+            // scoreboard scheduler assigns its write barrier and the wait on
+            // each consumer.
             try code.append(allocator, encode.ldgU32(rd, gprOf(loc.*, l.ptr), .{}));
         },
         .store => |st| {
-            // A store whose pointer is tagged with a graphics output attribute goes
-            // to that attribute (AST). A fragment color output is moved into the ROP
-            // color register (R0..R3), otherwise it is an ordinary global store.
+            // A store whose pointer is tagged with a graphics output
+            // attribute goes to that attribute (AST). A fragment color
+            // output is moved into the ROP color register (R0..R3), and
+            // otherwise it is an ordinary global store.
             if (attrTag(func, st.ptr, "out_attr")) |attr| {
                 try code.append(allocator, encode.ast(attr, gprOf(loc.*, st.value), 1, .{}));
             } else if (attrTag(func, st.ptr, "frag_depth") != null) {
-                // gl_FragDepth: move the shader-computed depth into the ROP depth-output
-                // register (reserved in assignLocs; past all N color targets). The SPH's
-                // OMAP_DEPTH makes the ROP read the fragment depth from here vs the interp z.
+                // gl_FragDepth: move the shader-computed depth into the ROP
+                // depth-output register, reserved in assignLocs past all N
+                // color targets. The SPH's OMAP_DEPTH makes the ROP read
+                // the fragment depth from here instead of the interpolated
+                // z value.
                 try code.append(allocator, encode.movReg(fragDepthReg(func), gprOf(loc.*, st.value), .{}));
             } else if (attrTag(func, st.ptr, "color_out")) |comp| {
-                // The fragment shader's render-target color: the ROP reads target T's RGBA
-                // from R[T*4 .. T*4+3] at EXIT, so `comp` (= target*4 + component) moves into
-                // R<comp>. R0..R3 (RT0) are always reserved; R4..R[4N-1] (RT1+) are reserved
-                // in assignLocs when the shader is MRT. The register allocator extends every
-                // color value's live range to the LAST color store, so the color values
-                // occupy distinct registers that all stay live to EXIT - the source register
-                // read here is never reused for another value before its move. The prologue
-                // pad already covers the async input-delivery window.
+                // The fragment shader's render-target color: the ROP reads
+                // target T's RGBA from R[T*4 .. T*4+3] at EXIT, so `comp`
+                // (= target*4 + component) moves into R<comp>. R0..R3 (RT0)
+                // are always reserved. R4..R[4N-1] (RT1+) are reserved in
+                // assignLocs when the shader is MRT. The register allocator
+                // extends every color value's live range to the last color
+                // store, so the color values occupy distinct registers that
+                // all stay live to EXIT. The source register read here is
+                // never reused for another value before its move. The
+                // prologue pad already covers the async input-delivery
+                // window.
                 if (comp < 32) try code.append(allocator, encode.movReg(@intCast(comp), gprOf(loc.*, st.value), .{}));
             } else {
                 try code.append(allocator, encode.stgU32(gprOf(loc.*, st.ptr), gprOf(loc.*, st.value), .{}));
             }
         },
-        .prefetch => {}, // a hint, no CPU-style prefetch on this GPU target, dropped
+        .prefetch => {}, // a hint; this GPU target has no CPU-style prefetch, so it is dropped
         .arith_imm => |a| {
             const result = func.instResult(inst).?;
-            // Logical NOT lowers to `bool ^ -1` (bit_xor against all-ones). A boolean
-            // result lives in a predicate, so negate the source predicate via PLOP3
-            // (`p ^ PT` = `!p`, since PT is true) - the GPR LOP3 path can't touch it.
+            // Logical NOT lowers to `bool ^ -1` (bit_xor against all-ones).
+            // A boolean result lives in a predicate, so negate the source
+            // predicate with PLOP3 (`p ^ PT` = `!p`, since PT is true). The
+            // GPR LOP3 path cannot touch it.
             if (isBool(func, result)) {
                 std.debug.assert(a.op == .bit_xor); // the only bool arith_imm the lowering emits
                 const pd = predOf(loc.*, result);
@@ -1869,12 +2083,15 @@ fn lowerInst(allocator: std.mem.Allocator, func: *const Function, loc: *std.Auto
         },
         .icmp => |cmp| {
             const pd = predOf(loc.*, func.instResult(inst).?);
-            // A compare of FLOAT operands must read them as IEEE floats (FSETP), not as
-            // integer bit-patterns (ISETP). The shared lowering emits `.icmp` for the
-            // GLSL float min/max/clamp ordered compares too (lower.zig f_max -> icmp.gt).
-            // an integer compare mis-orders negative floats, so e.g. `max(0.0, dot)`
-            // returns 0 for a positive dot (vkcube's lighting went black). Mirror the
-            // software backend, which already picks a float compare for float operands.
+            // A compare of float operands must read them as IEEE floats
+            // (FSETP), not as integer bit patterns (ISETP). The shared
+            // lowering emits `.icmp` for the GLSL float min, max, and clamp
+            // ordered compares too (lower.zig f_max maps to icmp.gt). An
+            // integer compare mis-orders negative floats, so for example
+            // `max(0.0, dot)` would return 0 for a positive dot. This is
+            // what made vkcube's lighting go black. This mirrors the
+            // software backend, which already picks a float compare for
+            // float operands.
             if (isFloat(func, cmp.lhs)) {
                 try code.append(allocator, encode.fsetp(pd, gprOf(loc.*, cmp.lhs), gprOf(loc.*, cmp.rhs), cmpOf(cmp.op), .{}));
             } else {
@@ -1896,34 +2113,39 @@ fn lowerInst(allocator: std.mem.Allocator, func: *const Function, loc: *std.Auto
             } else if (!src_float and dst_float) {
                 try code.append(allocator, encode.i2f(rd, rs, isSignedRaw(func, cv.value), .{})); // i32 -> f32
             } else {
-                return error.Unsupported; // int<->int width change / f32<->f64 not modeled yet
+                return error.Unsupported; // int-to-int width change, or f32-to-f64, is not modeled yet
             }
         },
         .alloca => {
-            // The only alloca the NVIDIA backend supports is the host-sampler
-            // out-pointer (a vec4 RGBA result slot), which is materialized as a 4-reg
-            // TEX result block (no real stack). Any other alloca is unsupported.
+            // The only alloca the NVIDIA backend supports is the
+            // host-sampler out-pointer (a vec4 RGBA result slot), which is
+            // materialized as a 4-register TEX result block, with no real
+            // stack. Any other alloca is unsupported.
             const result = func.instResult(inst).?;
             if (!tex.out_base.contains(result)) return error.Unsupported;
         },
         .call_indirect => |c| {
-            // The only indirect call the NVIDIA backend supports is the host-sampler
-            // call the SPIR-V image-sample lowering emits: lower it to a GPU TEX. The
-            // descriptor arg is the bindless handle (tic | tsc<<20) the prologue loaded
-            // from the constant bank. The (u, v) coord must occupy a consecutive
-            // register PAIR (TEX reads the pair from one source), so move them into the
-            // R0:R1 scratch pair. The RGBA result lands in the alloca's TEX result block.
-            // A discard call (OpKill): emit a KIL, which masks the fragment so the ROP
-            // does not write it. Execution continues to EXIT (the surrounding structured
-            // control flow already gates a conditional `if (cond) discard`).
+            // The only indirect call the NVIDIA backend supports is the
+            // host-sampler call the SPIR-V image-sample lowering emits:
+            // lower it to a GPU TEX. The descriptor arg is the bindless
+            // handle (tic | tsc<<20) the prologue loaded from the constant
+            // bank. The (u, v) coordinate must occupy a consecutive
+            // register pair, since TEX reads the pair from one source, so
+            // move them into the R0:R1 scratch pair. The RGBA result lands
+            // in the alloca's TEX result block.
+            // A discard call (OpKill): emit a KIL, which masks the fragment
+            // so the ROP does not write it. Execution continues to EXIT,
+            // since the surrounding structured control flow already gates a
+            // conditional `if (cond) discard`.
             if (hasGpuKey(func, c.target, "discard_fn")) {
                 try code.append(allocator, encode.kil(.{}));
                 return;
             }
-            // A host-math call (pow/exp/log/sin/cos): evaluate it on the MUFU
-            // special-function unit instead of a host function. The lowering passes
-            // (op:i32, a:f32, b:f32). The unary ops (exp2/log2/sin/cos) ignore b, and
-            // pow/exp/log compose two MUFUs around an FMUL via a reserved scratch reg.
+            // A host-math call (pow, exp, log, sin, cos): evaluate it on the
+            // MUFU special-function unit instead of a host function. The
+            // lowering passes (op:i32, a:f32, b:f32). The unary ops (exp2,
+            // log2, sin, cos) ignore b. pow, exp, and log compose two MUFUs
+            // around an FMUL through a reserved scratch register.
             if (isMathFn(func, c.target)) {
                 const m = math.calls.get(@intFromEnum(inst)) orelse return error.Unsupported;
                 const args = func.valueList(c.args);
@@ -1959,19 +2181,25 @@ fn lowerInst(allocator: std.mem.Allocator, func: *const Function, loc: *std.Auto
             }
             if (!isSamplerFn(func, c.target) and !isSamplerVec3Fn(func, c.target) and !isAnyShadowFn(func, c.target) and !isSamplerGatherFn(func, c.target) and !isSamplerFetchFn(func, c.target) and !isSamplerFetch3Fn(func, c.target)) return error.Unsupported;
             const call = tex.calls.get(@intFromEnum(inst)) orelse return error.Unsupported;
-            // sampler2DShadow: a depth-compare TEX (z_cmpr) that returns a SCALAR into the call's SSA
-            // result register (no out block). Build src0 = (u, v) and src1 = [handle, dref] in the
-            // reserved coord QUAD, then emit texShadow (bit 78). The scheduler gives the single-register
-            // result a write barrier (span from the R-only channel mask), so consumers wait correctly.
+            // sampler2DShadow: a depth-compare TEX (z_cmpr) that returns a
+            // scalar into the call's SSA result register, with no out
+            // block. Build src0 = (u, v) and src1 = [handle, dref] in the
+            // reserved coordinate quad, then emit texShadow (bit 78). The
+            // scheduler gives the single-register result a write barrier,
+            // from the R-only channel mask span, so consumers wait
+            // correctly.
             if (call.is_shadow) {
                 const rdst = gprOf(loc.*, func.instResult(inst).?);
                 const handle = gprOf(loc.*, call.handle);
                 const dref = gprOf(loc.*, call.dref);
                 if (call.dim == encode.TexDim.cube) {
-                    // samplerCubeShadow: run the samplerCube atlas major-axis lowering to get (u', v) into
-                    // coord/coord+1, then a 2D z_cmpr TEX over the 6-face ZF32 atlas. src1 = [handle, dref]
-                    // at coord+2/coord+3 (z_cmpr reads the dref from handle_reg+1; NAK: src1 = [tex_h,
-                    // z_cmpr] with no explicit lod). LOD is implicit (Auto) - a base-level shadow cube.
+                    // samplerCubeShadow: run the samplerCube atlas major-axis
+                    // lowering to get (u', v) into coord/coord+1, then do a
+                    // 2D z_cmpr TEX over the 6-face ZF32 atlas. src1 =
+                    // [handle, dref] at coord+2/coord+3. z_cmpr reads the
+                    // dref from handle_reg+1 (NAK: src1 = [tex_h, z_cmpr],
+                    // with no explicit lod). LOD is implicit (Auto), giving
+                    // a base-level shadow cube.
                     try emitCubeAtlasUv(allocator, code, loc, call);
                     try code.append(allocator, encode.movReg(call.coord + 2, handle, .{})); // src1[0] = handle
                     try code.append(allocator, encode.movReg(call.coord + 3, dref, .{})); // src1[1] = dref
@@ -1979,10 +2207,13 @@ fn lowerInst(allocator: std.mem.Allocator, func: *const Function, loc: *std.Auto
                     return;
                 }
                 if (call.dim == encode.TexDim.array_2d) {
-                    // sampler2DArrayShadow: native TWO_D_ARRAY z_cmpr TEX. NAK assembles src0 = [arr_idx,
-                    // coords...] (the LAYER FIRST) - and the HW layer index is an INTEGER, f2u(layer+0.5)
-                    // (like the non-shadow array path). The 3-reg coord (layer, u, v) is 4-aligned; the
-                    // (handle, dref) pair goes at coord+4/coord+5 (coord+3 is padding), src1 base = coord+4.
+                    // sampler2DArrayShadow: native TWO_D_ARRAY z_cmpr TEX.
+                    // NAK assembles src0 = [arr_idx, coords...], with the
+                    // layer first. The hardware layer index is an integer,
+                    // f2u(layer+0.5), like the non-shadow array path. The
+                    // 3-register coordinate (layer, u, v) is 4-aligned. The
+                    // (handle, dref) pair goes at coord+4/coord+5 (coord+3
+                    // is padding), with src1 base = coord+4.
                     const layer = gprOf(loc.*, call.w);
                     try code.append(allocator, encode.movImm(call.coord + 1, @bitCast(@as(f32, 0.5)), .{}));
                     try code.append(allocator, encode.fadd(call.coord, layer, call.coord + 1, .{}));
@@ -1994,7 +2225,8 @@ fn lowerInst(allocator: std.mem.Allocator, func: *const Function, loc: *std.Auto
                     try code.append(allocator, encode.texShadow(rdst, call.coord, call.coord + 4, encode.TexDim.array_2d, .{ .wr_barrier = 0 }));
                     return;
                 }
-                // sampler2DShadow: coord PAIR (u, v) + src1 = [handle, dref] at coord+2/coord+3.
+                // sampler2DShadow: coordinate pair (u, v) plus
+                // src1 = [handle, dref] at coord+2/coord+3.
                 try code.append(allocator, encode.movReg(call.coord, gprOf(loc.*, call.u), .{})); // u
                 try code.append(allocator, encode.movReg(call.coord + 1, gprOf(loc.*, call.v), .{})); // v
                 try code.append(allocator, encode.movReg(call.coord + 2, handle, .{})); // src1[0] = handle
@@ -2006,22 +2238,29 @@ fn lowerInst(allocator: std.mem.Allocator, func: *const Function, loc: *std.Auto
             const handle = gprOf(loc.*, call.handle);
             const u = gprOf(loc.*, call.u);
             const v = gprOf(loc.*, call.v);
-            // Build the coord group in the RESERVED registers (coord = u, coord+1 = v, and for a
-            // cube/3D sample coord+2 = w) - never the fixed R0/R1, which the allocator may have
-            // given to live SSA values a texture-AND-derivative shader still needs after the sample.
+            // Build the coordinate group in the reserved registers
+            // (coord = u, coord+1 = v, and for a cube or 3D sample
+            // coord+2 = w). Never use the fixed R0/R1, which the allocator
+            // may have given to live SSA values a texture-and-derivative
+            // shader still needs after the sample.
             var tex_dim = call.dim;
             var cube_lod = false; // cube samples carry an explicit LOD in coord+2 (emit TLD)
             var fetch_src1: u8 = call.coord + 2; // the TLD (handle, lod) pair base (2D fetch)
             if (call.is_fetch) {
-                // texelFetch: INTEGER coords + a consecutive (handle, lod) pair (the explicit LOD, Lod
-                // mode, read from handle_reg+1). Emits a TLD (integer fetch, no filter). See encode.tld.
-                // 2D = (x, y); 3D = (x, y, z) = (u, v, w); 2D-ARRAY = (LAYER, x, y) = (w, u, v) (NAK
-                // packs the array index FIRST). The (handle, lod) pair follows the spatial coords.
+                // texelFetch: integer coordinates plus a consecutive
+                // (handle, lod) pair, the explicit LOD, Lod mode, read from
+                // handle_reg+1. This emits a TLD, an integer fetch with no
+                // filter. See encode.tld. 2D = (x, y). 3D = (x, y, z) =
+                // (u, v, w). 2D-array = (LAYER, x, y) = (w, u, v), since NAK
+                // packs the array index first. The (handle, lod) pair
+                // follows the spatial coordinates.
                 const w = gprOf(loc.*, call.w);
                 const lodr = gprOf(loc.*, call.lod);
                 if (call.dim == encode.TexDim.dim_3d) {
-                    // The 3-reg coord is 4-aligned; the (handle, lod) pair goes at coord+4 (even),
-                    // coord+3 is padding (an odd base would fault "Misaligned Register").
+                    // The 3-register coordinate is 4-aligned. The
+                    // (handle, lod) pair goes at coord+4 (even). coord+3 is
+                    // padding. An odd base would fault with "Misaligned
+                    // Register".
                     try code.append(allocator, encode.movReg(call.coord, u, .{})); // x
                     try code.append(allocator, encode.movReg(call.coord + 1, v, .{})); // y
                     try code.append(allocator, encode.movReg(call.coord + 2, w, .{})); // z
@@ -2043,29 +2282,40 @@ fn lowerInst(allocator: std.mem.Allocator, func: *const Function, loc: *std.Auto
                     fetch_src1 = call.coord + 2;
                 }
             } else if (call.dim == encode.TexDim.cube) {
-                // CUBE is lowered to a 2D sample of a 6-face-WIDE atlas (the 6 faces stored side by
-                // side, face f in the x-column block [f/6, (f+1)/6)). The native cube TEX does not
-                // select the face on this Blackwell path, and the 3D within-slice u,v addressing is
-                // unreliable, so compute the GL cube (face, u, v) from (x,y,z) here and sample the
-                // proven 2D path at (u' = (face + u)/6, v). The branchless major-axis lowering is shared
-                // with samplerCubeShadow via emitCubeAtlasUv (writes u' -> coord, v -> coord+1).
+                // Cube is lowered to a 2D sample of a 6-face-wide atlas: the
+                // 6 faces stored side by side, with face f in the x-column
+                // block [f/6, (f+1)/6). The native cube TEX does not select
+                // the face on this Blackwell path, and the 3D
+                // within-slice u, v addressing is unreliable. So this
+                // computes the GL cube (face, u, v) from (x, y, z) here and
+                // samples the proven 2D path at (u' = (face + u)/6, v). The
+                // branchless major-axis lowering is shared with
+                // samplerCubeShadow through emitCubeAtlasUv, which writes
+                // u' to coord and v to coord+1.
                 try emitCubeAtlasUv(allocator, code, loc, call);
-                // Explicit LOD: NAK packs the sample's src1 as [handle, lod], so the HW reads the LOD
-                // from handle_reg + 1. Build that consecutive pair in coord+2 (handle copy) + coord+3
-                // (lod), and point the TEX's src1 at coord+2. textureCube passes lod 0, textureCubeLod
-                // its explicit level. Explicit LOD (not implicit) matches software + dodges the atlas
-                // face-boundary derivative seam.
+                // Explicit LOD: NAK packs the sample's src1 as [handle,
+                // lod], so the hardware reads the LOD from handle_reg + 1.
+                // Build that consecutive pair in coord+2 (handle copy) and
+                // coord+3 (lod), and point the TEX's src1 at coord+2.
+                // textureCube passes lod 0, and textureCubeLod passes its
+                // explicit level. Explicit LOD, not implicit, matches the
+                // software path and avoids the atlas face-boundary
+                // derivative seam.
                 try code.append(allocator, encode.movReg(call.coord + 2, handle, .{})); // handle copy
                 try code.append(allocator, encode.movReg(call.coord + 3, gprOf(loc.*, call.lod), .{})); // lod
                 tex_dim = encode.TexDim.dim_2d;
                 cube_lod = true;
             } else if (call.dim == encode.TexDim.array_2d) {
-                // 2D ARRAY: NAK packs the array-texture coord with the LAYER FIRST (arr_idx at
-                // src0[0], then u, v). CRUCIAL: the HW array index is an INTEGER, not a float - NAK
-                // converts it f2u(layer + 0.5) (nak_nir_lower_tex.c ~244). A raw float layer (e.g.
-                // 1.0 = 0x3F800000) reads as garbage -> always layer 0. So round + convert the layer
-                // to a u32 in coord[0], using coord[1] as scratch for the 0.5 (before u lands there).
-                // Then u, v (still floats) at coord[1], coord[2]. The 3-register coord is 4-aligned.
+                // 2D array: NAK packs the array-texture coordinate with the
+                // layer first (arr_idx at src0[0], then u, v). Crucially,
+                // the hardware array index is an integer, not a float. NAK
+                // converts it with f2u(layer + 0.5) (nak_nir_lower_tex.c,
+                // around line 244). A raw float layer, for example
+                // 1.0 = 0x3F800000, reads as garbage, always layer 0. So
+                // this rounds and converts the layer to a u32 in coord[0],
+                // using coord[1] as scratch for the 0.5 before u lands
+                // there. Then u, v (still floats) go at coord[1], coord[2].
+                // The 3-register coordinate is 4-aligned.
                 const layer = gprOf(loc.*, call.w);
                 try code.append(allocator, encode.movImm(call.coord + 1, @bitCast(@as(f32, 0.5)), .{}));
                 try code.append(allocator, encode.fadd(call.coord, layer, call.coord + 1, .{}));
@@ -2073,19 +2323,24 @@ fn lowerInst(allocator: std.mem.Allocator, func: *const Function, loc: *std.Auto
                 try code.append(allocator, encode.movReg(call.coord + 1, u, .{}));
                 try code.append(allocator, encode.movReg(call.coord + 2, v, .{}));
             } else if (call.dim != encode.TexDim.dim_2d) {
-                // 3D on Blackwell: with a properly 4-ALIGNED coord group the HW reads the natural
-                // NAK/NIR order (u, v, w) - u,v in-slice at coord/coord+1 and the slice/depth w at
-                // coord+2. (The earlier "(w,u,v) slice-first" finding was an ARTIFACT of a
-                // 2-aligned coord that also faulted Xid 13 "Misaligned Register"; fixing the
-                // alignment restores the standard order.) See [[prism-3d-textures]].
+                // 3D on Blackwell: with a properly 4-aligned coordinate
+                // group, the hardware reads the natural NAK/NIR order
+                // (u, v, w): u, v in-slice at coord/coord+1, and the
+                // slice/depth w at coord+2. The earlier "(w,u,v)
+                // slice-first" finding was an artifact of a 2-aligned
+                // coordinate that also faulted with Xid 13, "Misaligned
+                // Register". Fixing the alignment restores the standard
+                // order. See [[prism-3d-textures]].
                 const w = gprOf(loc.*, call.w);
                 try code.append(allocator, encode.movReg(call.coord, u, .{}));
                 try code.append(allocator, encode.movReg(call.coord + 1, v, .{}));
                 try code.append(allocator, encode.movReg(call.coord + 2, w, .{}));
             } else if (call.explicit_lod) {
-                // Explicit-LOD 2D (textureLod, or any vertex-shader sample - a VS has no derivatives).
-                // Pack (u, v) then a consecutive (handle, lod) pair at coord+2/coord+3, and emit a
-                // TEX.LL (like the cube-LOD path): NAK reads the explicit LOD from src1[1] = handle+1.
+                // Explicit-LOD 2D (textureLod, or any vertex-shader sample,
+                // since a vertex shader has no derivatives). Pack (u, v),
+                // then a consecutive (handle, lod) pair at coord+2/coord+3,
+                // and emit a TEX.LL, like the cube-LOD path: NAK reads the
+                // explicit LOD from src1[1] = handle+1.
                 try code.append(allocator, encode.movReg(call.coord, u, .{}));
                 try code.append(allocator, encode.movReg(call.coord + 1, v, .{}));
                 try code.append(allocator, encode.movReg(call.coord + 2, handle, .{})); // handle copy
@@ -2095,17 +2350,21 @@ fn lowerInst(allocator: std.mem.Allocator, func: *const Function, loc: *std.Auto
                 try code.append(allocator, encode.movReg(call.coord, u, .{}));
                 try code.append(allocator, encode.movReg(call.coord + 1, v, .{}));
             }
-            // TEX result -> dst..dst+3. wr_barrier so the scheduler gates the reloads (the result
-            // lands a variable number of cycles after issue). `dim` selects the texture target + coord
-            // count. A gather emits TLD4 (fetch one component of the footprint); a cube carries an
-            // EXPLICIT LOD (coord+2) so it emits TLD; else an implicit-LOD TEX.
+            // TEX result goes to dst..dst+3. wr_barrier lets the scheduler
+            // gate the reloads, since the result lands a variable number of
+            // cycles after issue. `dim` selects the texture target and
+            // coordinate count. A gather emits TLD4, fetching one component
+            // of the footprint. A cube carries an explicit LOD (coord+2), so
+            // it emits TLD. Otherwise this emits an implicit-LOD TEX.
             const tex_inst = if (call.is_fetch)
-                // src1 base = fetch_src1 (holds handle; the HW reads the explicit LOD from the next reg).
+                // src1 base = fetch_src1, which holds the handle. The
+                // hardware reads the explicit LOD from the next register.
                 encode.tld(dst, call.coord, fetch_src1, tex_dim, .{ .wr_barrier = 0 })
             else if (call.gather_comp) |comp|
                 encode.tld4(dst, call.coord, handle, tex_dim, comp, .{ .wr_barrier = 0 })
             else if (cube_lod)
-                // src1 base = coord+2 (holds handle; the HW reads the explicit LOD from coord+3).
+                // src1 base = coord+2, which holds the handle. The hardware
+                // reads the explicit LOD from coord+3.
                 encode.texLod(dst, call.coord, call.coord + 2, tex_dim, .{ .wr_barrier = 0 })
             else
                 encode.tex(dst, call.coord, handle, tex_dim, .{ .wr_barrier = 0 });
@@ -2127,23 +2386,26 @@ fn arith(func: *const Function, op: ir.function.BinOp, rd: u8, ra: u8, rb: u8, l
         .bit_xor => encode.lop3(rd, ra, rb, encode.LUT_XOR, .{}),
         .shl => encode.shf(rd, ra, rb, false, false, .{}),
         .shr => encode.shf(rd, ra, rb, true, isSignedRaw(func, lhs), .{}),
-        // Integer divide is a multi-instruction reciprocal sequence, deferred. `mulh` is expanded
-        // to plain multiplies/shifts (`expandMulh`) before this backend's isel.
+        // Integer divide is a multi-instruction reciprocal sequence, and is
+        // deferred. `mulh` is expanded to plain multiplies and shifts
+        // (`expandMulh`) before this backend's isel.
         .div, .rem, .mulh => error.Unsupported,
     };
 }
 
-/// The 3-input logic-op LUT (src0=0xF0, src1=0xCC, src2=0xAA truth table) for a
-/// two-input bitwise op - shared by LOP3 (integer) and PLOP3 (predicate). Only the
-/// bitwise ops are valid here (a logical predicate combine is always one of these).
+/// The 3-input logic-op LUT (src0=0xF0, src1=0xCC, src2=0xAA truth table)
+/// for a two-input bitwise op, shared by LOP3 (integer) and PLOP3
+/// (predicate). Only the bitwise ops are valid here, since a logical
+/// predicate combine is always one of these.
 fn lutOf(op: ir.function.BinOp) error{Unsupported}!u8 {
     return switch (op) {
         .bit_and => encode.LUT_AND,
         .bit_or => encode.LUT_OR,
         .bit_xor => encode.LUT_XOR,
-        // Only bitwise ops produce a bool that reaches a predicate combine; any other
-        // op here is an unsupported IR shape, surfaced as an error rather than a panic
-        // (matching isel's no-panic policy) since the convention is not compiler-enforced.
+        // Only bitwise ops produce a bool that reaches a predicate combine.
+        // Any other op here is an unsupported IR shape. This surfaces as an
+        // error, not a panic, matching isel's no-panic policy, since the
+        // convention is not compiler-enforced.
         else => error.Unsupported,
     };
 }
@@ -2179,12 +2441,14 @@ fn isSignedRaw(func: *const Function, v: Value) bool {
 
 fn emitIf(allocator: std.mem.Allocator, func: *const Function, loc: *std.AutoHashMapUnmanaged(Value, Loc), code: *std.ArrayList(Inst), fixups: *std.ArrayList(Fixup), cf: ir.function.If) Error!void {
     const pred = predOf(loc.*, cf.cond);
-    // Each path's phi edge moves must execute ONLY on that path. The old layout emitted
-    // the `then` moves UNCONDITIONALLY (before the guarded branch), so when the condition
-    // was false they still ran and clobbered registers before the `else` moves - benign
-    // for a single phi (the else move overwrote it) but corrupting when a then edge move's
-    // SOURCE was a register a later (else-path) value needed, which a shader with several
-    // phi-merging branches over live texture/derivative values hits. Layout now:
+    // Each path's phi edge moves must execute only on that path. The old
+    // layout emitted the `then` moves unconditionally, before the guarded
+    // branch, so when the condition was false they still ran and clobbered
+    // registers before the `else` moves. This was benign for a single phi,
+    // since the else move overwrote it, but it corrupted state when a then
+    // edge move's source was a register a later, else-path, value needed.
+    // A shader with several phi-merging branches over live texture or
+    // derivative values hits this. The layout is now:
     //     @P BRA L_then          (cond true -> skip the else moves)
     //        <else edge moves>
     //        BRA else_target
@@ -2214,8 +2478,8 @@ fn emitJump(allocator: std.mem.Allocator, func: *const Function, loc: *std.AutoH
 }
 
 /// Edge moves into the target block's parameters (register copies). Distinct
-/// registers per value mean the moves are independent except for genuine swaps. A
-/// scratch register breaks any cycle.
+/// registers per value mean the moves are independent, except for genuine
+/// swaps. A scratch register breaks any cycle.
 fn emitMoves(allocator: std.mem.Allocator, func: *const Function, loc: *std.AutoHashMapUnmanaged(Value, Loc), code: *std.ArrayList(Inst), jump: ir.function.Jump) Error!void {
     const args = func.blockArgs(jump);
     const params = func.blockParams(jump.target);
@@ -2259,6 +2523,9 @@ fn forEachUse(func: *const Function, inst: ir.function.Inst, last_use: []u32, po
             markUse(last_use, st.ptr, pos);
         },
         .prefetch => {}, // dropped at emission, no register read here
+        .va_start => |vs| markUse(last_use, vs.list, pos),
+        .va_arg => |va| markUse(last_use, va.list, pos),
+        .va_end => |ve| markUse(last_use, ve.list, pos),
         .dot => |d| {
             markUse(last_use, d.acc, pos);
             markUse(last_use, d.a, pos);
@@ -2285,7 +2552,7 @@ fn forEachUse(func: *const Function, inst: ir.function.Inst, last_use: []u32, po
 
 fn forEachTermUse(func: *const Function, term: Terminator, last_use: []u32, pos: u32) void {
     switch (term) {
-        .ret => |v| if (v) |vv| markUse(last_use, vv, pos),
+        .ret => |r| for (r.slice()) |vv| markUse(last_use, vv, pos),
         .jump => |j| for (func.blockArgs(j)) |a| markUse(last_use, a, pos),
     }
 }
@@ -2320,6 +2587,9 @@ fn markUsedBitset(func: *const Function, inst: ir.function.Inst, row: []bool) vo
             setUsed(row, st.ptr);
         },
         .prefetch => {}, // dropped at emission, no register read here
+        .va_start => |vs| setUsed(row, vs.list),
+        .va_arg => |va| setUsed(row, va.list),
+        .va_end => |ve| setUsed(row, ve.list),
         .dot => |d| {
             setUsed(row, d.acc);
             setUsed(row, d.a);
@@ -2346,7 +2616,7 @@ fn markUsedBitset(func: *const Function, inst: ir.function.Inst, row: []bool) vo
 
 fn markUsedTermBitset(func: *const Function, term: Terminator, row: []bool) void {
     switch (term) {
-        .ret => |v| if (v) |vv| setUsed(row, vv),
+        .ret => |r| for (r.slice()) |vv| setUsed(row, vv),
         .jump => |j| for (func.blockArgs(j)) |a| setUsed(row, a),
     }
 }
@@ -2438,8 +2708,8 @@ test "compiles a vertex shader: attribute load, compute, attribute store, exit" 
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const b = try func.appendBlock();
 
-    // A vertex input attribute (tagged with its slot), incremented and written to
-    // the clip-space position output.
+    // A vertex input attribute, tagged with its slot, incremented and
+    // written to the clip-space position output.
     const in = try func.appendBlockParam(b, f32_t);
     try func.addAttr(.{ .value = in }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "attr", .value = .{ .int = encode.ATTR_GENERIC0 } } });
     const one = try func.appendInst(b, f32_t, .{ .fconst = 1.0 });
@@ -2447,12 +2717,12 @@ test "compiles a vertex shader: attribute load, compute, attribute store, exit" 
     const out_ptr = try func.appendInst(b, i32_t, .{ .iconst = 0 }); // the position output slot
     try func.addAttr(.{ .value = out_ptr }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "out_attr", .value = .{ .int = encode.ATTR_POSITION } } });
     try func.appendStore(b, sum, out_ptr);
-    func.setTerminator(b, .{ .ret = null });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
 
     var kernel = try compileShader(allocator, &func, .vertex);
     defer kernel.deinit(allocator);
 
-    // ALD (attribute fetch) -> FADD -> AST (write position) -> EXIT.
+    // The sequence is: ALD (attribute fetch), FADD, AST (write position), EXIT.
     var has_ald = false;
     var has_fadd = false;
     var has_ast = false;
@@ -2479,10 +2749,11 @@ test "graphics: a UBO pointer param loads its address from constant bank (LDC), 
     const ptr_t = try func.types.intern(.ptr);
     const b = try func.appendBlock();
 
-    // Entry params (graphics order): a vertex input attribute scalar, then a UBO base
-    // pointer (a `ptr`, untagged - exactly what the SPIR-V lowering appends for a
-    // uniform block). The body loads a uniform float through the UBO pointer, adds the
-    // input, and writes the clip-space position output.
+    // Entry params, in graphics order: a vertex input attribute scalar,
+    // then a UBO base pointer (a `ptr`, untagged, exactly what the SPIR-V
+    // lowering appends for a uniform block). The body loads a uniform
+    // float through the UBO pointer, adds the input, and writes the
+    // clip-space position output.
     const in = try func.appendBlockParam(b, f32_t);
     try func.addAttr(.{ .value = in }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "attr", .value = .{ .int = encode.ATTR_GENERIC0 } } });
     const ubo = try func.appendBlockParam(b, ptr_t);
@@ -2491,13 +2762,14 @@ test "graphics: a UBO pointer param loads its address from constant bank (LDC), 
     const out_ptr = try func.appendInst(b, i32_t, .{ .iconst = 0 });
     try func.addAttr(.{ .value = out_ptr }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "out_attr", .value = .{ .int = encode.ATTR_POSITION } } });
     try func.appendStore(b, sum, out_ptr);
-    func.setTerminator(b, .{ .ret = null });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
 
     var kernel = try compileShader(allocator, &func, .vertex);
     defer kernel.deinit(allocator);
 
-    // The prologue must source the UBO pointer from constant bank (two LDCs for the
-    // 64-bit address pair) and the body must LDG through it, plus the ALD for the input.
+    // The prologue must source the UBO pointer from the constant bank (two
+    // LDCs for the 64-bit address pair), and the body must LDG through it,
+    // plus do an ALD for the input.
     var ldc_count: usize = 0;
     var has_ldg = false;
     var has_ald = false;
@@ -2534,11 +2806,13 @@ test "graphics: gl_VertexIndex sources from S2R and pulls a vec from a UBO array
     const ptr_t = try func.types.intern(.ptr);
     const b = try func.appendBlock();
 
-    // Entry params (vertex-pulling order, NO attribute inputs): the gl_VertexIndex
-    // builtin (i32, tagged vulcan.gpu.builtin=42), then the UBO base pointer. The body
-    // computes &u.pos[gl_VertexIndex] = base + index*stride, loads a float through it,
-    // and writes the clip-space position output - exactly the IR the SPIR-V lowering
-    // produces for `u.pos[gl_VertexIndex]` with a zero-attribute pipeline.
+    // Entry params, in vertex-pulling order with no attribute inputs: the
+    // gl_VertexIndex builtin (i32, tagged vulcan.gpu.builtin=42), then the
+    // UBO base pointer. The body computes
+    // &u.pos[gl_VertexIndex] = base + index*stride, loads a float through
+    // it, and writes the clip-space position output. This is exactly the
+    // IR the SPIR-V lowering produces for `u.pos[gl_VertexIndex]` with a
+    // zero-attribute pipeline.
     const vi = try func.appendBlockParam(b, i32_t);
     try func.addAttr(.{ .value = vi }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "builtin", .value = .{ .int = 42 } } });
     const ubo = try func.appendBlockParam(b, ptr_t);
@@ -2549,15 +2823,16 @@ test "graphics: gl_VertexIndex sources from S2R and pulls a vec from a UBO array
     const out_ptr = try func.appendInst(b, i32_t, .{ .iconst = 0 });
     try func.addAttr(.{ .value = out_ptr }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "out_attr", .value = .{ .int = encode.ATTR_POSITION } } });
     try func.appendStore(b, uval, out_ptr);
-    func.setTerminator(b, .{ .ret = null });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
 
     var kernel = try compileShader(allocator, &func, .vertex);
     defer kernel.deinit(allocator);
 
-    // Must source gl_VertexIndex via ALD a[ATTR_VERTEX_ID] (the DA-delivered vertex-id
-    // attribute), scale it (IMAD index*stride), load the UBO pointer (LDC x2), and LDG
-    // through base+offset. The ONLY ALD is the vertex-id read - there is no vertex
-    // attribute (the VS pulls from the UBO, not a vertex buffer).
+    // This must source gl_VertexIndex through ALD a[ATTR_VERTEX_ID] (the
+    // DA-delivered vertex-ID attribute), scale it (IMAD index*stride), load
+    // the UBO pointer (LDC x2), and LDG through base+offset. The only ALD
+    // is the vertex-ID read. There is no vertex attribute, since the vertex
+    // shader pulls from the UBO, not a vertex buffer.
     var has_ald_vid = false;
     var has_imad = false;
     var ldc_count: usize = 0;
@@ -2593,13 +2868,13 @@ test "compiles a kernel: load params, multiply-add, store, exit" {
     const y = try func.appendBlockParam(b, t);
     const prod = try func.appendInst(b, t, .{ .arith = .{ .op = .mul, .lhs = x, .rhs = y } });
     const sum = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = prod, .rhs = x } });
-    func.setTerminator(b, .{ .ret = sum });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(sum) });
 
     var kernel = try compileKernel(allocator, &func);
     defer kernel.deinit(allocator);
 
-    // Prologue: LDC outptr lo/hi + two inputs = 4 instructions, then IMAD, IADD3,
-    // STG, EXIT = 8 instructions total (32 dwords).
+    // Prologue: LDC outptr lo/hi plus two inputs equals 4 instructions,
+    // then IMAD, IADD3, STG, EXIT equals 8 instructions total (32 dwords).
     try testing.expectEqual(@as(usize, 8 * 4), kernel.code.len);
     try testing.expectEqual(@as(u32, 0xb82), kernel.code[0] & 0xfff); // first LDC
     // The first LDC reads the output pointer low word from the param base.
@@ -2627,7 +2902,7 @@ test "an f16 function is rejected cleanly, not miscompiled as f64" {
     const x = try func.appendBlockParam(b, t);
     const y = try func.appendBlockParam(b, t);
     const sum = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = y } });
-    func.setTerminator(b, .{ .ret = sum });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(sum) });
 
     try testing.expectError(error.Unsupported, compileKernel(allocator, &func));
 }
@@ -2645,12 +2920,13 @@ test "compiles control flow: a max via if and a merge block" {
     const r = try func.appendBlockParam(exit_b, t);
     const c = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .gt, .lhs = a, .rhs = b } });
     try func.appendIf(entry, c, .{ .target = exit_b, .args = &.{a} }, .{ .target = exit_b, .args = &.{b} });
-    func.setTerminator(exit_b, .{ .ret = r });
+    func.setTerminator(exit_b, .{ .ret = ir.function.Ret.one(r) });
 
     var kernel = try compileKernel(allocator, &func);
     defer kernel.deinit(allocator);
 
-    // The stream contains an ISETP (compare), at least two BRA, an STG, and EXIT.
+    // The stream contains an ISETP (compare), at least two BRA instructions,
+    // an STG, and an EXIT.
     var saw_isetp = false;
     var bra_count: usize = 0;
     var saw_exit = false;
@@ -2675,11 +2951,12 @@ test "convergence: a DIVERGENT if (distinct then/else blocks) wraps in BCLEAR/BS
     const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const bool_t = try func.types.intern(.bool);
 
-    // entry: if c { then_b } else { else_b }. Both -> merge. Merge: ret.
-    // This is a genuinely DIVERGENT branch (then and else are DISTINCT blocks), so
-    // the Volta+ convergence barrier must wrap it: BCLEAR + BSSY before the branch,
-    // BSYNC at the merge. (A degenerate if whose then==else targets is not divergent
-    // and gets no barrier - the "max via if" test above.)
+    // entry: if c { then_b } else { else_b }. Both go to merge. Merge does
+    // a ret. This is a genuinely divergent branch, since then and else are
+    // distinct blocks, so the Volta-and-later convergence barrier must wrap
+    // it: BCLEAR plus BSSY before the branch, and BSYNC at the merge. A
+    // degenerate if whose then and else targets match is not divergent and
+    // gets no barrier. See the "max via if" test above.
     const entry = try func.appendBlock();
     const a = try func.appendBlockParam(entry, t);
     const b = try func.appendBlockParam(entry, t);
@@ -2693,7 +2970,7 @@ test "convergence: a DIVERGENT if (distinct then/else blocks) wraps in BCLEAR/BS
     func.setTerminator(then_b, .{ .jump = .{ .target = merge, .args = try func.internValues(&.{one}) } });
     const two = try func.appendInst(else_b, t, .{ .iconst = 2 });
     func.setTerminator(else_b, .{ .jump = .{ .target = merge, .args = try func.internValues(&.{two}) } });
-    func.setTerminator(merge, .{ .ret = r });
+    func.setTerminator(merge, .{ .ret = ir.function.Ret.one(r) });
 
     var kernel = try compileKernel(allocator, &func);
     defer kernel.deinit(allocator);
@@ -2716,11 +2993,13 @@ test "convergence: a DIVERGENT if (distinct then/else blocks) wraps in BCLEAR/BS
 }
 
 test "a FLOAT compare (max/min of floats) lowers to FSETP, not ISETP" {
-    // The shared lowering turns GLSL f_max(a,b) into `icmp .gt` of the FLOAT operands +
-    // a select. The NVIDIA backend must emit a FLOAT set-predicate (FSETP, opcode 0x00b)
-    // for float operands, NOT an integer ISETP (0x00c): an integer compare of the float
-    // bit-patterns mis-orders values (e.g. max(0.0, x) returns 0 for a positive x - the
-    // bug that rendered vkcube's lit faces black). This asserts the codegen distinction.
+    // The shared lowering turns GLSL f_max(a,b) into `icmp .gt` of the
+    // float operands plus a select. The NVIDIA backend must emit a float
+    // set-predicate (FSETP, opcode 0x00b) for float operands, not an
+    // integer ISETP (0x00c). An integer compare of the float bit patterns
+    // mis-orders values, for example max(0.0, x) would return 0 for a
+    // positive x, which is the bug that rendered vkcube's lit faces black.
+    // This test asserts the codegen distinction.
     const allocator = testing.allocator;
     var func = Function.init(allocator);
     defer func.deinit();
@@ -2735,7 +3014,7 @@ test "a FLOAT compare (max/min of floats) lowers to FSETP, not ISETP" {
     const gt = try func.appendInst(b, bool_t, .{ .icmp = .{ .op = .gt, .lhs = a, .rhs = zero } });
     const mx = try func.appendInst(b, f32_t, .{ .select = .{ .cond = gt, .then = a, .@"else" = zero } });
     try func.appendStore(b, mx, outp);
-    func.setTerminator(b, .{ .ret = null });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
 
     var kernel = try compileKernel(allocator, &func);
     defer kernel.deinit(allocator);
@@ -2750,8 +3029,8 @@ test "a FLOAT compare (max/min of floats) lowers to FSETP, not ISETP" {
             else => {},
         }
     }
-    try testing.expect(saw_fsetp); // a FLOAT compare emits FSETP
-    try testing.expect(!saw_isetp); // and NOT an integer ISETP
+    try testing.expect(saw_fsetp); // a float compare emits FSETP
+    try testing.expect(!saw_isetp); // and not an integer ISETP
 }
 
 test "REPRO: derivative + multi-component color outputs stay distinct until their stores" {
@@ -2763,13 +3042,14 @@ test "REPRO: derivative + multi-component color outputs stay distinct until thei
     const ptr_t = try func.types.intern(.ptr);
     const b = try func.appendBlock();
 
-    // A frag_pos.x varying, interpolated. The derivative descriptor table records its
-    // (slot, axis). The FS computes 0.5 + frag_pos.x*0.5 (RED) and 0.5 + dFdx(x)*32 (GREEN).
+    // A frag_pos.x varying, interpolated. The derivative descriptor table
+    // records its slot and axis. The fragment shader computes
+    // 0.5 + frag_pos.x*0.5 (RED) and 0.5 + dFdx(x)*32 (GREEN).
     const x = try func.appendBlockParam(b, f32_t);
     try func.addAttr(.{ .value = x }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "attr", .value = .{ .int = encode.ATTR_GENERIC0 } } });
-    // The synthesized grad_buf pointer param (lazily appended after the varyings, exactly
-    // as the SPIR-V derivative lowering does), plus the one grad_slot descriptor (index 0:
-    // slot = ATTR_GENERIC0, axis = x).
+    // The synthesized grad_buf pointer param, lazily appended after the
+    // varyings, exactly as the SPIR-V derivative lowering does, plus the
+    // one grad_slot descriptor: index 0, slot = ATTR_GENERIC0, axis = x.
     const grad_buf = try func.appendBlockParam(b, ptr_t);
     try func.addAttr(.{ .value = grad_buf }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "grad_buf", .value = .{ .int = 0 } } });
     try func.addAttr(.func, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "grad_slot", .value = .{ .int = @as(i64, encode.ATTR_GENERIC0) << 1 } } });
@@ -2778,8 +3058,9 @@ test "REPRO: derivative + multi-component color outputs stay distinct until thei
     const half = try func.appendInst(b, f32_t, .{ .fconst = 0.5 });
     const x_half = try func.appendInst(b, f32_t, .{ .arith = .{ .op = .mul, .lhs = x, .rhs = half } });
     const red = try func.appendInst(b, f32_t, .{ .arith = .{ .op = .add, .lhs = half, .rhs = x_half } });
-    // GREEN = 0.5 + dFdx(x)*32. dFdx(x) is a grad_buf[0] load (index 0 -> the grad_buf
-    // param itself), replaced by the SHFL/FSWZADD quad-derivative in the backend.
+    // GREEN = 0.5 + dFdx(x)*32. dFdx(x) is a grad_buf[0] load (index 0
+    // maps to the grad_buf param itself), replaced by the SHFL/FSWZADD
+    // quad-derivative in the backend.
     const dfdx = try func.appendInst(b, f32_t, .{ .load = .{ .ptr = grad_buf } });
     const k32 = try func.appendInst(b, f32_t, .{ .fconst = 32.0 });
     const dfdx32 = try func.appendInst(b, f32_t, .{ .arith = .{ .op = .mul, .lhs = dfdx, .rhs = k32 } });
@@ -2795,7 +3076,7 @@ test "REPRO: derivative + multi-component color outputs stay distinct until thei
         try func.addAttr(.{ .value = color_slot }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "color_out", .value = .{ .int = @intCast(ci) } } });
         try func.appendStore(b, comp, color_slot);
     }
-    func.setTerminator(b, .{ .ret = null });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
 
     var kernel = try compileShader(allocator, &func, .fragment);
     defer kernel.deinit(allocator);
@@ -2804,12 +3085,14 @@ test "REPRO: derivative + multi-component color outputs stay distinct until thei
 }
 
 test "REPRO: derivative FS with interleaved color stores does not clobber a color value" {
-    // The exact shape behind the reported trace: a fragment shader that takes a screen-
-    // space derivative AND writes a multi-component color, where each color component is
-    // stored as soon as it is computed (interleaved store, the natural per-component
-    // lowering). The hazard: RED is computed + stored, then GREEN (the derivative path)
-    // reuses RED's register, and a later batched color-store move for RED reads the
-    // clobbered register. The fix must keep each color value live until its store move.
+    // The exact shape behind the reported trace: a fragment shader that
+    // takes a screen-space derivative and writes a multi-component color,
+    // where each color component is stored as soon as it is computed, an
+    // interleaved store, the natural per-component lowering. The hazard:
+    // RED is computed and stored, then GREEN, the derivative path, reuses
+    // RED's register, and a later batched color-store move for RED reads
+    // the clobbered register. The fix must keep each color value live
+    // until its store move.
     const allocator = testing.allocator;
     var func = Function.init(allocator);
     defer func.deinit();
@@ -2834,7 +3117,7 @@ test "REPRO: derivative FS with interleaved color stores does not clobber a colo
         try func.addAttr(.{ .value = slot }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "color_out", .value = .{ .int = 0 } } });
         try func.appendStore(b, red, slot);
     }
-    // GREEN = 0.5 + dFdx(x)*32, computed AFTER red's store, then stored.
+    // GREEN = 0.5 + dFdx(x)*32, computed after red's store, then stored.
     const dfdx = try func.appendInst(b, f32_t, .{ .load = .{ .ptr = grad_buf } });
     const k32 = try func.appendInst(b, f32_t, .{ .fconst = 32.0 });
     const dfdx32 = try func.appendInst(b, f32_t, .{ .arith = .{ .op = .mul, .lhs = dfdx, .rhs = k32 } });
@@ -2857,7 +3140,7 @@ test "REPRO: derivative FS with interleaved color stores does not clobber a colo
         try func.addAttr(.{ .value = slot }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "color_out", .value = .{ .int = 3 } } });
         try func.appendStore(b, alpha, slot);
     }
-    func.setTerminator(b, .{ .ret = null });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
 
     var kernel = try compileShader(allocator, &func, .fragment);
     defer kernel.deinit(allocator);
@@ -2865,13 +3148,14 @@ test "REPRO: derivative FS with interleaved color stores does not clobber a colo
 }
 
 test "REPRO: a derivative SHFL's source varying register is not clobbered before the SHFL" {
-    // The screen-space-derivative SHFL sources the prologue-IPA'd varying by REGISTER
-    // NUMBER, not as a tracked SSA use, so the linear-scan allocator did not see that use
-    // and freed + reused the varying register for a later value (the shader's `*32`
-    // immediate) BEFORE the SHFL read it - the SHFL then shuffled garbage. assignLocs now
-    // extends every fragment input-attribute param's live range to the last grad_buf load.
-    // Assert the SHFL's source register is written by an IPA and by nothing else between
-    // that IPA and the SHFL.
+    // The screen-space-derivative SHFL sources the prologue-IPA'd varying
+    // by register number, not as a tracked SSA use, so the linear-scan
+    // allocator did not see that use. It freed and reused the varying
+    // register for a later value, the shader's `*32` immediate, before the
+    // SHFL read it, so the SHFL then shuffled garbage. assignLocs now
+    // extends every fragment input-attribute param's live range to the
+    // last grad_buf load. This asserts the SHFL's source register is
+    // written by an IPA and by nothing else between that IPA and the SHFL.
     const allocator = testing.allocator;
     var func = Function.init(allocator);
     defer func.deinit();
@@ -2886,8 +3170,9 @@ test "REPRO: a derivative SHFL's source varying register is not clobbered before
     try func.addAttr(.{ .value = grad_buf }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "grad_buf", .value = .{ .int = 0 } } });
     try func.addAttr(.func, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "grad_slot", .value = .{ .int = @as(i64, encode.ATTR_GENERIC0) << 1 } } });
 
-    // o.r = 0.5 + dFdx(x)*32 - the multiply materialises a constant into a GPR that the
-    // allocator would otherwise place in the IPA'd varying's register (the bug).
+    // o.r = 0.5 + dFdx(x)*32. The multiply materializes a constant into a
+    // GPR that the allocator would otherwise place in the IPA'd varying's
+    // register, which was the bug.
     const half = try func.appendInst(b, f32_t, .{ .fconst = 0.5 });
     const dfdx = try func.appendInst(b, f32_t, .{ .load = .{ .ptr = grad_buf } });
     const k32 = try func.appendInst(b, f32_t, .{ .fconst = 32.0 });
@@ -2896,12 +3181,12 @@ test "REPRO: a derivative SHFL's source varying register is not clobbered before
     const slot = try func.appendInst(b, i32_t, .{ .iconst = 0 });
     try func.addAttr(.{ .value = slot }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "color_out", .value = .{ .int = 0 } } });
     try func.appendStore(b, red, slot);
-    func.setTerminator(b, .{ .ret = null });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
 
     var kernel = try compileShader(allocator, &func, .fragment);
     defer kernel.deinit(allocator);
 
-    // Find the (first) SHFL (opcode 0xf89) and its source register (bits 24..31).
+    // Find the first SHFL (opcode 0xf89) and its source register (bits 24..31).
     var shfl_idx: ?usize = null;
     var shfl_src: u8 = 0;
     {
@@ -2917,8 +3202,8 @@ test "REPRO: a derivative SHFL's source varying register is not clobbered before
         }
     }
     try testing.expect(shfl_idx != null);
-    // The SHFL source must be produced by an IPA (opcode 0x326) and not written again
-    // between that IPA and the SHFL.
+    // The SHFL source must be produced by an IPA (opcode 0x326) and not
+    // written again between that IPA and the SHFL.
     var last_ipa: ?usize = null;
     {
         var k: usize = 0;
@@ -2951,16 +3236,18 @@ test "REPRO: a derivative SHFL's source varying register is not clobbered before
     }
 }
 
-/// A color-store move is `MOV R<comp>, R<src>` (the 9-bit opcode field == 0x002, dst in
-/// 0..3). The bug: an instruction WRITES R<src> between the move's source's last
-/// definition and the move, so the move reads a clobbered value (RED ended up reading
-/// GREEN's data because the allocator reused the register). Assert that for each color
-/// move, nothing writes its source register in the window from that source's last write
-/// before the move up to (but not including) the move.
+/// A color-store move is `MOV R<comp>, R<src>` (the 9-bit opcode field
+/// == 0x002, dst in 0..3). The bug: an instruction writes R<src> between the
+/// move's source's last definition and the move, so the move reads a
+/// clobbered value. RED ended up reading GREEN's data because the allocator
+/// reused the register. This asserts that for each color move, nothing
+/// writes its source register in the window from that source's last write
+/// before the move, up to but not including the move.
 fn assertNoColorClobber(kernel: *const Kernel) !void {
-    // Walk the stream once. For every color move, find its source's most recent writer and
-    // ensure no later writer clobbers it before the move executes. Also assert the four
-    // color sources are mutually distinct registers at their move points.
+    // Walk the stream once. For every color move, find its source's most
+    // recent writer and ensure no later writer clobbers it before the move
+    // executes. Also assert the four color sources are mutually distinct
+    // registers at their move points.
     var move_src: [4]?u8 = .{ null, null, null, null };
     var move_idx: [4]usize = .{ 0, 0, 0, 0 };
     var prog: usize = 0;
@@ -2975,10 +3262,11 @@ fn assertNoColorClobber(kernel: *const Kernel) !void {
         prog += 1;
     }
     for (move_src) |s| try testing.expect(s != null);
-    // For each color move, the source register must hold the value produced for THAT
-    // component, i.e. no instruction between the producing write and the move writes the
-    // source register (would be a clobber). The producing write is the last write to the
-    // source strictly before the move.
+    // For each color move, the source register must hold the value
+    // produced for that component. That is, no instruction between the
+    // producing write and the move writes the source register, which would
+    // be a clobber. The producing write is the last write to the source
+    // strictly before the move.
     for (0..4) |ci| {
         const src = move_src[ci].?;
         const mv = move_idx[ci];
@@ -2990,8 +3278,9 @@ fn assertNoColorClobber(kernel: *const Kernel) !void {
             if (p >= mv) break;
             const op = kernel.code[k] & 0x1ff;
             const dst: u8 = @intCast((kernel.code[k] >> 16) & 0xff);
-            // Instructions that write a GPR dst (exclude stores/branches/exit and the
-            // color moves themselves are fine to count as writers of R0..R3, not src).
+            // Instructions that write a GPR dst. This excludes stores,
+            // branches, and exit. The color moves themselves are fine to
+            // count as writers of R0..R3, not src.
             const writes = switch (op) {
                 0x086, 0x047, 0x04d => false, // STG, BRA, EXIT (low 9 bits)
                 else => true,
@@ -3017,7 +3306,8 @@ fn assertNoColorClobber(kernel: *const Kernel) !void {
             try testing.expect(!(writes and dst == src));
         }
     }
-    // Mutually distinct color sources (overlapping liveness => same reg => the bug).
+    // Mutually distinct color sources. Overlapping liveness would give the
+    // same register, which is the bug.
     for (0..4) |a| for (a + 1..4) |c| {
         try testing.expect(move_src[a].? != move_src[c].?);
     };
@@ -3033,10 +3323,11 @@ test "graphics: a texturing fragment shader lowers the host-sampler call to a TE
     const ptr_t = try func.types.intern(.ptr);
     const b = try func.appendBlock();
 
-    // Entry params, exactly the order the SPIR-V image-sample lowering produces for an
-    // FS `o = texture(tex, uv)`: the two interpolated uv components (attribute inputs),
-    // then the combined-image-sampler descriptor (tagged sampler_desc), then the host
-    // sampler-fn pointer (tagged sampler_fn, appended last/lazily).
+    // Entry params, in exactly the order the SPIR-V image-sample lowering
+    // produces for a fragment shader `o = texture(tex, uv)`: the two
+    // interpolated uv components (attribute inputs), then the
+    // combined-image-sampler descriptor (tagged sampler_desc), then the
+    // host sampler-fn pointer (tagged sampler_fn, appended last and lazily).
     const u = try func.appendBlockParam(b, f32_t);
     try func.addAttr(.{ .value = u }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "attr", .value = .{ .int = encode.ATTR_GENERIC0 } } });
     const v = try func.appendBlockParam(b, f32_t);
@@ -3064,14 +3355,15 @@ test "graphics: a texturing fragment shader lowers the host-sampler call to a TE
         try func.addAttr(.{ .value = color_slot }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "color_out", .value = .{ .int = c } } });
         try func.appendStore(b, comp, color_slot);
     }
-    func.setTerminator(b, .{ .ret = null });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
 
     var kernel = try compileShader(allocator, &func, .fragment);
     defer kernel.deinit(allocator);
 
-    // The compiled FS must: load the bindless handle from the constant bank (LDC), emit
-    // exactly one TEX, and have NO LDG (the four reloads are register copies from the
-    // TEX result, not global loads). The two uv inputs are IPA'd (fragment interpolation).
+    // The compiled fragment shader must load the bindless handle from the
+    // constant bank (LDC), emit exactly one TEX, and have no LDG, since the
+    // four reloads are register copies from the TEX result, not global
+    // loads. The two uv inputs are IPA'd (fragment interpolation).
     var has_ldc = false;
     var tex_count: usize = 0;
     var ldg_count: usize = 0;
@@ -3094,7 +3386,7 @@ test "graphics: a texturing fragment shader lowers the host-sampler call to a TE
     try testing.expectEqual(@as(usize, 1), tex_count);
     try testing.expectEqual(@as(usize, 0), ldg_count); // reloads are register copies, no LDG
     try testing.expectEqual(@as(usize, 2), ipa_count); // u and v interpolated
-    // The TEX carries the bindless marker (bit 91 -> word 2 bit 27), 2D dim, RGBA mask.
+    // The TEX carries the bindless marker (bit 91, word 2 bit 27), 2D dimension, RGBA mask.
     const t = tex_idx.?;
     try testing.expectEqual(@as(u32, 1), (kernel.code[t + 2] >> 27) & 1); // bindless bit 91
     try testing.expectEqual(@as(u32, 1), (kernel.code[t + 1] >> 29) & 0x7); // dim _2D at bit 61
@@ -3102,11 +3394,13 @@ test "graphics: a texturing fragment shader lowers the host-sampler call to a TE
 }
 
 test "a boolean-valued && (bit_and of two bool compares) lowers to PLOP3, not a GPR LOP3" {
-    // The shared SPIR-V lowering emits `LogicalAnd`/`LogicalOr`/`LogicalNot` as a
-    // bool-typed `.binary` (bit_and/bit_or/bit_xor). The allocator gives a bool a
-    // PREDICATE register, so the result must combine the source predicates with PLOP3
-    // (the predicate-logic op, opcode 0x81c) - NOT the integer GPR LOP3, which would
-    // call `gprOf` on a predicate and hit `unreachable` (the glmark2 light-phong panic).
+    // The shared SPIR-V lowering emits `LogicalAnd`/`LogicalOr`/`LogicalNot`
+    // as a bool-typed `.binary` (bit_and/bit_or/bit_xor). The allocator
+    // gives a bool a predicate register, so the result must combine the
+    // source predicates with PLOP3, the predicate-logic op, opcode 0x81c,
+    // not the integer GPR LOP3. The GPR path would call `gprOf` on a
+    // predicate and hit `unreachable`, which was the glmark2 light-phong
+    // panic.
     const allocator = testing.allocator;
     var func = Function.init(allocator);
     defer func.deinit();
@@ -3120,11 +3414,11 @@ test "a boolean-valued && (bit_and of two bool compares) lowers to PLOP3, not a 
     const one = try func.appendInst(b, f32_t, .{ .fconst = 1.0 });
     const c1 = try func.appendInst(b, bool_t, .{ .icmp = .{ .op = .gt, .lhs = a, .rhs = zero } });
     const c2 = try func.appendInst(b, bool_t, .{ .icmp = .{ .op = .lt, .lhs = a, .rhs = one } });
-    // bool both = c1 && c2  (LogicalAnd -> bit_and of bools). A boolean VALUE consumed by select.
+    // bool both = c1 && c2 (LogicalAnd becomes bit_and of bools). A boolean value consumed by select.
     const both = try func.appendInst(b, bool_t, .{ .arith = .{ .op = .bit_and, .lhs = c1, .rhs = c2 } });
     const sel = try func.appendInst(b, f32_t, .{ .select = .{ .cond = both, .then = one, .@"else" = zero } });
     try func.appendStore(b, sel, outp);
-    func.setTerminator(b, .{ .ret = null });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
     var kernel = try compileKernel(allocator, &func);
     defer kernel.deinit(allocator);
     var saw_plop3 = false;
@@ -3136,8 +3430,9 @@ test "a boolean-valued && (bit_and of two bool compares) lowers to PLOP3, not a 
 }
 
 test "a boolean-valued NOT (bit_xor bool, -1) lowers to PLOP3 (predicate negation)" {
-    // LogicalNot lowers to `bool ^ -1` (an arith_imm bit_xor). The bool result is a
-    // predicate, so it negates via PLOP3 (`p ^ PT`), not the GPR immediate-xor path.
+    // LogicalNot lowers to `bool ^ -1` (an arith_imm bit_xor). The bool
+    // result is a predicate, so it negates through PLOP3 (`p ^ PT`), not
+    // the GPR immediate-xor path.
     const allocator = testing.allocator;
     var func = Function.init(allocator);
     defer func.deinit();
@@ -3153,7 +3448,7 @@ test "a boolean-valued NOT (bit_xor bool, -1) lowers to PLOP3 (predicate negatio
     const nc = try func.appendInst(b, bool_t, .{ .arith_imm = .{ .op = .bit_xor, .lhs = c, .imm = -1 } });
     const sel = try func.appendInst(b, f32_t, .{ .select = .{ .cond = nc, .then = one, .@"else" = zero } });
     try func.appendStore(b, sel, outp);
-    func.setTerminator(b, .{ .ret = null });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
     var kernel = try compileKernel(allocator, &func);
     defer kernel.deinit(allocator);
     var saw_plop3 = false;

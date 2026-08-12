@@ -22,7 +22,7 @@ test "module disasm: linked functions get labels and a resolved, named call" {
     const gb = try g.appendBlock();
     const gx = try g.appendBlockParam(gb, gi);
     const gm = try g.appendArithImm(gb, gi, .mul, gx, 3);
-    g.setTerminator(gb, .{ .ret = gm });
+    g.setTerminator(gb, .{ .ret = ir.function.Ret.one(gm) });
 
     var f = ir.function.Function.init(a);
     defer f.deinit();
@@ -32,7 +32,7 @@ test "module disasm: linked functions get labels and a resolved, named call" {
     const fbp = try f.appendBlockParam(fb, fi);
     const called = try f.appendCall(fb, fi, "helper", &.{fa});
     const fsum = try f.appendInst(fb, fi, .{ .arith = .{ .op = .add, .lhs = called, .rhs = fbp } });
-    f.setTerminator(fb, .{ .ret = fsum });
+    f.setTerminator(fb, .{ .ret = ir.function.Ret.one(fsum) });
 
     var module = link.Module{};
     defer module.deinit(a);
@@ -56,6 +56,35 @@ test "x86-64 cases run natively in-process (skips off x86-64)" {
     try cases.runAll(std.testing.io, std.testing.allocator, harness.native);
 }
 
+test "a rodata global read via global_addr runs in-process through native.jitModuleData (skips off x86-64)" {
+    // Same module as the qemu test in qemu.zig, run through `harness.runModuleData`'s
+    // native path (real only on an x86-64 host). `native.jitModuleData` maps code and
+    // rodata for real, and patches the `.pcrel_lea` reloc through the x86-64
+    // `applyGlobalReloc`. This exercises the exact in-process JIT path that production
+    // callers use, as opposed to qemu.zig's static, harness-only reloc resolution.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const i32k = ir.types.TypeKind{ .int = .{ .signedness = .signed, .bits = 32 } };
+
+    var main_f = ir.function.Function.init(allocator);
+    defer main_f.deinit();
+    {
+        const t = try main_f.types.intern(i32k);
+        const ptr_t = try main_f.types.intern(.ptr);
+        const b = try main_f.appendBlock();
+        const g = try main_f.appendGlobalAddr(b, ptr_t, "K");
+        const v = try main_f.appendInst(b, t, .{ .load = .{ .ptr = g } });
+        main_f.setTerminator(b, .{ .ret = ir.function.Ret.one(v) });
+    }
+    const k_bytes = [_]u8{ 42, 0, 0, 0 };
+    var module: link.Module = .{};
+    defer module.deinit(allocator);
+    try module.addFunction(allocator, "main", &main_f);
+    try module.addData(allocator, "K", &k_bytes);
+
+    try std.testing.expectEqual(@as(u8, 42), try harness.runModuleData(io, allocator, &module, &.{}, harness.native));
+}
+
 test "codegen+disasm round-trip: integer add" {
     // Compile x86-64 and assert the disassembled listing: checks instruction selection and
     // register allocation at the instruction level, and runs on any host (no execution).
@@ -67,14 +96,14 @@ test "codegen+disasm round-trip: integer add" {
     const x = try func.appendBlockParam(e, i32_t);
     const y = try func.appendBlockParam(e, i32_t);
     const s = try func.appendInst(e, i32_t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = y } });
-    func.setTerminator(e, .{ .ret = s });
+    func.setTerminator(e, .{ .ret = ir.function.Ret.one(s) });
 
     const code = try isel.selectFunction(a, &func);
     defer a.free(code);
     const text = try disasm.format(a, code);
     defer a.free(text);
-    // The shared Wimmer allocator (SP2 production flip) keeps the two params in their ABI registers
-    // and the result in rax, so the add is `x += y` in place with no shuffle moves.
+    // The shared Wimmer allocator keeps the two params in their ABI registers and the
+    // result in rax, so the add is `x += y` in place with no shuffle moves.
     try std.testing.expectEqualStrings(
         \\0000: mov rax, rdi
         \\0003: add eax, esi
@@ -97,15 +126,15 @@ test "codegen+disasm round-trip: control flow (max via if/else)" {
     const r = try func.appendBlockParam(m, i32_t);
     const c = try func.appendInst(e, bool_t, .{ .icmp = .{ .op = .gt, .lhs = x, .rhs = y } });
     try func.appendIf(e, c, .{ .target = m, .args = &.{x} }, .{ .target = m, .args = &.{y} });
-    func.setTerminator(m, .{ .ret = r });
+    func.setTerminator(m, .{ .ret = ir.function.Ret.one(r) });
 
     const code = try isel.selectFunction(a, &func);
     defer a.free(code);
     const text = try disasm.format(a, code);
     defer a.free(text);
-    // The shared Wimmer allocator (SP2 production flip) SPLITS the two critical edges e->m, so each
-    // arm reaches the join `m` through its own forwarding block (the extra `jmp`s), where the phi
-    // move places the taken value in rax before falling into the return.
+    // The shared Wimmer allocator SPLITS the two critical edges e->m, so each arm reaches
+    // the join `m` through its own forwarding block (the extra `jmp`s), where the phi move
+    // places the taken value in rax before falling into the return.
     try std.testing.expectEqualStrings(
         \\0000: cmp edi, esi
         \\0002: setg al
@@ -124,10 +153,10 @@ test "codegen+disasm round-trip: control flow (max via if/else)" {
 }
 
 test "x86_64 selectFunctionForModel with an inert-fusion model is byte-identical to selectFunction" {
-    // Reuses the icmp/if builder above: it is exactly the shape the cmp_branch fold (B2) targets.
+    // Reuses the icmp/if builder above: it is exactly the shape the cmp_branch fold targets.
     // Now that the fold reads `caps.fuse_cmp_branch` (see the cmp_branch fold tests below),
-    // cascadelake-sp's real fusion table (cmp_branch on) DIVERGES from plain `selectFunction` on
-    // this shape - that divergence is covered by the fold's own tests. This test keeps the
+    // cascadelake-sp's real fusion table (cmp_branch on) DIVERGES from plain `selectFunction`
+    // on this shape. That divergence is covered by the fold's own tests. This test keeps the
     // narrower guard that still matters: a model whose fusion table is EMPTY (caps all read
     // false) must stay byte-identical to plain, covering the off end of `capsForModel`.
     const a = std.testing.allocator;
@@ -142,7 +171,7 @@ test "x86_64 selectFunctionForModel with an inert-fusion model is byte-identical
     const r = try func.appendBlockParam(m, i32_t);
     const c = try func.appendInst(e, bool_t, .{ .icmp = .{ .op = .gt, .lhs = x, .rhs = y } });
     try func.appendIf(e, c, .{ .target = m, .args = &.{x} }, .{ .target = m, .args = &.{y} });
-    func.setTerminator(m, .{ .ret = r });
+    func.setTerminator(m, .{ .ret = ir.function.Ret.one(r) });
 
     const plain = try isel.selectFunction(a, &func);
     defer a.free(plain);
@@ -154,7 +183,7 @@ test "x86_64 selectFunctionForModel with an inert-fusion model is byte-identical
     try std.testing.expectEqualSlices(u8, plain, tuned_inert);
 }
 
-// --- B2: cmp_branch fold (fuse `cmp; setcc; ...; test; jcc` into `cmp; jcc`) --------------------
+// --- cmp_branch fold (fuse `cmp; setcc; ...; test; jcc` into `cmp; jcc`) -------------------------
 
 const CmpOp = ir.function.CmpOp;
 
@@ -176,9 +205,9 @@ fn buildCmpBranchIf(allocator: std.mem.Allocator, op: CmpOp, signed: bool, bits:
     const c = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = op, .lhs = a, .rhs = b } });
     try func.appendIf(entry, c, .{ .target = then_b }, .{ .target = else_b });
     const yes = try func.appendInst(then_b, i64_t, .{ .iconst = 100 });
-    func.setTerminator(then_b, .{ .ret = yes });
+    func.setTerminator(then_b, .{ .ret = ir.function.Ret.one(yes) });
     const no = try func.appendInst(else_b, i64_t, .{ .iconst = 200 });
-    func.setTerminator(else_b, .{ .ret = no });
+    func.setTerminator(else_b, .{ .ret = ir.function.Ret.one(no) });
     return func;
 }
 
@@ -337,8 +366,8 @@ test "x86_64 cmp_branch fold: a multi-use icmp does NOT fuse (boolean still mate
     const m = try func.appendInst(entry, t, .{ .select = .{ .cond = c, .then = av, .@"else" = bv } }); // min, uses c
     try func.appendIf(entry, c, .{ .target = tb, .args = &.{m} }, .{ .target = eb, .args = &.{m} });
     const inc = try func.appendArithImm(tb, t, .add, xtb, 1);
-    func.setTerminator(tb, .{ .ret = inc });
-    func.setTerminator(eb, .{ .ret = xeb });
+    func.setTerminator(tb, .{ .ret = ir.function.Ret.one(inc) });
+    func.setTerminator(eb, .{ .ret = ir.function.Ret.one(xeb) });
 
     const tuned = try isel.selectFunctionForModel(a, &func, mm.modelFor(.@"cascadelake-sp"));
     defer a.free(tuned);
@@ -368,8 +397,8 @@ test "x86_64 cmp_branch fold: an icmp not immediately before the if does NOT fus
     try func.appendIf(entry, c, .{ .target = tb, .args = &.{sum} }, .{ .target = eb, .args = &.{sum} });
     const xtb = try func.appendBlockParam(tb, t);
     const xeb = try func.appendBlockParam(eb, t);
-    func.setTerminator(tb, .{ .ret = xtb });
-    func.setTerminator(eb, .{ .ret = xeb });
+    func.setTerminator(tb, .{ .ret = ir.function.Ret.one(xtb) });
+    func.setTerminator(eb, .{ .ret = ir.function.Ret.one(xeb) });
 
     const tuned = try isel.selectFunctionForModel(a, &func, mm.modelFor(.@"cascadelake-sp"));
     defer a.free(tuned);
@@ -381,8 +410,8 @@ test "x86_64 cmp_branch fold: an icmp not immediately before the if does NOT fus
     try harness.expectRun(std.testing.io, a, &func, &.{ 3, 7 }, 10, harness.qemu);
 }
 
-// --- B3: arith_branch fold (fuse a flag-setting `add`/`sub`/`bit_and` into its consumer branch,
-// eliding the `cmp` the cmp_branch fold would otherwise still emit) -----------------------------
+// --- arith_branch fold (fuse a flag-setting `add`/`sub`/`bit_and` into its consumer branch,
+// eliding the `cmp` that the cmp_branch fold would otherwise still emit) -------------------------
 
 const ArithOp = ir.function.BinOp;
 
@@ -400,17 +429,17 @@ fn buildArithBranchIfReg(allocator: std.mem.Allocator, op: ArithOp, cmp: CmpOp) 
     const else_b = try func.appendBlock();
     const av = try func.appendBlockParam(entry, i64_t);
     const bv = try func.appendBlockParam(entry, i64_t);
-    // `zero` is created BEFORE the arith so the arith sits immediately before the icmp (adjacency
-    // is what `fusesArithIntoBranch` requires); the icmp's rhs may reference an `iconst` defined
-    // anywhere earlier in the block.
+    // `zero` is created BEFORE the arith so the arith sits immediately before the icmp
+    // (adjacency is what `fusesArithIntoBranch` requires). The icmp's rhs may reference an
+    // `iconst` defined anywhere earlier in the block.
     const zero = try func.appendInst(entry, i64_t, .{ .iconst = 0 });
     const s = try func.appendInst(entry, i64_t, .{ .arith = .{ .op = op, .lhs = av, .rhs = bv } });
     const c = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = cmp, .lhs = s, .rhs = zero } });
     try func.appendIf(entry, c, .{ .target = then_b }, .{ .target = else_b });
     const yes = try func.appendInst(then_b, i64_t, .{ .iconst = 100 });
-    func.setTerminator(then_b, .{ .ret = yes });
+    func.setTerminator(then_b, .{ .ret = ir.function.Ret.one(yes) });
     const no = try func.appendInst(else_b, i64_t, .{ .iconst = 200 });
-    func.setTerminator(else_b, .{ .ret = no });
+    func.setTerminator(else_b, .{ .ret = ir.function.Ret.one(no) });
     return func;
 }
 
@@ -432,9 +461,9 @@ fn buildArithBranchIfImm(allocator: std.mem.Allocator, op: ArithOp, imm: i64, cm
     const c = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = cmp, .lhs = s, .rhs = zero } });
     try func.appendIf(entry, c, .{ .target = then_b }, .{ .target = else_b });
     const yes = try func.appendInst(then_b, i64_t, .{ .iconst = 100 });
-    func.setTerminator(then_b, .{ .ret = yes });
+    func.setTerminator(then_b, .{ .ret = ir.function.Ret.one(yes) });
     const no = try func.appendInst(else_b, i64_t, .{ .iconst = 200 });
-    func.setTerminator(else_b, .{ .ret = no });
+    func.setTerminator(else_b, .{ .ret = ir.function.Ret.one(no) });
     return func;
 }
 
@@ -545,7 +574,7 @@ fn hasAdjacentLines(text: []const u8, first: []const u8, second: []const u8) boo
 }
 
 test "x86_64 arith_branch fold: tuned build emits sub immediately followed by jne, no cmp at all" {
-    // The fail-first signal: B2 (cmp_branch) alone still emits a separate `cmp` before the `jne`
+    // The fail-first signal: cmp_branch alone still emits a separate `cmp` before the `jne`
     // (it only elides the icmp's own setcc/test, not the compare itself). This structural check
     // is what actually distinguishes "arith_branch implemented" from "cmp_branch only" (the
     // execution differentials above pass trivially either way, since both paths compute the same
@@ -588,8 +617,8 @@ test "x86_64 arith_branch fold: a multi-use arith result does NOT fuse (cmp surv
     try func.appendIf(entry, c, .{ .target = tb, .args = &.{s} }, .{ .target = eb, .args = &.{s} }); // s used again
     const xtb = try func.appendBlockParam(tb, i64_t);
     const xeb = try func.appendBlockParam(eb, i64_t);
-    func.setTerminator(tb, .{ .ret = xtb });
-    func.setTerminator(eb, .{ .ret = xeb });
+    func.setTerminator(tb, .{ .ret = ir.function.Ret.one(xtb) });
+    func.setTerminator(eb, .{ .ret = ir.function.Ret.one(xeb) });
 
     const tuned = try isel.selectFunctionForModel(a, &func, mm.modelFor(.@"cascadelake-sp"));
     defer a.free(tuned);
@@ -613,7 +642,7 @@ test "x86_64 expectRunFull asserts the full 64-bit result, not just the low byte
     const i64_t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
     const b = try f.appendBlock();
     const c = try f.appendInst(b, i64_t, .{ .iconst = 0x1_0000_0100 });
-    f.setTerminator(b, .{ .ret = c });
+    f.setTerminator(b, .{ .ret = ir.function.Ret.one(c) });
 
     // 0x1_0000_0100 and 0x0000_0100 share the low byte (0x00) but are very different i64
     // values: the OLD low-byte runner cannot tell them apart, the Full runner must.
@@ -630,7 +659,7 @@ test "x86_64 expectRunFull asserts the full 64-bit result, not just the low byte
         try harness.expectRunFull(std.testing.io, a, &f, &.{}, 0x1_0000_0100, backend); // the Full runner is not
         ran = true;
     }
-    if (!ran) return error.SkipZigTest; // no execution backend available (e.g. qemu absent), nothing to assert
+    if (!ran) return error.SkipZigTest; // no execution backend available (for example, qemu absent), nothing to assert
 }
 
 test "x86_64 expectRunFloatFull asserts the exact f32 bits, not just the low byte" {
@@ -648,7 +677,7 @@ test "x86_64 expectRunFloatFull asserts the exact f32 bits, not just the low byt
     const t = try f.types.intern(.{ .float = .f32 });
     const b = try f.appendBlock();
     const x = try f.appendBlockParam(b, t);
-    f.setTerminator(b, .{ .ret = x });
+    f.setTerminator(b, .{ .ret = ir.function.Ret.one(x) });
 
     // The OLD low-byte runner cannot tell `full` from `collide`: both truncate to 0x00.
     try std.testing.expectEqual(@as(u8, 0x00), try harness.runFloatFunc(std.testing.io, a, &f, &.{full}, harness.qemu));
@@ -671,7 +700,7 @@ test "x86_64 expectRunDoubleFull asserts the exact f64 bits, not just the low by
     const t = try f.types.intern(.{ .float = .f64 });
     const b = try f.appendBlock();
     const x = try f.appendBlockParam(b, t);
-    f.setTerminator(b, .{ .ret = x });
+    f.setTerminator(b, .{ .ret = ir.function.Ret.one(x) });
 
     // The OLD low-byte runner cannot tell `full` from `collide`: both truncate to 0x00.
     try std.testing.expectEqual(@as(u8, 0x00), try harness.runDoubleFunc(std.testing.io, a, &f, &.{full}, harness.qemu));
@@ -721,7 +750,7 @@ fn buildReductionLoop(allocator: std.mem.Allocator) !ir.function.Function {
     try func.setJump(body, header, &.{ next_i, next_s });
 
     const e_s = try func.appendBlockParam(exit, i64_t);
-    func.setTerminator(exit, .{ .ret = e_s });
+    func.setTerminator(exit, .{ .ret = ir.function.Ret.one(e_s) });
     return func;
 }
 

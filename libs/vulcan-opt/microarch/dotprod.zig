@@ -138,7 +138,7 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, loop: *const loops.L
     if (iff.cond != func.instResult(h_insts[0]).?) return null;
     if (cmp.op != .lt) return null; // canonical `i < n`
     if (func.terminator(header)) |t| switch (t) {
-        .ret => |v| if (v != null) return null,
+        .ret => |r| if (r.count != 0) return null,
         .jump => return null,
     };
 
@@ -499,7 +499,7 @@ fn buildDotLoop(func: *Function, spec: LoopSpec) Error!void {
     const npb = try func.appendArithImm(body, ptr_t, .add, bpb, spec.stride);
     try func.setJump(body, header, &.{ ni, nacc, npa, npb });
 
-    func.setTerminator(exit, .{ .ret = acc });
+    func.setTerminator(exit, .{ .ret = ir.function.Ret.one(acc) });
 }
 
 fn countDots(func: *const Function) usize {
@@ -639,7 +639,7 @@ fn buildDotLoopExtraOp(func: *Function) Error!void {
     const npb = try func.appendArithImm(body, ptr_t, .add, bpb, 1);
     try func.setJump(body, header, &.{ ni, nacc, npa, npb });
 
-    func.setTerminator(exit, .{ .ret = acc });
+    func.setTerminator(exit, .{ .ret = ir.function.Ret.one(acc) });
 }
 
 test "skips a loop whose body has an extra unrelated instruction" {
@@ -697,7 +697,7 @@ fn buildMultiAccDotLoop(func: *Function) Error!void {
     const npb = try func.appendInst(body, ptr_t, .{ .arith = .{ .op = .add, .lhs = bpb, .rhs = nacc } });
     try func.setJump(body, header, &.{ ni, nacc, npa, npb });
 
-    func.setTerminator(exit, .{ .ret = acc });
+    func.setTerminator(exit, .{ .ret = ir.function.Ret.one(acc) });
 }
 
 test "skips a loop with two accumulator-shaped updates in the latch args" {
@@ -763,7 +763,7 @@ fn buildNestedBodyDotLoop(func: *Function) Error!void {
     // reduction's worth of work, just split across two blocks.
     try func.setJump(body2, header, &.{ ci, cacc, cpa, cpb });
 
-    func.setTerminator(exit, .{ .ret = acc });
+    func.setTerminator(exit, .{ .ret = ir.function.Ret.one(acc) });
 }
 
 test "skips a loop whose body spans more than one block" {
@@ -820,7 +820,7 @@ fn buildWrongParamCountLoop(func: *Function) Error!void {
     const npa = try func.appendArithImm(body, ptr_t, .add, bpa, 1);
     try func.setJump(body, header, &.{ ni, nacc, npa });
 
-    func.setTerminator(exit, .{ .ret = acc });
+    func.setTerminator(exit, .{ .ret = ir.function.Ret.one(acc) });
 }
 
 test "skips a loop whose header has the wrong param count" {
@@ -877,7 +877,7 @@ fn buildAliasedDotLoop(func: *Function) Error!void {
     const npb = try func.appendArithImm(body, ptr_t, .add, bpb, 1);
     try func.setJump(body, header, &.{ ni, nacc, npa, npb });
 
-    func.setTerminator(exit, .{ .ret = acc });
+    func.setTerminator(exit, .{ .ret = ir.function.Ret.one(acc) });
 }
 
 test "skips a loop whose two loads alias the same base pointer" {
