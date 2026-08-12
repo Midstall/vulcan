@@ -878,6 +878,118 @@ test "wasm: call_indirect through a function table" {
     try std.testing.expectEqual(@as(i32, 15), try inst.call2(i32, i32, i32, "dispatch", 1, 5)); // triple(5)
 }
 
+/// Build a module in the shape a real Wasm linker emits: a funcref table of 3 slots whose
+/// element segment starts at `elem_offset`, so the slots below it stay empty. `elem` holds
+/// *combined* function indices (the `n_imports` imports occupy the low ones). The module
+/// defines `double(x) = x * 2`, `triple(x) = x * 3`, and exports
+/// `dispatch(sel, x) = table[sel](x)`, which calls the import on the result when there is
+/// one. Caller owns the bytes.
+fn linkerShapeModule(
+    allocator: std.mem.Allocator,
+    n_imports: u8,
+    elem_offset: u8,
+    elem: []const u8,
+) ![]u8 {
+    std.debug.assert(n_imports <= 1);
+    std.debug.assert(elem_offset <= 0x3F); // one-byte signed LEB, so it stays positive
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, &.{ 0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00 });
+    // type0 = (i32)->i32, type1 = (i32,i32)->i32
+    try section(&out, allocator, 1, &.{ 0x02, 0x60, 0x01, 0x7F, 0x01, 0x7F, 0x60, 0x02, 0x7F, 0x7F, 0x01, 0x7F });
+    if (n_imports == 1) { // import env.addone: type0
+        try section(&out, allocator, 2, &.{ 0x01, 0x03, 'e', 'n', 'v', 0x06, 'a', 'd', 'd', 'o', 'n', 'e', 0x00, 0x00 });
+    }
+    try section(&out, allocator, 3, &.{ 0x03, 0x00, 0x00, 0x01 }); // double:type0, triple:type0, dispatch:type1
+    try section(&out, allocator, 4, &.{ 0x01, 0x70, 0x00, 0x03 }); // one funcref table, min 3
+    const dispatch_idx: u8 = n_imports + 2;
+    try section(&out, allocator, 7, &[_]u8{ 0x01, 0x08, 'd', 'i', 's', 'p', 'a', 't', 'c', 'h', 0x00, dispatch_idx });
+
+    // Element section: one active segment on table 0 at `i32.const elem_offset`.
+    var e: std.ArrayList(u8) = .empty;
+    defer e.deinit(allocator);
+    try e.appendSlice(allocator, &[_]u8{ 0x01, 0x00, 0x41, elem_offset, 0x0B });
+    try lebU(&e, allocator, elem.len);
+    try e.appendSlice(allocator, elem);
+    try section(&out, allocator, 9, e.items);
+
+    var code: std.ArrayList(u8) = .empty;
+    defer code.deinit(allocator);
+    try lebU(&code, allocator, 3);
+    const dispatch_body: []const u8 = if (n_imports == 1)
+        // x, sel, call_indirect type0, then call the import on the result
+        &.{ 0x00, 0x20, 0x01, 0x20, 0x00, 0x11, 0x00, 0x00, 0x10, 0x00, 0x0B }
+    else
+        &.{ 0x00, 0x20, 0x01, 0x20, 0x00, 0x11, 0x00, 0x00, 0x0B };
+    const bodies = [_][]const u8{
+        &.{ 0x00, 0x20, 0x00, 0x41, 0x02, 0x6C, 0x0B }, // double
+        &.{ 0x00, 0x20, 0x00, 0x41, 0x03, 0x6C, 0x0B }, // triple
+        dispatch_body,
+    };
+    for (bodies) |b| {
+        try lebU(&code, allocator, b.len);
+        try code.appendSlice(allocator, b);
+    }
+    try section(&out, allocator, 10, code.items);
+    return out.toOwnedSlice(allocator);
+}
+
+test "wasm: an element segment that starts above slot 0 instantiates" {
+    // Regression for the fault that stopped every linker-produced module from loading. A
+    // linker keeps table slot 0 empty so a null function pointer stays distinct from a real
+    // one, and starts its element segment at offset 1. The loader read the empty slot as
+    // function index 0, classified index 0 as an import, and refused the module.
+    // Combined indices here: import 0, double 1, triple 2, dispatch 3.
+    const allocator = std.testing.allocator;
+    const bytes = try linkerShapeModule(allocator, 1, 1, &.{ 1, 2 });
+    defer allocator.free(bytes);
+
+    var inst = try wasm.Instance.instantiate(allocator, bytes, &.{@intFromPtr(&Host.addOne)});
+    defer inst.deinit();
+    try std.testing.expectEqual(@as(?u32, null), inst.module.table[0]);
+    try std.testing.expectEqual(@as(usize, 0), inst.table[0]); // the null funcref
+    try std.testing.expectEqual(@as(i32, 11), try inst.call2(i32, i32, i32, "dispatch", 1, 5)); // addone(double(5))
+    try std.testing.expectEqual(@as(i32, 16), try inst.call2(i32, i32, i32, "dispatch", 2, 5)); // addone(triple(5))
+}
+
+test "wasm: an empty table slot is the null funcref, not function index 0" {
+    // The other half of the same fault. With no imports, function index 0 is a real
+    // function, so the empty slot 0 resolved to it: the table held `double` where the
+    // module says null, and `call_indirect 0` called `double` instead of trapping.
+    const allocator = std.testing.allocator;
+    const bytes = try linkerShapeModule(allocator, 0, 1, &.{ 0, 1 });
+    defer allocator.free(bytes);
+
+    var inst = try wasm.Instance.instantiate(allocator, bytes, &.{});
+    defer inst.deinit();
+    try std.testing.expectEqual(@as(?u32, null), inst.module.table[0]);
+    try std.testing.expectEqual(@as(usize, 0), inst.table[0]);
+    try std.testing.expect(inst.table[1] != 0); // double, so slot 0 is empty for a reason
+    try std.testing.expectEqual(@as(i32, 10), try inst.call2(i32, i32, i32, "dispatch", 1, 5)); // double(5)
+    try std.testing.expectEqual(@as(i32, 15), try inst.call2(i32, i32, i32, "dispatch", 2, 5)); // triple(5)
+}
+
+test "wasm: a table entry that names an imported function is refused" {
+    // Accepting the empty slot must not accept a *named* import, which is a different
+    // thing. `call_indirect` passes the module's hidden bases, while an import needs the
+    // host import-context, so the engine cannot dispatch to one through the table.
+    const allocator = std.testing.allocator;
+    const bytes = try linkerShapeModule(allocator, 1, 1, &.{ 0, 2 }); // slot 1 names import 0
+    defer allocator.free(bytes);
+    try std.testing.expectError(error.Unsupported, wasm.Instance.instantiate(allocator, bytes, &.{@intFromPtr(&Host.addOne)}));
+}
+
+test "wasm: a table entry that names a function outside the module is refused" {
+    // The bound the original check protected, which must survive: the index reaches
+    // `module.functions[fi - n_imports]`, so an out-of-range index must not index past
+    // the end of that slice.
+    const allocator = std.testing.allocator;
+    const bytes = try linkerShapeModule(allocator, 1, 1, &.{ 1, 99 });
+    defer allocator.free(bytes);
+    try std.testing.expectError(error.InvalidWasm, wasm.Instance.instantiate(allocator, bytes, &.{@intFromPtr(&Host.addOne)}));
+}
+
 const Host = struct {
     // Host imports now receive the instance's import-context pointer as a hidden first
     // argument; this one ignores it (it needs no per-instance state).

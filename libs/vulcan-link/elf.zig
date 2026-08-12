@@ -51,9 +51,6 @@ pub fn fromEMachine(e_machine: u16) ?Arch {
     };
 }
 
-/// Which allocatable section a symbol or chunk belongs to (`undef` = none).
-pub const SecKind = enum { undef, text, rodata, data, bss };
-
 /// The relocation kinds the linker understands. The numeric tags are the
 /// architectural `R_<ARCH>_*` codes (RISC-V and AArch64 codes never collide, so one
 /// enum serves every architecture); each `arch/<a>.zig` backend only ever sees the
@@ -154,49 +151,66 @@ pub const Reloc = struct {
     addend: i64 = 0,
 };
 
-/// A symbol parsed out of one object's symbol table. `section` says which
-/// allocatable section `value` is an offset into.
+/// A symbol parsed out of one object's symbol table. `section_index` says which
+/// allocatable section `value` is an offset into, as an index into
+/// `ParsedObject.sections` (the arbitrary-named-section model).
 pub const ObjSymbol = struct {
     name: []const u8,
     value: u64,
     defined: bool,
     local: bool,
-    section: SecKind,
+    /// The symbol's size in bytes (`st_size`). 0 for a symbol with no known size
+    /// (a label, or a fixture built before this field existed).
+    size: u64 = 0,
+    /// Index into the owning `ParsedObject.sections`, or `std.math.maxInt(u32)` for
+    /// an undefined (external) symbol, which has no defining section.
+    section_index: u32 = std.math.maxInt(u32),
+};
+
+/// One allocatable section from a parsed object. `ParsedObject.sections` keeps
+/// same-class sections (for example two PROGBITS|EXECINSTR sections named `.text`
+/// and `.text.extra`) as separate entries, so a symbol resolves to the exact
+/// section that defines it, not a merged per-class blob.
+pub const ObjSection = struct {
+    name: []const u8,
+    flags: u64,
+    /// The file bytes of this section. Empty for a NOBITS section (`is_nobits`).
+    /// `size` still gives its true in-memory extent.
+    bytes: []const u8 = &.{},
+    /// The section's in-memory size (`sh_size`).
+    size: u64,
+    is_nobits: bool,
+    /// The relocations whose target is this section, `offset` a byte offset
+    /// within it. `ParsedObject.deinit` owns and frees this slice.
+    relocs: []Reloc = &.{},
 };
 
 /// The pieces lifted out of a single relocatable object: each allocatable
-/// section's bytes (`.bss` has only a size), its symbols, and its relocations.
+/// section's bytes (`.bss` has only a size), its symbols, and each section's
+/// relocations (in `ObjSection.relocs`).
 pub const ParsedObject = struct {
     arch: Arch,
-    text: []const u8,
-    rodata: []const u8 = &.{},
-    data: []const u8 = &.{},
-    bss_size: u64 = 0,
     symbols: []ObjSymbol,
-    relocs: []Reloc,
-    /// Relocations applied to the `.data` section itself (pointer inits, `R_AARCH64_ABS64`
-    /// from `.rela.data`). Their `offset` is a byte offset within `.data`. Empty for objects
-    /// with no data-section relocs (every non-aarch64 object today).
-    data_relocs: []Reloc = &.{},
-    /// Relocations applied to the `.rodata` section itself (`R_AARCH64_ABS64` from
-    /// `.rela.rodata`, a `const`-qualified pointer init). `offset` is within `.rodata`.
-    rodata_relocs: []Reloc = &.{},
+    /// Every `SHF_ALLOC` section of the object, one entry each, in section-header
+    /// order, with no same-class collapsing. This is the arbitrary-named-section
+    /// linker model: each section owns its own bytes and per-section relocs, so two
+    /// same-class sections (for example two `.text` inputs) stay separate.
+    sections: []ObjSection = &.{},
 
     pub fn deinit(self: *ParsedObject, allocator: std.mem.Allocator) void {
         allocator.free(self.symbols);
-        allocator.free(self.relocs);
-        allocator.free(self.data_relocs);
-        allocator.free(self.rodata_relocs);
+        for (self.sections) |sec| allocator.free(sec.relocs);
+        allocator.free(self.sections);
     }
 };
 
-/// A resolved symbol in the linked image: its name, final absolute address, and which
-/// allocatable section defined it (`.text` a function, `.rodata`/`.data`/`.bss` a data
-/// object; `.undef` never occurs here since only defined symbols are resolved). Defaults to
-/// `.text` so existing construction sites that predate this field (literal test fixtures,
-/// synthesized script symbols with no natural section) keep their historical "function"
-/// classification.
-pub const ResolvedSymbol = struct { name: []const u8, address: u64, section: SecKind = .text };
+/// A resolved symbol in the linked image: its name, final absolute address, and whether the
+/// section that defined it is executable (`is_exec` true for a function in a `SHF_EXECINSTR`
+/// section, false for a data object in `.rodata`/`.data`/`.bss`). The dynamic exporter turns
+/// this into the `.dynsym` type bits (`STT_FUNC` vs `STT_OBJECT`). Defaults to `true` so
+/// existing construction sites that predate this field (literal test fixtures, synthesized
+/// script symbols with no natural section) keep their historical "function" classification.
+pub const ResolvedSymbol = struct { name: []const u8, address: u64, is_exec: bool = true };
 
 /// A linked code image: the relocated `.text` (in input order) plus the symbol
 /// table giving each defined symbol's absolute address. The code is meant to
@@ -247,40 +261,35 @@ pub const SecPlace = struct {
 /// `SecPlace.seg` sentinel: this (object, section) has no bytes and was not placed.
 pub const not_placed: u32 = std.math.maxInt(u32);
 
-/// The number of allocatable section kinds tracked per object in `Placement.places`
-/// (text, rodata, data, bss). `Placement.places` is indexed `oi * places_per_object +
-/// secIndex(kind)`.
-pub const places_per_object: usize = 4;
-
-/// The `Placement.places` sub-index for an allocatable section kind (text=0, rodata=1,
-/// data=2, bss=3). `.undef` has no place.
-pub fn secIndex(kind: SecKind) usize {
-    return switch (kind) {
-        .text => 0,
-        .rodata => 1,
-        .data => 2,
-        .bss => 3,
-        .undef => unreachable,
-    };
-}
-
 /// The interface between address assignment (LAYOUT) and relocation (bit math): a list
-/// of loadable `Segment`s, a per-(object, section) address map (`places`, indexed
-/// `oi * places_per_object + secIndex(kind)`), the resolved symbol table, and the entry
-/// address (0 = unset). A per-arch `computeDefaultPlacement` fills this (today's single
-/// contiguous image as one segment); a per-arch `applyRelocs` patches the segment bytes;
-/// a shared `writeElfSegments` emits one `PT_LOAD` per segment. Owns its segment bytes and
-/// symbol names.
+/// of loadable `Segment`s, a per-(object, section) address map (`section_places`), the
+/// resolved symbol table, and the entry address (0 = unset). A per-arch
+/// `computeDefaultPlacement` fills this (today's single contiguous image as one segment);
+/// a per-arch `applyRelocs` patches the segment bytes; a shared `writeElfSegments` emits
+/// one `PT_LOAD` per segment. Owns its segment bytes and symbol names.
 pub const Placement = struct {
     segments: []Segment,
-    places: []SecPlace,
     symbols: []ResolvedSymbol,
     entry: u64 = 0,
+    /// The per-(object, section) place map: a flat `SecPlace` array with one entry per
+    /// section of every object, indexed `section_place_base[oi] + section_index`. Every
+    /// placer (the shared default placer and the script layout engine) fills it. See
+    /// `sectionPlace`.
+    section_places: []SecPlace = &.{},
+    /// Per-object start offset into `section_places` (length = object count + 1, the
+    /// last entry the total section count). Empty when `section_places` is.
+    section_place_base: []usize = &.{},
+
+    /// The place of one (object, section) in the section-indexed map.
+    pub fn sectionPlace(self: *const Placement, oi: usize, section_index: usize) SecPlace {
+        return self.section_places[self.section_place_base[oi] + section_index];
+    }
 
     pub fn deinit(self: *Placement, allocator: std.mem.Allocator) void {
         for (self.segments) |seg| allocator.free(seg.bytes);
         allocator.free(self.segments);
-        allocator.free(self.places);
+        allocator.free(self.section_places);
+        allocator.free(self.section_place_base);
         for (self.symbols) |s| allocator.free(s.name);
         allocator.free(self.symbols);
     }
@@ -348,13 +357,16 @@ pub fn rdInt(comptime T: type, buf: []const u8, off: u64) Error!T {
     return std.mem.readInt(T, buf[o..][0..@sizeOf(T)], .little);
 }
 
-/// Classify a section header by its type and flags into an allocatable kind.
-fn classify(typ: u32, flags: u64) SecKind {
-    if (typ == SHT_NOBITS) return .bss;
-    if (typ != SHT_PROGBITS or (flags & SHF_ALLOC) == 0) return .undef;
-    if ((flags & SHF_EXECINSTR) != 0) return .text;
-    if ((flags & SHF_WRITE) != 0) return .data;
-    return .rodata;
+/// Classify a section header by its flags into a broad placement class, for the
+/// arbitrary-named-section model. Any allocatable section type gets a class, so
+/// `ParsedObject.sections` can hold a kind a strict PROGBITS filter would drop (for
+/// example `.init_array`). The placement and symbol-kind passes reuse this.
+pub fn sectionClass(sh_type: u32, sh_flags: u64) enum { exec, ro, rw, nobits, ignore } {
+    if ((sh_flags & SHF_ALLOC) == 0) return .ignore;
+    if (sh_type == SHT_NOBITS) return .nobits;
+    if ((sh_flags & SHF_EXECINSTR) != 0) return .exec;
+    if ((sh_flags & SHF_WRITE) != 0) return .rw;
+    return .ro;
 }
 
 /// Read a NUL-terminated string from a string table at `off`.
@@ -390,39 +402,55 @@ fn parseObject64(allocator: std.mem.Allocator, buf: []const u8) Error!ParsedObje
     const shentsize = try rdInt(u16, buf, 58);
     const shnum = try rdInt(u16, buf, 60);
 
-    // Map each section index to its allocatable kind, and pick up the allocatable
-    // section bytes plus the symbol/relocation tables.
-    var kinds = try allocator.alloc(SecKind, shnum);
-    defer allocator.free(kinds);
-    var text: []const u8 = &.{};
-    var rodata: []const u8 = &.{};
-    var data: []const u8 = &.{};
-    var bss_size: u64 = 0;
+    // The section-name string table (`.shstrtab`), located via `e_shstrndx`. It feeds
+    // the `sections` table below. A missing/out-of-range index (never happens for a real
+    // object) just leaves every section entry unnamed rather than failing the whole parse.
+    const e_shstrndx = try rdInt(u16, buf, 62);
+    const shstrtab: []const u8 = blk: {
+        if (e_shstrndx == 0 or e_shstrndx >= shnum) break :blk &.{};
+        const shstr_hdr = try tableOffset(shoff, e_shstrndx, shentsize);
+        const shstr_off = try rdInt(u64, buf, shstr_hdr + 24);
+        const shstr_size = try rdInt(u64, buf, shstr_hdr + 32);
+        break :blk try secSlice(buf, shstr_off, shstr_size);
+    };
+
+    // Pick up the symbol/relocation tables.
     var symtab_ndx: ?u16 = null;
     var rela_ndxs: std.ArrayList(u16) = .empty;
     defer rela_ndxs.deinit(allocator);
 
+    // The arbitrary-named-section table (every `SHF_ALLOC` section, no same-class
+    // collapsing), plus a map from the raw section-header index to its index within
+    // `sections` (`maxInt` for a section `sections` does not carry).
+    var sections: std.ArrayList(ObjSection) = .empty;
+    errdefer {
+        for (sections.items) |sec| allocator.free(sec.relocs);
+        sections.deinit(allocator);
+    }
+    var sec_map = try allocator.alloc(u32, shnum);
+    defer allocator.free(sec_map);
+    @memset(sec_map, std.math.maxInt(u32));
+
     var i: u16 = 0;
     while (i < shnum) : (i += 1) {
         const hdr = try tableOffset(shoff, i, shentsize);
+        const sh_name = try rdInt(u32, buf, hdr + 0);
         const typ = try rdInt(u32, buf, hdr + 4);
         const flags = try rdInt(u64, buf, hdr + 8);
         const sh_off = try rdInt(u64, buf, hdr + 24);
         const sh_size = try rdInt(u64, buf, hdr + 32);
-        const kind = classify(typ, flags);
-        kinds[i] = kind;
-        switch (kind) {
-            .text, .rodata, .data => {
-                const bytes = try secSlice(buf, sh_off, sh_size);
-                switch (kind) {
-                    .text => text = bytes,
-                    .rodata => rodata = bytes,
-                    .data => data = bytes,
-                    else => unreachable,
-                }
-            },
-            .bss => bss_size = std.math.add(u64, bss_size, sh_size) catch return error.MalformedObject,
-            .undef => {},
+        const class = sectionClass(typ, flags);
+        if (class != .ignore) {
+            const is_nobits = class == .nobits;
+            const bytes: []const u8 = if (is_nobits) &.{} else try secSlice(buf, sh_off, sh_size);
+            sec_map[i] = @intCast(sections.items.len);
+            try sections.append(allocator, .{
+                .name = if (shstrtab.len == 0) "" else try strAt(shstrtab, sh_name),
+                .flags = flags,
+                .bytes = bytes,
+                .size = sh_size,
+                .is_nobits = is_nobits,
+            });
         }
         if (typ == SHT_SYMTAB) symtab_ndx = i;
         if (typ == SHT_RELA) try rela_ndxs.append(allocator, i);
@@ -449,38 +477,35 @@ fn parseObject64(allocator: std.mem.Allocator, buf: []const u8) Error!ParsedObje
         const st_info = try rdInt(u8, buf, e + 4);
         const st_shndx = try rdInt(u16, buf, e + 6);
         const st_value = try rdInt(u64, buf, e + 8);
-        const section: SecKind = if (st_shndx != SHN_UNDEF and st_shndx < shnum) kinds[st_shndx] else .undef;
+        const st_size = try rdInt(u64, buf, e + 16);
+        const section_index: u32 = if (st_shndx != SHN_UNDEF and st_shndx < shnum) sec_map[st_shndx] else std.math.maxInt(u32);
         symbols[k] = .{
             .name = if (st_name == 0) "" else try strAt(strtab, st_name),
             .value = st_value,
             .defined = st_shndx != SHN_UNDEF,
             .local = (st_info >> 4) == 0, // STB_LOCAL
-            .section = section,
+            .size = st_size,
+            .section_index = section_index,
         };
     }
 
     // Relocations. Each `SHT_RELA` section applies to the section named by its `sh_info`:
-    // classify by that target section's kind so a `.rela.text` feeds `relocs`, a `.rela.data`
-    // feeds `data_relocs`, and a `.rela.rodata` feeds `rodata_relocs`. (Historically the only
-    // RELA section was `.rela.text`; data-section relocs are the pointer-init path.)
-    var text_relocs: std.ArrayList(Reloc) = .empty;
-    errdefer text_relocs.deinit(allocator);
-    var data_relocs: std.ArrayList(Reloc) = .empty;
-    errdefer data_relocs.deinit(allocator);
-    var rodata_relocs: std.ArrayList(Reloc) = .empty;
-    errdefer rodata_relocs.deinit(allocator);
+    // route each reloc into that target section's `ObjSection.relocs`, by section-table
+    // index. A `.rela.text` feeds the `.text` section's relocs, a `.rela.data` the `.data`
+    // section's, and so on. A RELA whose target is not an allocatable section (for example
+    // `.rela.debug`) has no `sections` entry and its relocs are dropped (the linker never
+    // patches a non-loadable section).
+    var sec_relocs = try allocator.alloc(std.ArrayList(Reloc), sections.items.len);
+    defer allocator.free(sec_relocs);
+    for (sec_relocs) |*sr| sr.* = .empty;
+    errdefer for (sec_relocs) |*sr| sr.deinit(allocator);
     for (rela_ndxs.items) |ri| {
         const rela_hdr = try tableOffset(shoff, ri, shentsize);
         const rela_off = try rdInt(u64, buf, rela_hdr + 24);
         const rela_size = try rdInt(u64, buf, rela_hdr + 32);
         const sh_info = try rdInt(u32, buf, rela_hdr + 44);
-        // The section this RELA modifies, and hence which reloc list it feeds.
-        const target_kind: SecKind = if (sh_info < shnum) kinds[sh_info] else .text;
-        const dst = switch (target_kind) {
-            .data => &data_relocs,
-            .rodata => &rodata_relocs,
-            else => &text_relocs,
-        };
+        // The section this RELA modifies, and hence which `ObjSection.relocs` list it feeds.
+        const target_sec: u32 = if (sh_info < shnum) sec_map[sh_info] else std.math.maxInt(u32);
         const rela_count: usize = @intCast(rela_size / 24);
         var r: usize = 0;
         while (r < rela_count) : (r += 1) {
@@ -522,25 +547,22 @@ fn parseObject64(allocator: std.mem.Allocator, buf: []const u8) Error!ParsedObje
                 1 => if (arch == .x86_64) .abs64 else return error.UnsupportedReloc,
                 else => return error.UnsupportedReloc,
             };
-            try dst.append(allocator, .{
+            const reloc: Reloc = .{
                 .offset = r_offset,
                 .symbol = sym_index,
                 .type = rt,
                 .addend = r_addend,
-            });
+            };
+            if (target_sec != std.math.maxInt(u32)) try sec_relocs[target_sec].append(allocator, reloc);
         }
     }
 
+    for (sections.items, 0..) |*sec, idx| sec.relocs = try sec_relocs[idx].toOwnedSlice(allocator);
+
     return .{
         .arch = arch,
-        .text = text,
-        .rodata = rodata,
-        .data = data,
-        .bss_size = bss_size,
         .symbols = symbols,
-        .relocs = try text_relocs.toOwnedSlice(allocator),
-        .data_relocs = try data_relocs.toOwnedSlice(allocator),
-        .rodata_relocs = try rodata_relocs.toOwnedSlice(allocator),
+        .sections = try sections.toOwnedSlice(allocator),
     };
 }
 
@@ -559,39 +581,55 @@ fn parseObject32(allocator: std.mem.Allocator, buf: []const u8) Error!ParsedObje
     const shentsize = try rdInt(u16, buf, 46);
     const shnum = try rdInt(u16, buf, 48);
 
-    // Map each section index to its allocatable kind, and pick up the allocatable
-    // section bytes plus the symbol/relocation tables.
-    var kinds = try allocator.alloc(SecKind, shnum);
-    defer allocator.free(kinds);
-    var text: []const u8 = &.{};
-    var rodata: []const u8 = &.{};
-    var data: []const u8 = &.{};
-    var bss_size: u64 = 0;
+    // The section-name string table (`.shstrtab`), located via `e_shstrndx`. It feeds
+    // the `sections` table below. A missing/out-of-range index (never happens for a real
+    // object) just leaves every section entry unnamed rather than failing the whole parse.
+    const e_shstrndx = try rdInt(u16, buf, 50);
+    const shstrtab: []const u8 = blk: {
+        if (e_shstrndx == 0 or e_shstrndx >= shnum) break :blk &.{};
+        const shstr_hdr = try tableOffset(shoff, e_shstrndx, shentsize);
+        const shstr_off = try rdInt(u32, buf, shstr_hdr + 16);
+        const shstr_size = try rdInt(u32, buf, shstr_hdr + 20);
+        break :blk try secSlice(buf, shstr_off, shstr_size);
+    };
+
+    // Pick up the symbol/relocation tables.
     var symtab_ndx: ?u16 = null;
     var rel_ndxs: std.ArrayList(u16) = .empty;
     defer rel_ndxs.deinit(allocator);
 
+    // The arbitrary-named-section table (every `SHF_ALLOC` section, no same-class
+    // collapsing), plus a map from the raw section-header index to its index within
+    // `sections` (`maxInt` for a section `sections` does not carry).
+    var sections: std.ArrayList(ObjSection) = .empty;
+    errdefer {
+        for (sections.items) |sec| allocator.free(sec.relocs);
+        sections.deinit(allocator);
+    }
+    var sec_map = try allocator.alloc(u32, shnum);
+    defer allocator.free(sec_map);
+    @memset(sec_map, std.math.maxInt(u32));
+
     var i: u16 = 0;
     while (i < shnum) : (i += 1) {
         const hdr = try tableOffset(shoff, i, shentsize);
+        const sh_name = try rdInt(u32, buf, hdr + 0);
         const typ = try rdInt(u32, buf, hdr + 4);
         const flags: u64 = try rdInt(u32, buf, hdr + 8);
         const sh_off = try rdInt(u32, buf, hdr + 16);
         const sh_size = try rdInt(u32, buf, hdr + 20);
-        const kind = classify(typ, flags);
-        kinds[i] = kind;
-        switch (kind) {
-            .text, .rodata, .data => {
-                const bytes = try secSlice(buf, sh_off, sh_size);
-                switch (kind) {
-                    .text => text = bytes,
-                    .rodata => rodata = bytes,
-                    .data => data = bytes,
-                    else => unreachable,
-                }
-            },
-            .bss => bss_size = std.math.add(u64, bss_size, sh_size) catch return error.MalformedObject,
-            .undef => {},
+        const class = sectionClass(typ, flags);
+        if (class != .ignore) {
+            const is_nobits = class == .nobits;
+            const bytes: []const u8 = if (is_nobits) &.{} else try secSlice(buf, sh_off, sh_size);
+            sec_map[i] = @intCast(sections.items.len);
+            try sections.append(allocator, .{
+                .name = if (shstrtab.len == 0) "" else try strAt(shstrtab, sh_name),
+                .flags = flags,
+                .bytes = bytes,
+                .size = sh_size,
+                .is_nobits = is_nobits,
+            });
         }
         if (typ == SHT_SYMTAB) symtab_ndx = i;
         if (typ == SHT_REL) try rel_ndxs.append(allocator, i);
@@ -620,15 +658,17 @@ fn parseObject32(allocator: std.mem.Allocator, buf: []const u8) Error!ParsedObje
         const e = try tableOffset(sym_off, k, 16);
         const st_name = try rdInt(u32, buf, e + 0);
         const st_value = try rdInt(u32, buf, e + 4);
+        const st_size = try rdInt(u32, buf, e + 8);
         const st_info = try rdInt(u8, buf, e + 12);
         const st_shndx = try rdInt(u16, buf, e + 14);
-        const section: SecKind = if (st_shndx != SHN_UNDEF and st_shndx < shnum) kinds[st_shndx] else .undef;
+        const section_index: u32 = if (st_shndx != SHN_UNDEF and st_shndx < shnum) sec_map[st_shndx] else std.math.maxInt(u32);
         symbols[k] = .{
             .name = if (st_name == 0) "" else try strAt(strtab, st_name),
             .value = st_value,
             .defined = st_shndx != SHN_UNDEF,
             .local = (st_info >> 4) == 0, // STB_LOCAL
-            .section = section,
+            .size = st_size,
+            .section_index = section_index,
         };
     }
 
@@ -637,31 +677,23 @@ fn parseObject32(allocator: std.mem.Allocator, buf: []const u8) Error!ParsedObje
     // the addend lives in the relocated field itself, left as `Reloc.addend = 0`
     // here (the default) for `arch/x86.zig` to read back out of the field.
     //
-    // Each `SHT_REL` section applies to the section named by its `sh_info`: classify by that
-    // target section's kind so a `.rel.text` feeds `relocs`, a `.rel.data` feeds
-    // `data_relocs`, and a `.rel.rodata` feeds `rodata_relocs` - the same classification
-    // `parseObject64` applies to `SHT_RELA`. A `.abs32` (`R_386_32`, numeric 1) reloc can
-    // appear in EITHER `.text` (a `global_addr` load's `mov reg, imm32`) or `.data`/`.rodata`
-    // (a pointer-init slot); which list it lands in is decided purely by the section it is
-    // found in, not by its numeric type.
-    var text_relocs: std.ArrayList(Reloc) = .empty;
-    errdefer text_relocs.deinit(allocator);
-    var data_relocs: std.ArrayList(Reloc) = .empty;
-    errdefer data_relocs.deinit(allocator);
-    var rodata_relocs: std.ArrayList(Reloc) = .empty;
-    errdefer rodata_relocs.deinit(allocator);
+    // Each `SHT_REL` section applies to the section named by its `sh_info`: route each
+    // reloc into that target section's `ObjSection.relocs`, by section-table index - the
+    // same per-section routing `parseObject64` applies to `SHT_RELA`. A `.abs32` (`R_386_32`,
+    // numeric 1) reloc can appear in EITHER `.text` (a `global_addr` load's `mov reg, imm32`)
+    // or `.data`/`.rodata` (a pointer-init slot); which section's relocs it lands in is
+    // decided purely by the section it is found in, not by its numeric type.
+    var sec_relocs = try allocator.alloc(std.ArrayList(Reloc), sections.items.len);
+    defer allocator.free(sec_relocs);
+    for (sec_relocs) |*sr| sr.* = .empty;
+    errdefer for (sec_relocs) |*sr| sr.deinit(allocator);
     for (rel_ndxs.items) |ri| {
         const rel_hdr = try tableOffset(shoff, ri, shentsize);
         const rel_off = try rdInt(u32, buf, rel_hdr + 16);
         const rel_size = try rdInt(u32, buf, rel_hdr + 20);
         const sh_info = try rdInt(u32, buf, rel_hdr + 28);
-        // The section this REL modifies, and hence which reloc list it feeds.
-        const target_kind: SecKind = if (sh_info < shnum) kinds[sh_info] else .text;
-        const dst = switch (target_kind) {
-            .data => &data_relocs,
-            .rodata => &rodata_relocs,
-            else => &text_relocs,
-        };
+        // The section this REL modifies, and hence which `ObjSection.relocs` list it feeds.
+        const target_sec: u32 = if (sh_info < shnum) sec_map[sh_info] else std.math.maxInt(u32);
         const rel_count: usize = @intCast(rel_size / 8);
         var r: usize = 0;
         while (r < rel_count) : (r += 1) {
@@ -676,24 +708,21 @@ fn parseObject32(allocator: std.mem.Allocator, buf: []const u8) Error!ParsedObje
                 @intFromEnum(RelocType.got32) => .got32,
                 else => return error.UnsupportedReloc,
             };
-            try dst.append(allocator, .{
+            const reloc: Reloc = .{
                 .offset = r_offset,
                 .symbol = sym_index,
                 .type = rt,
-            });
+            };
+            if (target_sec != std.math.maxInt(u32)) try sec_relocs[target_sec].append(allocator, reloc);
         }
     }
 
+    for (sections.items, 0..) |*sec, idx| sec.relocs = try sec_relocs[idx].toOwnedSlice(allocator);
+
     return .{
         .arch = arch,
-        .text = text,
-        .rodata = rodata,
-        .data = data,
-        .bss_size = bss_size,
         .symbols = symbols,
-        .relocs = try text_relocs.toOwnedSlice(allocator),
-        .data_relocs = try data_relocs.toOwnedSlice(allocator),
-        .rodata_relocs = try rodata_relocs.toOwnedSlice(allocator),
+        .sections = try sections.toOwnedSlice(allocator),
     };
 }
 
@@ -710,4 +739,115 @@ test "fromEMachine maps known machines and rejects the rest" {
     try std.testing.expectEqual(@as(?Arch, .x86_64), fromEMachine(EM_X86_64));
     try std.testing.expectEqual(@as(?Arch, .x86), fromEMachine(EM_386));
     try std.testing.expectEqual(@as(?Arch, null), fromEMachine(0));
+}
+
+test "parseObject64: two same-class sections stay separate in the new sections table" {
+    const allocator = std.testing.allocator;
+
+    // A minimal, hand-built ELF64/RELA relocatable object carrying TWO
+    // `SHT_PROGBITS | SHF_ALLOC|SHF_EXECINSTR` sections (".text" and ".text.extra"),
+    // a ".symtab" with one FUNC symbol in each (nonzero `st_size`), a ".strtab", and a
+    // ".shstrtab". Proves the `sections` table holds both separately, each symbol keyed
+    // to the section that defines it.
+    const shstrtab = "\x00.text\x00.text.extra\x00.symtab\x00.strtab\x00.shstrtab\x00";
+    const strtab = "\x00func1\x00func2\x00";
+
+    const text_off: u64 = 64;
+    const text_extra_off: u64 = text_off + 4;
+    const symtab_off: u64 = text_extra_off + 4;
+    const symtab_size: u64 = 3 * 24; // the null entry plus two symbols
+    const strtab_off: u64 = symtab_off + symtab_size;
+    const shstrtab_off: u64 = strtab_off + strtab.len;
+    const shoff: u64 = alignUp(shstrtab_off + shstrtab.len, 8);
+    const shnum: u16 = 6;
+    const total: usize = @intCast(shoff + @as(u64, shnum) * 64);
+
+    var buf = try allocator.alloc(u8, total);
+    defer allocator.free(buf);
+    @memset(buf, 0);
+
+    @memcpy(buf[0..4], "\x7fELF");
+    buf[4] = 2; // ELFCLASS64
+    buf[5] = 1; // ELFDATA2LSB
+    buf[6] = 1; // EV_CURRENT
+    std.mem.writeInt(u16, buf[16..18], 1, .little); // e_type = ET_REL
+    std.mem.writeInt(u16, buf[18..20], EM_X86_64, .little);
+    std.mem.writeInt(u32, buf[20..24], 1, .little); // e_version
+    std.mem.writeInt(u64, buf[40..48], shoff, .little); // e_shoff
+    std.mem.writeInt(u16, buf[52..54], 64, .little); // e_ehsize
+    std.mem.writeInt(u16, buf[58..60], 64, .little); // e_shentsize
+    std.mem.writeInt(u16, buf[60..62], shnum, .little); // e_shnum
+    std.mem.writeInt(u16, buf[62..64], 5, .little); // e_shstrndx (.shstrtab is index 5)
+
+    @memcpy(buf[text_off..][0..4], &[_]u8{ 0xaa, 0xbb, 0xcc, 0xdd });
+    @memcpy(buf[text_extra_off..][0..4], &[_]u8{ 0x11, 0x22, 0x33, 0x44 });
+    @memcpy(buf[strtab_off..][0..strtab.len], strtab);
+    @memcpy(buf[shstrtab_off..][0..shstrtab.len], shstrtab);
+
+    const writeSym = struct {
+        fn f(b: []u8, off: u64, idx: usize, name: u32, info: u8, shndx: u16, value: u64, size: u64) void {
+            const e = b[off + idx * 24 ..][0..24];
+            std.mem.writeInt(u32, e[0..4], name, .little);
+            e[4] = info;
+            e[5] = 0;
+            std.mem.writeInt(u16, e[6..8], shndx, .little);
+            std.mem.writeInt(u64, e[8..16], value, .little);
+            std.mem.writeInt(u64, e[16..24], size, .little);
+        }
+    }.f;
+    // func1 @ .text (shndx=1), func2 @ .text.extra (shndx=2). Both STB_GLOBAL|STT_FUNC.
+    writeSym(buf, symtab_off, 1, 1, 0x12, 1, 0, 4);
+    writeSym(buf, symtab_off, 2, 7, 0x12, 2, 0, 4);
+
+    const writeShdr = struct {
+        fn f(b: []u8, sh: u64, idx: u16, name: u32, typ: u32, flags: u64, off: u64, size: u64, link: u32, info: u32) void {
+            const e = b[sh + @as(u64, idx) * 64 ..][0..64];
+            std.mem.writeInt(u32, e[0..4], name, .little);
+            std.mem.writeInt(u32, e[4..8], typ, .little);
+            std.mem.writeInt(u64, e[8..16], flags, .little);
+            std.mem.writeInt(u64, e[16..24], 0, .little); // sh_addr
+            std.mem.writeInt(u64, e[24..32], off, .little);
+            std.mem.writeInt(u64, e[32..40], size, .little);
+            std.mem.writeInt(u32, e[40..44], link, .little);
+            std.mem.writeInt(u32, e[44..48], info, .little);
+            std.mem.writeInt(u64, e[48..56], 1, .little); // sh_addralign
+            std.mem.writeInt(u64, e[56..64], 0, .little); // sh_entsize
+        }
+    }.f;
+    writeShdr(buf, shoff, 0, 0, 0, 0, 0, 0, 0, 0); // the reserved NULL section
+    writeShdr(buf, shoff, 1, 1, SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR, text_off, 4, 0, 0);
+    writeShdr(buf, shoff, 2, 7, SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR, text_extra_off, 4, 0, 0);
+    writeShdr(buf, shoff, 3, 19, SHT_SYMTAB, 0, symtab_off, symtab_size, 4, 1); // sh_link -> .strtab
+    writeShdr(buf, shoff, 4, 27, 3, 0, strtab_off, strtab.len, 0, 0); // SHT_STRTAB
+    writeShdr(buf, shoff, 5, 35, 3, 0, shstrtab_off, shstrtab.len, 0, 0); // SHT_STRTAB
+
+    var parsed = try parseObject(allocator, buf);
+    defer parsed.deinit(allocator);
+
+    // Both sections show up, kept separate, with their names/sizes/flags intact.
+    try std.testing.expectEqual(@as(usize, 2), parsed.sections.len);
+    try std.testing.expectEqualStrings(".text", parsed.sections[0].name);
+    try std.testing.expectEqualStrings(".text.extra", parsed.sections[1].name);
+    try std.testing.expectEqual(@as(u64, 4), parsed.sections[0].size);
+    try std.testing.expectEqual(@as(u64, 4), parsed.sections[1].size);
+    try std.testing.expectEqual(SHF_ALLOC | SHF_EXECINSTR, parsed.sections[0].flags);
+    try std.testing.expectEqual(false, parsed.sections[0].is_nobits);
+
+    // func1 -> sections[0], func2 -> sections[1], each carrying its real st_size.
+    var seen_func1 = false;
+    var seen_func2 = false;
+    for (parsed.symbols) |s| {
+        if (std.mem.eql(u8, s.name, "func1")) {
+            seen_func1 = true;
+            try std.testing.expectEqual(@as(u32, 0), s.section_index);
+            try std.testing.expectEqual(@as(u64, 4), s.size);
+        }
+        if (std.mem.eql(u8, s.name, "func2")) {
+            seen_func2 = true;
+            try std.testing.expectEqual(@as(u32, 1), s.section_index);
+            try std.testing.expectEqual(@as(u64, 4), s.size);
+        }
+    }
+    try std.testing.expect(seen_func1);
+    try std.testing.expect(seen_func2);
 }

@@ -183,6 +183,10 @@ pub const DynOptions = struct {
     base: u64 = 0x400000,
     entry: []const u8 = "_start",
     pie: bool = false,
+    // Drop unreachable sections (`--gc-sections`). Off keeps every section, so the output is
+    // byte-identical to before. On, `linkDynamic` runs the GC mark pass and the sweep leaves
+    // out the dead sections. The driver turns this on, the library default is off.
+    gc_sections: bool = false,
 };
 
 /// One link input for the dynamic path: a relocatable object, an `.a` archive, or a

@@ -182,6 +182,60 @@ test "qemu-riscv: linkObjectsCompressed resolves a global auipc pair against the
     try std.testing.expect(image_c.code.len < image_g.code.len);
 }
 
+test "qemu-riscv: linkObjectsCompressed remaps a reloc site shifted by preceding compression" {
+    const allocator = std.testing.allocator;
+    // entry() -> *(&K) + 0, where the 0 is first stored to a stack slot and reloaded. The frame
+    // prologue (an sp adjustment) and the constant store COMPRESS, so they shrink the code that
+    // PRECEDES the PC-relative auipc/addi pair reaching K. Its reloc site therefore MOVES under
+    // compression, and the linker must patch the per-section reloc at its REMAPPED offset. A stale
+    // (pre-compression) per-section offset breaks the hi/lo pairing (error.MalformedObject) or
+    // patches the wrong word. Unlike the offset-0 pair test above, here something compressible
+    // precedes the site, so it exercises the offset remap. Compared against the uncompressed link.
+    const buildObj = struct {
+        fn run(a: std.mem.Allocator) ![]u8 {
+            var entry = Function.init(a);
+            defer entry.deinit();
+            const t = try entry.types.intern(.{ .int = .{ .bits = 32, .signedness = .signed } });
+            const ptr_t = try entry.types.intern(.ptr);
+            const b = try entry.appendBlock();
+            const slot = try entry.appendInst(b, ptr_t, .{ .alloca = .{ .elem = t } });
+            const zero = try entry.appendInst(b, t, .{ .iconst = 0 });
+            try entry.appendStore(b, zero, slot);
+            const y = try entry.appendInst(b, t, .{ .load = .{ .ptr = slot } });
+            const p = try entry.appendGlobalAddr(b, ptr_t, "K");
+            const k = try entry.appendInst(b, t, .{ .load = .{ .ptr = p } });
+            const r = try entry.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = k, .rhs = y } });
+            entry.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
+            const k_bytes = [_]u8{ 42, 0, 0, 0 };
+            var module: link.Module = .{};
+            defer module.deinit(a);
+            try module.addFunction(a, "entry", &entry);
+            try module.addData(a, "K", &k_bytes);
+            return object.writeModule(a, &module);
+        }
+    }.run;
+
+    const obj = try buildObj(allocator);
+    defer allocator.free(obj);
+
+    // The compressed link must SUCCEED. A stale per-section reloc offset makes pass 2b fail to pair
+    // the moved hi20/lo12 (error.MalformedObject), so a returned image proves the remap ran.
+    var image_c = try ld.linkObjectsCompressed(allocator, &.{obj}, 0x10000, null);
+    defer image_c.deinit(allocator);
+
+    var image_g = try ld.linkObjects(allocator, &.{obj}, 0x10000);
+    defer image_g.deinit(allocator);
+    // Compression actually shrank the text before the pair, so its reloc site genuinely moved.
+    try std.testing.expect(image_c.code.len < image_g.code.len);
+
+    const compressed = runLinkedImage(allocator, image_c.code) catch |e| switch (e) {
+        error.SkipZigTest => return error.SkipZigTest,
+        else => return e,
+    };
+    try std.testing.expectEqual(@as(u8, 42), compressed); // K + 0, read through the remapped pair
+    try std.testing.expectEqual(@as(u8, 42), try runLinkedImage(allocator, image_g.code));
+}
+
 test "qemu-riscv: compressPinned + a linker-style call patch runs correctly" {
     const allocator = std.testing.allocator;
     const cm = riscv64.compress;

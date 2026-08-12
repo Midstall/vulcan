@@ -106,7 +106,7 @@ fn keyOf(func: *const Function, canon: []const Value, inst: Inst, result: Value)
         // Previously every `iconst`/`fconst` this frontend emitted shared one `Type` handle
         // (e.g. plain `int`), so the omission was latent; SM4 Task 5 (typed integer-literal
         // suffixes) is the first place a same-valued constant can carry a different type.
-        .iconst => |v| .{ .kind = .iconst, .a = @bitCast(v), .sub = @intFromEnum(func.valueType(result)) },
+        .iconst => null, // SPIKE: do not common constants (rematerializable; commoning creates long-lived spills)
         .fconst => |v| .{ .kind = .fconst, .a = @bitCast(v), .sub = @intFromEnum(func.valueType(result)) },
         .arith => |x| blk: {
             var a = vn(canon, x.lhs);

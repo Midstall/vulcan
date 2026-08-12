@@ -12,6 +12,7 @@
 const std = @import("std");
 
 pub const elf = @import("vulcan-link/elf.zig");
+pub const gc = @import("vulcan-link/gc.zig");
 pub const dynamic = @import("vulcan-link/dynamic.zig");
 pub const archive = @import("vulcan-link/archive.zig");
 pub const resolve = @import("vulcan-link/resolve.zig");
@@ -65,7 +66,7 @@ pub const SharedExports = dynamic.SharedExports;
 // Script-driven layout: consume a parsed `Script` + objects, produce a `Placement`, then
 // relocate + link (see layout.zig / resolve.linkInputsScript).
 pub const computeScriptPlacement = layout.computeScriptPlacement;
-pub const secKindForPattern = layout.secKindForPattern;
+pub const sectionMatchesPattern = layout.sectionMatchesPattern;
 pub const linkInputsScript = resolve.linkInputsScript;
 pub const ScriptLinked = resolve.ScriptLinked;
 pub const ScriptError = resolve.ScriptError;

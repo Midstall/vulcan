@@ -81,14 +81,25 @@ pub const Instance = struct {
         // The function table holds the JITed address of each referenced function. Element
         // segments carry *combined* function indices (imports occupy the low indices, then
         // defined functions), and the index is untrusted. The table can only reference
-        // defined functions we JITed, so reject an import-range or out-of-range index rather
-        // than indexing `module.functions` out of bounds.
+        // defined functions we JITed, so reject an out-of-range index rather than indexing
+        // `module.functions` out of bounds, and reject an import-range index because
+        // `call_indirect` cannot supply the host calling convention an import needs.
+        //
+        // A slot no element segment names is the null funcref, and holds address 0. A real
+        // linker leaves slot 0 empty and puts its element segment at offset 1, so refusing
+        // an empty slot refuses every linker-produced module. An empty slot is NOT function
+        // index 0: `lower` keeps the two apart with an optional, because index 0 is a real
+        // function in a module with no imports.
         const table = try allocator.alloc(usize, module.table.len);
         errdefer allocator.free(table);
         const n_imports = module.imports.len;
-        for (module.table, 0..) |func_idx, t| {
-            const fi: usize = func_idx;
-            if (fi < n_imports or fi - n_imports >= module.functions.len) return error.InvalidWasm;
+        for (module.table, 0..) |entry, t| {
+            const fi: usize = entry orelse {
+                table[t] = 0;
+                continue;
+            };
+            if (fi < n_imports) return error.Unsupported;
+            if (fi - n_imports >= module.functions.len) return error.InvalidWasm;
             const name = module.functions[fi - n_imports].name;
             table[t] = @intFromPtr(jitted.entry(*const fn () callconv(.c) void, name) orelse return error.MissingExport);
         }

@@ -52,6 +52,71 @@ test "module disasm: linked functions get labels and a resolved, named call" {
     try std.testing.expect(std.mem.indexOf(u8, text, "  <helper>") != null); // resolved call
 }
 
+test "x86_64 copy coalescing: max + accumulate stay bit-exact on qemu-x86_64" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const i32_t_kind = ir.types.TypeKind{ .int = .{ .signedness = .signed, .bits = 32 } };
+
+    // max(x,y): the exact if/else block-param shape whose codegen coalescing changed.
+    {
+        const inputs = [_][2]i64{ .{ 5, 3 }, .{ 3, 5 }, .{ -7, -2 }, .{ 0, 0 }, .{ 100, -100 }, .{ -100, 100 }, .{ 1, 1 } };
+        for (inputs) |in| {
+            var func = ir.function.Function.init(a);
+            defer func.deinit();
+            const i32_t = try func.types.intern(i32_t_kind);
+            const bool_t = try func.types.intern(.bool);
+            const e = try func.appendBlock();
+            const x = try func.appendBlockParam(e, i32_t);
+            const y = try func.appendBlockParam(e, i32_t);
+            const m = try func.appendBlock();
+            const r = try func.appendBlockParam(m, i32_t);
+            const c = try func.appendInst(e, bool_t, .{ .icmp = .{ .op = .gt, .lhs = x, .rhs = y } });
+            try func.appendIf(e, c, .{ .target = m, .args = &.{x} }, .{ .target = m, .args = &.{y} });
+            func.setTerminator(m, .{ .ret = ir.function.Ret.one(r) });
+            const want: i64 = @max(in[0], in[1]);
+            try harness.expectRunFull(io, a, &func, &in, want, harness.qemu);
+        }
+    }
+
+    // Accumulate: s=0; for i in 0..n: s += (b>i) ; a loop-carried block-param + bool convert.
+    {
+        const params = [_][2]i64{ .{ 3, 5 }, .{ 5, 2 }, .{ 0, 9 }, .{ 6, 3 }, .{ 4, 4 } };
+        for (params) |p| {
+            const n = p[0];
+            const b = p[1];
+            var func = ir.function.Function.init(a);
+            defer func.deinit();
+            const i32_t = try func.types.intern(i32_t_kind);
+            const bool_t = try func.types.intern(.bool);
+            const entry = try func.appendBlock();
+            const na = try func.appendBlockParam(entry, i32_t);
+            const nb = try func.appendBlockParam(entry, i32_t);
+            const head = try func.appendBlock();
+            const hi = try func.appendBlockParam(head, i32_t); // i
+            const hs = try func.appendBlockParam(head, i32_t); // s
+            const body = try func.appendBlock();
+            const exit = try func.appendBlock();
+            const zero = try func.appendInst(entry, i32_t, .{ .iconst = 0 });
+            try func.setJump(entry, head, &.{ zero, zero });
+            const cond = try func.appendInst(head, bool_t, .{ .icmp = .{ .op = .lt, .lhs = hi, .rhs = na } });
+            try func.appendIf(head, cond, .{ .target = body, .args = &.{} }, .{ .target = exit, .args = &.{} });
+            const gt = try func.appendInst(body, bool_t, .{ .icmp = .{ .op = .gt, .lhs = nb, .rhs = hi } });
+            const gti = try func.appendInst(body, i32_t, .{ .convert = .{ .value = gt } });
+            const ns = try func.appendInst(body, i32_t, .{ .arith = .{ .op = .add, .lhs = hs, .rhs = gti } });
+            const one = try func.appendInst(body, i32_t, .{ .iconst = 1 });
+            const ni = try func.appendInst(body, i32_t, .{ .arith = .{ .op = .add, .lhs = hi, .rhs = one } });
+            try func.setJump(body, head, &.{ ni, ns });
+            func.setTerminator(exit, .{ .ret = ir.function.Ret.one(hs) });
+            var want: i64 = 0;
+            var i: i64 = 0;
+            while (i < n) : (i += 1) {
+                if (b > i) want += 1;
+            }
+            try harness.expectRunFull(io, a, &func, &.{ n, b }, want, harness.qemu);
+        }
+    }
+}
+
 test "x86-64 cases run natively in-process (skips off x86-64)" {
     try cases.runAll(std.testing.io, std.testing.allocator, harness.native);
 }
@@ -133,8 +198,10 @@ test "codegen+disasm round-trip: control flow (max via if/else)" {
     const text = try disasm.format(a, code);
     defer a.free(text);
     // The shared Wimmer allocator SPLITS the two critical edges e->m, so each arm reaches
-    // the join `m` through its own forwarding block (the extra `jmp`s), where the phi move
-    // places the taken value in rax before falling into the return.
+    // the join `m` through its own forwarding block (the extra `jmp`s). With block-param
+    // coalescing on, the join parameter `r` lands on `rdi` (the first arm's incoming value
+    // `x`, already in rdi): the `x` arm needs no move at all, and the `y` arm carries its
+    // value with a single `mov rdi, rsi` before the join loads the result into rax.
     try std.testing.expectEqualStrings(
         \\0000: cmp edi, esi
         \\0002: setg al
@@ -142,11 +209,11 @@ test "codegen+disasm round-trip: control flow (max via if/else)" {
         \\000a: test rax, rax
         \\000d: jne .+5
         \\0013: jmp .+14
-        \\0018: jmp .+1
-        \\001d: ret
-        \\001e: mov rax, rdi
+        \\0018: jmp .+4
+        \\001d: mov rax, rdi
+        \\0020: ret
         \\0021: jmp .-9
-        \\0026: mov rax, rsi
+        \\0026: mov rdi, rsi
         \\0029: jmp .-17
         \\
     , text);
@@ -628,6 +695,71 @@ test "x86_64 arith_branch fold: a multi-use arith result does NOT fuse (cmp surv
 
     try harness.expectRun(std.testing.io, a, &func, &.{1}, 0, harness.qemu); // s=0, else edge carries s=0
     try harness.expectRun(std.testing.io, a, &func, &.{5}, 4, harness.qemu); // s=4, then edge carries s=4
+}
+
+test "x86_64 edge-arg spill: a loop nest with more carried ints than registers spills across the back-edge (qemu)" {
+    // 20 accumulators plus i and n travel the loop as edge arguments, exceeding the 12 allocatable
+    // gpr registers. An edge argument is `should_have_register`, so the parallel-move resolver spills
+    // the excess to slots and reloads at the successor rather than over-demanding registers at the
+    // single back-edge position. The result must still be exact, proving the slot-sourced edge move
+    // is emitted correctly on this backend. a[k] = k+1, each incremented by i over i in 0..n, summed.
+    const a = std.testing.allocator;
+    const n_acc = 20;
+    var func = ir.function.Function.init(a);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
+    const bool_t = try func.types.intern(.bool);
+
+    const entry = try func.appendBlock();
+    const header = try func.appendBlock();
+    const body = try func.appendBlock();
+    const exit = try func.appendBlock();
+
+    const n = try func.appendBlockParam(entry, t);
+    const iv0 = try func.appendInst(entry, t, .{ .iconst = 0 });
+    var edge: [2 + n_acc]ir.function.Value = undefined;
+    edge[0] = iv0;
+    edge[1] = n;
+    for (0..n_acc) |k| edge[2 + k] = try func.appendInst(entry, t, .{ .iconst = @intCast(k + 1) });
+    try func.setJump(entry, header, &edge);
+
+    const h_i = try func.appendBlockParam(header, t);
+    const h_n = try func.appendBlockParam(header, t);
+    var h_acc: [n_acc]ir.function.Value = undefined;
+    for (0..n_acc) |k| h_acc[k] = try func.appendBlockParam(header, t);
+    const cond = try func.appendInst(header, bool_t, .{ .icmp = .{ .op = .lt, .lhs = h_i, .rhs = h_n } });
+    var then_args: [2 + n_acc]ir.function.Value = undefined;
+    then_args[0] = h_i;
+    then_args[1] = h_n;
+    for (0..n_acc) |k| then_args[2 + k] = h_acc[k];
+    var else_args: [n_acc]ir.function.Value = undefined;
+    for (0..n_acc) |k| else_args[k] = h_acc[k];
+    try func.appendIf(header, cond, .{ .target = body, .args = &then_args }, .{ .target = exit, .args = &else_args });
+
+    const b_i = try func.appendBlockParam(body, t);
+    const b_n = try func.appendBlockParam(body, t);
+    var b_acc: [n_acc]ir.function.Value = undefined;
+    for (0..n_acc) |k| b_acc[k] = try func.appendBlockParam(body, t);
+    var next_edge: [2 + n_acc]ir.function.Value = undefined;
+    next_edge[0] = try func.appendArithImm(body, t, .add, b_i, 1);
+    next_edge[1] = b_n;
+    for (0..n_acc) |k| next_edge[2 + k] = try func.appendInst(body, t, .{ .arith = .{ .op = .add, .lhs = b_acc[k], .rhs = b_i } });
+    try func.setJump(body, header, &next_edge);
+
+    var e_acc: [n_acc]ir.function.Value = undefined;
+    for (0..n_acc) |k| e_acc[k] = try func.appendBlockParam(exit, t);
+    var sum = e_acc[0];
+    for (1..n_acc) |k| sum = try func.appendInst(exit, t, .{ .arith = .{ .op = .add, .lhs = sum, .rhs = e_acc[k] } });
+    func.setTerminator(exit, .{ .ret = ir.function.Ret.one(sum) });
+
+    for ([_]i64{ 0, 1, 5, 10, 37 }) |nv| {
+        const got = harness.runFuncFull(std.testing.io, a, &func, &.{nv}, harness.qemu) catch |e| switch (e) {
+            error.SkipZigTest => return error.SkipZigTest,
+            else => return e,
+        };
+        const want: i64 = n_acc * (n_acc + 1) / 2 + @divTrunc(@as(i64, n_acc) * (nv * (nv - 1)), 2);
+        try std.testing.expectEqual(want, got);
+    }
 }
 
 // ---------------------------------------------------------------------------

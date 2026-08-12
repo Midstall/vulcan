@@ -1155,6 +1155,7 @@ pub fn x86_32RegDescription(allocator: std.mem.Allocator, func: *const Function)
         .classes = classes,
         .classOf = x86ClassOf,
         .useKind = x86UseKind,
+        .coalesce_spill_slots = true,
         .entry_fixed = entry_fixed,
         .call_sites = call_sites,
         .scratch = scratch,

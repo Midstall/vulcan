@@ -2636,6 +2636,56 @@ fn x86_64UseKind(ctx: *const anyopaque, func: *const Function, inst: ir.function
     return if (isXmm(func, operand)) .should_have_register else .must_have_register;
 }
 
+/// `RegDescription.copySource` for x86_64: report the source value when `v`'s defining
+/// instruction is a PURE register copy of it, one the backend lowers to a bare `mov`
+/// (or `movups`) that changes no bits. The shared allocator uses this to place the copy
+/// destination on its source's register, which turns the copy into a self-move the
+/// emission then elides (the `rd != src` guards on those branches). Only the EXACT
+/// plain-copy convert cases are safe:
+///   - int -> int convert that is same width or narrowing. Its `mov` copies the whole
+///     64-bit register, so the destination keeps the source bits. A WIDENING int convert
+///     emits movsx/movzx/movsxd (or a 32-bit mov that zero-extends), which changes bits,
+///     so it is NOT a copy.
+///   - float -> float convert between the SAME scalar view (f32 -> f32, f64 -> f64, or
+///     the f16 -> f32 widen, since an f16 is held AS its f32 widening so that move is a
+///     no-op copy) with neither a narrowing to f16 nor a single/double view change. Those
+///     emit a bare `movups`. A narrowing to f16 rounds (roundToHalf), and an f32<->f64
+///     view change emits cvtss2sd/cvtsd2ss, both real conversions that change bits.
+/// Every other case (a cross-class int <-> float convert via cvtsi2ss/cvttss2si, a vector
+/// operand, or any non-convert) returns null. The unused `ctx` is the generic hook shape.
+fn x86_64CopySource(ctx: *const anyopaque, func: *const Function, v: Value) ?Value {
+    _ = ctx;
+    const inst = func.definingInst(v) orelse return null;
+    const cv = switch (func.opcode(inst)) {
+        .convert => |c| c,
+        else => return null,
+    };
+    const src = cv.value;
+    const src_x = isXmm(func, src);
+    const dst_x = isXmm(func, v);
+    if (!src_x and !dst_x) {
+        // int -> int. Same width or narrowing lowers to a full-register `mov`. Only a
+        // widening (a wider result from a source under 64 bits) sign/zero extends, so
+        // exclude it, matching the emission's extend branch.
+        const src_bits = intBits(func, src);
+        const dst_bits = intBits(func, v);
+        if (dst_bits > src_bits and src_bits < 64) return null;
+        return src;
+    }
+    if (src_x and dst_x) {
+        // float -> float. A SIMD vector reports xmm too, but a vector convert never emits
+        // a bare `movups` whole-value copy here, so exclude it. A narrowing to f16 rounds,
+        // and a single/double view change is a real convert. Everything else (same-view
+        // scalar float, or the f16 -> f32 widen) is a bare `movups` copy.
+        if (isVector(func, src) or isVector(func, v)) return null;
+        if (isHalf(func, v)) return null;
+        if (isDouble(func, src) != isDouble(func, v)) return null;
+        return src;
+    }
+    // Cross-class int <-> float convert (cvtsi2ss/cvttss2si). Never a copy.
+    return null;
+}
+
 /// Append a `u16` index for every register in `regs` to `list` (via `@intFromEnum`).
 fn appendRegIndices(allocator: std.mem.Allocator, list: *std.ArrayList(u16), comptime R: type, regs: []const R) Error!void {
     for (regs) |r| try list.append(allocator, @intFromEnum(r));
@@ -2784,6 +2834,9 @@ pub fn x86_64RegDescription(allocator: std.mem.Allocator, func: *const Function)
         .classes = classes,
         .classOf = x86_64ClassOf,
         .useKind = x86_64UseKind,
+        .copySource = x86_64CopySource,
+        .coalesce_block_params = true,
+        .coalesce_spill_slots = true,
         .entry_fixed = entry_fixed,
         .call_sites = call_sites,
         .scratch = scratch,

@@ -18,6 +18,7 @@ const cc = @import("vulcan-cc");
 const target = @import("vulcan-target");
 const link = @import("vulcan-link");
 const mm = @import("vulcan-opt").microarch;
+const opt = @import("vulcan-opt");
 const preproc = cc.preproc;
 
 /// One positional input, in command-line order. It is a bare path (a `.c`/`.i` source, or
@@ -132,6 +133,18 @@ const Options = struct {
     /// `-mcpu=<name>` / `-mtune=<name>`: the raw value of the LAST such flag on the command
     /// line. `null` means neither flag was given. `resolveModel` reads it to pick the model.
     cpu_tune: ?[]const u8 = null,
+    /// `--gc-sections` / `--no-gc-sections`, or the same pair inside a `-Wl,` comma list:
+    /// drop unreachable sections at link time (`link.DynOptions.gc_sections`). Default ON,
+    /// so a plain link runs the mark-and-sweep pass without any extra flag. `--no-gc-sections`
+    /// opts back out to the old keep-everything behavior. See the LINK step in `main`.
+    gc_sections: bool = true,
+    /// Whether to run the IR optimization pipeline (`vulcan-opt`'s mem2reg, then the clean-up
+    /// passes) before code generation. Set by an `-O<n>` flag with a level of 1 or higher
+    /// (`-O1`/`-O2`/`-O3`/`-Os`/`-Ofast`). `-O0`, `-Og`, and NO `-O` flag leave it false, so
+    /// the output stays exactly what the un-optimized single-level pipeline produced before.
+    /// This mirrors clang, whose default is `-O0`. `./configure` builds pass `-O2`, so a real
+    /// autotools compile optimizes.
+    optimize: bool = false,
 };
 
 /// Which autoconf-style version probe was requested. `main` answers these BEFORE running
@@ -359,6 +372,31 @@ fn parseArgs(allocator: std.mem.Allocator, it: anytype) (error{Usage} || std.mem
             opts.cpu_tune = arg["-mtune=".len..];
         } else if (std.mem.startsWith(u8, arg, "-march=")) {
             // ISA selection. VCC's ISA is fixed by -target, so accept and ignore.
+        } else if (std.mem.startsWith(u8, arg, "-O")) {
+            // Optimization level. A level of 1 or higher (`-O1`/`-O2`/`-O3`/`-Os`/`-Ofast`)
+            // turns the IR optimization pipeline on. `-O0` and `-Og` leave it off, matching
+            // clang's default. The exact level does not further tune the pipeline yet, so all
+            // "on" levels run the same passes. Last flag on the line wins.
+            opts.optimize = optLevelEnablesOpt(arg["-O".len..]);
+        } else if (std.mem.eql(u8, arg, "--gc-sections")) {
+            opts.gc_sections = true;
+        } else if (std.mem.eql(u8, arg, "--no-gc-sections")) {
+            opts.gc_sections = false;
+        } else if (std.mem.startsWith(u8, arg, "-Wl,")) {
+            // `-Wl,<arg1>,<arg2>,...`: gcc's own convention for a comma-separated list of
+            // linker arguments. Most entries have no VCC equivalent yet and stay
+            // accept-ignored (the broad `-W` family below), but `--gc-sections` and
+            // `--no-gc-sections` control the driver's own dead-code-elimination default, so
+            // this splits the list on commas and honors those two here.
+            var wl_it = std.mem.splitScalar(u8, arg["-Wl,".len..], ',');
+            while (wl_it.next()) |piece| {
+                if (std.mem.eql(u8, piece, "--gc-sections")) {
+                    opts.gc_sections = true;
+                } else if (std.mem.eql(u8, piece, "--no-gc-sections")) {
+                    opts.gc_sections = false;
+                }
+                // Every other piece (e.g. `-z,now`) is accepted and ignored.
+            }
         } else if (std.mem.eql(u8, arg, "-Xlinker") or std.mem.eql(u8, arg, "-Xassembler")) {
             // `-Xlinker <arg>` / `-Xassembler <arg>`: accepted, along with the one
             // argument each carries, but not yet forwarded anywhere. There is no separate
@@ -395,6 +433,17 @@ fn parseArgs(allocator: std.mem.Allocator, it: anytype) (error{Usage} || std.mem
 /// recognizes but does not act on. `./configure`/`make` throw the full gcc flag surface at
 /// the compiler. Most of it (which warnings to print, which optimization level, how much
 /// debug info) has no effect on VCC's own single-level pipeline.
+/// Whether an `-O<level>` flag (the text after `-O`) turns the optimization pipeline on. A bare
+/// `-O` is gcc's `-O1`, so it counts. `-O0` and `-Og` (a debug-friendly build) stay off. Every
+/// other level (`-O1`/`-O2`/`-O3`/`-Os`/`-Oz`/`-Ofast`) turns it on. The exact level does not yet
+/// tune which passes run.
+fn optLevelEnablesOpt(level: []const u8) bool {
+    if (level.len == 0) return true; // bare -O is -O1
+    if (std.mem.eql(u8, level, "0")) return false;
+    if (std.mem.eql(u8, level, "g")) return false;
+    return true;
+}
+
 fn isIgnoredFlag(arg: []const u8) bool {
     if (std.mem.startsWith(u8, arg, "-std=")) return true; // -std=gnu11, -std=c99, ...
     if (std.mem.startsWith(u8, arg, "-O")) return true; // -O, -O0.. -Ofast, -Os, -Og
@@ -865,25 +914,29 @@ fn buildModuleData(allocator: std.mem.Allocator, objs: []const cc.DataObject) st
 /// microarch model for `arch` (see `resolveModel`). It tunes both the IR layer and the
 /// backend for every function this call compiles. Used by both the `-c` path (a single
 /// source) and the link step (one call per `.c`/`.i` input, in command order).
-fn compileToObject(allocator: std.mem.Allocator, io: std.Io, path: []const u8, pp_base: preproc.Options, arch: link.Arch, model: ?*const mm.Model) ![]u8 {
+fn compileToObject(allocator: std.mem.Allocator, io: std.Io, path: []const u8, pp_base: preproc.Options, arch: link.Arch, model: ?*const mm.Model, optimize: bool) ![]u8 {
     const source = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(16 * 1024 * 1024));
     var pp_opts = pp_base;
     pp_opts.filename = try filenameForPreproc(allocator, path);
-    return compileSourceToObject(allocator, source, pp_opts, arch, model);
+    return compileSourceToObject(allocator, source, pp_opts, arch, model, optimize);
 }
 
 /// Compiles in-memory `source` (already-read text, `pp_opts` carrying its filename and
 /// predefines) to a relocatable object. Split from `compileToObject` so the driver can
 /// also compile a SYNTHETIC source string it never read from disk (see
-/// `synthDsoHandleObject`). `model`, when set, runs `mm.optimize` over each function's IR
-/// before codegen, then hands the same model to `writeObjectDataForModel` so the backend
-/// tunes its own choices (instruction selection, scheduling) for it too.
-fn compileSourceToObject(allocator: std.mem.Allocator, source: []const u8, pp_opts: preproc.Options, arch: link.Arch, model: ?*const mm.Model) ![]u8 {
+/// `synthDsoHandleObject`). When `optimize` is set, the target-independent optimization
+/// pipeline (`opt.optimize`: mem2reg, then the clean-up passes) runs over each function's IR
+/// FIRST, so its allocas become register-resident SSA values. `model`, when set, then runs
+/// `mm.optimize` (the microarch layer, which needs that mem2reg'd form to do anything) over the
+/// same IR, and is handed to `writeObjectDataForModel` so the backend tunes its own choices
+/// (instruction selection, scheduling) for it too.
+fn compileSourceToObject(allocator: std.mem.Allocator, source: []const u8, pp_opts: preproc.Options, arch: link.Arch, model: ?*const mm.Model, optimize: bool) ![]u8 {
     var mod = try cc.compileWithOpts(allocator, source, pp_opts);
     defer mod.deinit(allocator);
 
     var mfs: std.ArrayList(target.native.ModuleFunction) = .empty;
     for (mod.funcs) |*nf| {
+        if (optimize) _ = try opt.optimize(allocator, &nf.func);
         if (model) |m| _ = try mm.optimize(allocator, &nf.func, m);
         try mfs.append(allocator, .{ .name = nf.name, .func = &nf.func });
     }
@@ -901,7 +954,8 @@ fn compileSourceToObject(allocator: std.mem.Allocator, source: []const u8, pp_op
 fn synthDsoHandleObject(allocator: std.mem.Allocator, pp_base: preproc.Options, arch: link.Arch) ![]u8 {
     var pp_opts = pp_base;
     pp_opts.filename = "<vcc-dso-handle>";
-    return compileSourceToObject(allocator, "void *__dso_handle = 0;\n", pp_opts, arch, null);
+    // Data only, no functions, so optimization has nothing to act on: pass it off.
+    return compileSourceToObject(allocator, "void *__dso_handle = 0;\n", pp_opts, arch, null, false);
 }
 
 /// The `vcc` driver entry point: parse argv, then dispatch on mode. `-E` preprocesses and
@@ -1038,7 +1092,7 @@ pub fn main(init: std.process.Init) !void {
     if (opts.compile_only) {
         const input = single_source.?;
         if (classifyExt(input) != .c) return fail("-c requires a .c/.i source file, got '{s}'", .{input});
-        const obj = try compileToObject(allocator, io, input, pp_base, arch, model);
+        const obj = try compileToObject(allocator, io, input, pp_base, arch, model, opts.optimize);
         const out = opts.output orelse try derivedOutputName(allocator, input);
         try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out, .data = obj });
         if (opts.gen_depfile) {
@@ -1064,6 +1118,11 @@ pub fn main(init: std.process.Init) !void {
         var mod = try cc.compileWithOpts(allocator, source, pp_opts);
         defer mod.deinit(allocator);
         var w = std.Io.File.stdout().writer(io, &buf);
+        // With an optimization level (`-O1`+), dump the IR the backend actually sees, not the raw
+        // lowering: run the same pipeline the object path runs.
+        if (opts.optimize) for (mod.funcs) |*nf| {
+            _ = try opt.optimize(allocator, &nf.func);
+        };
         for (mod.funcs) |nf| try w.interface.print("; function {s}\n{f}\n", .{ nf.name, nf.func });
         try w.interface.flush();
         return;
@@ -1085,7 +1144,7 @@ pub fn main(init: std.process.Init) !void {
     for (opts.inputs.items) |spec| switch (spec) {
         .path => |p| switch (classifyExt(p)) {
             .c => {
-                const obj = try compileToObject(allocator, io, p, pp_base, arch, model);
+                const obj = try compileToObject(allocator, io, p, pp_base, arch, model, opts.optimize);
                 try dyn_inputs.append(allocator, .{ .object = obj });
                 try display_names.append(allocator, "");
             },
@@ -1295,6 +1354,7 @@ pub fn main(init: std.process.Init) !void {
             .needed = needed_list.items,
             .base = defaultBase(arch),
             .entry = "_start",
+            .gc_sections = opts.gc_sections,
         }) catch |e| {
             if (e == error.OutOfMemory) return e;
             return fail("{s}", .{linkErrorMessage(e)});
@@ -1467,6 +1527,66 @@ test "parseArgs: -march= is accepted and ignored (no model selector)" {
     var it = SliceArgs{ .items = &.{ "-march=armv8-a", "-c", "foo.c" } };
     const o = try parseArgs(allocator, &it);
     try std.testing.expect(o.cpu_tune == null);
+}
+
+test "parseArgs: gc_sections defaults to true" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var it = SliceArgs{ .items = &.{"foo.c"} };
+    const o = try parseArgs(allocator, &it);
+    try std.testing.expect(o.gc_sections);
+}
+
+test "parseArgs: --gc-sections sets gc_sections true" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var it = SliceArgs{ .items = &.{ "--gc-sections", "foo.c" } };
+    const o = try parseArgs(allocator, &it);
+    try std.testing.expect(o.gc_sections);
+}
+
+test "parseArgs: --no-gc-sections sets gc_sections false" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var it = SliceArgs{ .items = &.{ "--no-gc-sections", "foo.c" } };
+    const o = try parseArgs(allocator, &it);
+    try std.testing.expect(!o.gc_sections);
+}
+
+test "parseArgs: -Wl,--no-gc-sections sets gc_sections false" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var it = SliceArgs{ .items = &.{ "-Wl,--no-gc-sections", "foo.c" } };
+    const o = try parseArgs(allocator, &it);
+    try std.testing.expect(!o.gc_sections);
+}
+
+test "parseArgs: -Wl,--gc-sections sets gc_sections true after a prior --no-gc-sections" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var it = SliceArgs{ .items = &.{ "--no-gc-sections", "-Wl,--gc-sections", "foo.c" } };
+    const o = try parseArgs(allocator, &it);
+    try std.testing.expect(o.gc_sections);
+}
+
+test "parseArgs: an unrelated -Wl, value leaves gc_sections at the default" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var it = SliceArgs{ .items = &.{ "-Wl,-z,now", "foo.c" } };
+    const o = try parseArgs(allocator, &it);
+    try std.testing.expect(o.gc_sections);
 }
 
 test "pickModel: named part matching target -> model" {

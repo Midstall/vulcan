@@ -13,6 +13,7 @@ const std = @import("std");
 const ld = @import("vulcan-link");
 const ir = @import("vulcan-ir");
 const object = @import("../object.zig");
+const object_emit = @import("../../object_emit.zig");
 const link = @import("../link.zig");
 const run_helper = @import("../../tests/run_helper.zig");
 
@@ -958,4 +959,118 @@ test "x86_64 object.writeModule emits a .rela.data R_X86_64_64 for a pointer-ini
     if (rels.term != .exited or rels.term.exited != 0) return error.SkipZigTest;
     try std.testing.expect(std.mem.indexOf(u8, rels.stdout, "R_X86_64_64") != null);
     try std.testing.expect(std.mem.indexOf(u8, rels.stdout, ".rela.data") != null);
+}
+
+/// Build one x86-64 relocatable object with THREE per-function `.text.<fn>` sections, the
+/// `-ffunction-sections` shape the GC mark pass walks:
+///   `.text._start` calls `used`, then exits with the returned value.
+///   `.text.used`   returns 42 (the reachable callee).
+///   `.text.unused` returns 7 (a leaf that NOTHING calls, so `--gc-sections` drops it).
+/// `_start`/`used`/`unused` are global defined functions, one per section. The `call used`
+/// (`E8 rel32`) at `.text._start` offset 0 carries an `R_X86_64_PLT32` at rel32 (offset 1,
+/// addend -4) against `used` (symbol index 1).
+fn buildGcProgramObj(allocator: std.mem.Allocator) ![]u8 {
+    // `.text._start`: call used ; mov edi, eax ; mov eax, 60 (SYS_exit) ; syscall
+    const start_text = [_]u8{
+        0xe8, 0x00, 0x00, 0x00, 0x00, // call used   (rel32 @1)
+        0x89, 0xc7, //                   mov edi, eax
+        0xb8, 0x3c, 0x00, 0x00, 0x00, // mov eax, 60
+        0x0f, 0x05, //                   syscall
+    };
+    // `.text.used`: mov eax, 42 ; ret
+    const used_text = [_]u8{ 0xb8, 0x2a, 0x00, 0x00, 0x00, 0xc3 };
+    // `.text.unused`: mov eax, 7 ; ret  (the immediate 7 is the drop marker)
+    const unused_text = [_]u8{ 0xb8, 0x07, 0x00, 0x00, 0x00, 0xc3 };
+
+    const alloc_exec: u64 = 0x2 | 0x4; // SHF_ALLOC | SHF_EXECINSTR
+    const relocs = [_]object_emit.OutReloc{
+        .{ .offset = 1, .symbol = 1, .r_type = R_X86_64_PLT32, .addend = -4 }, // call -> used
+    };
+    const sections = [_]object_emit.OutSection{
+        .{ .name = ".text._start", .sh_type = 1, .flags = alloc_exec, .bytes = &start_text, .size = start_text.len, .addralign = 16, .relocs = &relocs },
+        .{ .name = ".text.used", .sh_type = 1, .flags = alloc_exec, .bytes = &used_text, .size = used_text.len, .addralign = 16 },
+        .{ .name = ".text.unused", .sh_type = 1, .flags = alloc_exec, .bytes = &unused_text, .size = unused_text.len, .addralign = 16 },
+    };
+    const symbols = [_]object_emit.OutSymbol{
+        .{ .name = "_start", .section = 0, .value = 0, .size = 0, .binding = .global, .sym_type = .func, .defined = true },
+        .{ .name = "used", .section = 1, .value = 0, .size = 0, .binding = .global, .sym_type = .func, .defined = true },
+        .{ .name = "unused", .section = 2, .value = 0, .size = 0, .binding = .global, .sym_type = .func, .defined = true },
+    };
+    return object_emit.emit(allocator, &sections, &symbols, .{ .class = .elf64, .machine = 62, .use_rela = true });
+}
+
+test "x86-64 linkDynamic with gc_sections drops an uncalled function's .text section, and keeps it with gc off" {
+    const allocator = std.testing.allocator;
+
+    const obj = try buildGcProgramObj(allocator);
+    defer allocator.free(obj);
+
+    // The distinctive bytes of `unused` (`mov eax, 7`). They exist ONLY in `.text.unused`, so
+    // their presence tracks whether that section survived. Linking needs no loader or qemu,
+    // only a PT_INTERP string, so this drop proof runs on every host (a placeholder path is
+    // fine, only the RUN test below needs a real loader).
+    const marker = [_]u8{ 0xb8, 0x07, 0x00, 0x00, 0x00 };
+    const interp = "/lib64/ld-linux-x86-64.so.2";
+
+    // GC OFF: `.text.unused` is kept, so its marker is present in the image.
+    const exe_off = try ld.linkDynamic(allocator, &.{.{ .object = obj }}, .{
+        .mode = .exec,
+        .interp = interp,
+        .entry = "_start",
+        .gc_sections = false,
+    });
+    defer allocator.free(exe_off);
+    try std.testing.expect(std.mem.indexOf(u8, exe_off, &marker) != null);
+
+    // GC ON: nothing calls `unused`, so `.text.unused` is dropped. Its marker is gone.
+    const exe_on = try ld.linkDynamic(allocator, &.{.{ .object = obj }}, .{
+        .mode = .exec,
+        .interp = interp,
+        .entry = "_start",
+        .gc_sections = true,
+    });
+    defer allocator.free(exe_on);
+    try std.testing.expect(std.mem.indexOf(u8, exe_on, &marker) == null);
+    // The dropped section's bytes are gone, the definitive proof. The overall file never
+    // grows either (page/region alignment can absorb the freed bytes, so this is `<=`).
+    try std.testing.expect(exe_on.len <= exe_off.len);
+}
+
+test "x86-64 linkDynamic gc_sections program (uncalled function dropped) still runs to exit 42 under qemu" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    // The RUN needs a REAL cross loader and qemu-x86_64. Skip if either is absent.
+    const interp = (try findCrossInterp(allocator)) orelse return error.SkipZigTest;
+    defer allocator.free(interp);
+    const qemu = (try findQemu(allocator)) orelse return error.SkipZigTest;
+    defer allocator.free(qemu);
+
+    const obj = try buildGcProgramObj(allocator);
+    defer allocator.free(obj);
+
+    // Link with GC on: `.text.unused` is dropped, `_start` + `used` are kept.
+    const exe_on = try ld.linkDynamic(allocator, &.{.{ .object = obj }}, .{
+        .mode = .exec,
+        .interp = interp,
+        .entry = "_start",
+        .gc_sections = true,
+    });
+    defer allocator.free(exe_on);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "gcexe",
+        .data = exe_on,
+        .flags = .{ .permissions = .executable_file },
+    });
+    // `_start` calls `used` (kept) and exits with 42.
+    run_helper.runExpectExit(allocator, io, .{
+        .argv = &.{ qemu, "./gcexe" },
+        .cwd = .{ .dir = tmp.dir },
+    }, 42) catch |e| switch (e) {
+        error.FileNotFound => return error.SkipZigTest,
+        else => return e,
+    };
 }

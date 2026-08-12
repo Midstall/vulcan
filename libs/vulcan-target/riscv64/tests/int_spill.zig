@@ -1,15 +1,14 @@
 //! Integer register allocation under loop pressure, executed on qemu-riscv64 (the oracle). Two
 //! independent properties the riscv64 allocator gained:
 //!
-//!   1. SAME-POSITION REGISTER OVER-DEMAND LIMIT. Integer allocation now uses the SHARED
+//!   1. EDGE-ARGUMENT SPILL UNDER OVER-DEMAND. Integer allocation now uses the SHARED
 //!      Wimmer-Franz allocator, since this backend switched its register allocator over to it.
 //!      A loop that parallel-moves more simultaneously-live integer values into its header params
-//!      at ONE position than the 17 allocatable integer registers exceeds the shared allocator's
-//!      must-have-register demand and is rejected with `error.Unsupported`, the same limit
-//!      aarch64 shares (the retired native riscv scan happened to spill this shape instead, but
-//!      the shared allocator does not, and it is not weakened to restore that). The first test
-//!      carries 26 loop-live int params and pins that documented over-demand rejection. Integer
-//!      SPILL of instruction results under pressure is covered by the fan-reduce/tail-split/
+//!      at ONE position than the 17 allocatable integer registers no longer over-demands: an edge
+//!      argument is `should_have_register`, so the parallel-move resolver spills the excess to
+//!      slots and reloads at the successor, the same limit aarch64 and x86_64 share. The first
+//!      test carries 26 loop-live int params and pins that the allocation now succeeds by spilling.
+//!      Integer SPILL of instruction results under pressure is covered by the fan-reduce/tail-split/
 //!      re-home/decline tests below, which spill and reload through the shared path and run
 //!      bit-exact on qemu.
 //!
@@ -111,27 +110,38 @@ fn buildAccumNest(allocator: std.mem.Allocator) !Function {
     return func;
 }
 
-test "int-spill: a 26-live-int-param loop nest exceeds the shared allocator's same-position register demand and is rejected" {
-    // Integer register allocation is the SHARED Wimmer-Franz allocator (wimmer.zig), since this
-    // backend switched over to it, the same one aarch64 and x86_64 also switched to. That allocator rejects a function whose
-    // MUST-HAVE-REGISTER demand at a single position exceeds the class register pool: the back-edge here
-    // parallel-moves all 26 loop-carried integers into the header params at one position, and 26 > 17
-    // allocatable integer registers, so `spillCurrent` bails `error.Unsupported` (wimmer.zig, the
-    // `u <= current.start()` guard) rather than spill a value that is needed in a register right now.
+test "int-spill: a 26-live-int-param loop nest spills its edge arguments instead of over-demanding registers" {
+    // Integer register allocation is the SHARED Wimmer-Franz allocator (wimmer.zig), the same one
+    // aarch64 and x86_64 use. The back-edge here parallel-moves all 26 loop-carried integers into the
+    // header params at one position, and 26 exceeds the 17 allocatable integer registers. An edge
+    // argument is `should_have_register`, not `must_have_register`: the parallel-move resolver can load
+    // it from or store it to a spill slot (orderMoves routes a slot end through the class scratch), so
+    // the allocator spills the excess carried values rather than demanding a register for every one at
+    // the single back-edge position.
     //
-    // This is INTENTIONAL and matches aarch64's "too many simultaneously-live params" rejection: it is
-    // now a limit BOTH backends share, not a riscv regression. The retired native riscv scan happened to
-    // spill this shape to the stack, but the shared allocator does not, and we do NOT weaken it to
-    // restore that. Integer SPILL coverage under pressure is provided by the instruction-result tests
-    // below (fan-reduce, tail-split, re-home, terminator-re-home, decline), which spill and reload
-    // through the same shared path and execute bit-exact on qemu. This test now pins the documented
-    // over-demand limit so a future silent change to that bound is caught. The rejection happens at
-    // COMPILE time (before any emulator), so it is checkable in the qemu-less sandbox too.
+    // So the allocation now SUCCEEDS, where it once bailed `error.Unsupported`. The retired native riscv
+    // scan spilled this shape to the stack too; the shared allocator now matches that instead of
+    // rejecting it. The rejection path only remains for a genuine same-position MUST-HAVE cluster (a ret
+    // value bank), which no ordinary loop reaches.
     const allocator = std.testing.allocator;
     var func = try buildAccumNest(allocator);
     defer func.deinit();
 
-    try std.testing.expectError(error.Unsupported, isel.selectFunction(allocator, &func));
+    // First: the allocation itself succeeds (compile time, so it runs in a qemu-less sandbox too).
+    const code = try isel.selectFunction(allocator, &func);
+    allocator.free(code);
+
+    // Then: execute across a sweep and confirm the spilled edge arguments reload to the right values.
+    // With n_acc accumulators a[k] = k+1 each incremented by i over i in 0..n, the total is
+    // sum_k (k+1) + n_acc * (n*(n-1)/2).
+    for ([_]i64{ 0, 1, 5, 10, 37 }) |n| {
+        const got = harness.runFunc(std.testing.io, allocator, &func, &.{n}, harness.qemu_user) catch |e| switch (e) {
+            error.SkipZigTest => return error.SkipZigTest,
+            else => return e,
+        };
+        const want: i64 = n_acc * (n_acc + 1) / 2 + @divTrunc(@as(i64, n_acc) * (n * (n - 1)), 2);
+        try std.testing.expectEqual(want, got);
+    }
 }
 
 /// Build a loop whose invariant `C` is defined in the entry block and read inside the body but is NOT

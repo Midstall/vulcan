@@ -52,7 +52,13 @@ pub const Module = struct {
     /// The function table as function indices (from element segments). A function
     /// using `call_indirect` takes a hidden "table base" pointer to a buffer the
     /// runtime fills with the JITed address of each of these functions.
-    table: []u32,
+    ///
+    /// A `null` entry is a slot that no element segment names, which is the null
+    /// funcref. Slot 0 is usually one: a linker keeps it empty so that a null function
+    /// pointer stays distinct from a real one, and starts its element segment at
+    /// offset 1. `null` must stay distinct from function index 0, because index 0 is
+    /// a real function in a module with no imports.
+    table: []?u32,
     /// Imported function names ("module.field"), in import index order. A function
     /// that calls an import takes a hidden "imports base" pointer to a buffer the
     /// runtime fills with the host address of each import.
@@ -133,7 +139,7 @@ pub fn module(allocator: std.mem.Allocator, bytes: []const u8) Error!Module {
     var data_segs: std.ArrayList(RawData) = .empty;
     defer data_segs.deinit(allocator);
     var has_table = false;
-    var table_idx: std.ArrayList(u32) = .empty;
+    var table_idx: std.ArrayList(?u32) = .empty;
     defer table_idx.deinit(allocator);
     var import_names: std.ArrayList([]u8) = .empty;
     // deinit registered before the errdefer so on error the items are freed first, then the
@@ -246,7 +252,9 @@ pub fn module(allocator: std.mem.Allocator, bytes: []const u8) Error!Module {
                         const jj = std.math.cast(u32, j) orelse return error.InvalidWasm;
                         const slot = std.math.add(u32, offset, jj) catch return error.InvalidWasm;
                         if (slot >= max_table_entries) return error.InvalidWasm;
-                        while (table_idx.items.len <= slot) try table_idx.append(allocator, 0);
+                        // Slots the segment steps over stay `null` (the null funcref).
+                        // A segment that starts above 0 leaves the slots below it empty.
+                        while (table_idx.items.len <= slot) try table_idx.append(allocator, null);
                         table_idx.items[slot] = fi;
                     }
                 }
@@ -303,7 +311,7 @@ pub fn module(allocator: std.mem.Allocator, bytes: []const u8) Error!Module {
         .n_imports = n_imports,
         .has_imports = n_imports > 0,
     };
-    const table = try allocator.dupe(u32, table_idx.items);
+    const table = try allocator.dupe(?u32, table_idx.items);
     errdefer allocator.free(table);
     const imports = try import_names.toOwnedSlice(allocator);
     errdefer {

@@ -16,6 +16,7 @@ pub const jumpthread = @import("vulcan-opt/jumpthread.zig");
 pub const constfold = @import("vulcan-opt/constfold.zig");
 pub const simplify = @import("vulcan-opt/simplify.zig");
 pub const strength = @import("vulcan-opt/strength.zig");
+pub const immform = @import("vulcan-opt/immform.zig");
 pub const branchfold = @import("vulcan-opt/branchfold.zig");
 pub const gvn = @import("vulcan-opt/gvn.zig");
 pub const licm = @import("vulcan-opt/licm.zig");
@@ -37,6 +38,7 @@ pub const default_pipeline = [_]pass.Pass{
     simplify.pass_def,
     knownbits.pass_def,
     strength.pass_def,
+    immform.pass_def,
     branchfold.pass_def,
     jumpthread.pass_def,
     gvn.pass_def,

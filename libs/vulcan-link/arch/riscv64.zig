@@ -8,9 +8,9 @@
 
 const std = @import("std");
 const elf = @import("../elf.zig");
+const place = @import("../place.zig");
 
 const Error = elf.Error;
-const SecKind = elf.SecKind;
 const RelocType = elf.RelocType;
 const Reloc = elf.Reloc;
 const ObjSymbol = elf.ObjSymbol;
@@ -19,12 +19,9 @@ const ResolvedSymbol = elf.ResolvedSymbol;
 const Image = elf.Image;
 const Resolver = elf.Resolver;
 const Segment = elf.Segment;
-const SecPlace = elf.SecPlace;
 const Placement = elf.Placement;
 const alignUp = elf.alignUp;
 const findSymbol = elf.findSymbol;
-const secIndex = elf.secIndex;
-const places_per_object = elf.places_per_object;
 const not_placed = elf.not_placed;
 
 /// `EF_RISCV_FLOAT_ABI_DOUBLE`: the `e_flags` bit marking the `lp64d` (hard-double) float
@@ -215,15 +212,15 @@ fn externIndex(externs: []const Extern, name: []const u8) ?usize {
 /// map, and the resolved symbol table (including the stub symbols). No relocations are
 /// applied here (that is `applyRelocs`, which pairs the two-pass hi/lo). The caller owns
 /// the returned placement; it does not own `parsed`.
-pub fn computeDefaultPlacement(allocator: std.mem.Allocator, parsed: []ParsedObject, base: u64, resolver: ?Resolver, compress_text: bool) Error!Placement {
+pub fn computeDefaultPlacement(allocator: std.mem.Allocator, parsed: []ParsedObject, base: u64, resolver: ?Resolver, compress_text: bool, live: ?[]const bool) Error!Placement {
     const nobj = parsed.len;
 
-    // Compress each object's `.text` before layout. Pin every reloc site (call/PC-relative) so the
-    // linker's later patches land on intact 32-bit instructions, and remap this object's reloc
-    // offsets and `.text` symbol values through the shrunk-layout offset map. The compressed
-    // bytes are copied into the segment below; the `owned_texts` buffers are freed once the
-    // copy is done (`parsed[oi].text` then dangles but is never read again - `applyRelocs`
-    // patches the segment bytes, not `parsed`).
+    // Compress each object's code before layout. Pin every reloc site (call/PC-relative) so the
+    // linker's later patches land on intact 32-bit instructions, and remap the executable
+    // section's reloc offsets and its symbol values through the shrunk-layout offset map. The
+    // compressed bytes are copied into the segment below; the `owned_texts` buffers are freed
+    // once the copy is done (`sec.bytes` then dangles but is never read again - `applyRelocs`
+    // patches the segment bytes, not `parsed`). Today an object has one executable section.
     var owned_texts = try allocator.alloc(?[]u8, nobj);
     for (owned_texts) |*t| t.* = null;
     defer {
@@ -233,180 +230,137 @@ pub fn computeDefaultPlacement(allocator: std.mem.Allocator, parsed: []ParsedObj
     if (compress_text) {
         for (0..nobj) |oi| {
             const p = &parsed[oi];
-            const nwords = p.text.len / 4;
+            // The object's executable section (its code): the only section carrying compressible
+            // instructions and call/PC-relative relocs.
+            var exec_sec: ?*elf.ObjSection = null;
+            for (p.sections) |*sec| {
+                if (!sec.is_nobits and (sec.flags & elf.SHF_EXECINSTR) != 0) {
+                    exec_sec = sec;
+                    break;
+                }
+            }
+            const sec = exec_sec orelse continue;
+            const nwords = sec.bytes.len / 4;
             if (nwords == 0) continue;
             const words = try allocator.alloc(u32, nwords);
             defer allocator.free(words);
-            for (0..nwords) |k| words[k] = std.mem.readInt(u32, p.text[k * 4 ..][0..4], .little);
-            const pins = try allocator.alloc(usize, p.relocs.len);
+            for (0..nwords) |k| words[k] = std.mem.readInt(u32, sec.bytes[k * 4 ..][0..4], .little);
+            const pins = try allocator.alloc(usize, sec.relocs.len);
             defer allocator.free(pins);
-            for (p.relocs, 0..) |r, ri| pins[ri] = @intCast(r.offset / 4);
+            for (sec.relocs, 0..) |r, ri| pins[ri] = @intCast(r.offset / 4);
             const offmap = try allocator.alloc(usize, nwords + 1);
             defer allocator.free(offmap);
             const cbytes = try compressPinned(allocator, words, pins, offmap);
-            for (p.relocs) |*r| r.offset = offmap[@intCast(r.offset / 4)];
+            // Remap the exec section's reloc offsets through the shrunk-layout map so the later
+            // patches land on the compressed instructions.
+            for (sec.relocs) |*r| r.offset = offmap[@intCast(r.offset / 4)];
             for (p.symbols) |*s| {
-                if (s.section == .text and s.defined) s.value = offmap[@intCast(s.value / 4)];
+                // Remap a defined symbol that lives in an executable section (its `value`
+                // is a code byte offset), keyed by the defining section's `SHF_EXECINSTR` flag.
+                if (!s.defined or s.section_index >= p.sections.len) continue;
+                if ((p.sections[s.section_index].flags & elf.SHF_EXECINSTR) != 0) s.value = offmap[@intCast(s.value / 4)];
             }
             owned_texts[oi] = cbytes;
-            p.text = cbytes;
+            // Keep the exec section pointing at the compressed bytes so the shared placer packs
+            // the compressed length, not the original one.
+            sec.bytes = cbytes;
+            sec.size = cbytes.len;
         }
     }
 
-    // Pack each object's sections within its region, recording per-object offsets.
-    var text_at = try allocator.alloc(u64, nobj);
-    defer allocator.free(text_at);
-    var rodata_at = try allocator.alloc(u64, nobj);
-    defer allocator.free(rodata_at);
-    var data_at = try allocator.alloc(u64, nobj);
-    defer allocator.free(data_at);
-    var bss_at = try allocator.alloc(u64, nobj);
-    defer allocator.free(bss_at);
-    var text_total: u64 = 0;
-    var rodata_total: u64 = 0;
-    var data_total: u64 = 0;
-    var bss_total: u64 = 0;
-    for (0..nobj) |oi| {
-        text_at[oi] = alignUp(text_total, 4);
-        text_total = text_at[oi] + parsed[oi].text.len;
-        rodata_at[oi] = alignUp(rodata_total, 8);
-        rodata_total = rodata_at[oi] + parsed[oi].rodata.len;
-        data_at[oi] = alignUp(data_total, 8);
-        data_total = data_at[oi] + parsed[oi].data.len;
-        bss_at[oi] = alignUp(bss_total, 8);
-        bss_total = bss_at[oi] + parsed[oi].bss_size;
-    }
-
-    const rodata_region = alignUp(text_total, 8);
-    const data_region = alignUp(rodata_region + rodata_total, 8);
-    var data_end: u64 = text_total;
-    if (rodata_total > 0) data_end = rodata_region + rodata_total;
-    if (data_total > 0) data_end = data_region + data_total;
-
-    const regionOffset = struct {
-        fn f(section: SecKind, oi: usize, ro: u64, da: u64, bs: u64, t_at: []const u64, ro_at: []const u64, da_at: []const u64, bs_at: []const u64) u64 {
-            return switch (section) {
-                .text => t_at[oi],
-                .rodata => ro + ro_at[oi],
-                .data => da + da_at[oi],
-                .bss => bs + bs_at[oi],
-                .undef => unreachable,
-            };
-        }
-    }.f;
-
-    // Resolve each defined, non-local symbol to its final address.
-    var symbols: std.ArrayList(ResolvedSymbol) = .empty;
-    errdefer {
-        for (symbols.items) |s| allocator.free(s.name);
-        symbols.deinit(allocator);
-    }
-    for (0..nobj) |oi| {
-        for (parsed[oi].symbols) |sym| {
-            // A symbol can be "defined" (st_shndx != UNDEF) yet resolve to no
-            // allocatable section: an ABS symbol (SHN_ABS = 0xfff1) or one naming a
-            // reserved/non-allocatable section. Such symbols appear in real objects
-            // and have no region offset, so skip them rather than hitting the
-            // `.undef => unreachable` in regionOffset.
-            if (!sym.defined or sym.local or sym.name.len == 0 or sym.section == .undef) continue;
-            if (findSymbol(symbols.items, sym.name) != null) return error.DuplicateSymbol;
-            const region = regionOffset(sym.section, oi, rodata_region, data_region, alignUp(data_end, 8), text_at, rodata_at, data_at, bss_at);
-            const name = try allocator.dupe(u8, sym.name);
-            errdefer allocator.free(name);
-            try symbols.append(allocator, .{ .name = name, .address = base + region + sym.value, .section = sym.section });
-        }
-    }
-
-    // Collect the external call targets the resolver can bind: undefined symbols
-    // referenced by a `jal`/`call` relocation. Each needs a stub + GOT slot.
-    var externs: std.ArrayList(Extern) = .empty;
-    defer externs.deinit(allocator);
-    if (resolver) |res| {
-        for (0..nobj) |oi| {
-            for (parsed[oi].relocs) |r| {
-                if (r.type != .jal and r.type != .call) continue;
-                if (r.symbol >= parsed[oi].symbols.len) return error.MalformedObject;
-                const name = parsed[oi].symbols[r.symbol].name;
-                if (findSymbol(symbols.items, name) != null) continue; // defined or already a stub
-                if (externIndex(externs.items, name) != null) continue;
-                const addr = res.resolve(name) orelse continue; // unresolved: surfaced later as UndefinedSymbol
-                try externs.append(allocator, .{ .name = name, .addr = addr });
-            }
-        }
-    }
-
-    // Lay out the stub/GOT region after the data, then `.bss` after that.
-    const ext_n = externs.items.len;
-    const stub_region = alignUp(data_end, 4);
-    const got_region = alignUp(stub_region + ext_n * stub_bytes, 8);
-    const filesz = if (ext_n > 0) got_region + ext_n * 8 else data_end;
-    const bss_region = alignUp(filesz, 8);
-    const memsz = if (bss_total > 0) bss_region + bss_total else filesz;
-
-    // The loadable file image: text, rodata, data laid into place (bss is zero, beyond
-    // the file image entirely - it lives only in memsz).
-    var code = try allocator.alloc(u8, @intCast(filesz));
-    errdefer allocator.free(code);
-    @memset(code, 0);
-    for (0..nobj) |oi| {
-        if (parsed[oi].text.len > 0) @memcpy(code[@intCast(text_at[oi])..][0..parsed[oi].text.len], parsed[oi].text);
-        if (parsed[oi].rodata.len > 0) @memcpy(code[@intCast(rodata_region + rodata_at[oi])..][0..parsed[oi].rodata.len], parsed[oi].rodata);
-        if (parsed[oi].data.len > 0) @memcpy(code[@intCast(data_region + data_at[oi])..][0..parsed[oi].data.len], parsed[oi].data);
-    }
-
-    // Synthesize each stub and its GOT slot directly into the segment bytes, and register
-    // the stub as the symbol's address so calls route to it (resolved in `applyRelocs`).
-    for (externs.items, 0..) |ext, i| {
-        const stub_off = stub_region + i * stub_bytes;
-        const got_off = got_region + i * 8;
-        std.mem.writeInt(u64, code[@intCast(got_off)..][0..8], ext.addr, .little);
-        // `auipc t0, %pcrel_hi(got)`, then `ld t0, %pcrel_lo(got)(t0)`, then `jr t0`
-        const pcrel: i64 = @as(i64, @intCast(got_off)) - @as(i64, @intCast(stub_off));
-        const hi: u20 = @truncate(@as(u64, @bitCast(pcrel +% 0x800)) >> 12);
-        const lo: i12 = @bitCast(@as(u12, @truncate(@as(u64, @bitCast(pcrel)))));
-        std.mem.writeInt(u32, code[@intCast(stub_off)..][0..4], auipc(.x5, hi), .little);
-        std.mem.writeInt(u32, code[@intCast(stub_off + 4)..][0..4], ld(.x5, .x5, lo), .little);
-        std.mem.writeInt(u32, code[@intCast(stub_off + 8)..][0..4], jalr(.x0, .x5, 0), .little);
-        const name = try allocator.dupe(u8, ext.name);
-        errdefer allocator.free(name);
-        try symbols.append(allocator, .{ .name = name, .address = base + stub_off });
-    }
-
-    // One segment: the whole image at `base` (R|W|X), the bss tail living only in memsz.
-    var segments = try allocator.alloc(Segment, 1);
-    errdefer allocator.free(segments);
-    segments[0] = .{ .vaddr = base, .paddr = base, .bytes = code, .memsz = memsz, .flags = 7 };
-
-    // Record where each (object, section) landed: one segment (index 0), the region
-    // offset being both the in-segment offset and (added to `base`) the runtime address.
-    // A section with no bytes is not placed. `applyRelocs` reads only the `.text` place.
-    var places = try allocator.alloc(SecPlace, nobj * places_per_object);
-    errdefer allocator.free(places);
-    for (0..nobj) |oi| {
-        const present = [places_per_object]bool{
-            parsed[oi].text.len > 0,
-            parsed[oi].rodata.len > 0,
-            parsed[oi].data.len > 0,
-            parsed[oi].bss_size > 0,
-        };
-        inline for (.{ SecKind.text, SecKind.rodata, SecKind.data, SecKind.bss }) |kind| {
-            const idx = oi * places_per_object + secIndex(kind);
-            if (present[secIndex(kind)]) {
-                const off = regionOffset(kind, oi, rodata_region, data_region, bss_region, text_at, rodata_at, data_at, bss_at);
-                places[idx] = .{ .vaddr = base + off, .seg = 0, .seg_off = off };
-            } else {
-                places[idx] = .{ .vaddr = 0, .seg = not_placed, .seg_off = 0 };
-            }
-        }
-    }
-
-    return .{
-        .segments = segments,
-        .places = places,
-        .symbols = try symbols.toOwnedSlice(allocator),
-        .entry = 0,
+    // riscv64 packs `.text` to 4 bytes and, unlike the other three backends, has an
+    // extern-stub/GOT region between the data and `.bss`. That region is the shared
+    // placer's `StubHook`: `reserve` collects the externs and sizes the region, `emit`
+    // writes the stubs plus GOT slots and appends each stub's symbol.
+    var stub_state: StubState = .{};
+    defer stub_state.externs.deinit(allocator);
+    const hook: place.StubHook = .{
+        .context = &stub_state,
+        .reserve = StubState.reserve,
+        .emit = StubState.emit,
     };
+    return place.computeDefaultPlacement(allocator, parsed, base, .{ .text_align = 4 }, hook, resolver, live);
 }
+
+/// The riscv64 extern-stub/GOT `StubHook` state. `reserve` collects the externs the
+/// resolver can bind (undefined symbols a `jal`/`call` references) and records the stub
+/// and GOT region starts; `emit` writes the stubs and GOT slots into the code image and
+/// appends each stub's symbol. The stub region starts at `alignUp(data_end, 4)` and the
+/// GOT at `alignUp(stub_end, 8)`, matching the old inline placer exactly.
+const StubState = struct {
+    externs: std.ArrayList(Extern) = .empty,
+    stub_region: u64 = 0,
+    got_region: u64 = 0,
+
+    fn reserve(
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+        objs: []const ParsedObject,
+        symbols: []const ResolvedSymbol,
+        data_end: u64,
+        resolver: ?Resolver,
+        live: ?[]const bool,
+        section_place_base: []const usize,
+    ) Error!u64 {
+        const self: *StubState = @ptrCast(@alignCast(context));
+        // Collect the external call targets the resolver can bind: undefined symbols
+        // referenced by a `jal`/`call` relocation, scanning each object's EXECUTABLE
+        // (`SHF_EXECINSTR`) sections and their per-section relocs. Each needs a stub + GOT slot.
+        // A GC-dead section is skipped, so a call only a dead section makes seeds no stub.
+        if (resolver) |res| {
+            for (objs, 0..) |p, oi| {
+                for (p.sections, 0..) |sec, si| {
+                    if ((sec.flags & elf.SHF_EXECINSTR) == 0) continue;
+                    if (live) |lv| {
+                        if (!lv[section_place_base[oi] + si]) continue;
+                    }
+                    for (sec.relocs) |r| {
+                        if (r.type != .jal and r.type != .call) continue;
+                        if (r.symbol >= p.symbols.len) return error.MalformedObject;
+                        const name = p.symbols[r.symbol].name;
+                        if (findSymbol(symbols, name) != null) continue; // defined or already a stub
+                        if (externIndex(self.externs.items, name) != null) continue;
+                        const addr = res.resolve(name) orelse continue; // unresolved: surfaced later as UndefinedSymbol
+                        try self.externs.append(allocator, .{ .name = name, .addr = addr });
+                    }
+                }
+            }
+        }
+        // Lay out the stub/GOT region after the data. `.bss` follows the returned size.
+        const ext_n = self.externs.items.len;
+        self.stub_region = alignUp(data_end, 4);
+        self.got_region = alignUp(self.stub_region + ext_n * stub_bytes, 8);
+        return if (ext_n > 0) self.got_region + ext_n * 8 else data_end;
+    }
+
+    fn emit(
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+        code: []u8,
+        symbols: *std.ArrayList(ResolvedSymbol),
+        base: u64,
+    ) Error!void {
+        const self: *StubState = @ptrCast(@alignCast(context));
+        // Synthesize each stub and its GOT slot directly into the segment bytes, and
+        // register the stub as the symbol's address so calls route to it (resolved in
+        // `applyRelocs`).
+        for (self.externs.items, 0..) |ext, i| {
+            const stub_off = self.stub_region + i * stub_bytes;
+            const got_off = self.got_region + i * 8;
+            std.mem.writeInt(u64, code[@intCast(got_off)..][0..8], ext.addr, .little);
+            // `auipc t0, %pcrel_hi(got)`, then `ld t0, %pcrel_lo(got)(t0)`, then `jr t0`
+            const pcrel: i64 = @as(i64, @intCast(got_off)) - @as(i64, @intCast(stub_off));
+            const hi: u20 = @truncate(@as(u64, @bitCast(pcrel +% 0x800)) >> 12);
+            const lo: i12 = @bitCast(@as(u12, @truncate(@as(u64, @bitCast(pcrel)))));
+            std.mem.writeInt(u32, code[@intCast(stub_off)..][0..4], auipc(.x5, hi), .little);
+            std.mem.writeInt(u32, code[@intCast(stub_off + 4)..][0..4], ld(.x5, .x5, lo), .little);
+            std.mem.writeInt(u32, code[@intCast(stub_off + 8)..][0..4], jalr(.x0, .x5, 0), .little);
+            const name = try allocator.dupe(u8, ext.name);
+            errdefer allocator.free(name);
+            try symbols.append(allocator, .{ .name = name, .address = base + stub_off });
+        }
+    }
+};
 
 /// Apply every relocation into `placement`'s segment bytes, sourcing each site's address
 /// and each target from the placement. RISC-V's relocations are all PC-relative, and the
@@ -419,45 +373,77 @@ pub fn computeDefaultPlacement(allocator: std.mem.Allocator, parsed: []ParsedObj
 /// redundant `SecPlace.vaddr` field is never read - see the aarch64 backend for the
 /// heap-layout miscompile that pins this). It does not own `parsed`.
 pub fn applyRelocs(allocator: std.mem.Allocator, placement: *Placement, parsed: []ParsedObject) Error!void {
-    const nobj = parsed.len;
-
-    // Pass 2a: resolve calls and PCREL_HI20 (sites live in `.text`). Record each
-    // hi20 site's resolved target so the paired lo12 recomputes the same delta.
+    // Pass 2a: resolve calls and PCREL_HI20, walking each object's EXECUTABLE
+    // (`SHF_EXECINSTR`) sections and their per-section relocs. Record each hi20 site's
+    // resolved target so the paired lo12 recomputes the same delta. The pairing key is the
+    // auipc's segment-relative image offset (`sp.seg_off + r.offset`), which pass 2b
+    // rederives from the SAME section place (a hi/lo pair lives in one section). Non-exec
+    // (data-pointer) relocs are handled only by `collectDataFixups`, never here.
     var hi_target: std.AutoHashMapUnmanaged(u64, i64) = .empty;
     defer hi_target.deinit(allocator);
-    for (0..nobj) |oi| {
-        const tp = placement.places[oi * places_per_object + secIndex(.text)];
-        for (parsed[oi].relocs) |r| {
-            if (r.type == .pcrel_lo12_i) continue;
-            if (r.symbol >= parsed[oi].symbols.len) return error.MalformedObject;
-            if (tp.seg == not_placed or tp.seg >= placement.segments.len) return error.MalformedObject;
-            const seg = &placement.segments[tp.seg];
-            const target_name = parsed[oi].symbols[r.symbol].name;
-            const target_addr = findSymbol(placement.symbols, target_name) orelse return error.UndefinedSymbol;
-            // Site is a segment-relative image offset; the target delta is taken against
-            // the segment's own `vaddr` (so `delta = target_off - site = target_addr -
-            // (seg.vaddr + site)`, the PC-relative displacement). Never read `tp.vaddr`.
-            const site = std.math.add(u64, tp.seg_off, r.offset) catch return error.MalformedObject;
-            const target_off: i64 = (@as(i64, @intCast(target_addr)) - @as(i64, @intCast(seg.vaddr))) + r.addend;
-            try applyReloc(seg.bytes, site, target_off, r.type);
-            if (r.type == .pcrel_hi20) try hi_target.put(allocator, site, target_off);
+    for (parsed, 0..) |*obj, oi| {
+        for (obj.sections, 0..) |*isec, si| {
+            if ((isec.flags & elf.SHF_EXECINSTR) == 0) continue;
+            if (isec.relocs.len == 0) continue;
+            const sp = placement.sectionPlace(oi, si);
+            // A GC-dropped (not-placed) section takes no bytes in the image, so its own relocs
+            // are dropped with it. A real dropped section always has a nonzero size (it held
+            // actual code), so a ZERO-size section that still carries relocs cannot be a GC
+            // drop: it is a malformed object, and stays fail-closed. With GC off no
+            // reloc-bearing section is ever not-placed, so this is byte-identical to the plain
+            // error path.
+            if (sp.seg == not_placed) {
+                if (isec.size == 0) return error.MalformedObject;
+                continue;
+            }
+            if (sp.seg >= placement.segments.len) return error.MalformedObject;
+            const seg = &placement.segments[sp.seg];
+            for (isec.relocs) |r| {
+                if (r.type == .pcrel_lo12_i) continue;
+                if (r.symbol >= obj.symbols.len) return error.MalformedObject;
+                const target_name = obj.symbols[r.symbol].name;
+                const target_addr = findSymbol(placement.symbols, target_name) orelse return error.UndefinedSymbol;
+                // Site is a segment-relative image offset; the target delta is taken against
+                // the segment's own `vaddr` (so `delta = target_off - site = target_addr -
+                // (seg.vaddr + site)`, the PC-relative displacement).
+                const site = std.math.add(u64, sp.seg_off, r.offset) catch return error.MalformedObject;
+                const target_off: i64 = (@as(i64, @intCast(target_addr)) - @as(i64, @intCast(seg.vaddr))) + r.addend;
+                try applyReloc(seg.bytes, site, target_off, r.type);
+                if (r.type == .pcrel_hi20) try hi_target.put(allocator, site, target_off);
+            }
         }
     }
 
     // Pass 2b: resolve PCREL_LO12 against its paired `auipc` (keyed by the auipc's
-    // segment-relative image offset, matching the hi20 site recorded above).
-    for (0..nobj) |oi| {
-        const tp = placement.places[oi * places_per_object + secIndex(.text)];
-        for (parsed[oi].relocs) |r| {
-            if (r.type != .pcrel_lo12_i) continue;
-            if (r.symbol >= parsed[oi].symbols.len) return error.MalformedObject;
-            if (tp.seg == not_placed or tp.seg >= placement.segments.len) return error.MalformedObject;
-            const seg = &placement.segments[tp.seg];
-            const auipc_site = std.math.add(u64, tp.seg_off, parsed[oi].symbols[r.symbol].value) catch return error.MalformedObject;
-            const target_off = hi_target.get(auipc_site) orelse return error.MalformedObject;
-            const pcrel = target_off - @as(i64, @intCast(auipc_site));
-            const lo12_site = std.math.add(u64, tp.seg_off, r.offset) catch return error.MalformedObject;
-            try patchLo12(seg.bytes, lo12_site, pcrel);
+    // segment-relative image offset, matching the hi20 site recorded above). The lo12 and
+    // its auipc live in the same exec section, so `sp` is the one pass 2a keyed with, and
+    // `sp.seg_off + symbol.value` reproduces that key.
+    for (parsed, 0..) |*obj, oi| {
+        for (obj.sections, 0..) |*isec, si| {
+            if ((isec.flags & elf.SHF_EXECINSTR) == 0) continue;
+            if (isec.relocs.len == 0) continue;
+            const sp = placement.sectionPlace(oi, si);
+            // A GC-dropped (not-placed) section takes no bytes in the image, so its own relocs
+            // are dropped with it. A real dropped section always has a nonzero size (it held
+            // actual code), so a ZERO-size section that still carries relocs cannot be a GC
+            // drop: it is a malformed object, and stays fail-closed. With GC off no
+            // reloc-bearing section is ever not-placed, so this is byte-identical to the plain
+            // error path.
+            if (sp.seg == not_placed) {
+                if (isec.size == 0) return error.MalformedObject;
+                continue;
+            }
+            if (sp.seg >= placement.segments.len) return error.MalformedObject;
+            const seg = &placement.segments[sp.seg];
+            for (isec.relocs) |r| {
+                if (r.type != .pcrel_lo12_i) continue;
+                if (r.symbol >= obj.symbols.len) return error.MalformedObject;
+                const auipc_site = std.math.add(u64, sp.seg_off, obj.symbols[r.symbol].value) catch return error.MalformedObject;
+                const target_off = hi_target.get(auipc_site) orelse return error.MalformedObject;
+                const pcrel = target_off - @as(i64, @intCast(auipc_site));
+                const lo12_site = std.math.add(u64, sp.seg_off, r.offset) catch return error.MalformedObject;
+                try patchLo12(seg.bytes, lo12_site, pcrel);
+            }
         }
     }
 }
@@ -1107,16 +1093,17 @@ test "computeDefaultPlacement yields exactly one segment at base (vaddr==paddr==
     const base: u64 = 0x80000000;
 
     var text = [_]u8{ 0x67, 0x80, 0x00, 0x00 }; // jalr x0, x1, 0 (ret)
-    var syms = [_]ObjSymbol{.{ .name = "f", .value = 0, .defined = true, .local = false, .section = .text }};
-    var relocs = [_]Reloc{};
+    var syms = [_]ObjSymbol{.{ .name = "f", .value = 0, .defined = true, .local = false, .section_index = 0 }};
+    var secs = [_]elf.ObjSection{
+        .{ .name = ".text", .flags = elf.SHF_ALLOC | elf.SHF_EXECINSTR, .bytes = &text, .size = text.len, .is_nobits = false },
+    };
     var parsed = [_]ParsedObject{.{
         .arch = .riscv64,
-        .text = &text,
         .symbols = &syms,
-        .relocs = &relocs,
+        .sections = &secs,
     }};
 
-    var placement = try computeDefaultPlacement(allocator, &parsed, base, null, false);
+    var placement = try computeDefaultPlacement(allocator, &parsed, base, null, false, null);
     defer placement.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 1), placement.segments.len);

@@ -4,12 +4,14 @@
 //! return and call, NEON vectors, and stack memory.
 //!
 //! It uses linear-scan register allocation with spilling. Live intervals (from the
-//! definition to the last use) are scanned in start order from a register pool
-//! (caller-saved x9 to x12 plus unused argument registers for a leaf function,
-//! callee-saved x19 to x28 for a non-leaf function). When the pool runs out,
-//! a result spills to a stack slot. Block parameters are never spilled. This keeps
-//! edge moves simple. A non-leaf function opens a frame that saves lr and its
-//! callee-saved registers. Alloca and spill slots live above them.
+//! definition to the last use) are scanned in start order from a register pool. A
+//! non-leaf function draws from the callee-saved x19 to x28 plus the caller-saved
+//! temporaries x9 to x12. A leaf function draws from the caller-saved x9 to x12 and
+//! its unused argument registers first, then, only under high pressure, from the same
+//! callee-saved x19 to x28. When the pool runs out, a result spills to a stack slot.
+//! Block parameters are never spilled. This keeps edge moves simple. A function opens
+//! a frame when it makes a call (to save lr) or uses any callee-saved register (to
+//! save it). Alloca and spill slots live above them.
 
 const std = @import("std");
 const ir = @import("vulcan-ir");
@@ -287,8 +289,8 @@ const Allocation = struct {
     edge_moves: []EdgeMoveSet = &.{},
     edge_move_driven: bool = false,
     def_pos: []u32 = &.{}, // per value: its definition position (copied from Liveness, and the emission assert reads it)
-    saved_gpr: std.ArrayList(Reg) = .empty, // callee-saved x-registers used (non-leaf)
-    saved_fpr: std.ArrayList(Reg) = .empty, // callee-saved v-registers used (non-leaf)
+    saved_gpr: std.ArrayList(Reg) = .empty, // callee-saved x-registers the allocation used
+    saved_fpr: std.ArrayList(Reg) = .empty, // callee-saved v-registers the allocation used
     spill_count: u32 = 0,
 
     fn deinit(self: *Allocation, allocator: std.mem.Allocator) void {
@@ -803,11 +805,13 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
     }
 
     if (frame > 0) try emitFrameImm(allocator, &code, true, sp, sp, frame);
-    if (!leaf) {
-        try code.append(allocator, encode.strOff(.x30, sp, @intCast(lr_off)));
-        for (alloc.saved_gpr.items, 0..) |r, i| try code.append(allocator, encode.strOff(r, sp, @intCast(gpr_saved_base + 8 * i)));
-        for (alloc.saved_fpr.items, 0..) |r, i| try code.append(allocator, encode.strFp(r, sp, @intCast(fpr_saved_base + 8 * i), true));
-    }
+    // Only a non-leaf saves lr: a leaf makes no call, so lr stays untouched over its body. The
+    // callee-saved register saves, in contrast, run for ANY function that used one. Both loops are
+    // empty for a leaf that reached for no callee-saved register, so an ordinary leaf prologue is
+    // byte-identical.
+    if (!leaf) try code.append(allocator, encode.strOff(.x30, sp, @intCast(lr_off)));
+    for (alloc.saved_gpr.items, 0..) |r, i| try code.append(allocator, encode.strOff(r, sp, @intCast(gpr_saved_base + 8 * i)));
+    for (alloc.saved_fpr.items, 0..) |r, i| try code.append(allocator, encode.strFp(r, sp, @intCast(fpr_saved_base + 8 * i), true));
     // AAPCS64 variadic register save: spill EVERY incoming argument register into its save area
     // BEFORE the argument-homing moves below (which may overwrite x0..x7), and before the body
     // (a leaf may reuse x1..x7 as scratch). Both blocks are filled unconditionally (AAPCS64 has
@@ -938,8 +942,13 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
         }
         const pr = alloc.reg.get(p).?;
         if (l.idx < 8) {
-            if (!leaf) {
-                const incoming: Reg = @enumFromInt(@as(u5, @intCast(l.idx)));
+            // Home the incoming argument register into the parameter's assigned register. A non-leaf
+            // always emits the move (unchanged). A leaf normally keeps a register parameter in its
+            // own ABI register, so `pr` equals `incoming` and no move is needed. But a high-pressure
+            // leaf can now relocate a parameter into a callee-saved register (`pr != incoming`), and
+            // that move MUST be emitted, or the parameter never reaches its register.
+            const incoming: Reg = @enumFromInt(@as(u5, @intCast(l.idx)));
+            if (!leaf or pr != incoming) {
                 try code.append(allocator, if (l.class == .fpr) encode.fmovReg(pr, incoming) else encode.mov(pr, incoming));
             }
         } else if (l.class == .fpr) {
@@ -1033,6 +1042,11 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
             }
             switch (func.opcode(inst)) {
                 .iconst => |c| {
+                    // A small constant used only as a compare's right operand, or as an add/sub's
+                    // folded immediate operand, is emitted inline at that instruction, so skip
+                    // materializing it into a register here.
+                    if (foldsAsCmpImm(func, insts, inst_idx)) continue;
+                    if (foldsAsAddSubImm(func, insts, inst_idx)) continue;
                     const result = func.instResult(inst).?;
                     const rd = ctx.resultReg(result);
                     if (regClass(func, result) == .fpr) {
@@ -1120,6 +1134,16 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     // after the fma/shift consumer folds (an integer add is never an fma consumer,
                     // and a shift_add consumer is rejected by the predicate, so this never doubles).
                     if (isArithBranchProducer(func, insts, inst_idx, caps.fuse_arith_branch and caps.fuse_cmp_branch)) continue;
+                    // Immediate-form add/sub: a small constant operand folds into `add/sub #imm`
+                    // instead of being materialized in a register. The constant's own `iconst` is
+                    // skipped below when it is single-use.
+                    if (addSubImmFold(func, a)) |f| {
+                        const rl = try ctx.loadOp(allocator, &code, f.base, spill_op[0]);
+                        const rd = ctx.resultReg(result);
+                        std.debug.assert(try tryAddSubImm(allocator, &code, a.op, rd, rl, f.imm, isWide(func, result)));
+                        try storeResult(allocator, &code, ctx, result, rd);
+                        continue;
+                    }
                     try ctx.binary(allocator, &code, result, a.op, a.lhs, a.rhs);
                 },
                 .arith_imm => |a| {
@@ -1139,9 +1163,14 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     if (isArithBranchProducer(func, insts, inst_idx, caps.fuse_arith_branch and caps.fuse_cmp_branch)) continue;
                     const result = func.instResult(inst).?;
                     const rl = try ctx.loadOp(allocator, &code, a.lhs, spill_op[0]);
-                    try loadConst(allocator, &code, spill_op[1], a.imm); // imm in x14, x16 stays free for rem
                     const rd = ctx.resultReg(result);
-                    try emitBinary(allocator, &code, a.op, rd, rl, spill_op[1], isSignedInt(func, a.lhs), isWide(func, result));
+                    const wide = isWide(func, result);
+                    // Prefer the add/sub immediate form for a small constant; only fall back to
+                    // materializing the constant in a scratch register and a register op otherwise.
+                    if (!try tryAddSubImm(allocator, &code, a.op, rd, rl, a.imm, wide)) {
+                        try loadConst(allocator, &code, spill_op[1], a.imm); // imm in x14, x16 stays free for rem
+                        try emitBinary(allocator, &code, a.op, rd, rl, spill_op[1], isSignedInt(func, a.lhs), wide);
+                    }
                     try storeResult(allocator, &code, ctx, result, rd);
                 },
                 .icmp => |cmp| {
@@ -1185,12 +1214,18 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                         try storeResult(allocator, &code, ctx, result, rd);
                     } else {
                         const rl = try ctx.loadOp(allocator, &code, cmp.lhs, spill_op[0]);
-                        const rr = try ctx.loadOp(allocator, &code, cmp.rhs, spill_op[1]);
                         const rd = ctx.resultReg(result);
                         // Compare at the operand width: a 32-bit cmp on an i64/ptr operand would
                         // only test the low 32 bits, mismeasuring values whose high bits differ.
                         const wide = isWide(func, cmp.lhs);
-                        try code.append(allocator, if (wide) encode.cmp64(rl, rr) else encode.cmp(rl, rr));
+                        if (cmpFoldImm(func, cmp.rhs)) |imm| {
+                            // A small constant right operand folds into the compare immediate, so it
+                            // is never loaded into a register (its materialization is skipped).
+                            try code.append(allocator, if (wide) encode.subsImm64(.zr, rl, imm) else encode.subsImm(.zr, rl, imm));
+                        } else {
+                            const rr = try ctx.loadOp(allocator, &code, cmp.rhs, spill_op[1]);
+                            try code.append(allocator, if (wide) encode.cmp64(rl, rr) else encode.cmp(rl, rr));
+                        }
                         try code.append(allocator, encode.cset(rd, condFor(cmp.op, isSignedInt(func, cmp.lhs))));
                         try storeResult(allocator, &code, ctx, result, rd);
                     }
@@ -1285,7 +1320,8 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                             // Same register view, dest not half: a plain copy. Covers f32->f32,
                             // f64->f64, and (emulation) f16->f32 (the S reg already holds the exact
                             // half value as its f32 widening, so widening to f32 is the identity).
-                            try code.append(allocator, encode.fmovReg(rd, src));
+                            // A coalesced result (`rd == src`) makes the copy a no-op, so elide it.
+                            if (rd != src) try code.append(allocator, encode.fmovReg(rd, src));
                         } else {
                             // Different views, dest not half: the base single<->double convert,
                             // byte-identical to the pre-f16 behavior for f32<->f64, and also the
@@ -1305,8 +1341,11 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                                 encode.sbfm(rd, src, 0, imms)
                             else
                                 encode.ubfm(rd, src, 0, imms));
-                        } else {
-                            try code.append(allocator, encode.mov(rd, src)); // same width / narrowing
+                        } else if (rd != src) {
+                            // Same width or narrowing: a full-register copy. When the allocator
+                            // coalesced the result onto the source register (`rd == src`), the move
+                            // is a no-op, so it is elided.
+                            try code.append(allocator, encode.mov(rd, src));
                         }
                     }
                     try storeResult(allocator, &code, ctx, result, rd);
@@ -1603,11 +1642,12 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                             for (0..ret_vals.count) |i| try code.append(allocator, if (is_fp[i]) encode.fmovReg(dst[i], staged[i]) else encode.mov(dst[i], staged[i]));
                         },
                     }
-                    if (!leaf) {
-                        for (alloc.saved_gpr.items, 0..) |r, i| try code.append(allocator, encode.ldrOff(r, sp, @intCast(gpr_saved_base + 8 * i)));
-                        for (alloc.saved_fpr.items, 0..) |r, i| try code.append(allocator, encode.ldrFp(r, sp, @intCast(fpr_saved_base + 8 * i), true));
-                        try code.append(allocator, encode.ldrOff(.x30, sp, @intCast(lr_off)));
-                    }
+                    // Mirror of the prologue: restore every used callee-saved register (both loops
+                    // empty for an ordinary leaf, so byte-identical), and reload lr only for a
+                    // non-leaf.
+                    for (alloc.saved_gpr.items, 0..) |r, i| try code.append(allocator, encode.ldrOff(r, sp, @intCast(gpr_saved_base + 8 * i)));
+                    for (alloc.saved_fpr.items, 0..) |r, i| try code.append(allocator, encode.ldrFp(r, sp, @intCast(fpr_saved_base + 8 * i), true));
+                    if (!leaf) try code.append(allocator, encode.ldrOff(.x30, sp, @intCast(lr_off)));
                     if (frame > 0) try emitFrameImm(allocator, &code, false, sp, sp, frame);
                     try code.append(allocator, encode.ret());
                 },
@@ -2033,8 +2073,24 @@ const Ctx = struct {
     /// (branch to ELSE) from this single descriptor.
     const IfBranch = union(enum) {
         cc: encode.Cond,
-        reg: Reg,
+        reg: Reg, // take the THEN edge when the register is NON-zero (`cbnz`)
+        reg_eqz: Reg, // take the THEN edge when the register is ZERO (`cbz`)
     };
+
+    /// Emit a plain integer compare of `cmp`'s operands (`cmp rl, rr`, or `cmp rl, #imm` when the
+    /// right operand folds to an immediate), setting the flags for a following `b.cc`.
+    fn plainCompare(self: Ctx, allocator: std.mem.Allocator, code: *std.ArrayList(u32), cmp: anytype) Error!void {
+        const rl = try self.loadOp(allocator, code, cmp.lhs, spill_op[0]);
+        // Compare at the operand width: a 32-bit cmp on an i64/ptr operand would only test the low 32
+        // bits, mismeasuring values whose high bits differ.
+        const wide = isWide(self.func, cmp.lhs);
+        if (cmpFoldImm(self.func, cmp.rhs)) |imm| {
+            try code.append(allocator, if (wide) encode.subsImm64(.zr, rl, imm) else encode.subsImm(.zr, rl, imm));
+        } else {
+            const rr = try self.loadOp(allocator, code, cmp.rhs, spill_op[1]);
+            try code.append(allocator, if (wide) encode.cmp64(rl, rr) else encode.cmp(rl, rr));
+        }
+    }
 
     fn emitIf(
         self: Ctx,
@@ -2063,17 +2119,33 @@ const Ctx = struct {
             // eq/ne `b.cc` below then branches on that Z flag. The SAME predicate skipped the
             // arith's own materialization, so it is emitted exactly once. Otherwise fall back to
             // the plain compare-and-branch (load the icmp operands, `cmp`).
+            // A narrow eq/ne comparison against constant 0 branches with `cbz`/`cbnz` on the tested
+            // register directly, saving the `cmp #0`. It tests the whole 32-bit register, exactly the
+            // eq/ne-vs-0 relation, so it is equal in effect to `cmp #0; b.cc`. A 64-bit operand is left
+            // to the plain path, since the `cbz`/`cbnz` encoders here are the 32-bit form.
+            const eqz_op: ?Value = if (cmp.op == .eq or cmp.op == .ne) blk: {
+                if (isConstZero(self.func, cmp.rhs)) break :blk cmp.lhs;
+                if (isConstZero(self.func, cmp.lhs)) break :blk cmp.rhs;
+                break :blk null;
+            } else null;
             if (fusesArithIntoBranch(self.func, insts, if_idx, self.fuse_arith_branch and self.fuse_cmp_branch)) {
+                // Arith-branch fold: when the arith at if_idx-2 is a single-use add/sub/and whose
+                // result the icmp compares eq/ne against 0, emit its flag-setting S-form (which sets
+                // Z = (result == 0)) instead of loading the icmp operands and doing a `cmp #0`. The
+                // eq/ne `b.cc` below then branches on that Z flag. The SAME predicate skipped the
+                // arith's own materialization, so it is emitted exactly once.
                 try self.emitArithBranch(allocator, code, insts, if_idx);
+                branch = .{ .cc = cond };
+            } else if (eqz_op) |v| if (!isWide(self.func, v)) {
+                const r = try self.loadOp(allocator, code, v, spill_op[0]);
+                branch = if (cmp.op == .ne) .{ .reg = r } else .{ .reg_eqz = r };
             } else {
-                const rl = try self.loadOp(allocator, code, cmp.lhs, spill_op[0]);
-                const rr = try self.loadOp(allocator, code, cmp.rhs, spill_op[1]);
-                // Compare at the operand width: a 32-bit cmp on an i64/ptr operand would only
-                // test the low 32 bits, mismeasuring values whose high bits differ.
-                const wide = isWide(self.func, cmp.lhs);
-                try code.append(allocator, if (wide) encode.cmp64(rl, rr) else encode.cmp(rl, rr));
+                try self.plainCompare(allocator, code, cmp);
+                branch = .{ .cc = cond };
+            } else {
+                try self.plainCompare(allocator, code, cmp);
+                branch = .{ .cc = cond };
             }
-            branch = .{ .cc = cond };
         } else {
             const cond = try self.loadOp(allocator, code, cf.cond, spill_op[0]);
             branch = .{ .reg = cond };
@@ -2096,6 +2168,7 @@ const Ctx = struct {
             try code.append(allocator, switch (branch) {
                 .cc => |cond| encode.bcc(cond, 0),
                 .reg => |reg| encode.cbnz(reg, 0),
+                .reg_eqz => |reg| encode.cbz(reg, 0),
             });
             try self.emitMoves(allocator, code, cf.@"else"); // ELSE-moves on the else path
             try fixups.append(allocator, .{ .at = code.items.len, .target = @intFromEnum(else_target) });
@@ -2105,6 +2178,7 @@ const Ctx = struct {
             code.items[bcc_at] = switch (branch) {
                 .cc => |cond| encode.bcc(cond, disp),
                 .reg => |reg| encode.cbnz(reg, disp),
+                .reg_eqz => |reg| encode.cbz(reg, disp),
             };
             try self.emitMoves(allocator, code, cf.then); // THEN-moves, then fall through to THEN
             return;
@@ -2119,6 +2193,7 @@ const Ctx = struct {
             try code.append(allocator, switch (branch) {
                 .cc => |cond| encode.bcc(encode.invertCond(cond), 0),
                 .reg => |reg| encode.cbz(reg, 0),
+                .reg_eqz => |reg| encode.cbnz(reg, 0),
             });
             try self.emitMoves(allocator, code, cf.then); // THEN-moves on the then (not-taken) path
             try fixups.append(allocator, .{ .at = code.items.len, .target = @intFromEnum(then_target) });
@@ -2128,6 +2203,7 @@ const Ctx = struct {
             code.items[bcc_at] = switch (branch) {
                 .cc => |cond| encode.bcc(encode.invertCond(cond), disp),
                 .reg => |reg| encode.cbz(reg, disp),
+                .reg_eqz => |reg| encode.cbnz(reg, disp),
             };
             try self.emitMoves(allocator, code, cf.@"else"); // ELSE-moves, then fall through to ELSE
             return;
@@ -2138,6 +2214,7 @@ const Ctx = struct {
         try code.append(allocator, switch (branch) {
             .cc => |cond| encode.bcc(cond, 0),
             .reg => |reg| encode.cbnz(reg, 0),
+            .reg_eqz => |reg| encode.cbz(reg, 0),
         });
         try self.emitMoves(allocator, code, cf.@"else");
         try fixups.append(allocator, .{ .at = code.items.len, .target = @intFromEnum(else_target) });
@@ -2147,6 +2224,7 @@ const Ctx = struct {
         code.items[bcc_at] = switch (branch) {
             .cc => |cond| encode.bcc(cond, disp),
             .reg => |reg| encode.cbnz(reg, disp),
+            .reg_eqz => |reg| encode.cbz(reg, disp),
         };
         try self.emitMoves(allocator, code, cf.then);
         try fixups.append(allocator, .{ .at = code.items.len, .target = @intFromEnum(then_target) });
@@ -2653,6 +2731,49 @@ fn aarch64UseKind(ctx: *const anyopaque, func: *const Function, inst: ir.functio
     return .must_have_register;
 }
 
+/// `RegDescription.copySource` for aarch64: report the source value when `v`'s defining instruction
+/// is a PURE register copy of it, one the backend lowers to a bare `mov`/`fmov` that changes no bits.
+/// The shared allocator uses this to place a copy destination on its source's register, which turns
+/// the copy into a no-op the emission then elides. Only the EXACT plain-copy cases are safe:
+///   - int -> int convert that is same width or narrowing. Its `mov` copies the whole 64-bit
+///     register, so the destination keeps the source bits. A WIDENING int convert emits `sbfm`/
+///     `ubfm`, which sign or zero extends, so it changes bits and is NOT a copy.
+///   - float -> float convert between the SAME register view (f32 -> f32 or f64 -> f64) with neither
+///     side an f16. Those emit a bare `fmov`. A convert that touches f16, or changes the single/
+///     double view, emits `fcvt` (a real conversion). The f16 cases stay out under BOTH the native
+///     and the emulated f16 mode, so this needs no `fp16` flag.
+/// Every other case (a cross-class int <-> float convert, or any non-convert) returns null. The
+/// unused `ctx` is the generic hook shape.
+fn aarch64CopySource(ctx: *const anyopaque, func: *const Function, v: Value) ?Value {
+    _ = ctx;
+    const inst = func.definingInst(v) orelse return null;
+    const cv = switch (func.opcode(inst)) {
+        .convert => |c| c,
+        else => return null,
+    };
+    const sc = regClass(func, cv.value);
+    const dc = regClass(func, v);
+    if (sc == .gpr and dc == .gpr) {
+        // Same width or narrowing lowers to a full-register `mov`. Only widening (a wider result
+        // from a source under 64 bits) transforms bits, so exclude it, matching the emission.
+        const src_bits = intBitsOf(func, cv.value);
+        const dst_bits = intBitsOf(func, v);
+        if (dst_bits > src_bits and src_bits < 64) return null;
+        return cv.value;
+    }
+    if (sc == .fpr and dc == .fpr) {
+        // Only a same-view SCALAR float copy (f32 -> f32 or f64 -> f64, no f16) is a bare `fmov`. Any
+        // f16, or a single/double view change, is a real `fcvt` that changes bits. A 128-bit SIMD
+        // vector also reports `.fpr`, and `fmov` would copy only its low 64 bits, so a vector operand
+        // is never a whole-value copy here.
+        if (isVector(func, cv.value) or isVector(func, v)) return null;
+        if (isHalf(func, cv.value) or isHalf(func, v)) return null;
+        if (isDouble(func, cv.value) != isDouble(func, v)) return null;
+        return cv.value;
+    }
+    return null;
+}
+
 /// Build the per-function aarch64 `RegDescription` the shared Wimmer-Franz allocator consumes. The
 /// physical-register INDEX numbering is the register's own enum integer value: gpr class index n
 /// names x_n (x0..x30), fpr class index n names v_n (v0..v31), the two classes disambiguating the
@@ -2695,6 +2816,14 @@ pub fn aarch64RegDescription(allocator: std.mem.Allocator, func: *const Function
     if (leaf) {
         for (9..13) |r| try gpr_alloc.append(allocator, @intCast(r));
         for (@min(n_gpr, 8)..8) |r| try gpr_alloc.append(allocator, @intCast(r));
+        // ALSO offer the callee-saved registers x19..x28 to a leaf. A high-pressure leaf, for
+        // example a loop that carries more live integer values than the caller-saved pool holds,
+        // needs them (a loop back-edge makes every carried value a must-have-register edge move at
+        // one position, so the class must have a register for each). The register pick breaks a tie
+        // toward the LOWEST register number, so a low-pressure leaf still fills x9..x12 and the
+        // unused argument registers first and never reaches x19..x28. It stays frame-free. Only a
+        // leaf that actually uses one opens a frame and saves it (see the prologue/epilogue below).
+        for (19..29) |r| try gpr_alloc.append(allocator, @intCast(r));
         for (16..24) |r| try fpr_alloc.append(allocator, @intCast(r));
         for (@min(n_fpr, 8)..8) |r| try fpr_alloc.append(allocator, @intCast(r));
     } else {
@@ -2783,13 +2912,28 @@ pub fn aarch64RegDescription(allocator: std.mem.Allocator, func: *const Function
     scratch[0] = @intCast(@intFromEnum(scratch_move));
     scratch[1] = @intCast(@intFromEnum(fp_move));
 
+    // Second per-class scratch for breaking a parallel-move cycle that involves a spill slot (so
+    // spill-slot coalescing commits on high-pressure functions instead of reverting). Reuses regs the
+    // backend ALREADY reserves outside every pool and that carry no live value across an edge move:
+    // `scratch_imm`/x16 for gpr, `fp_spill_res`/v26 for fpr. Distinct from the slot->slot scratch
+    // (x17/v27), so a held cycle never blocks a slot-to-slot memory move. Reusing reserved regs keeps
+    // every allocatable pool unchanged, so no existing codegen shifts.
+    const scratch2 = try allocator.alloc(u16, 2);
+    errdefer allocator.free(scratch2);
+    scratch2[0] = @intCast(@intFromEnum(scratch_imm));
+    scratch2[1] = @intCast(@intFromEnum(fp_spill_res));
+
     return .{
         .classes = classes,
         .classOf = aarch64ClassOf,
         .useKind = aarch64UseKind,
+        .copySource = aarch64CopySource,
+        .coalesce_block_params = true,
+        .coalesce_spill_slots = true,
         .entry_fixed = entry_fixed,
         .call_sites = call_sites,
         .scratch = scratch,
+        .scratch2 = scratch2,
         .ctx = &aarch64_reg_ctx,
     };
 }
@@ -2980,8 +3124,10 @@ fn translateAllocation(allocator: std.mem.Allocator, func: *const Function, wall
     // lowering emits the argument setup as a parallel move (stack stores first, then a register
     // permutation through the reserved scratch, then slot reloads).
 
-    // Callee-saved registers the shared allocation used, so the prologue saves them (empty for a
-    // leaf, whose pools are caller-saved, but populated for completeness).
+    // Callee-saved registers the shared allocation used, so the prologue saves them. This is empty
+    // for a low-pressure leaf (which fills its caller-saved pool first and never reaches the
+    // callee-saved registers) but populated for a high-pressure leaf that did use one, or any
+    // non-leaf.
     for (walloc.used_callee_saved) |us| {
         const reg: Reg = @enumFromInt(@as(u5, @intCast(us.reg)));
         if (us.class == 0) try alloc.saved_gpr.append(allocator, reg) else try alloc.saved_fpr.append(allocator, reg);
@@ -3408,6 +3554,92 @@ fn fusesIntoNextShiftAdd(func: *const Function, insts: []const ir.function.Inst,
 
 /// Total operand uses of `v` across the whole function (instruction operands, if/jump
 /// edge args, and terminators). Used by the fusion eligibility's single-use check.
+/// The u12 compare immediate `v` provides, or null. A `cmp rn, #imm` (the `subs wzr, rn, #imm`
+/// form) accepts an unsigned 12-bit immediate, so an integer constant in `0..4095` folds straight
+/// into the compare and never needs its own register. A negative or wider constant must be
+/// materialized, so it does not fold. A float compare's operand is an `fconst`, not an `iconst`, so
+/// it never matches here.
+/// Whether `v` is the integer constant 0. A compare of a value against 0 can branch with `cbz`/
+/// `cbnz` (test the register directly) instead of `cmp #0; b.cc`.
+fn isConstZero(func: *const Function, v: Value) bool {
+    const def = func.definingInst(v) orelse return false;
+    return func.opcode(def) == .iconst and func.opcode(def).iconst == 0;
+}
+
+/// The integer constant `v` provides if it fits the add/sub immediate (a magnitude the unsigned
+/// 12-bit immediate can hold, negatives handled by flipping add<->sub in `tryAddSubImm`), else null.
+fn addSubImmConst(func: *const Function, v: Value) ?i64 {
+    const def = func.definingInst(v) orelse return null;
+    if (func.opcode(def) != .iconst) return null;
+    const c = func.opcode(def).iconst;
+    if (c < -4095 or c > 4095) return null;
+    return c;
+}
+
+/// For an `add`/`sub` with one constant operand that fits the immediate, the OTHER operand (the
+/// register base) and the constant, else null. For `sub` only a RIGHT constant folds (`x - c`); for
+/// commutative `add` a constant on either side folds.
+fn addSubImmFold(func: *const Function, a: ir.function.Arith) ?struct { base: Value, imm: i64 } {
+    if (a.op != .add and a.op != .sub) return null;
+    if (addSubImmConst(func, a.rhs)) |c| return .{ .base = a.lhs, .imm = c };
+    if (a.op == .add) if (addSubImmConst(func, a.lhs)) |c| return .{ .base = a.rhs, .imm = c };
+    return null;
+}
+
+/// Whether the `iconst` at `insts[inst_idx]` is consumed ONLY as the folded immediate of an add/sub
+/// in the same block, so its register materialization can be skipped. Requires it to fit the add/sub
+/// immediate, to have exactly one use, and that use to be a foldable operand (a `sub` LEFT operand is
+/// `c - x`, which does not fold).
+fn foldsAsAddSubImm(func: *const Function, insts: []const ir.function.Inst, inst_idx: usize) bool {
+    const inst = insts[inst_idx];
+    if (func.opcode(inst) != .iconst) return false;
+    const result = func.instResult(inst) orelse return false;
+    if (addSubImmConst(func, result) == null) return false;
+    if (countUses(func, result) != 1) return false;
+    for (insts) |other| {
+        const oa = switch (func.opcode(other)) {
+            .arith => |x| x,
+            else => continue,
+        };
+        if (oa.op != .add and oa.op != .sub) continue;
+        // The RIGHT operand is always the immediate candidate (`addSubImmFold` checks it first). The
+        // LEFT operand only becomes the immediate for a commutative `add`, and only when the RIGHT
+        // operand is NOT itself a constant (otherwise the right is the immediate and this left is the
+        // base register, which must stay materialized).
+        if (oa.rhs == result) return true;
+        if (oa.lhs == result) return oa.op == .add and addSubImmConst(func, oa.rhs) == null;
+    }
+    return false;
+}
+
+fn cmpFoldImm(func: *const Function, v: Value) ?u12 {
+    const def = func.definingInst(v) orelse return null;
+    if (func.opcode(def) != .iconst) return null;
+    const c = func.opcode(def).iconst;
+    if (c < 0 or c > 4095) return null;
+    return @intCast(c);
+}
+
+/// Whether the `iconst` at `insts[inst_idx]` is consumed ONLY as the folded immediate right-hand
+/// operand of a compare in the same block, so its register materialization can be skipped: the
+/// compare emits it inline through `cmpFoldImm`. Requires the constant to fit the compare immediate
+/// and to have exactly one use, and that use to read it as the compare's `rhs` (a `lhs` constant is
+/// not folded, since the immediate compare form fixes the immediate on the right).
+fn foldsAsCmpImm(func: *const Function, insts: []const ir.function.Inst, inst_idx: usize) bool {
+    const inst = insts[inst_idx];
+    if (func.opcode(inst) != .iconst) return false;
+    const result = func.instResult(inst) orelse return false;
+    if (cmpFoldImm(func, result) == null) return false;
+    if (countUses(func, result) != 1) return false;
+    for (insts) |other| {
+        if (func.opcode(other) != .icmp) continue;
+        const cmp = func.opcode(other).icmp;
+        if (cmp.lhs == result) return false; // read as the left operand: not folded
+        if (cmp.rhs == result) return true;
+    }
+    return false;
+}
+
 fn countUses(func: *const Function, v: Value) usize {
     var count: usize = 0;
     for (0..func.blockCount()) |bi| {
@@ -3883,6 +4115,24 @@ fn condForFloat(op: ir.function.CmpOp) encode.Cond {
 /// through a quotient scratch. `wide` selects the 64-bit (x-register) form for
 /// pointer/address arithmetic. The `sf` bit (31) is uniform across these A64
 /// data-processing encodings, so it composes with the 32-bit base.
+/// Emit an add/sub of a small constant in its IMMEDIATE form (`add rd, rn, #imm`), avoiding the
+/// materialize-then-register-add the general `arith_imm` path uses. Returns whether it emitted: only
+/// an add or sub whose constant fits the unsigned 12-bit immediate (after turning a negative constant
+/// into the opposite op) is handled here; anything else falls back to the materialized register form.
+fn tryAddSubImm(allocator: std.mem.Allocator, code: *std.ArrayList(u32), op: ir.function.BinOp, rd: Reg, rn: Reg, imm: i64, wide: bool) Error!bool {
+    if (op != .add and op != .sub) return false;
+    if (imm < -4095 or imm > 4095) return false;
+    // `add rn, #-k` is `sub rn, #k`, and vice versa, so a negative constant flips the op.
+    const o: ir.function.BinOp = if (imm < 0) (if (op == .add) .sub else .add) else op;
+    const u: u12 = @intCast(if (imm < 0) -imm else imm);
+    try code.append(allocator, switch (o) {
+        .add => if (wide) encode.addImm64(rd, rn, u) else encode.addImm(rd, rn, u),
+        .sub => if (wide) encode.subImm64(rd, rn, u) else encode.subImm(rd, rn, u),
+        else => unreachable,
+    });
+    return true;
+}
+
 fn emitBinary(
     allocator: std.mem.Allocator,
     code: *std.ArrayList(u32),
