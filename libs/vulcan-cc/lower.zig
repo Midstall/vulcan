@@ -796,7 +796,6 @@ fn labelBlock(l: *L, name: []const u8) ?Block {
 /// Whether any statement in `body` is a `.label`. Only the TOP LEVEL of `body` is checked
 /// (not recursive), matching `lowerBlock`'s use: it decides whether dead code right here, in
 /// this same statement list, can still be revived by a later label in it.
-
 /// Lower a statement list in its own scope. Returns whether control was terminated (a
 /// return/break/continue, or an if/switch whose arms all terminated), i.e. The current
 /// block already has a terminator and no fall-through successor exists.

@@ -18,6 +18,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const ir = @import("vulcan-ir");
 const link = @import("vulcan-link");
+const mm = @import("vulcan-opt").microarch;
 
 const Function = ir.function.Function;
 
@@ -307,11 +308,21 @@ pub fn writeObjectData(allocator: std.mem.Allocator, funcs: []const ModuleFuncti
 /// `object.writeModule` gets called) from the neutral `funcs`/`data`, so the caller
 /// builds its inputs once and can target any of the 4 without branching itself.
 pub fn writeObjectDataFor(allocator: std.mem.Allocator, target: link.Arch, funcs: []const ModuleFunction, data: []const ObjData) Error![]u8 {
+    return writeObjectDataForModel(allocator, target, funcs, data, null);
+}
+
+/// Like `writeObjectDataFor`, but selects code for a specific microarch `model` on
+/// the 3 model-capable backends (aarch64, x86_64, riscv64). The caller guarantees
+/// `model.?.arch` matches `target`, so this does not re-check the arch itself. `x86`
+/// (32-bit) has no model support and always takes the generic path. A null `model`
+/// keeps every backend on its generic path, so `writeObjectDataFor` above is exactly
+/// this function called with `null`, so it stays byte-identical to before it existed.
+pub fn writeObjectDataForModel(allocator: std.mem.Allocator, target: link.Arch, funcs: []const ModuleFunction, data: []const ObjData, model: ?*const mm.Model) Error![]u8 {
     return switch (target) {
-        .aarch64 => writeObjectDataWith(@import("aarch64.zig"), allocator, funcs, data),
-        .x86_64 => writeObjectDataWith(@import("x86_64.zig"), allocator, funcs, data),
-        .x86 => writeObjectDataWith(@import("x86.zig"), allocator, funcs, data),
-        .riscv64 => writeObjectDataWith(@import("riscv64.zig"), allocator, funcs, data),
+        .aarch64 => writeObjectDataWithModel(@import("aarch64.zig"), allocator, funcs, data, model),
+        .x86_64 => writeObjectDataWithModel(@import("x86_64.zig"), allocator, funcs, data, model),
+        .riscv64 => writeObjectDataWithModel(@import("riscv64.zig"), allocator, funcs, data, model),
+        .x86 => writeObjectDataWith(@import("x86.zig"), allocator, funcs, data), // 32-bit x86 has no model
     };
 }
 
@@ -378,6 +389,18 @@ fn buildBackendModule(comptime B: type, allocator: std.mem.Allocator, funcs: []c
 fn writeObjectDataWith(comptime B: type, allocator: std.mem.Allocator, funcs: []const ModuleFunction, data: []const ObjData) Error![]u8 {
     var built = try buildBackendModule(B, allocator, funcs, data);
     defer built.deinit(allocator);
+    return B.object.writeModule(allocator, &built.module);
+}
+
+/// Like `writeObjectDataWith`, but for one of the 3 model-capable backends (`B` is
+/// `aarch64.zig`/`x86_64.zig`/`riscv64.zig`): sets the built module's `model` before
+/// serializing, so `B.object.writeModule` selects code tuned for it. A null `model`
+/// leaves the built module's `model` at its default `null`, so this is
+/// byte-identical to `writeObjectDataWith` in that case.
+fn writeObjectDataWithModel(comptime B: type, allocator: std.mem.Allocator, funcs: []const ModuleFunction, data: []const ObjData, model: ?*const mm.Model) Error![]u8 {
+    var built = try buildBackendModule(B, allocator, funcs, data);
+    defer built.deinit(allocator);
+    built.module.model = model;
     return B.object.writeModule(allocator, &built.module);
 }
 
@@ -502,6 +525,83 @@ test "writeObjectDataFor(hostLinkArch, ...) is byte-identical to writeObjectData
     defer allocator.free(new_bytes);
 
     try std.testing.expectEqualSlices(u8, old_bytes, new_bytes);
+}
+
+test "writeObjectDataForModel(model=null) is byte-identical to writeObjectDataFor, on every model-capable arch" {
+    // Regression: `writeObjectDataForModel` is the new, more general entry point that
+    // `writeObjectDataFor` now delegates to with a null model. A null model must keep
+    // every model-capable backend (aarch64, x86_64, riscv64) on its untuned, generic
+    // path. This invariant protects existing `.o` output from this change.
+    const allocator = std.testing.allocator;
+    const i32k = ir.types.TypeKind{ .int = .{ .signedness = .signed, .bits = 32 } };
+
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(i32k);
+    const ptr_t = try func.types.intern(.ptr);
+    const b = try func.appendBlock();
+    const g = try func.appendGlobalAddr(b, ptr_t, "g");
+    const v = try func.appendInst(b, t, .{ .load = .{ .ptr = g } });
+    const r = try func.appendArithImm(b, t, .add, v, 1);
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
+
+    const g_bytes = [_]u8{ 5, 0, 0, 0 };
+    const funcs = &[_]ModuleFunction{.{ .name = "f", .func = &func }};
+    const data = &[_]ObjData{.{ .name = "g", .bytes = &g_bytes, .kind = .rodata, .size = g_bytes.len }};
+
+    const model_capable_arches = [_]link.Arch{ .aarch64, .x86_64, .riscv64 };
+    for (model_capable_arches) |a| {
+        const via_for = try writeObjectDataFor(allocator, a, funcs, data);
+        defer allocator.free(via_for);
+        const via_for_model = try writeObjectDataForModel(allocator, a, funcs, data, null);
+        defer allocator.free(via_for_model);
+        try std.testing.expectEqualSlices(u8, via_for, via_for_model);
+    }
+}
+
+test "writeObjectDataForModel tunes aarch64 output for ampere-altra: loop-header alignment changes the bytes" {
+    // Preferred "model changes output" proof (see the task brief): a fusible
+    // compare-and-branch (`icmp` feeding `if`) alone does NOT differ, because base-ISA
+    // compare-into-branch fusion is already the default (`ModelCaps.fuse_cmp_branch`
+    // defaults to true, see aarch64/isel.zig's `ModelCaps` doc comment). The
+    // ampere-altra model's real point of difference from the default caps is its
+    // `fetch_align = 32` (aarch64/isel.zig, `capsForModel`), which only has an effect
+    // on a genuine LOOP HEADER block. So this kernel places the icmp-feeding-if at a
+    // loop header (a back edge from `body` to `loop`), mirroring
+    // tests/microarch_e2e.zig's `buildSumLoop`: `for (i = 0; i < n; i++) s += i;`.
+    if (mm.modelFor(.@"ampere-altra").arch != .aarch64) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const i64_t_kind = ir.types.TypeKind{ .int = .{ .signedness = .signed, .bits = 64 } };
+
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i64_t = try func.types.intern(i64_t_kind);
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const loop = try func.appendBlock();
+    const body = try func.appendBlock();
+    const done = try func.appendBlock();
+    const n = try func.appendBlockParam(entry, i64_t);
+    const i = try func.appendBlockParam(loop, i64_t);
+    const s = try func.appendBlockParam(loop, i64_t);
+    const bi = try func.appendBlockParam(body, i64_t);
+    const bs = try func.appendBlockParam(body, i64_t);
+    const zero = try func.appendInst(entry, i64_t, .{ .iconst = 0 });
+    try func.setJump(entry, loop, &.{ zero, zero });
+    const cmp = try func.appendInst(loop, bool_t, .{ .icmp = .{ .op = .lt, .lhs = i, .rhs = n } });
+    try func.appendIf(loop, cmp, .{ .target = body, .args = &.{ i, s } }, .{ .target = done });
+    const ns = try func.appendInst(body, i64_t, .{ .arith = .{ .op = .add, .lhs = bs, .rhs = bi } });
+    const ni = try func.appendArithImm(body, i64_t, .add, bi, 1);
+    try func.setJump(body, loop, &.{ ni, ns });
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(s) });
+
+    const funcs = &[_]ModuleFunction{.{ .name = "f", .func = &func }};
+    const untuned = try writeObjectDataForModel(allocator, .aarch64, funcs, &.{}, null);
+    defer allocator.free(untuned);
+    const tuned = try writeObjectDataForModel(allocator, .aarch64, funcs, &.{}, mm.modelFor(.@"ampere-altra"));
+    defer allocator.free(tuned);
+
+    try std.testing.expect(!std.mem.eql(u8, untuned, tuned));
 }
 
 test "native: compiles and runs a function in-process on the host" {

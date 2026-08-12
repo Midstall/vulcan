@@ -17,6 +17,7 @@ const std = @import("std");
 const cc = @import("vulcan-cc");
 const target = @import("vulcan-target");
 const link = @import("vulcan-link");
+const mm = @import("vulcan-opt").microarch;
 const preproc = cc.preproc;
 
 /// One positional input, in command-line order. It is a bare path (a `.c`/`.i` source, or
@@ -128,6 +129,9 @@ const Options = struct {
     /// probe `main` should answer, bypassing the normal compile/link pipeline. `null`
     /// means none was requested, so the ordinary "no input file" check still applies.
     probe: ?Probe = null,
+    /// `-mcpu=<name>` / `-mtune=<name>`: the raw value of the LAST such flag on the command
+    /// line. `null` means neither flag was given. `resolveModel` reads it to pick the model.
+    cpu_tune: ?[]const u8 = null,
 };
 
 /// Which autoconf-style version probe was requested. `main` answers these BEFORE running
@@ -349,6 +353,12 @@ fn parseArgs(allocator: std.mem.Allocator, it: anytype) (error{Usage} || std.mem
             // driver fails closed with a clear message instead of joining the
             // accept-ignore families below.
             return fail("'{s}' changes the ABI/word size and is not supported (use -target instead)", .{arg});
+        } else if (std.mem.startsWith(u8, arg, "-mcpu=")) {
+            opts.cpu_tune = arg["-mcpu=".len..]; // last wins
+        } else if (std.mem.startsWith(u8, arg, "-mtune=")) {
+            opts.cpu_tune = arg["-mtune=".len..];
+        } else if (std.mem.startsWith(u8, arg, "-march=")) {
+            // ISA selection. VCC's ISA is fixed by -target, so accept and ignore.
         } else if (std.mem.eql(u8, arg, "-Xlinker") or std.mem.eql(u8, arg, "-Xassembler")) {
             // `-Xlinker <arg>` / `-Xassembler <arg>`: accepted, along with the one
             // argument each carries, but not yet forwarded anywhere. There is no separate
@@ -733,6 +743,81 @@ fn hostLinkArch() error{UnsupportedHostArch}!link.Arch {
     };
 }
 
+/// The microarch model arch for a target, or null when the target has no model (32-bit x86
+/// ships no microarch part).
+fn modelArchOf(a: link.Arch) ?mm.Arch {
+    return switch (a) {
+        .aarch64 => .aarch64,
+        .x86_64 => .x86_64,
+        .riscv64 => .riscv64,
+        .x86 => null,
+    };
+}
+
+/// The result of the PURE `-mcpu`/`-mtune` decision: a resolved part, an opt-out (no model
+/// selected), or a named part that does not exist for the target architecture.
+const Pick = union(enum) { model: mm.Microarch, none, mismatch };
+
+/// The pure `-mcpu`/`-mtune` decision. No host reads, no I/O, so this is fully unit-testable.
+/// `selector` is `Options.cpu_tune` (null means the implicit native default). `host` is the
+/// arch this compiler runs on. It is reserved for a future rule. The current rules read only
+/// `detected`, the host's DETECTED part. `detected` is `mm.detectHost()`'s result, or null
+/// when the host part is not recognized.
+fn pickModel(selector: ?[]const u8, target_arch: link.Arch, host: link.Arch, detected: ?mm.Microarch) Pick {
+    _ = host;
+
+    const is_native = selector == null or std.mem.eql(u8, selector.?, "native");
+    if (!is_native) {
+        if (std.mem.eql(u8, selector.?, "generic") or std.mem.eql(u8, selector.?, "none")) return .none;
+        const tag = mm.Microarch.parse(selector.?) orelse return .none;
+        return if (mm.modelFor(tag).arch == modelArchOf(target_arch)) .{ .model = tag } else .mismatch;
+    }
+
+    if (detected) |d| {
+        if (mm.modelFor(d).arch == modelArchOf(target_arch)) return .{ .model = d };
+    }
+    return .none;
+}
+
+/// Writes a `vcc: warning: ...` line to stderr. Failures to write are swallowed: a warning
+/// that cannot print is not worth aborting the compile over.
+fn warn(io: std.Io, comptime fmt: []const u8, args: anytype) void {
+    var buf: [256]u8 = undefined;
+    var w = std.Io.File.stderr().writer(io, &buf);
+    w.interface.print("vcc: warning: " ++ fmt ++ "\n", args) catch return;
+    w.interface.flush() catch return;
+}
+
+/// Resolves the effective microarch model for this compile, or null when none applies.
+/// Reads the host's detected part (`mm.detectHost`) and this build's own host arch, then
+/// applies `pickModel`'s pure decision. An opt-out or an unresolved implicit default warns
+/// (or stays silent) and returns null. A named part that does not exist for `arch` is a hard
+/// error, except on a 32-bit x86 target, where it only warns (x86 ships no model at all).
+fn resolveModel(opts: *const Options, arch: link.Arch, io: std.Io) !?*const mm.Model {
+    const detected = mm.detectHost();
+    const host = hostLinkArch() catch arch;
+    switch (pickModel(opts.cpu_tune, arch, host, detected)) {
+        .model => |tag| return mm.modelFor(tag),
+        .none => {
+            if (opts.cpu_tune) |v| {
+                if (std.mem.eql(u8, v, "native")) {
+                    warn(io, "-mcpu=native has no model for target {s}, ignoring", .{@tagName(arch)});
+                } else if (!std.mem.eql(u8, v, "generic") and !std.mem.eql(u8, v, "none") and mm.Microarch.parse(v) == null) {
+                    warn(io, "unknown -mcpu/-mtune value '{s}', ignoring", .{v});
+                }
+            }
+            return null;
+        },
+        .mismatch => {
+            if (arch == .x86) {
+                warn(io, "-mcpu/-mtune has no model for a 32-bit x86 target, ignoring", .{});
+                return null;
+            }
+            return fail("-mcpu={s} is not valid for target {s}", .{ opts.cpu_tune.?, @tagName(arch) });
+        },
+    }
+}
+
 /// The default static-executable image base per architecture - matches `ld.vulcan`'s
 /// `defaultBase` (aarch64/x86_64/riscv64 share the conventional `0x400000`; `x86` uses the
 /// classic i386 `0x08048000`).
@@ -776,39 +861,47 @@ fn buildModuleData(allocator: std.mem.Allocator, objs: []const cc.DataObject) st
 /// `target.native.writeObjectDataFor`. `pp_base` is the driver's shared preprocessor
 /// options (defines, undefines, resolver, timestamp). Only `.filename` is overridden per
 /// file here, so every `.c` input in a multi-input link shares the same
-/// `-I`/`-D`/`-U`/`-freproducible-compile` behavior. Used by both the `-c` path (a single
+/// `-I`/`-D`/`-U`/`-freproducible-compile` behavior. `model`, when set, is the resolved
+/// microarch model for `arch` (see `resolveModel`). It tunes both the IR layer and the
+/// backend for every function this call compiles. Used by both the `-c` path (a single
 /// source) and the link step (one call per `.c`/`.i` input, in command order).
-fn compileToObject(allocator: std.mem.Allocator, io: std.Io, path: []const u8, pp_base: preproc.Options, arch: link.Arch) ![]u8 {
+fn compileToObject(allocator: std.mem.Allocator, io: std.Io, path: []const u8, pp_base: preproc.Options, arch: link.Arch, model: ?*const mm.Model) ![]u8 {
     const source = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(16 * 1024 * 1024));
     var pp_opts = pp_base;
     pp_opts.filename = try filenameForPreproc(allocator, path);
-    return compileSourceToObject(allocator, source, pp_opts, arch);
+    return compileSourceToObject(allocator, source, pp_opts, arch, model);
 }
 
 /// Compiles in-memory `source` (already-read text, `pp_opts` carrying its filename and
 /// predefines) to a relocatable object. Split from `compileToObject` so the driver can
 /// also compile a SYNTHETIC source string it never read from disk (see
-/// `synthDsoHandleObject`).
-fn compileSourceToObject(allocator: std.mem.Allocator, source: []const u8, pp_opts: preproc.Options, arch: link.Arch) ![]u8 {
+/// `synthDsoHandleObject`). `model`, when set, runs `mm.optimize` over each function's IR
+/// before codegen, then hands the same model to `writeObjectDataForModel` so the backend
+/// tunes its own choices (instruction selection, scheduling) for it too.
+fn compileSourceToObject(allocator: std.mem.Allocator, source: []const u8, pp_opts: preproc.Options, arch: link.Arch, model: ?*const mm.Model) ![]u8 {
     var mod = try cc.compileWithOpts(allocator, source, pp_opts);
     defer mod.deinit(allocator);
 
     var mfs: std.ArrayList(target.native.ModuleFunction) = .empty;
-    for (mod.funcs) |*nf| try mfs.append(allocator, .{ .name = nf.name, .func = &nf.func });
+    for (mod.funcs) |*nf| {
+        if (model) |m| _ = try mm.optimize(allocator, &nf.func, m);
+        try mfs.append(allocator, .{ .name = nf.name, .func = &nf.func });
+    }
 
     const data = try buildModuleData(allocator, mod.data);
 
-    return target.native.writeObjectDataFor(allocator, arch, mfs.items, data.items);
+    return target.native.writeObjectDataForModel(allocator, arch, mfs.items, data.items, model);
 }
 
 /// A synthetic object defining `__dso_handle` (a NULL `void *`), the per-DSO handle the
 /// glibc `atexit`/`__cxa_atexit` wrapper (pulled from `libc_nonshared.a`) loads. `crtbegin.o`
 /// normally supplies it. VCC links a minimal crt (`crt1.o` only), so the driver provides it
-/// instead. A whole-program (main-executable) handle is NULL, so the stored value is 0.
+/// instead. A whole-program (main-executable) handle is NULL, so the stored value is 0. This
+/// object holds data only, no functions, so it passes no microarch model through.
 fn synthDsoHandleObject(allocator: std.mem.Allocator, pp_base: preproc.Options, arch: link.Arch) ![]u8 {
     var pp_opts = pp_base;
     pp_opts.filename = "<vcc-dso-handle>";
-    return compileSourceToObject(allocator, "void *__dso_handle = 0;\n", pp_opts, arch);
+    return compileSourceToObject(allocator, "void *__dso_handle = 0;\n", pp_opts, arch, null);
 }
 
 /// The `vcc` driver entry point: parse argv, then dispatch on mode. `-E` preprocesses and
@@ -862,6 +955,13 @@ pub fn main(init: std.process.Init) !void {
     // cross-emitted object always links against a matching-arch executable format.
     const arch: link.Arch = opts.target_arch orelse
         (hostLinkArch() catch return fail("no native linker support for this host architecture (pass -target)", .{}));
+
+    // The microarch model this whole invocation tunes for, or null when none applies (an
+    // explicit opt-out, an unresolved implicit default, or a target with no model at all).
+    // A native build with no `-mcpu`/`-mtune` resolves the detected host part BY DEFAULT,
+    // so `compileToObject` below runs the IR microarch layer and hands the backend a model
+    // even with no flags given. See `resolveModel`.
+    const model = try resolveModel(&opts, arch, io);
 
     // Default system include directory: the host glibc dev tree when `arch` is the host's
     // own arch, else a CROSS glibc dev tree for `arch`'s triple. This lets `#include
@@ -938,7 +1038,7 @@ pub fn main(init: std.process.Init) !void {
     if (opts.compile_only) {
         const input = single_source.?;
         if (classifyExt(input) != .c) return fail("-c requires a .c/.i source file, got '{s}'", .{input});
-        const obj = try compileToObject(allocator, io, input, pp_base, arch);
+        const obj = try compileToObject(allocator, io, input, pp_base, arch, model);
         const out = opts.output orelse try derivedOutputName(allocator, input);
         try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out, .data = obj });
         if (opts.gen_depfile) {
@@ -985,7 +1085,7 @@ pub fn main(init: std.process.Init) !void {
     for (opts.inputs.items) |spec| switch (spec) {
         .path => |p| switch (classifyExt(p)) {
             .c => {
-                const obj = try compileToObject(allocator, io, p, pp_base, arch);
+                const obj = try compileToObject(allocator, io, p, pp_base, arch, model);
                 try dyn_inputs.append(allocator, .{ .object = obj });
                 try display_names.append(allocator, "");
             },
@@ -1343,6 +1443,68 @@ test "parseArgs: -m32/-m64/-mabi= are denylisted and fail closed" {
 
     var it3 = SliceArgs{ .items = &.{ "-mabi=lp64", "foo.c" } };
     try std.testing.expectError(error.Usage, parseArgs(allocator, &it3));
+}
+
+test "parseArgs: -mcpu= and -mtune= capture the value, last wins" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var it = SliceArgs{ .items = &.{ "-mcpu=cascadelake-sp", "-c", "foo.c" } };
+    const o = try parseArgs(allocator, &it);
+    try std.testing.expectEqualStrings("cascadelake-sp", o.cpu_tune.?);
+
+    var it2 = SliceArgs{ .items = &.{ "-mtune=native", "-mcpu=et-soc", "-c", "foo.c" } };
+    const o2 = try parseArgs(allocator, &it2);
+    try std.testing.expectEqualStrings("et-soc", o2.cpu_tune.?); // last wins
+}
+
+test "parseArgs: -march= is accepted and ignored (no model selector)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var it = SliceArgs{ .items = &.{ "-march=armv8-a", "-c", "foo.c" } };
+    const o = try parseArgs(allocator, &it);
+    try std.testing.expect(o.cpu_tune == null);
+}
+
+test "pickModel: named part matching target -> model" {
+    try std.testing.expectEqual(mm.Microarch.@"cascadelake-sp", pickModel("cascadelake-sp", .x86_64, .aarch64, null).model);
+}
+
+test "pickModel: named part not matching target -> mismatch" {
+    try std.testing.expect(pickModel("cascadelake-sp", .riscv64, .riscv64, null) == .mismatch);
+}
+
+test "pickModel: implicit native on recognized matching host -> host model" {
+    try std.testing.expectEqual(mm.Microarch.@"ampere-altra", pickModel(null, .aarch64, .aarch64, .@"ampere-altra").model);
+}
+
+test "pickModel: implicit native, cross target -> none" {
+    try std.testing.expect(pickModel(null, .x86_64, .aarch64, .@"ampere-altra") == .none);
+}
+
+test "pickModel: generic opts out -> none" {
+    try std.testing.expect(pickModel("generic", .aarch64, .aarch64, .@"ampere-altra") == .none);
+}
+
+test "pickModel: unknown value -> none" {
+    try std.testing.expect(pickModel("frobnicate", .aarch64, .aarch64, .@"ampere-altra") == .none);
+}
+
+test "pickModel: named part on i386 target -> mismatch (no x86 model)" {
+    try std.testing.expect(pickModel("cascadelake-sp", .x86, .x86, null) == .mismatch);
+}
+
+test "resolveModel: a named part mismatched with -target fails closed" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var it = SliceArgs{ .items = &.{ "-target", "riscv64", "-mcpu=cascadelake-sp", "foo.c" } };
+    const o = try parseArgs(allocator, &it);
+    try std.testing.expectError(error.Usage, resolveModel(&o, .riscv64, std.testing.io));
 }
 
 test "parseArgs: -S still fails closed, not silently ignored" {

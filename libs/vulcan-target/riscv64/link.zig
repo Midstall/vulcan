@@ -6,6 +6,7 @@ const std = @import("std");
 const ir = @import("vulcan-ir");
 const encode = @import("encode.zig");
 const isel = @import("isel.zig");
+const mm = @import("vulcan-opt").microarch;
 
 const Function = ir.function.Function;
 
@@ -33,6 +34,9 @@ pub const Data = struct { name: []const u8, bytes: []const u8, kind: DataKind, s
 pub const Module = struct {
     entries: std.ArrayList(Entry) = .empty,
     data: std.ArrayList(Data) = .empty,
+    /// When set, `object.writeModule` selects code for this microarch model
+    /// instead of the generic default. Null keeps the generic path.
+    model: ?*const mm.Model = null,
 
     pub fn deinit(self: *Module, allocator: std.mem.Allocator) void {
         self.entries.deinit(allocator);

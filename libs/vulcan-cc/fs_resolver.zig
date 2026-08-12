@@ -183,10 +183,9 @@ test "asResolver serves the built-in stddef.h even with no system_dirs at all" {
     // `size_t x;` line comes last, unexpanded (`size_t` is a plain identifier here, the
     // preprocessor has no notion of typedefs).
     const expected_text = [_][]const u8{
-        "typedef", "long", "unsigned", "int", "size_t", ";",
-        "typedef", "long", "int",      "ptrdiff_t", ";",
-        "typedef", "int",  "wchar_t",  ";",
-        "size_t",  "x",    ";",
+        "typedef", "long",    "unsigned", "int",       "size_t", ";",
+        "typedef", "long",    "int",      "ptrdiff_t", ";",      "typedef",
+        "int",     "wchar_t", ";",        "size_t",    "x",      ";",
     };
     try std.testing.expectEqual(expected_text.len + 1, toks.len); // +1 for the trailing eof
     for (expected_text, toks[0..expected_text.len]) |want, got| try std.testing.expectEqualStrings(want, got.text);
@@ -198,7 +197,8 @@ test "asResolver serves the built-in stddef.h even with no system_dirs at all" {
 test "the built-in stddef.h also defines NULL and offsetof" {
     const allocator = std.testing.allocator;
     var fsr = FsResolver.init(allocator, std.testing.io, &.{});
-    const toks = try preproc.preprocess(allocator,
+    const toks = try preproc.preprocess(
+        allocator,
         "#include <stddef.h>\n" ++
             "#ifdef NULL\nint has_null;\n#else\nint no_null;\n#endif\n" ++
             "#ifdef offsetof\nint has_offsetof;\n#else\nint no_offsetof;\n#endif\n",

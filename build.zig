@@ -132,6 +132,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "vulcan-cc", .module = vulcan_cc },
             .{ .name = "vulcan-target", .module = vulcan_target },
             .{ .name = "vulcan-link", .module = vulcan_link },
+            .{ .name = "vulcan-opt", .module = vulcan_opt },
         },
     });
     const vcc_cli = b.addExecutable(.{ .name = "vcc", .root_module = vcc_module });
