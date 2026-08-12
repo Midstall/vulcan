@@ -1520,17 +1520,23 @@ fn buildManyParamSelfLoop(allocator: std.mem.Allocator, n_params: usize) anyerro
 // `allocate`) hits the shared "too many live params" limit and bails `error.Unsupported` for the
 // same shape today. So Wimmer bailing the same way, not crashing, is a MATCHED shared limit, not
 // a new restriction.
-test "wimmer: an over-demand self-loop with more live params than registers bails on both allocators" {
+test "wimmer: an over-demand self-loop with more live params than registers spills its edge arguments" {
     if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
     const allocator = std.testing.allocator;
 
-    // 24 simultaneously-live i32 params vastly exceeds every register-supply story the leaf pool
-    // can offer (8 arg registers plus 4 scratch registers, and even that generous upper bound
-    // assumes zero contention). So both allocators must reject this function, rather than
-    // mis-schedule it.
+    // 24 simultaneously-live i32 params exceed every register the pool can offer. The 24 values
+    // travel the self-jump as edge arguments, and an edge argument is `should_have_register`: the
+    // parallel-move resolver can load it from or store it to a spill slot, so the allocator spills
+    // the excess instead of demanding a register for every one at the single back-edge position.
+    // So the allocation now SUCCEEDS, where it once bailed `error.Unsupported`.
     var func = try buildManyParamSelfLoop(allocator, 24);
     defer func.deinit();
 
-    try std.testing.expectError(error.Unsupported, isel.selectFunction(allocator, &func));
-    try std.testing.expectError(error.Unsupported, isel.compileFunctionWimmer(allocator, &func));
+    const code1 = try isel.selectFunction(allocator, &func);
+    defer allocator.free(code1);
+    try std.testing.expect(code1.len > 0);
+
+    var compiled = try isel.compileFunctionWimmer(allocator, &func);
+    defer compiled.deinit(allocator);
+    try std.testing.expect(compiled.code.len > 0);
 }

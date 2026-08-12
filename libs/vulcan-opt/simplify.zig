@@ -28,6 +28,26 @@ const BinOp = ir.function.BinOp;
 
 pub const pass_def = pass.Pass{ .name = "simplify", .run = run };
 
+/// For `a != b` where one operand is the constant 0 and the other is an integer widened from a
+/// boolean, the result is that boolean. Returns it as a `.value` simplification, else `.none`.
+fn boolRoundTrip(func: *const Function, lhs: Value, lc: ?i64, rhs: Value, rc: ?i64) Simplified {
+    if (rc == 0) {
+        if (boolBehindConvert(func, lhs)) |b| return .{ .value = b };
+    }
+    if (lc == 0) {
+        if (boolBehindConvert(func, rhs)) |b| return .{ .value = b };
+    }
+    return .none;
+}
+
+/// The boolean `v` is a widening `convert` of, or null if `v` is not a convert of a boolean.
+fn boolBehindConvert(func: *const Function, v: Value) ?Value {
+    const def = func.definingInst(v) orelse return null;
+    if (func.opcode(def) != .convert) return null;
+    const src = func.opcode(def).convert.value;
+    return if (func.types.type_kind(func.valueType(src)) == .bool) src else null;
+}
+
 fn isInt(func: *const Function, v: Value) bool {
     return switch (func.types.type_kind(func.valueType(v))) {
         .int, .bool => true,
@@ -84,62 +104,73 @@ fn simplify(op: BinOp, lhs: Value, rhs: ?Value, lc: ?i64, rc: ?i64, same: bool) 
 pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analyses) pass.Error!bool {
     _ = analyses;
 
-    // Map each value defined by an `iconst` to its constant (to spot 0/1 operands).
+    // Map each value defined by an `iconst` to its constant (to spot 0/1 operands). Iterate LIVE
+    // block instructions, not the whole instruction pool: an instruction a prior pass replaced and
+    // dce dropped is gone from its block but still sits in the pool, and re-processing it below
+    // would re-fire a no-op `replaceAllUses` and report a spurious change forever, so the pipeline
+    // fixpoint would never converge.
     var consts = try allocator.alloc(?i64, func.valueCount());
     defer allocator.free(consts);
     @memset(consts, null);
-    for (0..func.instCount()) |i| {
-        const inst: ir.function.Inst = @enumFromInt(i);
-        if (func.opcode(inst) == .iconst) {
-            if (func.instResult(inst)) |r| consts[@intFromEnum(r)] = func.opcode(inst).iconst;
+    for (0..func.blockCount()) |bi| {
+        for (func.blockInsts(@enumFromInt(bi))) |inst| {
+            if (func.opcode(inst) == .iconst) {
+                if (func.instResult(inst)) |r| consts[@intFromEnum(r)] = func.opcode(inst).iconst;
+            }
         }
     }
 
     var changed = false;
-    for (0..func.instCount()) |i| {
-        const inst: ir.function.Inst = @enumFromInt(i);
-        const result = func.instResult(inst) orelse continue;
-        if (consts[@intFromEnum(result)] != null) continue; // already a constant
+    for (0..func.blockCount()) |bi| {
+        for (func.blockInsts(@enumFromInt(bi))) |inst| {
+            const result = func.instResult(inst) orelse continue;
+            if (consts[@intFromEnum(result)] != null) continue; // already a constant
 
-        // `select` folds for any type since it just picks an existing value. A constant condition
-        // resolves to one arm, and identical arms collapse to that value.
-        if (func.opcode(inst) == .select) {
-            const sel = func.opcode(inst).select;
-            const repl: ?Value = if (sel.then == sel.@"else")
-                sel.then // select(c, x, x) -> x
-            else if (consts[@intFromEnum(sel.cond)]) |cv|
-                (if (cv != 0) sel.then else sel.@"else") // select(const, a, b) -> a / b
-            else
-                null;
-            if (repl) |v| {
-                func.replaceAllUses(result, v);
-                changed = true;
+            // `select` folds for any type since it just picks an existing value. A constant condition
+            // resolves to one arm, and identical arms collapse to that value.
+            if (func.opcode(inst) == .select) {
+                const sel = func.opcode(inst).select;
+                const repl: ?Value = if (sel.then == sel.@"else")
+                    sel.then // select(c, x, x) -> x
+                else if (consts[@intFromEnum(sel.cond)]) |cv|
+                    (if (cv != 0) sel.then else sel.@"else") // select(const, a, b) -> a / b
+                else
+                    null;
+                if (repl) |v| {
+                    func.replaceAllUses(result, v);
+                    changed = true;
+                }
+                continue;
             }
-            continue;
-        }
 
-        if (!isInt(func, result)) continue; // the identities below are integer-only
-        const s: Simplified = switch (func.opcode(inst)) {
-            .arith => |a| simplify(a.op, a.lhs, a.rhs, consts[@intFromEnum(a.lhs)], consts[@intFromEnum(a.rhs)], a.lhs == a.rhs),
-            .arith_imm => |a| simplify(a.op, a.lhs, null, consts[@intFromEnum(a.lhs)], a.imm, false),
-            // A comparison of a value with itself is constant (icmp is integer, so no NaN caveat).
-            .icmp => |c| if (c.lhs == c.rhs) Simplified{ .constant = switch (c.op) {
-                .eq, .le, .ge => @as(i64, 1),
-                .ne, .lt, .gt => @as(i64, 0),
-            } } else .none,
-            else => .none,
-        };
-        switch (s) {
-            .none => {},
-            .value => |v| {
-                func.replaceAllUses(result, v); // the defining instruction is now dead (DCE removes it)
-                changed = true;
-            },
-            .constant => |c| {
-                func.opcodeMut(inst).* = .{ .iconst = c };
-                consts[@intFromEnum(result)] = c;
-                changed = true;
-            },
+            if (!isInt(func, result)) continue; // the identities below are integer-only
+            const s: Simplified = switch (func.opcode(inst)) {
+                .arith => |a| simplify(a.op, a.lhs, a.rhs, consts[@intFromEnum(a.lhs)], consts[@intFromEnum(a.rhs)], a.lhs == a.rhs),
+                .arith_imm => |a| simplify(a.op, a.lhs, null, consts[@intFromEnum(a.lhs)], a.imm, false),
+                // A comparison of a value with itself is constant (icmp is integer, so no NaN caveat).
+                .icmp => |c| if (c.lhs == c.rhs) Simplified{ .constant = switch (c.op) {
+                    .eq, .le, .ge => @as(i64, 1),
+                    .ne, .lt, .gt => @as(i64, 0),
+                } }
+                // `(convert-to-int b) != 0` recovers the boolean `b`: a bool widens to 0 or 1, so it is
+                // non-zero exactly when `b` is true. This kills the round trip the frontend emits for
+                // `if (cond)` (`cond` is already a boolean icmp), so the consumer branch fuses with the
+                // original compare instead of materializing the boolean and testing it against zero.
+                else if (c.op == .ne) boolRoundTrip(func, c.lhs, consts[@intFromEnum(c.lhs)], c.rhs, consts[@intFromEnum(c.rhs)]) else .none,
+                else => .none,
+            };
+            switch (s) {
+                .none => {},
+                .value => |v| {
+                    func.replaceAllUses(result, v); // the defining instruction is now dead (DCE removes it)
+                    changed = true;
+                },
+                .constant => |c| {
+                    func.opcodeMut(inst).* = .{ .iconst = c };
+                    consts[@intFromEnum(result)] = c;
+                    changed = true;
+                },
+            }
         }
     }
     return changed;

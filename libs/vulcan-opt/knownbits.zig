@@ -361,36 +361,41 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
     defer allocator.free(bits);
 
     var changed = false;
-    for (0..func.instCount()) |i| {
-        const inst: Inst = @enumFromInt(i);
-        const result = func.instResult(inst) orelse continue;
-        // Redundant mask: `x & c` is `x` when every bit that `c` clears is already known 0 in x.
-        switch (func.opcode(inst)) {
-            .arith_imm => |a| if (a.op == .bit_and) {
-                if (redundantMask(func, bits, a.lhs, a.imm)) {
-                    func.replaceAllUses(result, a.lhs);
+    // Iterate LIVE block instructions, not the whole instruction pool: an instruction dropped from
+    // its block by dce still sits in the pool, and re-processing it would re-fire a no-op
+    // `replaceAllUses` and report a spurious change every iteration, so the pipeline fixpoint would
+    // never converge.
+    for (0..func.blockCount()) |bi| {
+        for (func.blockInsts(@enumFromInt(bi))) |inst| {
+            const result = func.instResult(inst) orelse continue;
+            // Redundant mask: `x & c` is `x` when every bit that `c` clears is already known 0 in x.
+            switch (func.opcode(inst)) {
+                .arith_imm => |a| if (a.op == .bit_and) {
+                    if (redundantMask(func, bits, a.lhs, a.imm)) {
+                        func.replaceAllUses(result, a.lhs);
+                        changed = true;
+                    }
+                },
+                // A known-bit conflict proves the operands unequal, so eq/ne folds to a constant bool.
+                // Rewriting the icmp in place (its result stays a bool) keeps every use valid and hands
+                // branchfold a constant condition.
+                .icmp => |cmp| if (cmp.op == .eq or cmp.op == .ne) {
+                    const ba = bits[@intFromEnum(cmp.lhs)];
+                    const bb = bits[@intFromEnum(cmp.rhs)];
+                    const conflict = (ba.ones & bb.zeros) | (ba.zeros & bb.ones);
+                    if (conflict != 0) {
+                        func.opcodeMut(inst).* = .{ .iconst = if (cmp.op == .ne) 1 else 0 };
+                        changed = true;
+                    }
+                },
+                // Redundant sign/zero-extension: a widen of a narrow of `s` recovers `s` when `s` already
+                // fits the narrower width (its extended bits are known), so the round-trip is dropped.
+                .convert => if (redundantExtend(func, bits, inst)) |s| {
+                    func.replaceAllUses(result, s);
                     changed = true;
-                }
-            },
-            // A known-bit conflict proves the operands unequal, so eq/ne folds to a constant bool.
-            // Rewriting the icmp in place (its result stays a bool) keeps every use valid and hands
-            // branchfold a constant condition.
-            .icmp => |cmp| if (cmp.op == .eq or cmp.op == .ne) {
-                const ba = bits[@intFromEnum(cmp.lhs)];
-                const bb = bits[@intFromEnum(cmp.rhs)];
-                const conflict = (ba.ones & bb.zeros) | (ba.zeros & bb.ones);
-                if (conflict != 0) {
-                    func.opcodeMut(inst).* = .{ .iconst = if (cmp.op == .ne) 1 else 0 };
-                    changed = true;
-                }
-            },
-            // Redundant sign/zero-extension: a widen of a narrow of `s` recovers `s` when `s` already
-            // fits the narrower width (its extended bits are known), so the round-trip is dropped.
-            .convert => if (redundantExtend(func, bits, inst)) |s| {
-                func.replaceAllUses(result, s);
-                changed = true;
-            },
-            else => {},
+                },
+                else => {},
+            }
         }
     }
     return changed;

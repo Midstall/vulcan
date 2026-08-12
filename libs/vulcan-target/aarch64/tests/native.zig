@@ -3130,7 +3130,7 @@ test "object+ld+exec: aarch64 links through the Placement model, byte-identical,
     // Drive the Placement model directly: parse -> computeDefaultPlacement -> applyRelocs.
     var parsed = [_]ld.elf.ParsedObject{try ld.elf.parseObject(allocator, obj)};
     defer parsed[0].deinit(allocator);
-    var placement = try ld.aarch64.computeDefaultPlacement(allocator, &parsed, base, null, false);
+    var placement = try ld.aarch64.computeDefaultPlacement(allocator, &parsed, base, null, false, null);
     defer placement.deinit(allocator);
 
     // The default placement is exactly one R|W|X segment mapping the whole image at base.
@@ -3171,7 +3171,7 @@ test "object+ld+exec: aarch64 links through the Placement model, byte-identical,
 
     // Wrap the stub+image as a one-segment placement and emit via writeElfSegments.
     var run_segs = [_]ld.Segment{.{ .vaddr = base, .paddr = base, .bytes = program.items, .memsz = program.items.len, .flags = 7 }};
-    var run_pl: ld.Placement = .{ .segments = &run_segs, .places = &.{}, .symbols = &.{}, .entry = base };
+    var run_pl: ld.Placement = .{ .segments = &run_segs, .symbols = &.{}, .entry = base };
     const elf = try ld.writeElfSegments(.aarch64, allocator, &run_pl, base);
     defer allocator.free(elf);
 
@@ -4265,10 +4265,14 @@ fn countAdds(allocator: std.mem.Allocator, func: *const Function) !usize {
     const code = try isel.selectFunction(allocator, func);
     defer allocator.free(code);
     var count: usize = 0;
-    for (code) |w| switch (w & 0xFFE0FC00) {
-        0x8B000000, 0x0B000000 => count += 1,
-        else => {},
-    };
+    for (code) |w| {
+        // Register-form add (`add Xd, Xn, Xm` / `add Wd, Wn, Wm`).
+        const reg_add = (w & 0xFFE0FC00) == 0x8B000000 or (w & 0xFFE0FC00) == 0x0B000000;
+        // Immediate-form add (`add Xd, Xn, #imm` / `add Wd, Wn, #imm`, unshifted), which a small
+        // constant address-add now uses. The sf bit is masked out so both widths match.
+        const imm_add = (w & 0x7F800000) == 0x11000000;
+        if (reg_add or imm_add) count += 1;
+    }
     return count;
 }
 
@@ -4792,12 +4796,11 @@ test "aarch64 arith_branch off (flag false) emits arith+cmp+branch, no S-form fo
     const text = try disasm.format(allocator, compiled.code);
     defer allocator.free(text);
     // The gate declined the arith-branch fold. The decrement materializes with a plain `sub`
-    // (no flag-setting `subs` Rd), and the compare-and-branch fold still fires with a separate
-    // `cmp` before the `b.ne`. So no S-form is used for the branch.
+    // (no flag-setting `subs` Rd). The `!= 0` compare-and-branch then uses `cbnz` on the result
+    // directly (no separate `cmp`), so no S-form is used for the branch.
     try std.testing.expect(std.mem.indexOf(u8, text, "subs") == null);
     try std.testing.expect(std.mem.indexOf(u8, text, "sub w") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "cmp") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "b.ne ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "cbnz") != null);
 
     if (builtin.cpu.arch == .aarch64) {
         var buf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(compiled.code));
@@ -4811,8 +4814,8 @@ test "aarch64 arith_branch off (flag false) emits arith+cmp+branch, no S-form fo
 test "aarch64 arith_branch: arith result used twice is NOT folded (plain add + cmp), correct result" {
     const allocator = std.testing.allocator;
     // `s = a + b` feeds the icmp and is returned on both edges, so it has more than one use. The
-    // single-use gate declines. `s` materializes plainly, and the compare-and-branch keeps a
-    // separate `cmp`. The result is `a + b` regardless of which edge is taken.
+    // single-use gate declines. `s` materializes plainly, and the `== 0` compare-and-branch uses
+    // `cbz` on the result directly. The result is `a + b` regardless of which edge is taken.
     var func = Function.init(allocator);
     defer func.deinit();
     const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
@@ -4836,7 +4839,7 @@ test "aarch64 arith_branch: arith result used twice is NOT folded (plain add + c
     const text = try disasm.format(allocator, code);
     defer allocator.free(text);
     try std.testing.expect(std.mem.indexOf(u8, text, "adds w") == null); // not folded
-    try std.testing.expect(std.mem.indexOf(u8, text, "cmp") != null); // separate compare kept
+    try std.testing.expect(std.mem.indexOf(u8, text, "cbz") != null); // eq-vs-0 branches with cbz, no separate cmp
 
     try expectRun(allocator, &func, &.{ 3, 4 }, 7);
     try expectRun(allocator, &func, &.{ 3, -3 }, 0);
@@ -4891,7 +4894,7 @@ test "aarch64 arith_branch: an instruction between the arith and the icmp blocks
     const text = try disasm.format(allocator, code);
     defer allocator.free(text);
     try std.testing.expect(std.mem.indexOf(u8, text, "adds w") == null); // not folded (non-adjacent)
-    try std.testing.expect(std.mem.indexOf(u8, text, "cmp") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "cbz") != null); // eq-vs-0 branches with cbz, no separate cmp
 
     try expectRun(allocator, &func, &.{ 5, 3 }, 2); // returns a - b
     try expectRun(allocator, &func, &.{ 2, 10 }, -8);

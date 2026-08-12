@@ -733,7 +733,11 @@ fn segmentAt(segs: []const wimmer.Segment, pos: u32) wimmer.Segment {
 /// reduction. This exceeds the ten-register leaf gpr pool, so the scan must split and spill.
 fn buildPressureKernel(func: *Function, t: ir.types.Type) !Value {
     const b = try func.appendBlock();
-    var consts: [12]Value = undefined;
+    // Thirty-two constants are all live at once (each is defined up front, then consumed by the add
+    // chain), so the peak demand exceeds even the widest leaf gpr pool. A leaf with no parameters
+    // draws from x9..x12, the eight unused argument registers x0..x7, and the callee-saved x19..x28,
+    // which is 22 registers, so the count must stay well above that to still force a spill.
+    var consts: [32]Value = undefined;
     for (&consts, 0..) |*c, idx| c.* = try func.appendInst(b, t, .{ .iconst = @intCast(idx) });
     var acc = consts[0];
     for (consts[1..]) |c| acc = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = c } });
@@ -1265,19 +1269,19 @@ test "buildAllocation: a value split mid-successor-block gets an intra-block act
     const t = try func.types.intern(i32k);
 
     // entry(seed): v = seed + seed. jump body. `v` is defined in entry, live-in to body, and used only
-    // at the VERY END of body. Twelve fresh constants in body create register pressure that exceeds the
-    // leaf gpr pool, and `v`'s next use is the furthest, so the blocked-register path evicts `v` MID-body:
-    // its register is stolen at a mid-block position `p` and `v` is stored to a slot there. That store is
-    // an INTRA-block action at `p`, NOT a cross-block edge move (the edge sees `v` in a register on both
-    // sides). Before the predicate fix, `p`'s block differs from the first segment's block, so the store
-    // was misclassified as cross-block and silently dropped: a miscompile.
+    // at the VERY END of body. Thirty-two fresh constants in body create register pressure that exceeds
+    // the leaf gpr pool, and `v`'s next use is the furthest, so the blocked-register path evicts `v`
+    // MID-body: its register is stolen at a mid-block position `p` and `v` is stored to a slot there. That
+    // store is an INTRA-block action at `p`, NOT a cross-block edge move (the edge sees `v` in a register
+    // on both sides). Before the predicate fix, `p`'s block differs from the first segment's block, so the
+    // store was misclassified as cross-block and silently dropped: a miscompile.
     const entry = try func.appendBlock();
     const seed = try func.appendBlockParam(entry, t);
     const v = try func.appendInst(entry, t, .{ .arith = .{ .op = .add, .lhs = seed, .rhs = seed } });
     const body = try func.appendBlock();
     try func.setJump(entry, body, &.{});
 
-    var consts: [12]Value = undefined;
+    var consts: [32]Value = undefined;
     for (&consts, 0..) |*c, idx| c.* = try func.appendInst(body, t, .{ .iconst = @intCast(idx) });
     var acc = consts[0];
     for (consts[1..]) |c| acc = try func.appendInst(body, t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = c } });

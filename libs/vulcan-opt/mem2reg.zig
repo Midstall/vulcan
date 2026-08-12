@@ -28,17 +28,22 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
     @memset(slot_of_value, null);
     var slot_elem: std.ArrayList(ir.types.Type) = .empty;
     defer slot_elem.deinit(allocator);
-    for (0..func.instCount()) |i| {
-        const inst: Inst = @enumFromInt(i);
-        switch (func.opcode(inst)) {
-            .alloca => |al| {
-                const r = func.instResult(inst).?;
-                if (promotable[@intFromEnum(r)]) {
-                    slot_of_value[@intFromEnum(r)] = @intCast(slot_elem.items.len);
-                    try slot_elem.append(allocator, al.elem);
-                }
-            },
-            else => {},
+    // Iterate LIVE block instructions, not the whole instruction pool: a prior mem2reg run
+    // (an earlier fixpoint iteration) leaves its promoted allocas in the pool but removes them
+    // from every block. Seeding from the pool would re-discover such a dead alloca and re-promote
+    // it forever, so the pass would never report "no change" and the fixpoint would not converge.
+    for (0..func.blockCount()) |bi| {
+        for (func.blockInsts(@enumFromInt(bi))) |inst| {
+            switch (func.opcode(inst)) {
+                .alloca => |al| {
+                    const r = func.instResult(inst).?;
+                    if (promotable[@intFromEnum(r)]) {
+                        slot_of_value[@intFromEnum(r)] = @intCast(slot_elem.items.len);
+                        try slot_elem.append(allocator, al.elem);
+                    }
+                },
+                else => {},
+            }
         }
     }
     const num_slots = slot_elem.items.len;
@@ -55,6 +60,7 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
     defer b.deinit();
     try b.buildTables();
     try b.rewrite();
+    try b.collapseTrivialPhis();
     return true;
 }
 
@@ -95,6 +101,18 @@ const Builder = struct {
         return slot * self.cfg.blockCount() + block;
     }
 
+    /// The promotable slot index a value names, or null. `slot_of_value` is sized to the value
+    /// count when the pass started. The SSA construction then SYNTHESIZES new values (block
+    /// parameters), whose indices fall at or beyond that length. Such a value is never a
+    /// promotable alloca, so it names no slot. A promoted POINTER slot produces one of these
+    /// values, and a later load or store THROUGH that pointer reads it here, so this bounds
+    /// check is load-bearing, not defensive.
+    fn slotOf(self: *const Builder, v: Value) ?u32 {
+        const i = @intFromEnum(v);
+        if (i >= self.slot_of_value.len) return null;
+        return self.slot_of_value[i];
+    }
+
     /// Phase 1: record each block's last store per slot. Independent of any traversal order.
     fn buildTables(self: *Builder) pass.Error!void {
         const n = self.num_slots * self.cfg.blockCount();
@@ -114,7 +132,7 @@ const Builder = struct {
         for (0..self.cfg.blockCount()) |bi| {
             for (self.func.blockInsts(@enumFromInt(bi))) |inst| {
                 switch (self.func.opcode(inst)) {
-                    .store => |st| if (self.slot_of_value[@intFromEnum(st.ptr)]) |s| {
+                    .store => |st| if (self.slotOf(st.ptr)) |s| {
                         self.local_end[self.idx(s, bi)] = st.value;
                         self.writes[self.idx(s, bi)] = true;
                     },
@@ -168,13 +186,12 @@ const Builder = struct {
     /// and its now-orphaned argument dropped from every incoming edge, and `v` is returned. Two or
     /// more distinct non-self operands make it a genuine merge, returned unchanged.
     ///
-    /// Only phis found trivial at construction time are collapsed. A loop-carried parameter that is
-    /// only *retroactively* self-trivial (its back-edge argument became a self-reference after an
-    /// inner single-pred phi collapsed onto it) is intentionally kept: it is the identity phi that
-    /// threads a loop-invariant slot around the back edge, still valid SSA. No later pass eliminates
-    /// it (gvn numbers instruction results, not block params, and simplify does not fold identity
-    /// block params either); it is left for the backend register allocator, whose live-range
-    /// coalescing merges the parameter with the self-fed argument at negligible cost.
+    /// This handles a phi trivial at the moment it is built. A phi that becomes trivial only LATER
+    /// (its back-edge argument turned into a self-reference after an inner single-pred phi collapsed
+    /// onto it) is a loop-carried identity parameter threading a loop-invariant slot around the back
+    /// edge. `collapseTrivialPhis` sweeps those away after construction, so the function does not
+    /// carry thousands of identity parameters into the backend (each one is otherwise an edge move
+    /// across every loop iteration).
     fn removeTrivialPhi(self: *Builder, slot: usize, block: usize, phi: Value) pass.Error!Value {
         const blk: Block = @enumFromInt(block);
         const params = self.func.blockParams(blk);
@@ -182,43 +199,88 @@ const Builder = struct {
             if (p == phi) break i;
         } else return phi; // no longer a parameter (already collapsed): nothing to do
 
-        // Gather the operand at position `pidx` on every edge into `block`, tracking the single
-        // distinct value other than `phi` itself. The edge scan mirrors `addEdgeArgs` exactly so the
-        // argument positions line up with the parameter positions.
+        const c = self.classifyPhi(blk, pidx, phi);
+        if (c.distinct_two) return phi; // a genuine merge of >=2 values: keep the block parameter
+
+        const v: Value = c.same orelse try self.undefZero(slot);
+        self.func.replaceAllUses(phi, v);
+        self.repointCaches(phi, v);
+        try self.dropParamAndEdgeArgs(blk, pidx);
+        return v;
+    }
+
+    /// The classification of a block parameter's incoming edge arguments: `same` is the single
+    /// distinct value other than the parameter itself (null when every operand is a self-reference),
+    /// and `distinct_two` is set once two different non-self values appear. Only PREDECESSORS carry
+    /// an edge into `blk`, so scan those, not every block. The predecessor list is built in ascending
+    /// source order with a block that has two edges to `blk` appearing on consecutive entries, so
+    /// skipping a repeat visits each source once (its inner scan then handles both of its edges),
+    /// matching the argument order `addEdgeArgs` wrote.
+    fn classifyPhi(self: *Builder, blk: Block, pidx: usize, phi: Value) struct { same: ?Value, distinct_two: bool } {
         var same: ?Value = null;
         var distinct_two = false;
-        const cls = struct {
-            fn consider(op: Value, self_phi: Value, s: *?Value, two: *bool) void {
+        const consider = struct {
+            fn f(op: Value, self_phi: Value, s: *?Value, two: *bool) void {
                 if (op == self_phi) return; // self-reference: does not count toward triviality
                 if (s.*) |prev| {
                     if (prev != op) two.* = true;
                 } else s.* = op;
             }
-        };
-        for (0..self.cfg.blockCount()) |si| {
+        }.f;
+        var prev_si: i64 = -1;
+        for (self.cfg.predecessors(@intFromEnum(blk))) |si| {
+            if (@as(i64, si) == prev_si) continue;
+            prev_si = si;
             const source: Block = @enumFromInt(si);
             for (self.func.blockInsts(source)) |inst| {
                 switch (self.func.opcode(inst)) {
                     .@"if" => |cf| {
-                        if (cf.then.target == blk) cls.consider(self.func.blockArgs(cf.then)[pidx], phi, &same, &distinct_two);
-                        if (cf.@"else".target == blk) cls.consider(self.func.blockArgs(cf.@"else")[pidx], phi, &same, &distinct_two);
+                        if (cf.then.target == blk) consider(self.func.blockArgs(cf.then)[pidx], phi, &same, &distinct_two);
+                        if (cf.@"else".target == blk) consider(self.func.blockArgs(cf.@"else")[pidx], phi, &same, &distinct_two);
                     },
                     else => {},
                 }
             }
             if (self.func.terminator(source)) |term| switch (term) {
-                .jump => |j| if (j.target == blk) cls.consider(self.func.blockArgs(j)[pidx], phi, &same, &distinct_two),
+                .jump => |j| if (j.target == blk) consider(self.func.blockArgs(j)[pidx], phi, &same, &distinct_two),
                 .ret => {},
             };
         }
+        return .{ .same = same, .distinct_two = distinct_two };
+    }
 
-        if (distinct_two) return phi; // a genuine merge of >=2 values: keep the block parameter
-
-        const v: Value = same orelse try self.undefZero(slot);
-        self.func.replaceAllUses(phi, v);
-        self.repointCaches(phi, v);
-        try self.dropParamAndEdgeArgs(blk, pidx);
-        return v;
+    /// After SSA construction, collapse every block parameter that has become trivial - one whose
+    /// incoming edges carry at most one distinct value other than itself. `readEntry` only removes a
+    /// phi that is trivial at the moment it is built; a phi that becomes trivial LATER (an inner phi
+    /// it merged collapsed onto one value) is left in place, and a large function with many loops
+    /// accumulates thousands of these identity parameters. They bloat every later pass and, since the
+    /// backend threads each one across every edge, the generated code. This runs to a fixpoint:
+    /// collapsing one parameter can make a parameter that referenced it trivial, so it repeats until a
+    /// full sweep collapses nothing. A parameter with no non-self operand (an unreachable self-cycle)
+    /// is left alone. `replaceAllUses` fixes every use, including the edge arguments feeding other
+    /// parameters, so a later sweep sees the exposed triviality.
+    fn collapseTrivialPhis(self: *Builder) pass.Error!void {
+        var changed = true;
+        while (changed) {
+            changed = false;
+            for (0..self.cfg.blockCount()) |bi| {
+                const blk: Block = @enumFromInt(bi);
+                var pi: usize = 0;
+                while (pi < self.func.blockParams(blk).len) {
+                    const param = self.func.blockParams(blk)[pi];
+                    const c = self.classifyPhi(blk, pi, param);
+                    if (c.distinct_two or c.same == null) {
+                        pi += 1; // a real merge, or an unreachable self-cycle: keep it
+                        continue;
+                    }
+                    self.func.replaceAllUses(param, c.same.?);
+                    try self.dropParamAndEdgeArgs(blk, pi);
+                    changed = true;
+                    // The parameter at `pi` is gone and the next one shifted into its place, so do
+                    // not advance `pi`.
+                }
+            }
+        }
     }
 
     /// Repoint every cached reference to `from` (a value just folded into `to`, its defining
@@ -254,7 +316,10 @@ const Builder = struct {
         for (params, 0..) |p, i| if (i != pidx) try np.append(self.allocator, p);
         try self.func.setBlockParams(block, np.items);
 
-        for (0..self.cfg.blockCount()) |si| {
+        var prev_si: i64 = -1;
+        for (self.cfg.predecessors(@intFromEnum(block))) |si| {
+            if (@as(i64, si) == prev_si) continue;
+            prev_si = si;
             const source: Block = @enumFromInt(si);
             for (self.func.blockInsts(source)) |inst| {
                 switch (self.func.opcode(inst)) {
@@ -295,7 +360,10 @@ const Builder = struct {
     /// slot, matching the block parameter just appended. Arity stays consistent because each edge
     /// gains exactly one argument per new parameter.
     fn addEdgeArgs(self: *Builder, slot: usize, block: Block) pass.Error!void {
-        for (0..self.cfg.blockCount()) |si| {
+        var prev_si: i64 = -1;
+        for (self.cfg.predecessors(@intFromEnum(block))) |si| {
+            if (@as(i64, si) == prev_si) continue;
+            prev_si = si;
             const source: Block = @enumFromInt(si);
             for (self.func.blockInsts(source)) |inst| {
                 switch (self.func.opcode(inst)) {
@@ -361,12 +429,12 @@ const Builder = struct {
                 switch (self.func.opcode(inst)) {
                     .alloca => {
                         const r = self.func.instResult(inst).?;
-                        if (self.slot_of_value[@intFromEnum(r)] == null) try kept.append(self.allocator, inst);
+                        if (self.slotOf(r) == null) try kept.append(self.allocator, inst);
                     },
-                    .store => |st| if (self.slot_of_value[@intFromEnum(st.ptr)]) |s| {
+                    .store => |st| if (self.slotOf(st.ptr)) |s| {
                         current[s] = st.value;
                     } else try kept.append(self.allocator, inst),
-                    .load => |ld| if (self.slot_of_value[@intFromEnum(ld.ptr)]) |s| {
+                    .load => |ld| if (self.slotOf(ld.ptr)) |s| {
                         const val = current[s] orelse blk: {
                             const v = try self.readEntry(s, bi);
                             current[s] = v;
@@ -397,14 +465,17 @@ fn findPromotable(allocator: std.mem.Allocator, func: *const Function) pass.Erro
     errdefer allocator.free(promotable);
     @memset(promotable, false);
 
-    // Seed with every scalar-element alloca.
-    for (0..func.instCount()) |i| {
-        const inst: Inst = @enumFromInt(i);
-        switch (func.opcode(inst)) {
-            .alloca => |al| if (isScalar(func, al.elem)) {
-                promotable[@intFromEnum(func.instResult(inst).?)] = true;
-            },
-            else => {},
+    // Seed with every scalar-element alloca. Iterate LIVE block instructions, not the pool: a
+    // promoted alloca left over from an earlier fixpoint iteration still sits in the pool but is
+    // gone from every block, and re-seeding it would make the pass re-promote a dead slot forever.
+    for (0..func.blockCount()) |bi| {
+        for (func.blockInsts(@enumFromInt(bi))) |inst| {
+            switch (func.opcode(inst)) {
+                .alloca => |al| if (isScalar(func, al.elem)) {
+                    promotable[@intFromEnum(func.instResult(inst).?)] = true;
+                },
+                else => {},
+            }
         }
     }
     // Clear any whose address escapes: used anywhere but as a load/store `ptr`.
@@ -745,20 +816,12 @@ test "loop-invariant slot through a single-pred chain re-entering the header is 
 
     try testing.expect(try runOnce(allocator, &func));
 
-    // `nv`'s use in the comparison always resolves correctly to header's own parameter for n
-    // (this leg of the resolution never re-enters a `computing` block), so it is a stable,
-    // bug-independent handle on which header parameter carries the invariant slot.
-    const n_param = func.opcode(func.definingInst(ge).?).icmp.rhs;
-    const header_params = func.blockParams(header);
-    const n_index = for (header_params, 0..) |p, idx2| {
-        if (p == n_param) break idx2;
-    } else return error.InvariantParamNotFound;
-
-    // The crux: the back edge from `cont` must thread that same parameter around unchanged
-    // (the invariant slot never changes), not some other value entirely - and definitely not a
-    // freshly materialized zero constant fabricated by the cycle-guard bug.
-    const back_edge_arg = func.blockArgs(func.terminator(cont).?.jump)[n_index];
-    try testing.expectEqual(n_param, back_edge_arg);
+    // The crux: `nv` (the loaded value of the invariant slot, compared in `iv >= nv`) must resolve
+    // to the function's own `n` parameter, NOT a freshly materialized zero constant that the
+    // cycle-guard bug would fabricate on the back edge. `collapseTrivialPhis` folds the loop-carried
+    // identity parameter that construction threaded n through straight back to n, so the comparison
+    // reads n directly. A `0` here (or any other value) would prove the invariant was corrupted.
+    try testing.expectEqual(n, func.opcode(func.definingInst(ge).?).icmp.rhs);
     try expectVerifies(allocator, &func);
 }
 

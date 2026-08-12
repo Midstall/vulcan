@@ -160,6 +160,10 @@ pub fn build(b: *std.Build) void {
     // The deliverable follows `-Dtarget`'s OS: a no-OS target installs the freestanding
     // proof object. Any hosted/UEFI target installs the Wasm runner, whose `main` is the
     // host CLI or the boot-time app (chosen at comptime). One target in, one output out.
+    //
+    // The Wasm CLI is held here, outside the branch, so the toolchain test at the test step
+    // can drive the freshly built binary. It stays null on a target that does not build it.
+    var wasm_cli_artifact: ?*std.Build.Step.Compile = null;
     if (target.result.os.tag == .freestanding) {
         // An object has no standard install procedure. Install the emitted `.o` directly.
         const install_obj = b.addInstallBinFile(freestanding_proof.getEmittedBin(), "vulcan-freestanding.o");
@@ -180,6 +184,7 @@ pub fn build(b: *std.Build) void {
                 .imports = &.{ .{ .name = "vulcan-wasm", .module = vulcan_wasm }, .{ .name = "uefi", .module = uefi_mod } },
             }) });
             b.installArtifact(wasm_cli);
+            wasm_cli_artifact = wasm_cli;
             const run_cli = b.addRunArtifact(wasm_cli);
             if (b.args) |a| run_cli.addArgs(a);
             const run_step = b.step("run-wasm", "Run the host Wasm CLI: -- <file.wasm> [export] [i32 args]");
@@ -293,6 +298,27 @@ pub fn build(b: *std.Build) void {
         },
     }) });
     test_step.dependOn(&b.addRunArtifact(wasm_exec).step);
+
+    // Wasm tests over modules a REAL toolchain produced: `zig cc` builds them at test time,
+    // and the WASI one runs through the freshly built CLI. Every other Wasm test assembles
+    // its module by hand, which is how a loader fault that refused every linker-produced
+    // module stayed invisible. `zig_exe` is the same `zig` that builds this, so the test does
+    // not depend on the PATH. Wired only where the CLI exists (a native arch, hosted or UEFI).
+    if (wasm_cli_artifact) |cli| {
+        const wasm_toolchain_opts = b.addOptions();
+        wasm_toolchain_opts.addOption([]const u8, "zig_exe", b.graph.zig_exe);
+        wasm_toolchain_opts.addOptionPath("vulcan_wasm_bin", cli.getEmittedBin());
+        const wasm_toolchain = b.addTest(.{ .root_module = b.createModule(.{
+            .root_source_file = b.path("libs/vulcan-wasm/tests/toolchain.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "vulcan-wasm", .module = vulcan_wasm },
+                .{ .name = "build_options", .module = wasm_toolchain_opts.createModule() },
+            },
+        }) });
+        test_step.dependOn(&b.addRunArtifact(wasm_toolchain).step);
+    }
 
     // C backend execution tests: emit C from IR, compile with the host `cc`, run, and
     // cross-check against the native JIT. Skips when `cc` is absent.

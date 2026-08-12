@@ -1132,30 +1132,73 @@ fn lowerStmt(l: *L, stmt: parser.Stmt) Error!bool {
             // Dispatch ladder: from the current block, chain equality tests. Each test block
             // branches to its case body or to the next test. Default (or exit) catches the rest.
             var default_target: Block = exit_b;
-            for (sw.cases, 0..) |c, i| if (c.label == null) {
-                default_target = body_blocks[i];
+            for (sw.cases, 0..) |c, di| if (c.label == null) {
+                default_target = body_blocks[di];
             };
 
+            // A run of source-consecutive cases whose values ascend by exactly 1 and whose
+            // intermediate bodies are all empty (so intra-run C fall-through is a no-op) is
+            // equivalent, for dispatch, to a single value range: matching any value in
+            // `[lo, hi]` and entering the run's FIRST body block reproduces matching that exact
+            // value, because every body up to the matched one is empty and falls through. A run
+            // of `range_cluster_min` or more cases dispatches with one `lo <= v <= hi` range test
+            // (two compares) instead of that many equality tests, which shrinks a dense switch
+            // like the C-locale `c_isalnum` (62 cases) from a 62-long compare ladder to three
+            // range checks, the same shape gcc emits. The compares use the switch value's own
+            // signedness (its promoted type), which is the correct membership test for a signed
+            // or an unsigned controlling expression alike. A shorter run keeps the per-case
+            // equality ladder unchanged, so every switch without such a run stays byte-identical.
+            const range_cluster_min = 4;
             var test_block = l.block;
-            for (sw.cases, 0..) |c, i| {
-                if (c.label) |lab| {
-                    const labv = try l.func.appendInst(test_block, vt, .{ .iconst = lab });
-                    const eq = try l.func.appendInst(test_block, l.boolt, .{ .icmp = .{ .op = .eq, .lhs = v.value, .rhs = labv } });
-                    const next_test = try l.func.appendBlock();
-                    try l.func.appendIf(test_block, eq, .{ .target = body_blocks[i] }, .{ .target = next_test });
-                    test_block = next_test;
+            var i: usize = 0;
+            while (i < sw.cases.len) {
+                if (sw.cases[i].label == null) {
+                    i += 1; // The default arm is not a dispatch test, it is the fall-off target.
+                    continue;
                 }
+                // Grow the run [i .. j]: extend past case `j` only when `j`'s body is empty and
+                // the next case's value is exactly one greater (and is itself a real case label).
+                var j = i;
+                while (j + 1 < sw.cases.len and
+                    sw.cases[j].body.len == 0 and
+                    sw.cases[j].label.? != std.math.maxInt(i64) and // guards the `+ 1` below from overflow
+                    sw.cases[j + 1].label != null and
+                    sw.cases[j + 1].label.? == sw.cases[j].label.? + 1) : (j += 1)
+                {}
+                if (j - i + 1 >= range_cluster_min) {
+                    const lo = sw.cases[i].label.?;
+                    const hi = sw.cases[j].label.?;
+                    const lo_c = try l.func.appendInst(test_block, vt, .{ .iconst = lo });
+                    const ge = try l.func.appendInst(test_block, l.boolt, .{ .icmp = .{ .op = .ge, .lhs = v.value, .rhs = lo_c } });
+                    const hi_block = try l.func.appendBlock();
+                    const next_test = try l.func.appendBlock();
+                    try l.func.appendIf(test_block, ge, .{ .target = hi_block }, .{ .target = next_test });
+                    const hi_c = try l.func.appendInst(hi_block, vt, .{ .iconst = hi });
+                    const le = try l.func.appendInst(hi_block, l.boolt, .{ .icmp = .{ .op = .le, .lhs = v.value, .rhs = hi_c } });
+                    try l.func.appendIf(hi_block, le, .{ .target = body_blocks[i] }, .{ .target = next_test });
+                    test_block = next_test;
+                } else {
+                    var k = i;
+                    while (k <= j) : (k += 1) {
+                        const labv = try l.func.appendInst(test_block, vt, .{ .iconst = sw.cases[k].label.? });
+                        const eq = try l.func.appendInst(test_block, l.boolt, .{ .icmp = .{ .op = .eq, .lhs = v.value, .rhs = labv } });
+                        const next_test = try l.func.appendBlock();
+                        try l.func.appendIf(test_block, eq, .{ .target = body_blocks[k] }, .{ .target = next_test });
+                        test_block = next_test;
+                    }
+                }
+                i = j + 1;
             }
             // The last test block falls through to the default target.
             try l.func.setJump(test_block, default_target, &.{});
 
             // Lower each case body. Fall through to the next body block (C fallthrough).
             try l.loops.append(l.allocator, .{ .brk = exit_b, .cont = exit_b, .is_switch = true });
-            for (sw.cases, 0..) |c, i| {
-                l.block = body_blocks[i];
+            for (sw.cases, 0..) |c, bi| {
+                l.block = body_blocks[bi];
                 const term = try lowerBlock(l, c.body);
                 if (!term) {
-                    const fallthrough = if (i + 1 < sw.cases.len) body_blocks[i + 1] else exit_b;
+                    const fallthrough = if (bi + 1 < sw.cases.len) body_blocks[bi + 1] else exit_b;
                     try l.func.setJump(l.block, fallthrough, &.{});
                 }
             }

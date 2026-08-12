@@ -10,6 +10,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const object = @import("../object.zig");
+const object_emit = @import("../../object_emit.zig");
 const encode = @import("../encode.zig");
 const link = @import("../link.zig");
 const ld = @import("vulcan-link");
@@ -935,6 +936,106 @@ test "linkDynamic dynexe imports a DATA global from a .so via GOT/GLOB_DAT and t
         .environ_map = &env,
     }, 42) catch |e| switch (e) {
         error.FileNotFound => return error.SkipZigTest, // sh/loader absent
+        else => return e,
+    };
+}
+
+/// Build one aarch64 relocatable object with THREE per-function `.text.<fn>` sections, the
+/// `-ffunction-sections` shape the GC mark pass walks:
+///   `.text._start` calls `used`, then exits with the returned value.
+///   `.text.used`   returns 42 (the reachable callee).
+///   `.text.unused` returns 7 (a leaf that NOTHING calls, so `--gc-sections` drops it).
+/// `_start`/`used`/`unused` are global defined functions, one per section. The `bl used` at
+/// `.text._start` offset 0 carries an `R_AARCH64_CALL26` against `used` (symbol index 1).
+fn buildGcProgramObj(allocator: std.mem.Allocator) ![]u8 {
+    // `.text._start`: bl used ; movz x8, #93 ; svc #0  (exit with used's result)
+    const start_words = [_]u32{ encode.bl(0), encode.movz(.x8, 93, 0), encode.svc(0) };
+    var start_text: [start_words.len * 4]u8 = undefined;
+    for (start_words, 0..) |wd, i| std.mem.writeInt(u32, start_text[i * 4 ..][0..4], wd, .little);
+    // `.text.used`: movz w0, #42 ; ret
+    const used_words = [_]u32{ encode.movz(.x0, 42, 0), encode.ret() };
+    var used_text: [used_words.len * 4]u8 = undefined;
+    for (used_words, 0..) |wd, i| std.mem.writeInt(u32, used_text[i * 4 ..][0..4], wd, .little);
+    // `.text.unused`: bl used ; movz w0, #7 ; ret. This is a NON-leaf dead section: it carries
+    // its OWN CALL26 reloc, so the sweep must drop that reloc along with the section (and never
+    // apply it against the not-placed section). The `movz w0, #7` is still the drop marker.
+    const unused_words = [_]u32{ encode.bl(0), encode.movz(.x0, 7, 0), encode.ret() };
+    var unused_text: [unused_words.len * 4]u8 = undefined;
+    for (unused_words, 0..) |wd, i| std.mem.writeInt(u32, unused_text[i * 4 ..][0..4], wd, .little);
+
+    const alloc_exec: u64 = 0x2 | 0x4; // SHF_ALLOC | SHF_EXECINSTR
+    const R_AARCH64_CALL26: u32 = 283;
+    const start_relocs = [_]object_emit.OutReloc{
+        .{ .offset = 0, .symbol = 1, .r_type = R_AARCH64_CALL26, .addend = 0 }, // _start bl -> used
+    };
+    const unused_relocs = [_]object_emit.OutReloc{
+        .{ .offset = 0, .symbol = 1, .r_type = R_AARCH64_CALL26, .addend = 0 }, // unused bl -> used
+    };
+    const sections = [_]object_emit.OutSection{
+        .{ .name = ".text._start", .sh_type = 1, .flags = alloc_exec, .bytes = &start_text, .size = start_text.len, .addralign = 4, .relocs = &start_relocs },
+        .{ .name = ".text.used", .sh_type = 1, .flags = alloc_exec, .bytes = &used_text, .size = used_text.len, .addralign = 4 },
+        .{ .name = ".text.unused", .sh_type = 1, .flags = alloc_exec, .bytes = &unused_text, .size = unused_text.len, .addralign = 4, .relocs = &unused_relocs },
+    };
+    const symbols = [_]object_emit.OutSymbol{
+        .{ .name = "_start", .section = 0, .value = 0, .size = 0, .binding = .global, .sym_type = .func, .defined = true },
+        .{ .name = "used", .section = 1, .value = 0, .size = 0, .binding = .global, .sym_type = .func, .defined = true },
+        .{ .name = "unused", .section = 2, .value = 0, .size = 0, .binding = .global, .sym_type = .func, .defined = true },
+    };
+    return object_emit.emit(allocator, &sections, &symbols, .{ .class = .elf64, .machine = 183, .use_rela = true });
+}
+
+test "aarch64 linkDynamic with gc_sections drops an uncalled function's .text section, keeps it with gc off, and the program still runs to exit 42" {
+    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    const interp = (try findGlibcInterp(allocator)) orelse return error.SkipZigTest;
+    defer allocator.free(interp);
+
+    const obj = try buildGcProgramObj(allocator);
+    defer allocator.free(obj);
+
+    // The distinctive bytes of `unused` (`movz w0, #7`). They exist ONLY in `.text.unused`,
+    // so their presence tracks whether that section survived.
+    var marker: [4]u8 = undefined;
+    std.mem.writeInt(u32, &marker, encode.movz(.x0, 7, 0), .little);
+
+    // GC OFF: `.text.unused` is kept, so its marker is present in the image.
+    const exe_off = try ld.linkDynamic(allocator, &.{.{ .object = obj }}, .{
+        .mode = .exec,
+        .interp = interp,
+        .entry = "_start",
+        .gc_sections = false,
+    });
+    defer allocator.free(exe_off);
+    try std.testing.expect(std.mem.indexOf(u8, exe_off, &marker) != null);
+
+    // GC ON: nothing calls `unused`, so `.text.unused` is dropped. Its marker is gone and the
+    // image is smaller.
+    const exe_on = try ld.linkDynamic(allocator, &.{.{ .object = obj }}, .{
+        .mode = .exec,
+        .interp = interp,
+        .entry = "_start",
+        .gc_sections = true,
+    });
+    defer allocator.free(exe_on);
+    try std.testing.expect(std.mem.indexOf(u8, exe_on, &marker) == null);
+    // The dropped section's bytes are gone, the definitive proof. The overall file never
+    // grows either (page/region alignment can absorb the freed bytes, so this is `<=`).
+    try std.testing.expect(exe_on.len <= exe_off.len);
+
+    // The gc-on program still runs: `_start` calls `used` (kept) and exits with 42.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "gcexe",
+        .data = exe_on,
+        .flags = .{ .permissions = .executable_file },
+    });
+    run_helper.runExpectExit(allocator, std.testing.io, .{
+        .argv = &.{"./gcexe"},
+        .cwd = .{ .dir = tmp.dir },
+    }, 42) catch |e| switch (e) {
+        error.FileNotFound => return error.SkipZigTest,
         else => return e,
     };
 }

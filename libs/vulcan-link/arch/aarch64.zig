@@ -10,9 +10,9 @@
 
 const std = @import("std");
 const elf = @import("../elf.zig");
+const place = @import("../place.zig");
 
 const Error = elf.Error;
-const SecKind = elf.SecKind;
 const ParsedObject = elf.ParsedObject;
 const ResolvedSymbol = elf.ResolvedSymbol;
 const Image = elf.Image;
@@ -22,8 +22,6 @@ const SecPlace = elf.SecPlace;
 const Placement = elf.Placement;
 const alignUp = elf.alignUp;
 const findSymbol = elf.findSymbol;
-const secIndex = elf.secIndex;
-const places_per_object = elf.places_per_object;
 const not_placed = elf.not_placed;
 
 /// Executable parameters for wrapping an AArch64 image in a static ELF64 (`ET_EXEC`).
@@ -45,122 +43,12 @@ pub const exec_params: elf.ExecParams = .{
 /// `applyRelocs`). AArch64 has no resolver/stub/GOT mechanism, so `resolver` is unused;
 /// `compress_text` is unused too (no RVC-equivalent form). The caller owns the returned
 /// placement; it does not own `parsed`.
-pub fn computeDefaultPlacement(allocator: std.mem.Allocator, parsed: []ParsedObject, base: u64, resolver: ?Resolver, compress_text: bool) Error!Placement {
-    _ = resolver;
+pub fn computeDefaultPlacement(allocator: std.mem.Allocator, parsed: []ParsedObject, base: u64, resolver: ?Resolver, compress_text: bool, live: ?[]const bool) Error!Placement {
     _ = compress_text;
-    const nobj = parsed.len;
-
-    // Pack each object's sections within its region, recording per-object offsets.
-    var text_at = try allocator.alloc(u64, nobj);
-    defer allocator.free(text_at);
-    var rodata_at = try allocator.alloc(u64, nobj);
-    defer allocator.free(rodata_at);
-    var data_at = try allocator.alloc(u64, nobj);
-    defer allocator.free(data_at);
-    var bss_at = try allocator.alloc(u64, nobj);
-    defer allocator.free(bss_at);
-    var text_total: u64 = 0;
-    var rodata_total: u64 = 0;
-    var data_total: u64 = 0;
-    var bss_total: u64 = 0;
-    for (0..nobj) |oi| {
-        text_at[oi] = alignUp(text_total, 4);
-        text_total = text_at[oi] + parsed[oi].text.len;
-        rodata_at[oi] = alignUp(rodata_total, 8);
-        rodata_total = rodata_at[oi] + parsed[oi].rodata.len;
-        data_at[oi] = alignUp(data_total, 8);
-        data_total = data_at[oi] + parsed[oi].data.len;
-        bss_at[oi] = alignUp(bss_total, 8);
-        bss_total = bss_at[oi] + parsed[oi].bss_size;
-    }
-
-    const rodata_region = alignUp(text_total, 8);
-    const data_region = alignUp(rodata_region + rodata_total, 8);
-    var data_end: u64 = text_total;
-    if (rodata_total > 0) data_end = rodata_region + rodata_total;
-    if (data_total > 0) data_end = data_region + data_total;
-    const filesz = data_end;
-    const bss_region = alignUp(filesz, 8);
-    const memsz = if (bss_total > 0) bss_region + bss_total else filesz;
-
-    const regionOffset = struct {
-        fn f(section: SecKind, oi: usize, ro: u64, da: u64, bs: u64, t_at: []const u64, ro_at: []const u64, da_at: []const u64, bs_at: []const u64) u64 {
-            return switch (section) {
-                .text => t_at[oi],
-                .rodata => ro + ro_at[oi],
-                .data => da + da_at[oi],
-                .bss => bs + bs_at[oi],
-                .undef => unreachable,
-            };
-        }
-    }.f;
-
-    // The loadable file image: text, rodata, data laid into place (bss is zero,
-    // beyond the file image entirely - it lives only in memsz).
-    var code = try allocator.alloc(u8, @intCast(filesz));
-    errdefer allocator.free(code);
-    @memset(code, 0);
-    for (0..nobj) |oi| {
-        if (parsed[oi].text.len > 0) @memcpy(code[@intCast(text_at[oi])..][0..parsed[oi].text.len], parsed[oi].text);
-        if (parsed[oi].rodata.len > 0) @memcpy(code[@intCast(rodata_region + rodata_at[oi])..][0..parsed[oi].rodata.len], parsed[oi].rodata);
-        if (parsed[oi].data.len > 0) @memcpy(code[@intCast(data_region + data_at[oi])..][0..parsed[oi].data.len], parsed[oi].data);
-    }
-
-    // One segment: the whole image at `base` (R|W|X), the bss tail living only in memsz.
-    var segments = try allocator.alloc(Segment, 1);
-    errdefer allocator.free(segments);
-    segments[0] = .{ .vaddr = base, .paddr = base, .bytes = code, .memsz = memsz, .flags = 7 };
-
-    // Record where each (object, section) landed: one segment (index 0), the region
-    // offset being both the in-segment offset and (added to `base`) the runtime address.
-    // A section with no bytes is not placed.
-    var places = try allocator.alloc(SecPlace, nobj * places_per_object);
-    errdefer allocator.free(places);
-    for (0..nobj) |oi| {
-        const present = [places_per_object]bool{
-            parsed[oi].text.len > 0,
-            parsed[oi].rodata.len > 0,
-            parsed[oi].data.len > 0,
-            parsed[oi].bss_size > 0,
-        };
-        inline for (.{ SecKind.text, SecKind.rodata, SecKind.data, SecKind.bss }) |kind| {
-            const idx = oi * places_per_object + secIndex(kind);
-            if (present[secIndex(kind)]) {
-                const off = regionOffset(kind, oi, rodata_region, data_region, bss_region, text_at, rodata_at, data_at, bss_at);
-                places[idx] = .{ .vaddr = base + off, .seg = 0, .seg_off = off };
-            } else {
-                places[idx] = .{ .vaddr = 0, .seg = not_placed, .seg_off = 0 };
-            }
-        }
-    }
-
-    // Resolve each defined, non-local symbol to its final address.
-    var symbols: std.ArrayList(ResolvedSymbol) = .empty;
-    errdefer {
-        for (symbols.items) |s| allocator.free(s.name);
-        symbols.deinit(allocator);
-    }
-    for (0..nobj) |oi| {
-        for (parsed[oi].symbols) |sym| {
-            // A symbol can be "defined" (st_shndx != UNDEF) yet resolve to no
-            // allocatable section (e.g. an ABS symbol); such symbols have no
-            // region offset, so skip them rather than hitting the
-            // `.undef => unreachable` in regionOffset.
-            if (!sym.defined or sym.local or sym.name.len == 0 or sym.section == .undef) continue;
-            if (findSymbol(symbols.items, sym.name) != null) return error.DuplicateSymbol;
-            const region = regionOffset(sym.section, oi, rodata_region, data_region, bss_region, text_at, rodata_at, data_at, bss_at);
-            const name = try allocator.dupe(u8, sym.name);
-            errdefer allocator.free(name);
-            try symbols.append(allocator, .{ .name = name, .address = base + region + sym.value, .section = sym.section });
-        }
-    }
-
-    return .{
-        .segments = segments,
-        .places = places,
-        .symbols = try symbols.toOwnedSlice(allocator),
-        .entry = 0,
-    };
+    // AArch64 packs `.text` to 4 bytes and has no stub/GOT region, so it passes no hook.
+    // The shared placer ignores `resolver` without a hook. `live` is the GC mask (null when
+    // GC is off, so the layout is byte-identical).
+    return place.computeDefaultPlacement(allocator, parsed, base, .{ .text_align = 4 }, null, resolver, live);
 }
 
 /// `R_AARCH64_JUMP_SLOT`: the dynamic relocation a `.rela.plt` entry carries so a real
@@ -259,78 +147,103 @@ pub fn patchCall26(code: []u8, site: u64, site_vaddr: u64, target_vaddr: u64) Er
 pub fn applyRelocs(allocator: std.mem.Allocator, placement: *Placement, parsed: []ParsedObject) Error!void {
     _ = allocator;
     for (parsed, 0..) |*obj, oi| {
-        const tp = placement.places[oi * places_per_object + secIndex(.text)];
-        for (obj.relocs) |r| {
-            if (r.symbol >= obj.symbols.len) return error.MalformedObject;
-            if (tp.seg == not_placed or tp.seg >= placement.segments.len) return error.MalformedObject;
-            const seg = &placement.segments[tp.seg];
-            const sym = obj.symbols[r.symbol];
-            // Resolve the reloc target. A GLOBAL symbol comes from the merged symbol table by
-            // name. A LOCAL DEFINED symbol (a real glibc `crt1.o` addresses a `.text`-local
-            // trampoline through a `.text` SECTION symbol, whose name is empty and so is not in
-            // the global table) is resolved through THIS object's own placement of the symbol's
-            // section, plus the symbol's in-section value. The global lookup is tried FIRST, so
-            // every pre-existing (global-name) reloc resolves exactly as before.
-            const target = findSymbol(placement.symbols, sym.name) orelse blk: {
-                if (sym.defined and sym.local and sym.section != .undef) {
-                    const sp = placement.places[oi * places_per_object + secIndex(sym.section)];
-                    if (sp.seg == not_placed or sp.seg >= placement.segments.len) return error.MalformedObject;
-                    break :blk placement.segments[sp.seg].vaddr + sp.seg_off + sym.value;
+        // Patch every relocation the object's EXECUTABLE (`SHF_EXECINSTR`) sections carry.
+        // Each exec section owns its own reloc list (parsed per section) and its own
+        // placement, so a site's image offset comes from that section's place. Non-exec
+        // (data-pointer) relocs are handled only by the dynamic path's `collectDataFixups`,
+        // never here, so an exec reloc is applied once and a data reloc once.
+        for (obj.sections, 0..) |*isec, si| {
+            if ((isec.flags & elf.SHF_EXECINSTR) == 0) continue;
+            if (isec.relocs.len == 0) continue;
+            const sp = placement.sectionPlace(oi, si);
+            // A GC-dropped (not-placed) section takes no bytes in the image, so its own relocs
+            // are dropped with it. A real dropped section always has a nonzero size (it held
+            // actual code), so a ZERO-size section that still carries relocs cannot be a GC
+            // drop: it is a malformed object, and stays fail-closed. With GC off no
+            // reloc-bearing section is ever not-placed, so this is byte-identical to the plain
+            // error path.
+            // A GC-dropped (not-placed) section takes no bytes in the image, so its own relocs
+            // are dropped with it. A real dropped section always has a nonzero size (it held
+            // actual code), so a ZERO-size section that still carries relocs cannot be a GC
+            // drop: it is a malformed object, and stays fail-closed. With GC off no
+            // reloc-bearing section is ever not-placed, so this is byte-identical to the plain
+            // error path.
+            if (sp.seg == not_placed) {
+                if (isec.size == 0) return error.MalformedObject;
+                continue;
+            }
+            if (sp.seg >= placement.segments.len) return error.MalformedObject;
+            const seg = &placement.segments[sp.seg];
+            for (isec.relocs) |r| {
+                if (r.symbol >= obj.symbols.len) return error.MalformedObject;
+                const sym = obj.symbols[r.symbol];
+                // Resolve the reloc target. A GLOBAL symbol comes from the merged symbol
+                // table by name. A LOCAL DEFINED symbol (a real glibc `crt1.o` addresses a
+                // `.text`-local trampoline through a `.text` SECTION symbol, whose name is
+                // empty and so is not in the global table) is resolved through THIS object's
+                // own placement of the symbol's defining section (by section index), plus the
+                // symbol's in-section value. The global lookup is tried FIRST, so every
+                // pre-existing (global-name) reloc resolves exactly as before.
+                const target = findSymbol(placement.symbols, sym.name) orelse blk: {
+                    if (sym.defined and sym.local and sym.section_index != std.math.maxInt(u32)) {
+                        const sp2 = placement.sectionPlace(oi, sym.section_index);
+                        if (sp2.seg == not_placed or sp2.seg >= placement.segments.len) return error.MalformedObject;
+                        break :blk placement.segments[sp2.seg].vaddr + sp2.seg_off + sym.value;
+                    }
+                    return error.UndefinedSymbol;
+                };
+                // Offset of the patched word within this segment's bytes, and its runtime
+                // address. Both derive from the segment actually being patched (`seg`), so
+                // the page-relative ADRP/ADD math sees the same load address the bytes land
+                // at. Sourcing `site_addr` from `seg.vaddr + site` keeps the site address and
+                // the patched buffer in lockstep, matching the pre-placement single image
+                // path's `base + site`.
+                const site = std.math.add(u64, sp.seg_off, r.offset) catch return error.MalformedObject;
+                const site_addr = seg.vaddr + site;
+                switch (r.type) {
+                    .call26, .jump26 => {
+                        // CALL26 and JUMP26 share one encoding field and one PC-relative math.
+                        // `applyCall26` rebuilds the word keeping the B-vs-BL opcode bit it found,
+                        // so a JUMP26 (a `b` tail branch, from a real `crt1.o`'s trampoline to
+                        // `main`) patches correctly the same way a `bl` CALL26 does.
+                        const delta = (@as(i64, @intCast(target)) - @as(i64, @intCast(seg.vaddr))) - @as(i64, @intCast(site)) + r.addend;
+                        try applyCall26(seg.bytes, site, delta);
+                    },
+                    .adr_prel_pg_hi21 => {
+                        const target_addr: u64 = @intCast(@as(i64, @intCast(target)) + r.addend);
+                        try applyAdrpPg(seg.bytes, site, site_addr, target_addr);
+                    },
+                    .add_abs_lo12_nc => {
+                        const target_addr: u64 = @intCast(@as(i64, @intCast(target)) + r.addend);
+                        try applyAddPgoff(seg.bytes, site, target_addr);
+                    },
+                    .adr_got_page => {
+                        // A GOT-indirect page reference (`adrp xN, :got:sym`) to a symbol DEFINED in
+                        // this image needs no GOT slot: the address is fixed at link time. Relax it to
+                        // a direct `adrp xN, sym` page reference - the same instruction, the symbol's
+                        // page in place of the GOT slot's page, exactly like an `adr_prel_pg_hi21`. An
+                        // UNDEFINED symbol's GOT ref never reaches here (it was diverted to a real GOT
+                        // slot in the dynamic-import path), so any GOT reloc left for `applyRelocs` is
+                        // in-image and safe to relax.
+                        const target_addr: u64 = @intCast(@as(i64, @intCast(target)) + r.addend);
+                        try applyAdrpPg(seg.bytes, site, site_addr, target_addr);
+                    },
+                    .ld64_got_lo12_nc => {
+                        // The paired GOT load (`ldr xT, [xN, :got_lo12:sym]`) for an in-image symbol.
+                        // With no GOT slot to load from, REWRITE the `ldr` into `add xT, xN, :lo12:sym`
+                        // so the `adrp`+`add` pair computes the symbol address directly.
+                        const target_addr: u64 = @intCast(@as(i64, @intCast(target)) + r.addend);
+                        try relaxGotLoadToAdd(seg.bytes, site, target_addr);
+                    },
+                    .ldst64_abs_lo12_nc => {
+                        // The low half of a direct `adrp`/`ldr` pair addressing a symbol's storage
+                        // (`ldr xT, [xN, #:lo12:sym]`). The 64-bit access scales its 12-bit immediate
+                        // by 8, so the field holds `lo12(sym) >> 3`.
+                        const target_addr: u64 = @intCast(@as(i64, @intCast(target)) + r.addend);
+                        try applyLdst64Lo12(seg.bytes, site, target_addr);
+                    },
+                    else => return error.UnsupportedReloc,
                 }
-                return error.UndefinedSymbol;
-            };
-            // Offset of the patched word within this segment's bytes, and its runtime
-            // address. Both derive from the segment actually being patched (`seg`), so
-            // the page-relative ADRP/ADD math sees the same load address the bytes land
-            // at. (`tp.vaddr` is a redundant `base + seg_off` restatement of the same
-            // value; sourcing `site_addr` from `seg.vaddr + site` keeps the site address
-            // and the patched buffer in lockstep - matching the pre-placement single
-            // image path's `base + site`.)
-            const site = std.math.add(u64, tp.seg_off, r.offset) catch return error.MalformedObject;
-            const site_addr = seg.vaddr + site;
-            switch (r.type) {
-                .call26, .jump26 => {
-                    // CALL26 and JUMP26 share one encoding field and one PC-relative math.
-                    // `applyCall26` rebuilds the word keeping the B-vs-BL opcode bit it found,
-                    // so a JUMP26 (a `b` tail branch, from a real `crt1.o`'s trampoline to
-                    // `main`) patches correctly the same way a `bl` CALL26 does.
-                    const delta = (@as(i64, @intCast(target)) - @as(i64, @intCast(seg.vaddr))) - @as(i64, @intCast(site)) + r.addend;
-                    try applyCall26(seg.bytes, site, delta);
-                },
-                .adr_prel_pg_hi21 => {
-                    const target_addr: u64 = @intCast(@as(i64, @intCast(target)) + r.addend);
-                    try applyAdrpPg(seg.bytes, site, site_addr, target_addr);
-                },
-                .add_abs_lo12_nc => {
-                    const target_addr: u64 = @intCast(@as(i64, @intCast(target)) + r.addend);
-                    try applyAddPgoff(seg.bytes, site, target_addr);
-                },
-                .adr_got_page => {
-                    // A GOT-indirect page reference (`adrp xN, :got:sym`) to a symbol DEFINED in
-                    // this image needs no GOT slot: the address is fixed at link time. Relax it to
-                    // a direct `adrp xN, sym` page reference - the same instruction, the symbol's
-                    // page in place of the GOT slot's page, exactly like an `adr_prel_pg_hi21`. An
-                    // UNDEFINED symbol's GOT ref never reaches here (it was diverted to a real GOT
-                    // slot in the dynamic-import path), so any GOT reloc left for `applyRelocs` is
-                    // in-image and safe to relax.
-                    const target_addr: u64 = @intCast(@as(i64, @intCast(target)) + r.addend);
-                    try applyAdrpPg(seg.bytes, site, site_addr, target_addr);
-                },
-                .ld64_got_lo12_nc => {
-                    // The paired GOT load (`ldr xT, [xN, :got_lo12:sym]`) for an in-image symbol.
-                    // With no GOT slot to load from, REWRITE the `ldr` into `add xT, xN, :lo12:sym`
-                    // so the `adrp`+`add` pair computes the symbol address directly.
-                    const target_addr: u64 = @intCast(@as(i64, @intCast(target)) + r.addend);
-                    try relaxGotLoadToAdd(seg.bytes, site, target_addr);
-                },
-                .ldst64_abs_lo12_nc => {
-                    // The low half of a direct `adrp`/`ldr` pair addressing a symbol's storage
-                    // (`ldr xT, [xN, #:lo12:sym]`). The 64-bit access scales its 12-bit immediate
-                    // by 8, so the field holds `lo12(sym) >> 3`.
-                    const target_addr: u64 = @intCast(@as(i64, @intCast(target)) + r.addend);
-                    try applyLdst64Lo12(seg.bytes, site, target_addr);
-                },
-                else => return error.UnsupportedReloc,
             }
         }
     }
@@ -421,7 +334,7 @@ test "applyRelocs sources the ADRP/ADD site address from the segment, not the re
     // landed one page off and the global read a zero page - even though the resolved
     // symbol and the byte placement were both correct. This test pins the invariant that
     // `applyRelocs` must derive the site address from the segment actually being patched,
-    // by handing it a placement whose `places[text].vaddr` is deliberately inconsistent
+    // by handing it a placement whose section place `vaddr` is deliberately inconsistent
     // with the segment (as the misread made it) and requiring correct resolution anyway.
     const allocator = std.testing.allocator;
     const base: u64 = 0x400000;
@@ -434,31 +347,38 @@ test "applyRelocs sources the ADRP/ADD site address from the segment, not the re
     std.mem.writeInt(u32, code[4..8], 0x91000000, .little); // add  x0, x0, #0 (placeholder)
     std.mem.writeInt(u32, code[8..12], 5, .little); // g = i32 5
 
-    var syms = [_]elf.ObjSymbol{.{ .name = "g", .value = 0, .defined = true, .local = false, .section = .data }};
+    var syms = [_]elf.ObjSymbol{.{ .name = "g", .value = 0, .defined = true, .local = false, .section_index = 1 }};
     var relocs = [_]elf.Reloc{
         .{ .offset = 0, .symbol = 0, .type = .adr_prel_pg_hi21, .addend = 0 },
         .{ .offset = 4, .symbol = 0, .type = .add_abs_lo12_nc, .addend = 0 },
     };
+    // Section 0 is the `.text` code that carries the two relocs. Section 1 is the `.data`
+    // holding `g`. `applyRelocs` walks the code section's own reloc list.
+    var isections = [_]elf.ObjSection{
+        .{ .name = ".text", .flags = elf.SHF_ALLOC | elf.SHF_EXECINSTR, .bytes = code[0..8], .size = 8, .is_nobits = false, .relocs = &relocs },
+        .{ .name = ".data", .flags = elf.SHF_ALLOC | elf.SHF_WRITE, .bytes = code[8..12], .size = 4, .is_nobits = false },
+    };
     var parsed = [_]ParsedObject{.{
         .arch = .aarch64,
-        .text = code[0..8],
-        .data = code[8..12],
         .symbols = &syms,
-        .relocs = &relocs,
+        .sections = &isections,
     }};
 
     var segments = [_]Segment{.{ .vaddr = base, .paddr = base, .bytes = code, .memsz = code.len, .flags = 7 }};
-    // The `.text` place's `vaddr` is set one page high on purpose (base + 0x1000) while
-    // its `seg_off` stays 0 - exactly the inconsistency the miscompile produced. A linker
-    // that (wrongly) trusts `tp.vaddr` resolves the ADRP one page low; the fix ignores it.
-    var places = [_]SecPlace{
-        .{ .vaddr = base + 0x1000, .seg = 0, .seg_off = 0 }, // text (poisoned vaddr)
-        .{ .vaddr = 0, .seg = not_placed, .seg_off = 0 }, // rodata
-        .{ .vaddr = base + g_off, .seg = 0, .seg_off = g_off }, // data
-        .{ .vaddr = 0, .seg = not_placed, .seg_off = 0 }, // bss
+    // The `.text` section place's `vaddr` is set one page high on purpose (base + 0x1000)
+    // while its `seg_off` stays 0, exactly the inconsistency the miscompile produced. A
+    // linker that (wrongly) trusts the place `vaddr` resolves the ADRP one page low. The
+    // fix sources the site address from the segment, so it ignores the poisoned field.
+    //
+    // The section-indexed place map the applier reads: section 0 `.text` (poisoned vaddr),
+    // section 1 `.data` holding `g`.
+    var section_places = [_]SecPlace{
+        .{ .vaddr = base + 0x1000, .seg = 0, .seg_off = 0 }, // .text (poisoned vaddr)
+        .{ .vaddr = base + g_off, .seg = 0, .seg_off = g_off }, // .data
     };
+    var section_place_base = [_]usize{ 0, 2 };
     var symbols = [_]ResolvedSymbol{.{ .name = "g", .address = base + g_off }};
-    var placement: Placement = .{ .segments = &segments, .places = &places, .symbols = &symbols, .entry = 0 };
+    var placement: Placement = .{ .segments = &segments, .symbols = &symbols, .entry = 0, .section_places = &section_places, .section_place_base = &section_place_base };
 
     try applyRelocs(allocator, &placement, &parsed);
 

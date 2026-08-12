@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const elf = @import("elf.zig");
+const gc = @import("gc.zig");
 const dynamic = @import("dynamic.zig");
 const archive = @import("archive.zig");
 const scriptmod = @import("script.zig");
@@ -34,16 +35,13 @@ pub const Input = union(enum) {
     archive: []const u8,
 };
 
-/// A resolved symbol's defining section, translated to the `.dynsym` type bits a `-shared`
-/// export carries: a `.text` global is a callable function (`STT_FUNC`), a
-/// `.rodata`/`.data`/`.bss` global is a data object (`STT_OBJECT`). `.undef` never reaches
-/// here (only defined symbols are resolved into `image.symbols`/`placement.symbols`), so it
-/// falls back to `.func` rather than being unreachable.
-fn symKindOf(section: elf.SecKind) dynamic.SymKind {
-    return switch (section) {
-        .text, .undef => .func,
-        .rodata, .data, .bss => .object,
-    };
+/// A resolved symbol's defining-section kind, translated to the `.dynsym` type bits a
+/// `-shared` export carries: a symbol defined in an executable section is a callable function
+/// (`STT_FUNC`), one in a data section (`.rodata`/`.data`/`.bss`) is a data object
+/// (`STT_OBJECT`). A synthesized symbol with no natural section defaults to `is_exec = true`,
+/// so it falls back to `.func`.
+fn symKindOf(is_exec: bool) dynamic.SymKind {
+    return if (is_exec) .func else .object;
 }
 
 /// The per-architecture executable parameters used by `writeElfExec`.
@@ -76,9 +74,11 @@ fn linkArch(allocator: std.mem.Allocator, arch: Arch, parsed: []elf.ParsedObject
 /// of them exposes the same `computeDefaultPlacement`/`applyRelocs` pair, so this single
 /// generic helper serves all of them. Ownership handoff: the single segment's relocated
 /// bytes and the resolved symbols move into the `Image`; only the placement's wrapper
-/// slices (the segment array and the `places` map) are freed.
+/// slices (the segment array and the `section_places` map) are freed.
 fn buildImageViaPlacement(comptime Mod: type, allocator: std.mem.Allocator, parsed: []elf.ParsedObject, base: u64, resolver: ?Resolver, compress_text: bool) Error!Image {
-    var placement = try Mod.computeDefaultPlacement(allocator, parsed, base, resolver, compress_text);
+    // The static path never runs the GC sweep, so it passes a null liveness mask (every
+    // section is live) and the layout stays byte-identical.
+    var placement = try Mod.computeDefaultPlacement(allocator, parsed, base, resolver, compress_text, null);
     errdefer placement.deinit(allocator);
     try Mod.applyRelocs(allocator, &placement, parsed);
 
@@ -87,7 +87,8 @@ fn buildImageViaPlacement(comptime Mod: type, allocator: std.mem.Allocator, pars
     const image: Image = .{ .code = seg0.bytes, .symbols = placement.symbols, .base = seg0.vaddr, .memsz = seg0.memsz };
     // `seg0.bytes` and `placement.symbols` now belong to `image`; free only the wrappers.
     allocator.free(placement.segments);
-    allocator.free(placement.places);
+    allocator.free(placement.section_places);
+    allocator.free(placement.section_place_base);
     return image;
 }
 
@@ -687,6 +688,26 @@ pub fn linkDynamic(allocator: std.mem.Allocator, inputs: []const dynamic.DynInpu
         if (p.arch != arch) return error.MalformedObject;
     }
 
+    // Run the GC mark pass when `--gc-sections` is on. `live` is a per-(object, section)
+    // liveness mask indexed `live_base[oi] + si`, the same flat scheme `place.zig` uses.
+    // `live` is null when GC is off, and every skip below then becomes a no-op, so the output
+    // stays byte-identical. `live_base` mirrors that indexing for the resolve-layer skips.
+    const live: ?[]bool = if (opts.gc_sections)
+        try gc.computeLiveSections(allocator, parsed, opts.entry, opts.mode == .shared)
+    else
+        null;
+    defer if (live) |lv| allocator.free(lv);
+    var live_base: []usize = &.{};
+    defer if (live_base.len > 0) allocator.free(live_base);
+    if (live != null) {
+        live_base = try allocator.alloc(usize, parsed.len);
+        var total: usize = 0;
+        for (parsed, 0..) |p, i| {
+            live_base[i] = total;
+            total += p.sections.len;
+        }
+    }
+
     // Classify each CALL relocation to an undefined symbol that a `.shared` exports as an
     // import: record its owning object, `.text` offset, and import index; build the deduped
     // import list. A CALL to a locally defined symbol, or an undefined one no `.shared`
@@ -699,7 +720,7 @@ pub fn linkDynamic(allocator: std.mem.Allocator, inputs: []const dynamic.DynInpu
     // `near` marks a riscv64 `.jal` site (a single-instruction call, +/-1MiB reach): the
     // redirect must patch just that one `jal`, not the `.call` auipc+jalr pair. Always
     // false on the other three arches (their `isCallReloc` never matches `.jal`).
-    const ImportSite = struct { oi: usize, offset: u64, import_index: u32, near: bool };
+    const ImportSite = struct { oi: usize, si: usize, offset: u64, import_index: u32, near: bool };
     var import_sites: std.ArrayList(ImportSite) = .empty;
     defer import_sites.deinit(allocator);
 
@@ -722,52 +743,62 @@ pub fn linkDynamic(allocator: std.mem.Allocator, inputs: []const dynamic.DynInpu
     }
 
     for (parsed, 0..) |obj, oi| {
-        for (obj.relocs) |r| {
-            // A CALL reloc to an undefined `.shared` export is a FUNCTION import (PLT/JUMP_SLOT).
-            if (isCallReloc(arch, r.type)) {
-                if (r.symbol >= obj.symbols.len) return error.MalformedObject;
-                const name = obj.symbols[r.symbol].name;
-                if (defined_names.contains(name)) continue; // resolved in-image
-                const soname = shared_exports.get(name) orelse continue; // not a shared export
-                const idx = importIndexOf(imports.items, name) orelse blk: {
-                    const i: u32 = @intCast(imports.items.len);
-                    try imports.append(allocator, .{ .name = name, .soname = soname });
-                    break :blk i;
+        // Scan each executable section's own relocs (the code relocs). An import call and a
+        // GOT-indirect data ref both live in an `SHF_EXECINSTR` section. Record the owning
+        // section index `si`, so a per-function object (many `.text.<name>` sections) resolves
+        // each diverted site against the section it actually lives in, not the first one.
+        for (obj.sections, 0..) |isec, si| {
+            if ((isec.flags & elf.SHF_EXECINSTR) == 0) continue;
+            // A GC-dead section is dropped, so record no import call or GOT ref against it
+            // (its placement is not_placed, which would surface as a MalformedObject below).
+            if (sectionDead(live, live_base, oi, si)) continue;
+            for (isec.relocs) |r| {
+                // A CALL reloc to an undefined `.shared` export is a FUNCTION import (PLT/JUMP_SLOT).
+                if (isCallReloc(arch, r.type)) {
+                    if (r.symbol >= obj.symbols.len) return error.MalformedObject;
+                    const name = obj.symbols[r.symbol].name;
+                    if (defined_names.contains(name)) continue; // resolved in-image
+                    const soname = shared_exports.get(name) orelse continue; // not a shared export
+                    const idx = importIndexOf(imports.items, name) orelse blk: {
+                        const i: u32 = @intCast(imports.items.len);
+                        try imports.append(allocator, .{ .name = name, .soname = soname });
+                        break :blk i;
+                    };
+                    const near = arch == .riscv64 and r.type == .jal;
+                    try import_sites.append(allocator, .{ .oi = oi, .si = si, .offset = r.offset, .import_index = idx, .near = near });
+                    continue;
+                }
+                // A GOT-indirect reloc (aarch64 `.got_pg`/`.got_lo12`, x86-64 `.got_pcrel`) to an
+                // undefined `.shared` export is a data import (GOT slot + GLOB_DAT). A GOT ref to an
+                // in-image symbol (a local GOT, for a PIE) is left in place. This is not yet supported.
+                const kind: ?dynamic.DataRefKind = switch (r.type) {
+                    .adr_got_page => .got_pg,
+                    .ld64_got_lo12_nc => .got_lo12,
+                    .gotpcrel => .got_pcrel,
+                    .got32 => .got_abs,
+                    // riscv64's GOT-indirect `auipc` (the paired `ld` reuses `pcrel_lo12_i`, so it is
+                    // NOT classified by reloc type - it is derived from the `auipc` below).
+                    .got_hi20 => .got_hi20,
+                    else => null,
                 };
-                const near = arch == .riscv64 and r.type == .jal;
-                try import_sites.append(allocator, .{ .oi = oi, .offset = r.offset, .import_index = idx, .near = near });
-                continue;
-            }
-            // A GOT-indirect reloc (aarch64 `.got_pg`/`.got_lo12`, x86-64 `.got_pcrel`) to an
-            // undefined `.shared` export is a data import (GOT slot + GLOB_DAT). A GOT ref to an
-            // in-image symbol (a local GOT, for a PIE) is left in place. This is not yet supported.
-            const kind: ?dynamic.DataRefKind = switch (r.type) {
-                .adr_got_page => .got_pg,
-                .ld64_got_lo12_nc => .got_lo12,
-                .gotpcrel => .got_pcrel,
-                .got32 => .got_abs,
-                // riscv64's GOT-indirect `auipc` (the paired `ld` reuses `pcrel_lo12_i`, so it is
-                // NOT classified by reloc type - it is derived from the `auipc` below).
-                .got_hi20 => .got_hi20,
-                else => null,
-            };
-            if (kind) |k| {
-                if (r.symbol >= obj.symbols.len) return error.MalformedObject;
-                const name = obj.symbols[r.symbol].name;
-                if (defined_names.contains(name)) continue; // resolved in-image (local GOT, not yet supported)
-                const soname = shared_exports.get(name) orelse continue; // not a shared export
-                const idx = dataImportIndexOf(data_imports.items, name) orelse blk: {
-                    const i: u32 = @intCast(data_imports.items.len);
-                    try data_imports.append(allocator, .{ .name = name, .soname = soname });
-                    break :blk i;
-                };
-                try data_ref_sites.append(allocator, .{ .oi = oi, .offset = r.offset, .import_index = idx, .kind = k });
-                // riscv64: the GOT-indirect `ld` sits one word after its `auipc` and reuses
-                // `pcrel_lo12_i` (target = the `auipc` label), so it is not itself a shared-export
-                // reloc. Derive its data ref from the `auipc` (offset + 4, same GOT slot) so the
-                // emitter patches its lo12 and it is filtered out of `applyRelocs`.
-                if (k == .got_hi20) {
-                    try data_ref_sites.append(allocator, .{ .oi = oi, .offset = r.offset + 4, .import_index = idx, .kind = .got_lo12_i });
+                if (kind) |k| {
+                    if (r.symbol >= obj.symbols.len) return error.MalformedObject;
+                    const name = obj.symbols[r.symbol].name;
+                    if (defined_names.contains(name)) continue; // resolved in-image (local GOT, not yet supported)
+                    const soname = shared_exports.get(name) orelse continue; // not a shared export
+                    const idx = dataImportIndexOf(data_imports.items, name) orelse blk: {
+                        const i: u32 = @intCast(data_imports.items.len);
+                        try data_imports.append(allocator, .{ .name = name, .soname = soname });
+                        break :blk i;
+                    };
+                    try data_ref_sites.append(allocator, .{ .oi = oi, .si = si, .offset = r.offset, .import_index = idx, .kind = k });
+                    // riscv64: the GOT-indirect `ld` sits one word after its `auipc` and reuses
+                    // `pcrel_lo12_i` (target = the `auipc` label), so it is not itself a shared-export
+                    // reloc. Derive its data ref from the `auipc` (offset + 4, same GOT slot) so the
+                    // emitter patches its lo12 and it is filtered out of `applyRelocs`.
+                    if (k == .got_hi20) {
+                        try data_ref_sites.append(allocator, .{ .oi = oi, .si = si, .offset = r.offset + 4, .import_index = idx, .kind = .got_lo12_i });
+                    }
                 }
             }
         }
@@ -778,14 +809,14 @@ pub fn linkDynamic(allocator: std.mem.Allocator, inputs: []const dynamic.DynInpu
     // RELATIVE (PIE/`.so`) or direct fixups (non-PIE). The placement (not a plain `Image`) is
     // kept so `collectDataFixups` can locate each data slot and its target within the image.
     if (imports.items.len == 0 and data_imports.items.len == 0) {
-        var placement = try computeDefaultPlacementArch(allocator, arch, parsed, 0, null, false);
+        var placement = try computeDefaultPlacementArch(allocator, arch, parsed, 0, null, false, live);
         defer placement.deinit(allocator);
         try applyRelocsArch(allocator, arch, &placement, parsed);
-        const fixups = try collectDataFixups(allocator, &placement, parsed);
+        const fixups = try collectDataFixups(allocator, &placement, parsed, live, live_base);
         defer allocator.free(fixups);
         var exports = try allocator.alloc(dynamic.Export, placement.symbols.len);
         defer allocator.free(exports);
-        for (placement.symbols, 0..) |s, i| exports[i] = .{ .name = s.name, .offset = s.address, .kind = symKindOf(s.section) };
+        for (placement.symbols, 0..) |s, i| exports[i] = .{ .name = s.name, .offset = s.address, .kind = symKindOf(s.is_exec) };
         const seg0 = placement.segments[0];
         return dynamic.emit(allocator, execParams(arch), seg0.bytes, seg0.memsz, opts, exports, &.{}, &.{}, &.{}, &.{}, fixups);
     }
@@ -799,23 +830,31 @@ pub fn linkDynamic(allocator: std.mem.Allocator, inputs: []const dynamic.DynInpu
     if (arch != .aarch64 and arch != .x86_64 and arch != .x86 and arch != .riscv64) return error.UnsupportedReloc;
     // GOT-indirect data imports are now all four arches (aarch64 + x86-64 + i386 + riscv64).
     if (data_imports.items.len > 0 and arch != .aarch64 and arch != .x86_64 and arch != .x86 and arch != .riscv64) return error.UnsupportedReloc;
-    return linkDynamicImports(allocator, arch, parsed, opts, imports.items, import_sites.items, data_imports.items, data_ref_sites.items);
+    return linkDynamicImports(allocator, arch, parsed, opts, imports.items, import_sites.items, data_imports.items, data_ref_sites.items, live, live_base);
 }
 
 /// One recorded GOT-indirect reference site (a data import's `.got_pg`/`.got_lo12` reloc):
-/// its owning object index, `.text` offset, which data import it addresses, and which half of
-/// the `adrp`/`ldr` pair it patches.
-const DataRefSite = struct { oi: usize, offset: u64, import_index: u32, kind: dynamic.DataRefKind };
+/// its owning object index, its owning exec section index, the in-section offset, which data
+/// import it addresses, and which half of the `adrp`/`ldr` pair it patches.
+const DataRefSite = struct { oi: usize, si: usize, offset: u64, import_index: u32, kind: dynamic.DataRefKind };
+
+/// True when GC is on and section `si` of object `oi` is dead (must be dropped). Returns
+/// false when `live` is null (GC off), so every caller's skip is a no-op then. The index
+/// `live_base[oi] + si` matches `gc.computeLiveSections` and `place.zig`.
+fn sectionDead(live: ?[]const bool, live_base: []const usize, oi: usize, si: usize) bool {
+    const lv = live orelse return false;
+    return !lv[live_base[oi] + si];
+}
 
 /// Dispatch the per-arch `computeDefaultPlacement` for the dynamic import path. Mirrors
 /// `applyRelocsArch`: the same backend that lays out a default static link lays out the
 /// import path's code image.
-fn computeDefaultPlacementArch(allocator: std.mem.Allocator, arch: Arch, parsed: []elf.ParsedObject, base: u64, resolver: ?Resolver, compress_text: bool) Error!elf.Placement {
+fn computeDefaultPlacementArch(allocator: std.mem.Allocator, arch: Arch, parsed: []elf.ParsedObject, base: u64, resolver: ?Resolver, compress_text: bool, live: ?[]const bool) Error!elf.Placement {
     return switch (arch) {
-        .riscv64 => riscv64.computeDefaultPlacement(allocator, parsed, base, resolver, compress_text),
-        .aarch64 => aarch64.computeDefaultPlacement(allocator, parsed, base, resolver, compress_text),
-        .x86_64 => x86_64.computeDefaultPlacement(allocator, parsed, base, resolver, compress_text),
-        .x86 => x86.computeDefaultPlacement(allocator, parsed, base, resolver, compress_text),
+        .riscv64 => riscv64.computeDefaultPlacement(allocator, parsed, base, resolver, compress_text, live),
+        .aarch64 => aarch64.computeDefaultPlacement(allocator, parsed, base, resolver, compress_text, live),
+        .x86_64 => x86_64.computeDefaultPlacement(allocator, parsed, base, resolver, compress_text, live),
+        .x86 => x86.computeDefaultPlacement(allocator, parsed, base, resolver, compress_text, live),
     };
 }
 
@@ -833,51 +872,74 @@ fn linkDynamicImports(
     import_sites: anytype,
     data_imports: []const dynamic.DataImport,
     data_ref_sites: anytype,
+    live: ?[]const bool,
+    live_base: []const usize,
 ) Error![]u8 {
-    // Shallow-copy each object with an import-free reloc slice (import CALL sites AND
-    // GOT-indirect data-import refs removed, so `applyRelocs` leaves each as a placeholder the
-    // emitter patches; the layout is otherwise identical to a full link). Freed at the end.
+    // Shallow-copy each object, filtering each EXECUTABLE section's own relocs (import CALL
+    // sites AND GOT-indirect data-import refs removed, so `applyRelocs` leaves each as a
+    // placeholder the emitter patches; the layout is otherwise identical to a full link).
+    // The filtered relocs go into a fresh owned slice per exec section, replacing that
+    // section's relocs in a shallow-copied `sections` array. Non-exec sections keep their
+    // original relocs (owned by `parsed`, never freed here). The copied section-array
+    // wrappers and each filtered reloc slice are freed at the end.
     var filtered = try allocator.alloc(elf.ParsedObject, parsed.len);
-    var filtered_relocs = try allocator.alloc([]elf.Reloc, parsed.len);
+    var filtered_sections = try allocator.alloc([]elf.ObjSection, parsed.len);
+    var owned_kept: std.ArrayList([]elf.Reloc) = .empty;
     var built: usize = 0;
     defer {
+        for (owned_kept.items) |s| allocator.free(s);
+        owned_kept.deinit(allocator);
         var i: usize = 0;
-        while (i < built) : (i += 1) allocator.free(filtered_relocs[i]);
-        allocator.free(filtered_relocs);
+        while (i < built) : (i += 1) allocator.free(filtered_sections[i]);
+        allocator.free(filtered_sections);
         allocator.free(filtered);
     }
     for (parsed, 0..) |obj, oi| {
-        var keep: std.ArrayList(elf.Reloc) = .empty;
-        errdefer keep.deinit(allocator);
-        for (obj.relocs) |r| {
-            if (isImportSite(arch, import_sites, oi, r.offset, r.type)) continue;
-            if (isDataRefSite(data_ref_sites, oi, r.offset, r.type)) continue;
-            try keep.append(allocator, r);
-        }
-        filtered_relocs[oi] = try keep.toOwnedSlice(allocator);
+        const secs = try allocator.dupe(elf.ObjSection, obj.sections);
+        filtered_sections[oi] = secs;
         built = oi + 1;
+        for (secs, 0..) |*s, si| {
+            if ((s.flags & elf.SHF_EXECINSTR) == 0) continue;
+            var keep: std.ArrayList(elf.Reloc) = .empty;
+            errdefer keep.deinit(allocator);
+            for (s.relocs) |r| {
+                if (isImportSite(arch, import_sites, oi, si, r.offset, r.type)) continue;
+                if (isDataRefSite(data_ref_sites, oi, si, r.offset, r.type)) continue;
+                try keep.append(allocator, r);
+            }
+            const kept = try keep.toOwnedSlice(allocator);
+            errdefer allocator.free(kept);
+            try owned_kept.append(allocator, kept);
+            s.relocs = kept;
+        }
         filtered[oi] = obj;
-        filtered[oi].relocs = filtered_relocs[oi];
+        filtered[oi].sections = secs;
     }
 
-    var placement = try computeDefaultPlacementArch(allocator, arch, filtered, 0, null, false);
+    // `filtered` keeps the same section count per object as `parsed`, so the `live`/`live_base`
+    // indexing carries over unchanged.
+    var placement = try computeDefaultPlacementArch(allocator, arch, filtered, 0, null, false, live);
     defer placement.deinit(allocator);
     try applyRelocsArch(allocator, arch, &placement, filtered);
 
-    // Each import call's final image offset = its object's `.text` placement + the reloc offset.
+    // Each import call's final image offset = its object's code section placement + the reloc
+    // offset. The diverted site lives in the exec (`SHF_EXECINSTR`) section, so its address
+    // comes from that section's place, not a per-class `.text` slot.
     var import_calls = try allocator.alloc(dynamic.ImportCall, import_sites.len);
     defer allocator.free(import_calls);
     for (import_sites, 0..) |isite, k| {
-        const tp = placement.places[isite.oi * elf.places_per_object + elf.secIndex(.text)];
+        // Resolve the diverted call against the section it actually lives in, so a per-function
+        // object (many `.text.<name>` sections) redirects the right site.
+        const tp = placement.sectionPlace(isite.oi, isite.si);
         if (tp.seg == elf.not_placed) return error.MalformedObject;
         import_calls[k] = .{ .site = tp.seg_off + isite.offset, .import_index = isite.import_index, .near = isite.near };
     }
 
-    // Each data-import GOT ref's final image offset, likewise from its `.text` placement.
+    // Each data-import GOT ref's final image offset, likewise from its code section placement.
     var data_refs = try allocator.alloc(dynamic.DataImportRef, data_ref_sites.len);
     defer allocator.free(data_refs);
     for (data_ref_sites, 0..) |dsite, k| {
-        const tp = placement.places[dsite.oi * elf.places_per_object + elf.secIndex(.text)];
+        const tp = placement.sectionPlace(dsite.oi, dsite.si);
         if (tp.seg == elf.not_placed) return error.MalformedObject;
         data_refs[k] = .{ .site = tp.seg_off + dsite.offset, .import_index = dsite.import_index, .kind = dsite.kind };
     }
@@ -886,11 +948,11 @@ fn linkDynamicImports(
     // entry symbol (`_start`) and, for a shared object, the exports.
     var exports = try allocator.alloc(dynamic.Export, placement.symbols.len);
     defer allocator.free(exports);
-    for (placement.symbols, 0..) |s, i| exports[i] = .{ .name = s.name, .offset = s.address, .kind = symKindOf(s.section) };
+    for (placement.symbols, 0..) |s, i| exports[i] = .{ .name = s.name, .offset = s.address, .kind = symKindOf(s.is_exec) };
 
     // Internal-target data-section pointer-init relocs, alongside the import machinery
     // (a program can carry both an imported-function PLT and an internal pointer init).
-    const fixups = try collectDataFixups(allocator, &placement, filtered);
+    const fixups = try collectDataFixups(allocator, &placement, filtered, live, live_base);
     defer allocator.free(fixups);
 
     const seg0 = placement.segments[0];
@@ -906,20 +968,26 @@ fn linkDynamicImports(
 /// symbol's image offset (+ addend). A data reloc whose target is not defined in-image is an
 /// imported pointer (the GLOB_DAT/GOT path, out of scope here) and surfaces as
 /// `error.UndefinedSymbol`. The caller owns the returned slice.
-fn collectDataFixups(allocator: std.mem.Allocator, placement: *const elf.Placement, parsed: []elf.ParsedObject) Error![]dynamic.DataFixup {
+fn collectDataFixups(allocator: std.mem.Allocator, placement: *const elf.Placement, parsed: []elf.ParsedObject, live: ?[]const bool, live_base: []const usize) Error![]dynamic.DataFixup {
     var fixups: std.ArrayList(dynamic.DataFixup) = .empty;
     errdefer fixups.deinit(allocator);
     const base_vaddr = if (placement.segments.len > 0) placement.segments[0].vaddr else 0;
     for (parsed, 0..) |obj, oi| {
-        const groups = [_]struct { relocs: []const elf.Reloc, section: elf.SecKind }{
-            .{ .relocs = obj.data_relocs, .section = .data },
-            .{ .relocs = obj.rodata_relocs, .section = .rodata },
-        };
-        for (groups) |g| {
-            if (g.relocs.len == 0) continue;
-            const place = placement.places[oi * elf.places_per_object + elf.secIndex(g.section)];
+        // Walk every NON-exec allocatable section, not a fixed data/rodata pair. Each section
+        // owns its own placement, so a pointer-init reloc resolves its site against the exact
+        // section that holds it. That is what closes the last-wins gap: two sections of the
+        // same class (for example two `.data` inputs) no longer collapse to one per-class slot.
+        // Exec sections carry text relocs, which the arch applier patches, so this pass skips
+        // them (`SHF_EXECINSTR`).
+        for (obj.sections, 0..) |sec, si| {
+            if ((sec.flags & elf.SHF_EXECINSTR) != 0) continue;
+            if (sec.relocs.len == 0) continue;
+            // A GC-dead source section is dropped, so its pointer-init fixups go with it (its
+            // placement is not_placed, which would otherwise be a MalformedObject below).
+            if (sectionDead(live, live_base, oi, si)) continue;
+            const place = placement.sectionPlace(oi, si);
             if (place.seg == elf.not_placed) return error.MalformedObject;
-            for (g.relocs) |r| {
+            for (sec.relocs) |r| {
                 if (r.symbol >= obj.symbols.len) return error.MalformedObject;
                 // A `.prel32` is a 32-bit PC-relative FDE pointer in `.eh_frame` (a real glibc
                 // `crt1.o` carries two). VCC never registers the crt's unwind tables (the
@@ -937,8 +1005,8 @@ fn collectDataFixups(allocator: std.mem.Allocator, placement: *const elf.Placeme
                 // pointer-init slot referencing an own-`.rodata` string (`char *p = "x";`) takes
                 // this path.
                 const target_addr = elf.findSymbol(placement.symbols, sym.name) orelse blk: {
-                    if (sym.defined and sym.local and sym.section != .undef) {
-                        const sp = placement.places[oi * elf.places_per_object + elf.secIndex(sym.section)];
+                    if (sym.defined and sym.local and sym.section_index != std.math.maxInt(u32)) {
+                        const sp = placement.sectionPlace(oi, sym.section_index);
                         if (sp.seg == elf.not_placed or sp.seg >= placement.segments.len) return error.MalformedObject;
                         break :blk placement.segments[sp.seg].vaddr + sp.seg_off + sym.value;
                     }
@@ -970,14 +1038,15 @@ fn dataImportIndexOf(list: []const dynamic.DataImport, name: []const u8) ?u32 {
     return null;
 }
 
-/// True iff `(oi, offset)` names one of the recorded GOT-indirect data-import ref sites (a
+/// True iff `(oi, si, offset)` names one of the recorded GOT-indirect data-import ref sites (a
 /// `.got_pg`/`.got_lo12` reloc the emitter patches, so it is filtered before `applyRelocs`).
-fn isDataRefSite(data_ref_sites: anytype, oi: usize, offset: u64, typ: elf.RelocType) bool {
+/// The section index `si` keeps two same-offset sites in different `.text.<name>` sections apart.
+fn isDataRefSite(data_ref_sites: anytype, oi: usize, si: usize, offset: u64, typ: elf.RelocType) bool {
     // riscv64's GOT `auipc` is `got_hi20` and its paired `ld` reuses `pcrel_lo12_i` (recorded as a
     // derived ref at auipc+4); both must be filtered so `applyRelocs` never sees them.
     if (typ != .adr_got_page and typ != .ld64_got_lo12_nc and typ != .gotpcrel and typ != .got32 and typ != .got_hi20 and typ != .pcrel_lo12_i) return false;
     for (data_ref_sites) |dsite| {
-        if (dsite.oi == oi and dsite.offset == offset) return true;
+        if (dsite.oi == oi and dsite.si == si and dsite.offset == offset) return true;
     }
     return false;
 }
@@ -1011,11 +1080,135 @@ fn isCallReloc(arch: Arch, t: elf.RelocType) bool {
     };
 }
 
-/// True iff `(oi, offset, type)` names one of the recorded import call sites.
-fn isImportSite(arch: Arch, import_sites: anytype, oi: usize, offset: u64, typ: elf.RelocType) bool {
+/// True iff `(oi, si, offset, type)` names one of the recorded import call sites. The section
+/// index `si` keeps two same-offset call sites in different `.text.<name>` sections apart.
+fn isImportSite(arch: Arch, import_sites: anytype, oi: usize, si: usize, offset: u64, typ: elf.RelocType) bool {
     if (!isCallReloc(arch, typ)) return false;
     for (import_sites) |isite| {
-        if (isite.oi == oi and isite.offset == offset) return true;
+        if (isite.oi == oi and isite.si == si and isite.offset == offset) return true;
     }
     return false;
+}
+
+test "linkObjects: a cross-section call resolves the callee to its OWN same-class section (not last-wins)" {
+    const allocator = std.testing.allocator;
+
+    // A hand-built ELF64/RELA x86-64 object with TWO executable sections of the same
+    // class: ".text.a" holds a `call rel32` to the global `func_b`, and ".text.b" holds
+    // `func_b`. This is the arbitrary-section, per-section-reloc path the old fixed
+    // 4-section model could not represent: both `.text` inputs would have collapsed into
+    // one blob and `func_b` would resolve to the merged base. Here each section keeps its
+    // own place, so `func_b` must resolve to `.text.b`'s address, and the call in
+    // `.text.a` must patch to reach it. Mirrors the hand-built fixture of the two-`.text`
+    // parse test in `elf.zig`, extended with a cross-section relocation.
+    const shstrtab = "\x00.text.a\x00.text.b\x00.symtab\x00.strtab\x00.rela.text.a\x00.shstrtab\x00";
+    const strtab = "\x00func_a\x00func_b\x00";
+
+    const text_a_off: u64 = 64;
+    const text_a_size: u64 = 6; // E8 00 00 00 00 (call rel32) + C3 (ret)
+    const text_b_off: u64 = text_a_off + text_a_size;
+    const text_b_size: u64 = 1; // C3 (ret)
+    const symtab_off: u64 = text_b_off + text_b_size;
+    const symtab_size: u64 = 3 * 24; // null + func_a + func_b
+    const strtab_off: u64 = symtab_off + symtab_size;
+    const rela_off: u64 = strtab_off + strtab.len;
+    const rela_size: u64 = 24; // one Elf64_Rela
+    const shstrtab_off: u64 = rela_off + rela_size;
+    const shoff: u64 = elf.alignUp(shstrtab_off + shstrtab.len, 8);
+    const shnum: u16 = 7;
+    const total: usize = @intCast(shoff + @as(u64, shnum) * 64);
+
+    var buf = try allocator.alloc(u8, total);
+    defer allocator.free(buf);
+    @memset(buf, 0);
+
+    @memcpy(buf[0..4], "\x7fELF");
+    buf[4] = 2; // ELFCLASS64
+    buf[5] = 1; // ELFDATA2LSB
+    buf[6] = 1; // EV_CURRENT
+    std.mem.writeInt(u16, buf[16..18], 1, .little); // e_type = ET_REL
+    std.mem.writeInt(u16, buf[18..20], elf.EM_X86_64, .little);
+    std.mem.writeInt(u32, buf[20..24], 1, .little); // e_version
+    std.mem.writeInt(u64, buf[40..48], shoff, .little); // e_shoff
+    std.mem.writeInt(u16, buf[52..54], 64, .little); // e_ehsize
+    std.mem.writeInt(u16, buf[58..60], 64, .little); // e_shentsize
+    std.mem.writeInt(u16, buf[60..62], shnum, .little); // e_shnum
+    std.mem.writeInt(u16, buf[62..64], 6, .little); // e_shstrndx (.shstrtab is index 6)
+
+    // `.text.a`: `call rel32` (E8, disp field at offset 1) to `func_b`, then `ret`.
+    @memcpy(buf[text_a_off..][0..6], &[_]u8{ 0xE8, 0, 0, 0, 0, 0xC3 });
+    // `.text.b`: `ret`.
+    buf[@intCast(text_b_off)] = 0xC3;
+    @memcpy(buf[@intCast(strtab_off)..][0..strtab.len], strtab);
+    @memcpy(buf[@intCast(shstrtab_off)..][0..shstrtab.len], shstrtab);
+
+    const writeSym = struct {
+        fn f(b: []u8, off: u64, idx: usize, name: u32, info: u8, shndx: u16, value: u64, size: u64) void {
+            const e = b[@intCast(off + idx * 24)..][0..24];
+            std.mem.writeInt(u32, e[0..4], name, .little);
+            e[4] = info;
+            e[5] = 0;
+            std.mem.writeInt(u16, e[6..8], shndx, .little);
+            std.mem.writeInt(u64, e[8..16], value, .little);
+            std.mem.writeInt(u64, e[16..24], size, .little);
+        }
+    }.f;
+    // func_a @ .text.a (shndx=1), func_b @ .text.b (shndx=2). Both STB_GLOBAL|STT_FUNC.
+    writeSym(buf, symtab_off, 1, 1, 0x12, 1, 0, text_a_size);
+    writeSym(buf, symtab_off, 2, 8, 0x12, 2, 0, text_b_size);
+
+    // The one relocation: `.rela.text.a` patches the call's disp32 (offset 1 in .text.a)
+    // to reach `func_b` (symbol index 2), `R_X86_64_PLT32` (4) with addend -4.
+    const rela = buf[@intCast(rela_off)..][0..24];
+    std.mem.writeInt(u64, rela[0..8], 1, .little); // r_offset
+    std.mem.writeInt(u64, rela[8..16], (@as(u64, 2) << 32) | 4, .little); // r_info = sym 2, PLT32
+    std.mem.writeInt(i64, rela[16..24], -4, .little); // r_addend
+
+    const writeShdr = struct {
+        fn f(b: []u8, sh: u64, idx: u16, name: u32, typ: u32, flags: u64, off: u64, size: u64, link: u32, info: u32) void {
+            const e = b[@intCast(sh + @as(u64, idx) * 64)..][0..64];
+            std.mem.writeInt(u32, e[0..4], name, .little);
+            std.mem.writeInt(u32, e[4..8], typ, .little);
+            std.mem.writeInt(u64, e[8..16], flags, .little);
+            std.mem.writeInt(u64, e[16..24], 0, .little); // sh_addr
+            std.mem.writeInt(u64, e[24..32], off, .little);
+            std.mem.writeInt(u64, e[32..40], size, .little);
+            std.mem.writeInt(u32, e[40..44], link, .little);
+            std.mem.writeInt(u32, e[44..48], info, .little);
+            std.mem.writeInt(u64, e[48..56], 1, .little); // sh_addralign
+            std.mem.writeInt(u64, e[56..64], 0, .little); // sh_entsize
+        }
+    }.f;
+    const XF = elf.SHF_ALLOC | elf.SHF_EXECINSTR;
+    writeShdr(buf, shoff, 0, 0, 0, 0, 0, 0, 0, 0); // NULL
+    writeShdr(buf, shoff, 1, 1, elf.SHT_PROGBITS, XF, text_a_off, text_a_size, 0, 0); // .text.a
+    writeShdr(buf, shoff, 2, 9, elf.SHT_PROGBITS, XF, text_b_off, text_b_size, 0, 0); // .text.b
+    writeShdr(buf, shoff, 3, 17, elf.SHT_SYMTAB, 0, symtab_off, symtab_size, 4, 1); // .symtab -> .strtab
+    writeShdr(buf, shoff, 4, 25, 3, 0, strtab_off, strtab.len, 0, 0); // .strtab
+    writeShdr(buf, shoff, 5, 33, elf.SHT_RELA, 0, rela_off, rela_size, 3, 1); // .rela.text.a -> symtab, target .text.a
+    writeShdr(buf, shoff, 6, 46, 3, 0, shstrtab_off, shstrtab.len, 0, 0); // .shstrtab
+
+    const base: u64 = 0x400000;
+    var image = try linkObjects(allocator, &.{buf}, base);
+    defer image.deinit(allocator);
+
+    // The two exec sections land in section-header order, `.text.a` first at `base`,
+    // `.text.b` next at the 16-byte-aligned end of `.text.a` (x86-64 text alignment). So
+    // `func_a` is at `base` and `func_b` at `base + 16`, each in its OWN section.
+    const func_a = image.addressOf("func_a") orelse return error.UndefinedSymbol;
+    const func_b = image.addressOf("func_b") orelse return error.UndefinedSymbol;
+    try std.testing.expectEqual(base, func_a);
+    const text_b_start = base + elf.alignUp(text_a_size, 16);
+    try std.testing.expectEqual(text_b_start, func_b);
+    // `func_b` resolves inside `.text.b`'s placed range, distinct from `.text.a`'s range
+    // (this is the last-wins gap the old model had: it would have folded both to `base`).
+    try std.testing.expect(func_b >= text_b_start and func_b < text_b_start + text_b_size);
+    try std.testing.expect(func_b >= base + text_a_size); // beyond `.text.a`
+
+    // The call's disp32 is patched so RIP-relative it lands exactly on `func_b`. The CPU's
+    // RIP at the branch is the byte after the 4-byte field (`base + 1 + 4`).
+    const disp = std.mem.readInt(i32, image.code[1..5], .little);
+    const site_addr = base + 1;
+    const call_target: u64 = @intCast(@as(i64, @intCast(site_addr + 4)) + disp);
+    try std.testing.expectEqual(func_b, call_target);
 }

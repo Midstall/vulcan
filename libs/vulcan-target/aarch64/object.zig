@@ -1,17 +1,20 @@
 //! This file emits an ELF64 relocatable object (`ET_REL`, `EM_AARCH64`). Each function
-//! becomes an `STT_FUNC` global symbol in `.text`. Each call (`bl`) becomes an
-//! `R_AARCH64_CALL26` relocation against the callee symbol. The symbol is undefined if
-//! external. Each data global (`module.data`) becomes an `STT_OBJECT` symbol in
-//! `.rodata`, `.data`, or `.bss`. A `global_addr`'s `adrp`/`add` pair becomes an
+//! becomes its own `.text.<name>` section with an `STT_FUNC` symbol at offset 0. Each
+//! data global (`module.data`) becomes its own `.rodata.<name>`, `.data.<name>`, or
+//! `.bss.<name>` section with an `STT_OBJECT` symbol at offset 0. Each call (`bl`)
+//! becomes an `R_AARCH64_CALL26` relocation against the callee symbol. The symbol is
+//! undefined if external. A `global_addr`'s `adrp`/`add` pair becomes an
 //! `R_AARCH64_ADR_PREL_PG_HI21` / `R_AARCH64_ADD_ABS_LO12_NC` relocation pair against
-//! the symbol. `readelf` and a system AArch64 linker accept the output. `ld.zig` is
-//! Vulcan's own linker for this object format.
+//! the symbol. The shared `object_emit.emit` serializes the neutral section, symbol, and
+//! relocation lists into the ELF bytes. `readelf` and a system AArch64 linker accept the
+//! output. `ld.zig` is Vulcan's own linker for this object format.
 
 const std = @import("std");
 const ir = @import("vulcan-ir");
 const isel = @import("isel.zig");
 const link = @import("link.zig");
 const dwarf = @import("../dwarf.zig");
+const object_emit = @import("../object_emit.zig");
 
 const Function = ir.function.Function;
 
@@ -112,302 +115,106 @@ pub const Object = struct {
     debug: []const DebugSection = &.{},
 };
 
-const ET_REL: u16 = 1;
 const EM_AARCH64: u16 = 183;
 const SHT_PROGBITS: u32 = 1;
-const SHT_SYMTAB: u32 = 2;
-const SHT_STRTAB: u32 = 3;
-const SHT_RELA: u32 = 4;
 const SHT_NOBITS: u32 = 8;
 const SHF_WRITE: u64 = 0x1;
 const SHF_ALLOC: u64 = 0x2;
 const SHF_EXECINSTR: u64 = 0x4;
-const SHF_INFO_LINK: u64 = 0x40;
-const STB_LOCAL: u8 = 0;
-const STB_GLOBAL: u8 = 1;
-const STT_NOTYPE: u8 = 0;
-const STT_OBJECT: u8 = 1;
-const STT_FUNC: u8 = 2;
-const SHN_UNDEF: u16 = 0;
-
-const ehsize: u64 = 64;
-const shentsize: u64 = 64;
-const symentsize: u64 = 24;
-const relaentsize: u64 = 24;
-
-fn alignUp(v: u64, a: u64) u64 {
-    return (v + a - 1) & ~(a - 1);
-}
 
 fn putInt(buf: []u8, comptime T: type, value: T) void {
     std.mem.writeInt(T, buf[0..@sizeOf(T)], value, .little);
 }
 
-/// A growable string table. It starts with a leading NUL byte, then holds
-/// NUL-terminated names. `add` returns each appended name's byte offset.
-const StrTab = struct {
-    bytes: std.ArrayList(u8) = .empty,
-
-    fn init(allocator: std.mem.Allocator) Error!StrTab {
-        var t: StrTab = .{};
-        try t.bytes.append(allocator, 0);
-        return t;
-    }
-    fn deinit(self: *StrTab, allocator: std.mem.Allocator) void {
-        self.bytes.deinit(allocator);
-    }
-    fn add(self: *StrTab, allocator: std.mem.Allocator, name: []const u8) Error!u32 {
-        const off: u32 = @intCast(self.bytes.items.len);
-        try self.bytes.appendSlice(allocator, name);
-        try self.bytes.append(allocator, 0);
-        return off;
-    }
-};
-
-/// One emitted section header.
-const Shdr = struct {
-    name: []const u8,
-    typ: u32,
-    flags: u64,
-    addralign: u64,
-    entsize: u64 = 0,
-    link: u16 = 0,
-    info: u32 = 0,
-    bytes: ?[]const u8,
-    size: u64,
-};
-
-/// Serialize `obj` into an ELF64 AArch64 relocatable object. The output has these
-/// sections: `.text`. `.rodata`, `.data`, and `.bss` when they are non-empty.
-/// `.rela.text` when there are relocations. `.symtab`. `.strtab`. `.shstrtab`. The
-/// caller owns the result.
-pub fn write(allocator: std.mem.Allocator, obj: Object) Error![]u8 {
-    var local_count: u32 = 0;
-    var seen_global = false;
-    for (obj.symbols) |s| switch (s.binding) {
-        .local => {
-            if (seen_global) return error.Unsupported; // a local symbol after a global one
-            local_count += 1;
-        },
-        .global => seen_global = true,
+/// Map this file's `Binding` to the shared emitter's binding.
+fn toBinding(b: Binding) object_emit.Binding {
+    return switch (b) {
+        .local => .local,
+        .global => .global,
     };
-    const first_global: u32 = 1 + local_count; // the null symbol at 0 is local
+}
+
+/// Map this file's `SymKind` to the shared emitter's symbol type.
+fn toSymType(k: SymKind) object_emit.SymType {
+    return switch (k) {
+        .notype => .notype,
+        .func => .func,
+        .object => .object,
+    };
+}
+
+/// Serialize a single-section `Object` into an ELF64 AArch64 relocatable object. This is
+/// the raw entry point that hand-built test objects use. It maps the `.text`, `.rodata`,
+/// `.data`, and `.bss` blobs and the symbol and relocation lists into the neutral form,
+/// then lets `object_emit.emit` write the ELF bytes. The emitter owns the symbol sort and
+/// the reloc-index remap, so the symbols pass in their natural order. The caller owns the
+/// result.
+pub fn write(allocator: std.mem.Allocator, obj: Object) Error![]u8 {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
 
     const has_rodata = obj.rodata.len > 0;
     const has_data = obj.data.len > 0;
     const has_bss = obj.bss_size > 0;
-    const has_rela = obj.relocs.len > 0;
-    // Split the data-section relocations by the section they modify: `.rela.data` or
-    // `.rela.rodata`. Each group needs its own `SHT_RELA` header. Its `sh_info` field
-    // names the target section.
-    var rela_data_count: usize = 0;
-    var rela_rodata_count: usize = 0;
-    for (obj.data_relocs) |dr| switch (dr.section) {
-        .data => rela_data_count += 1,
-        .rodata => rela_rodata_count += 1,
-        .text, .bss => {}, // a data relocation never lives in .text or .bss
-    };
-    const has_rela_data = rela_data_count > 0;
-    const has_rela_rodata = rela_rodata_count > 0;
-    var next: u16 = 1;
-    const text_ndx = next;
-    next += 1;
-    const rodata_ndx = if (has_rodata) blk: {
-        defer next += 1;
-        break :blk next;
-    } else 0;
-    const data_ndx = if (has_data) blk: {
-        defer next += 1;
-        break :blk next;
-    } else 0;
-    const bss_ndx = if (has_bss) blk: {
-        defer next += 1;
-        break :blk next;
-    } else 0;
-    if (has_rela) next += 1; // .rela.text
-    if (has_rela_data) next += 1; // .rela.data
-    if (has_rela_rodata) next += 1; // .rela.rodata
-    const symtab_ndx = next;
-    next += 1;
-    const strtab_ndx = next;
-    next += 1;
-    // The .shstrtab index and the total section count are set after the header list is
-    // built. The `debug` sections are inserted before it.
 
-    const shndxOf = struct {
-        fn f(kind: SectionKind, t: u16, ro: u16, d: u16, b: u16) u16 {
-            return switch (kind) {
-                .text => t,
-                .rodata => ro,
-                .data => d,
-                .bss => b,
-            };
+    // The text relocations, section-relative offsets already. Each `symbol` is the index
+    // into `obj.symbols`. The emitter remaps it after its symbol sort.
+    const text_relocs = try a.alloc(object_emit.OutReloc, obj.relocs.len);
+    for (obj.relocs, 0..) |r, i| text_relocs[i] = .{ .offset = r.offset, .symbol = r.symbol, .r_type = @intFromEnum(r.type), .addend = r.addend };
+
+    // The data pointer-init relocations, grouped by the section they modify. Each one is
+    // an `R_AARCH64_ABS64` against the target symbol.
+    var rodata_relocs: std.ArrayList(object_emit.OutReloc) = .empty;
+    var data_relocs: std.ArrayList(object_emit.OutReloc) = .empty;
+    for (obj.data_relocs) |dr| {
+        const e: object_emit.OutReloc = .{ .offset = dr.offset, .symbol = dr.symbol, .r_type = R_AARCH64_ABS64, .addend = dr.addend };
+        switch (dr.section) {
+            .rodata => try rodata_relocs.append(a, e),
+            .data => try data_relocs.append(a, e),
+            .text, .bss => {}, // a data relocation never lives in .text or .bss
         }
-    }.f;
+    }
 
-    // The symbol-name string table.
-    var strtab = try StrTab.init(allocator);
-    defer strtab.deinit(allocator);
-    var name_offsets = try allocator.alloc(u32, obj.symbols.len);
-    defer allocator.free(name_offsets);
-    for (obj.symbols, 0..) |s, i| name_offsets[i] = try strtab.add(allocator, s.name);
+    // The section list. `.text` is index 0, always present. Track each present section's
+    // index, so a symbol resolves its owning section.
+    var sections: std.ArrayList(object_emit.OutSection) = .empty;
+    var text_idx: u32 = 0;
+    var rodata_idx: u32 = 0;
+    var data_idx: u32 = 0;
+    var bss_idx: u32 = 0;
+    text_idx = @intCast(sections.items.len);
+    try sections.append(a, .{ .name = ".text", .sh_type = SHT_PROGBITS, .flags = SHF_ALLOC | SHF_EXECINSTR, .bytes = obj.text, .size = obj.text.len, .addralign = 4, .relocs = text_relocs });
+    if (has_rodata) {
+        rodata_idx = @intCast(sections.items.len);
+        try sections.append(a, .{ .name = ".rodata", .sh_type = SHT_PROGBITS, .flags = SHF_ALLOC, .bytes = obj.rodata, .size = obj.rodata.len, .addralign = 8, .relocs = rodata_relocs.items });
+    }
+    if (has_data) {
+        data_idx = @intCast(sections.items.len);
+        try sections.append(a, .{ .name = ".data", .sh_type = SHT_PROGBITS, .flags = SHF_ALLOC | SHF_WRITE, .bytes = obj.data, .size = obj.data.len, .addralign = 8, .relocs = data_relocs.items });
+    }
+    if (has_bss) {
+        bss_idx = @intCast(sections.items.len);
+        try sections.append(a, .{ .name = ".bss", .sh_type = SHT_NOBITS, .flags = SHF_ALLOC | SHF_WRITE, .size = obj.bss_size, .addralign = 8 });
+    }
+    // DWARF (or other) debug sections. They are plain PROGBITS, non-alloc, and no other
+    // section refers to them.
+    for (obj.debug) |d| try sections.append(a, .{ .name = d.name, .sh_type = SHT_PROGBITS, .flags = 0, .bytes = d.bytes, .size = d.bytes.len, .addralign = 1 });
 
-    // The symbol table.
-    const sym_bytes = (1 + obj.symbols.len) * symentsize;
-    var symtab = try allocator.alloc(u8, sym_bytes);
-    defer allocator.free(symtab);
-    @memset(symtab, 0);
+    // The symbols, in their natural order. Each defined symbol names its own section.
+    const symbols = try a.alloc(object_emit.OutSymbol, obj.symbols.len);
     for (obj.symbols, 0..) |s, i| {
-        const e = symtab[(i + 1) * symentsize ..][0..symentsize];
-        const binding: u8 = switch (s.binding) {
-            .local => STB_LOCAL,
-            .global => STB_GLOBAL,
+        const sec: u32 = switch (s.section) {
+            .text => text_idx,
+            .rodata => rodata_idx,
+            .data => data_idx,
+            .bss => bss_idx,
         };
-        const typ: u8 = switch (s.kind) {
-            .notype => STT_NOTYPE,
-            .func => STT_FUNC,
-            .object => STT_OBJECT,
-        };
-        putInt(e[0..4], u32, name_offsets[i]); // st_name
-        e[4] = (binding << 4) | typ; // st_info
-        e[5] = 0; // st_other
-        const shndx: u16 = if (s.defined) shndxOf(s.section, text_ndx, rodata_ndx, data_ndx, bss_ndx) else SHN_UNDEF;
-        putInt(e[6..8], u16, shndx); // st_shndx
-        putInt(e[8..16], u64, s.value); // st_value
-        putInt(e[16..24], u64, s.size); // st_size
+        symbols[i] = .{ .name = s.name, .section = sec, .value = s.value, .size = s.size, .binding = toBinding(s.binding), .sym_type = toSymType(s.kind), .defined = s.defined };
     }
 
-    // Relocation table. It applies to `.text`.
-    const rela_bytes = obj.relocs.len * relaentsize;
-    var rela = try allocator.alloc(u8, rela_bytes);
-    defer allocator.free(rela);
-    for (obj.relocs, 0..) |r, i| {
-        const e = rela[i * relaentsize ..][0..relaentsize];
-        const sym_index: u64 = @as(u64, r.symbol) + 1; // null entry at 0
-        putInt(e[0..8], u64, r.offset); // r_offset
-        putInt(e[8..16], u64, (sym_index << 32) | @intFromEnum(r.type)); // r_info
-        putInt(e[16..24], i64, r.addend); // r_addend
-    }
-
-    // `.rela.data` and `.rela.rodata` hold the data-section pointer-init relocations.
-    // Each one is an `R_AARCH64_ABS64` relocation against the target symbol. They are
-    // grouped by the section they modify, so each group can name its target section in
-    // `sh_info`.
-    var rela_data = try allocator.alloc(u8, rela_data_count * relaentsize);
-    defer allocator.free(rela_data);
-    var rela_rodata = try allocator.alloc(u8, rela_rodata_count * relaentsize);
-    defer allocator.free(rela_rodata);
-    {
-        var di: usize = 0;
-        var ri: usize = 0;
-        for (obj.data_relocs) |dr| {
-            const dst = switch (dr.section) {
-                .data => blk: {
-                    const e = rela_data[di * relaentsize ..][0..relaentsize];
-                    di += 1;
-                    break :blk e;
-                },
-                .rodata => blk: {
-                    const e = rela_rodata[ri * relaentsize ..][0..relaentsize];
-                    ri += 1;
-                    break :blk e;
-                },
-                .text, .bss => continue,
-            };
-            const sym_index: u64 = @as(u64, dr.symbol) + 1; // null entry at 0
-            putInt(dst[0..8], u64, dr.offset); // r_offset
-            putInt(dst[8..16], u64, (sym_index << 32) | R_AARCH64_ABS64); // r_info
-            putInt(dst[16..24], i64, dr.addend); // r_addend
-        }
-    }
-
-    var shstrtab = try StrTab.init(allocator);
-    defer shstrtab.deinit(allocator);
-
-    var headers: std.ArrayList(Shdr) = .empty;
-    defer headers.deinit(allocator);
-    try headers.append(allocator, .{ .name = ".text", .typ = SHT_PROGBITS, .flags = SHF_ALLOC | SHF_EXECINSTR, .addralign = 4, .bytes = obj.text, .size = obj.text.len });
-    if (has_rodata) try headers.append(allocator, .{ .name = ".rodata", .typ = SHT_PROGBITS, .flags = SHF_ALLOC, .addralign = 8, .bytes = obj.rodata, .size = obj.rodata.len });
-    if (has_data) try headers.append(allocator, .{ .name = ".data", .typ = SHT_PROGBITS, .flags = SHF_ALLOC | SHF_WRITE, .addralign = 8, .bytes = obj.data, .size = obj.data.len });
-    if (has_bss) try headers.append(allocator, .{ .name = ".bss", .typ = SHT_NOBITS, .flags = SHF_ALLOC | SHF_WRITE, .addralign = 8, .bytes = null, .size = obj.bss_size });
-    if (has_rela) try headers.append(allocator, .{ .name = ".rela.text", .typ = SHT_RELA, .flags = SHF_INFO_LINK, .addralign = 8, .entsize = relaentsize, .link = symtab_ndx, .info = text_ndx, .bytes = rela, .size = rela_bytes });
-    if (has_rela_data) try headers.append(allocator, .{ .name = ".rela.data", .typ = SHT_RELA, .flags = SHF_INFO_LINK, .addralign = 8, .entsize = relaentsize, .link = symtab_ndx, .info = data_ndx, .bytes = rela_data, .size = rela_data.len });
-    if (has_rela_rodata) try headers.append(allocator, .{ .name = ".rela.rodata", .typ = SHT_RELA, .flags = SHF_INFO_LINK, .addralign = 8, .entsize = relaentsize, .link = symtab_ndx, .info = rodata_ndx, .bytes = rela_rodata, .size = rela_rodata.len });
-    try headers.append(allocator, .{ .name = ".symtab", .typ = SHT_SYMTAB, .flags = 0, .addralign = 8, .entsize = symentsize, .link = strtab_ndx, .info = first_global, .bytes = symtab, .size = sym_bytes });
-    try headers.append(allocator, .{ .name = ".strtab", .typ = SHT_STRTAB, .flags = 0, .addralign = 1, .bytes = strtab.bytes.items, .size = strtab.bytes.items.len });
-    // DWARF (or other) debug sections. They are plain PROGBITS, and no other section
-    // refers to them.
-    for (obj.debug) |d| try headers.append(allocator, .{ .name = d.name, .typ = SHT_PROGBITS, .flags = 0, .addralign = 1, .bytes = d.bytes, .size = d.bytes.len });
-    try headers.append(allocator, .{ .name = ".shstrtab", .typ = SHT_STRTAB, .flags = 0, .addralign = 1, .bytes = null, .size = 0 });
-
-    // `.shstrtab` is the last header. The section count includes the leading null
-    // section.
-    const shstrtab_ndx: u16 = @intCast(headers.items.len);
-    const section_count: u16 = @intCast(headers.items.len + 1);
-
-    var offsets = try allocator.alloc(u64, headers.items.len);
-    defer allocator.free(offsets);
-    var off: u64 = ehsize;
-    for (headers.items, 0..) |h, i| {
-        off = alignUp(off, 8);
-        offsets[i] = off;
-        if (h.bytes != null) off += h.size;
-    }
-    var name_in_shstr = try allocator.alloc(u32, headers.items.len);
-    defer allocator.free(name_in_shstr);
-    for (headers.items, 0..) |h, i| name_in_shstr[i] = try shstrtab.add(allocator, h.name);
-    const shstr_idx = headers.items.len - 1;
-    offsets[shstr_idx] = alignUp(off, 8);
-    off = offsets[shstr_idx] + shstrtab.bytes.items.len;
-
-    off = alignUp(off, 8);
-    const shoff = off;
-    const total = shoff + @as(u64, section_count) * shentsize;
-
-    var buf = try allocator.alloc(u8, total);
-    errdefer allocator.free(buf);
-    @memset(buf, 0);
-
-    @memcpy(buf[0..4], "\x7fELF");
-    buf[4] = 2; // ELFCLASS64
-    buf[5] = 1; // ELFDATA2LSB
-    buf[6] = 1; // EV_CURRENT
-    putInt(buf[16..18], u16, ET_REL);
-    putInt(buf[18..20], u16, EM_AARCH64);
-    putInt(buf[20..24], u32, 1); // e_version
-    putInt(buf[40..48], u64, shoff); // e_shoff
-    putInt(buf[52..54], u16, @intCast(ehsize)); // e_ehsize
-    putInt(buf[58..60], u16, @intCast(shentsize)); // e_shentsize
-    putInt(buf[60..62], u16, section_count); // e_shnum
-    putInt(buf[62..64], u16, shstrtab_ndx); // e_shstrndx
-
-    putShdr(buf, shoff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
-    for (headers.items, 0..) |h, i| {
-        const ndx: u16 = @intCast(i + 1);
-        const content = if (i == shstr_idx) shstrtab.bytes.items else (h.bytes orelse &.{});
-        const size = if (i == shstr_idx) shstrtab.bytes.items.len else h.size;
-        if (content.len > 0) @memcpy(buf[offsets[i]..][0..content.len], content);
-        putShdr(buf, shoff, ndx, name_in_shstr[i], h.typ, h.flags, offsets[i], size, h.link, h.info, h.addralign, h.entsize);
-    }
-
-    return buf;
+    return object_emit.emit(allocator, sections.items, symbols, .{ .class = .elf64, .machine = EM_AARCH64, .use_rela = true });
 }
-
-fn putShdr(buf: []u8, shoff: u64, idx: u16, name: u32, typ: u32, flags: u64, offset: u64, size: u64, sh_link: u32, sh_info: u32, addralign: u64, entsize: u64) void {
-    const e = buf[shoff + idx * shentsize ..][0..shentsize];
-    putInt(e[0..4], u32, name);
-    putInt(e[4..8], u32, typ);
-    putInt(e[8..16], u64, flags);
-    putInt(e[16..24], u64, 0); // sh_addr
-    putInt(e[24..32], u64, offset);
-    putInt(e[32..40], u64, size);
-    putInt(e[40..44], u32, sh_link);
-    putInt(e[44..48], u32, sh_info);
-    putInt(e[48..56], u64, addralign);
-    putInt(e[56..64], u64, entsize);
-}
-
-const Pending = struct { offset: u64, name: []const u8, kind: isel.Kind };
 
 /// Map an isel relocation's `kind` to the matching ELF relocation type. The `kind` says
 /// which half of a call, or an adrp/add pair, the relocation patches.
@@ -421,218 +228,212 @@ fn relocTypeOf(kind: isel.Kind) RelocType {
     };
 }
 
-/// A data-section pointer-init relocation before its target name resolves to a symbol
-/// index. It holds the section and byte offset of the slot, and the target symbol's
-/// name.
-const PendingDataReloc = struct { section: SectionKind, offset: u64, symbol: []const u8 };
-
-/// Lay out `module.data` into `.rodata`/`.data` byte buffers and a `.bss` size. For each
-/// data global, append an `STT_OBJECT` symbol (its section and offset) to `globals`. Each
-/// data global's own `DataReloc`s (pointer initializers) are recorded in `data_relocs` at
-/// their absolute section offset. This offset is the global's placement plus the
-/// relocation's offset within the object. The function returns the accumulated `.bss`
-/// size. It grows `rodata` and `data` in place.
-fn layoutData(allocator: std.mem.Allocator, module: *const link.Module, globals: *std.ArrayList(Symbol), rodata: *std.ArrayList(u8), data: *std.ArrayList(u8), data_relocs: *std.ArrayList(PendingDataReloc)) Error!u64 {
-    var bss_size: u64 = 0;
-    for (module.data.items) |d| {
-        const section: SectionKind, const value: u64 = switch (d.kind) {
-            .rodata => blk: {
-                const start = rodata.items.len;
-                try rodata.appendSlice(allocator, d.bytes);
-                break :blk .{ .rodata, start };
-            },
-            .data => blk: {
-                const start = data.items.len;
-                try data.appendSlice(allocator, d.bytes);
-                break :blk .{ .data, start };
-            },
-            .bss => blk: {
-                const start = bss_size;
-                bss_size += d.size;
-                break :blk .{ .bss, start };
-            },
-        };
-        for (d.relocs) |r| try data_relocs.append(allocator, .{ .section = section, .offset = value + r.off, .symbol = r.symbol });
-        // An anonymous compiler-internal object has internal linkage. This includes a
-        // string literal named `.str.N`, and any other `.`-prefixed assembler-local
-        // name. Emit it with LOCAL binding. Every object numbers its own string literals
-        // from zero, so two objects can both define `.str.2`. A local symbol keeps each
-        // one private and avoids a link-time collision.
-        const binding: Binding = if (std.mem.startsWith(u8, d.name, ".")) .local else .global;
-        try globals.append(allocator, .{ .name = d.name, .value = value, .size = d.size, .kind = .object, .defined = true, .section = section, .binding = binding });
-    }
-    return bss_size;
-}
-
-/// Compile every function in `module`, and serialize them and its data globals into one
-/// ELF relocatable object. Each function becomes a defined `STT_FUNC` symbol in `.text`.
-/// Each data global becomes an `STT_OBJECT` symbol in `.rodata`, `.data`, or `.bss`. Each
-/// `bl` becomes an `R_AARCH64_CALL26` relocation. Each `global_addr`'s `adrp`/`add` pair
-/// becomes an `R_AARCH64_ADR_PREL_PG_HI21`/`R_AARCH64_ADD_ABS_LO12_NC` pair. Both kinds
-/// of relocation target the referenced symbol, which is undefined if external. The
-/// caller owns the returned ELF bytes.
-pub fn writeModule(allocator: std.mem.Allocator, module: *const link.Module) Error![]u8 {
-    var text: std.ArrayList(u8) = .empty;
-    defer text.deinit(allocator);
-    var globals: std.ArrayList(Symbol) = .empty;
-    defer globals.deinit(allocator);
-    var pending: std.ArrayList(Pending) = .empty;
-    defer pending.deinit(allocator);
-
-    const caps: isel.ModelCaps = if (module.model) |m| isel.capsForModel(m) else .{};
-    for (module.functions.items) |entry| {
-        const start: u64 = text.items.len;
-        var compiled = try isel.compileFunction(allocator, entry.func, caps);
-        defer compiled.deinit(allocator);
-        for (compiled.code) |word| {
-            var w: [4]u8 = undefined;
-            putInt(&w, u32, word);
-            try text.appendSlice(allocator, &w);
-        }
-        try globals.append(allocator, .{ .name = entry.name, .value = start, .size = @as(u64, compiled.code.len) * 4, .kind = .func, .defined = true, .binding = if (entry.func.is_local) .local else .global });
-        for (compiled.relocs) |r| {
-            try pending.append(allocator, .{ .offset = start + @as(u64, r.offset) * 4, .name = r.symbol, .kind = r.kind });
-        }
-    }
-
-    var rodata: std.ArrayList(u8) = .empty;
-    defer rodata.deinit(allocator);
-    var data: std.ArrayList(u8) = .empty;
-    defer data.deinit(allocator);
-    var pending_data: std.ArrayList(PendingDataReloc) = .empty;
-    defer pending_data.deinit(allocator);
-    const bss_size = try layoutData(allocator, module, &globals, &rodata, &data, &pending_data);
-
-    // The symbol table lists defined globals first, then any undefined external callees.
-    var symbols: std.ArrayList(Symbol) = .empty;
-    defer symbols.deinit(allocator);
-    try symbols.appendSlice(allocator, globals.items);
-    for (pending.items) |p| {
-        if (symbolIndex(symbols.items, p.name) == null) {
-            try symbols.append(allocator, .{ .name = p.name, .size = 0, .kind = .notype, .defined = false });
-        }
-    }
-    // ELF requires every LOCAL symbol to precede every GLOBAL one. Since `static`
-    // functions are local, the function list can interleave the two kinds. Stable-sort
-    // locals ahead of globals before the relocations below resolve their target symbol
-    // indices. Those indices must match the emitted order.
-    std.mem.sort(Symbol, symbols.items, {}, localsFirst);
-
-    var relocs = try allocator.alloc(Reloc, pending.items.len);
-    defer allocator.free(relocs);
-    for (pending.items, 0..) |p, i| {
-        relocs[i] = .{ .offset = p.offset, .symbol = symbolIndex(symbols.items, p.name).?, .type = relocTypeOf(p.kind) };
-    }
-
-    // Resolve each data-section relocation's target name to a symbol index. The target
-    // of a pointer initializer is an internally defined data or function global, added
-    // above.
-    var data_relocs = try allocator.alloc(DataRelocEntry, pending_data.items.len);
-    defer allocator.free(data_relocs);
-    for (pending_data.items, 0..) |p, i| {
-        data_relocs[i] = .{ .section = p.section, .offset = p.offset, .symbol = symbolIndex(symbols.items, p.symbol) orelse return error.Unsupported };
-    }
-
-    return write(allocator, .{ .text = text.items, .rodata = rodata.items, .data = data.items, .bss_size = bss_size, .symbols = symbols.items, .relocs = relocs, .data_relocs = data_relocs });
-}
-
-fn symbolIndex(symbols: []const Symbol, name: []const u8) ?u32 {
+/// Find the index of the symbol named `name` in the neutral symbol list, or null.
+fn oeIndex(symbols: []const object_emit.OutSymbol, name: []const u8) ?u32 {
     for (symbols, 0..) |s, i| if (std.mem.eql(u8, s.name, name)) return @intCast(i);
     return null;
 }
 
-/// Order a symbol table so every LOCAL binding sorts before every GLOBAL one
-/// (`Binding.local` = 0, `.global` = 1). This is the ELF requirement that `write`
-/// validates. Used with the stable `std.mem.sort`, so functions and data keep their
-/// relative order within each binding group.
-fn localsFirst(_: void, a: Symbol, b: Symbol) bool {
-    return @intFromEnum(a.binding) < @intFromEnum(b.binding);
+/// The section-name class for a data global's kind. A `.rodata` global lands in
+/// `.rodata.<name>`, a `.data` global in `.data.<name>`, and a `.bss` global in
+/// `.bss.<name>`.
+fn dataClass(kind: link.DataKind) []const u8 {
+    return switch (kind) {
+        .rodata => "rodata",
+        .data => "data",
+        .bss => "bss",
+    };
 }
 
-/// Like `writeModule`, but also emits inline DWARF (`.debug_abbrev`, `.debug_info`,
-/// `.debug_line`) describing each function's name and PC range. It also maps code
-/// offsets to `source_file` line numbers, taken from the `debug.line` IR attributes. The
-/// result is a real relocatable object that carries debug info for objdump or gdb. The
-/// caller owns the bytes.
-pub fn writeModuleWithDebug(allocator: std.mem.Allocator, module: *const link.Module, source_file: []const u8) Error![]u8 {
-    var text: std.ArrayList(u8) = .empty;
-    defer text.deinit(allocator);
-    var globals: std.ArrayList(Symbol) = .empty;
-    defer globals.deinit(allocator);
-    var pending: std.ArrayList(Pending) = .empty;
-    defer pending.deinit(allocator);
-    var rows: std.ArrayList(dwarf.LineRow) = .empty;
-    defer rows.deinit(allocator);
+/// Build a data global's own section name. A leading `.` is stripped from the symbol
+/// name, so a local `.str.N` becomes `.rodata.str.N`, not `..rodata..str.N`.
+fn dataSectionName(a: std.mem.Allocator, class: []const u8, name: []const u8) Error![]u8 {
+    const bare = if (std.mem.startsWith(u8, name, ".")) name[1..] else name;
+    return std.fmt.allocPrint(a, ".{s}.{s}", .{ class, bare });
+}
+
+/// Compile every function in `module`, and serialize them and its data globals into one
+/// ELF relocatable object. Each function becomes its own `.text.<name>` section with a
+/// defined `STT_FUNC` symbol at offset 0. Each data global becomes its own
+/// `.rodata.<name>`, `.data.<name>`, or `.bss.<name>` section with an `STT_OBJECT` symbol
+/// at offset 0. Each `bl` becomes an `R_AARCH64_CALL26` relocation, rebased to its own
+/// section. Each `global_addr`'s `adrp`/`add` pair becomes an
+/// `R_AARCH64_ADR_PREL_PG_HI21`/`R_AARCH64_ADD_ABS_LO12_NC` pair. Both kinds of
+/// relocation target the referenced symbol, which is undefined if external. The shared
+/// `object_emit.emit` writes the ELF bytes. The caller owns the result.
+pub fn writeModule(allocator: std.mem.Allocator, module: *const link.Module) Error![]u8 {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var sections: std.ArrayList(object_emit.OutSection) = .empty;
+    var symbols: std.ArrayList(object_emit.OutSymbol) = .empty;
+    // One relocation list per section. Its index matches `sections`.
+    var reloc_lists: std.ArrayList(std.ArrayList(object_emit.OutReloc)) = .empty;
+
+    // A text relocation recorded by its owning section and target name. Its target symbol
+    // index resolves after every symbol is known.
+    const TextReloc = struct { sec: usize, offset: u64, name: []const u8, r_type: u32 };
+    var text_relocs: std.ArrayList(TextReloc) = .empty;
+    // A data pointer-init relocation, likewise resolved by name after every symbol exists.
+    const DataR = struct { sec: usize, offset: u64, name: []const u8 };
+    var data_pending: std.ArrayList(DataR) = .empty;
 
     const caps: isel.ModelCaps = if (module.model) |m| isel.capsForModel(m) else .{};
     for (module.functions.items) |entry| {
-        const start: u64 = text.items.len;
         var compiled = try isel.compileFunction(allocator, entry.func, caps);
         defer compiled.deinit(allocator);
-        for (compiled.code) |word| {
-            var w: [4]u8 = undefined;
-            putInt(&w, u32, word);
-            try text.appendSlice(allocator, &w);
-        }
-        try globals.append(allocator, .{ .name = entry.name, .value = start, .size = @as(u64, compiled.code.len) * 4, .kind = .func, .defined = true, .binding = if (entry.func.is_local) .local else .global });
-        for (compiled.relocs) |r| {
-            try pending.append(allocator, .{ .offset = start + @as(u64, r.offset) * 4, .name = r.symbol, .kind = r.kind });
-        }
-        // Line rows are function-relative. Shift each one to the module-relative .text
-        // offset.
-        for (compiled.lines) |e| try rows.append(allocator, .{ .address = start + e.offset, .line = e.line });
+        const code = try a.alloc(u8, compiled.code.len * 4);
+        for (compiled.code, 0..) |word, wi| putInt(code[wi * 4 ..][0..4], u32, word);
+        const sec_index = sections.items.len;
+        try sections.append(a, .{
+            .name = try std.fmt.allocPrint(a, ".text.{s}", .{entry.name}),
+            .sh_type = SHT_PROGBITS,
+            .flags = SHF_ALLOC | SHF_EXECINSTR,
+            .bytes = code,
+            .size = code.len,
+            .addralign = 4,
+        });
+        try reloc_lists.append(a, .empty);
+        // A `static` function has internal linkage. So does a `.`-prefixed compiler-local
+        // name. Both get LOCAL binding.
+        const binding: object_emit.Binding = if (entry.func.is_local or std.mem.startsWith(u8, entry.name, ".")) .local else .global;
+        try symbols.append(a, .{ .name = entry.name, .section = @intCast(sec_index), .value = 0, .size = code.len, .binding = binding, .sym_type = .func, .defined = true });
+        // Rebase each relocation section-relative. Its offset was a word index into this
+        // function's own code, so multiply by 4.
+        for (compiled.relocs) |r| try text_relocs.append(a, .{ .sec = sec_index, .offset = @as(u64, r.offset) * 4, .name = r.symbol, .r_type = @intFromEnum(relocTypeOf(r.kind)) });
     }
 
-    var symbols: std.ArrayList(Symbol) = .empty;
-    defer symbols.deinit(allocator);
-    try symbols.appendSlice(allocator, globals.items);
-    for (pending.items) |p| {
-        if (symbolIndex(symbols.items, p.name) == null) {
-            try symbols.append(allocator, .{ .name = p.name, .size = 0, .kind = .notype, .defined = false });
+    // One section per data global.
+    for (module.data.items) |d| {
+        const sec_index = sections.items.len;
+        const sec_name = try dataSectionName(a, dataClass(d.kind), d.name);
+        switch (d.kind) {
+            .rodata => try sections.append(a, .{ .name = sec_name, .sh_type = SHT_PROGBITS, .flags = SHF_ALLOC, .bytes = d.bytes, .size = d.bytes.len, .addralign = 8 }),
+            .data => try sections.append(a, .{ .name = sec_name, .sh_type = SHT_PROGBITS, .flags = SHF_ALLOC | SHF_WRITE, .bytes = d.bytes, .size = d.bytes.len, .addralign = 8 }),
+            .bss => try sections.append(a, .{ .name = sec_name, .sh_type = SHT_NOBITS, .flags = SHF_ALLOC | SHF_WRITE, .size = d.size, .addralign = 8 }),
         }
-    }
-    // See `writeModule`. Locals must precede globals, sorted before the relocations
-    // resolve indices. The DWARF `subs` list below indexes `globals.items` in function
-    // order, unsorted, so it is unaffected.
-    std.mem.sort(Symbol, symbols.items, {}, localsFirst);
-    var relocs = try allocator.alloc(Reloc, pending.items.len);
-    defer allocator.free(relocs);
-    for (pending.items, 0..) |p, i| {
-        relocs[i] = .{ .offset = p.offset, .symbol = symbolIndex(symbols.items, p.name).?, .type = relocTypeOf(p.kind) };
+        try reloc_lists.append(a, .empty);
+        // An anonymous compiler-internal object (a string literal `.str.N` or any other
+        // `.`-prefixed name) has internal linkage, so it takes LOCAL binding.
+        const binding: object_emit.Binding = if (std.mem.startsWith(u8, d.name, ".")) .local else .global;
+        try symbols.append(a, .{ .name = d.name, .section = @intCast(sec_index), .value = 0, .size = d.size, .binding = binding, .sym_type = .object, .defined = true });
+        // A data global is its own section, so its pointer-init offset is already
+        // section-relative.
+        for (d.relocs) |r| try data_pending.append(a, .{ .sec = sec_index, .offset = r.off, .name = r.symbol });
     }
 
-    // DWARF: one subprogram DIE per function. Its PC range is the function's .text
-    // placement. It carries the function's IR return type as a base-type reference, so a
-    // debugger can show a typed signature.
-    const subs = try allocator.alloc(dwarf.Subprogram, globals.items.len);
-    defer allocator.free(subs);
-    for (globals.items, 0..) |g, i| subs[i] = .{
-        .name = g.name,
-        .low_pc = g.value,
-        .high_pc = g.value + g.size,
-        .ret_type = returnBaseType(module.functions.items[i].func),
+    // An undefined external callee. A text relocation whose target names no defined
+    // symbol is an import. Add it once as an undefined `notype` global.
+    for (text_relocs.items) |p| {
+        if (oeIndex(symbols.items, p.name) == null) try symbols.append(a, .{ .name = p.name, .section = 0, .value = 0, .size = 0, .binding = .global, .sym_type = .notype, .defined = false });
+    }
+
+    // Resolve every text relocation to its symbol index. Its `symbol` is the index into
+    // this symbol list. The emitter remaps it after its own symbol sort.
+    for (text_relocs.items) |p| {
+        const sym = oeIndex(symbols.items, p.name).?;
+        try reloc_lists.items[p.sec].append(a, .{ .offset = p.offset, .symbol = sym, .r_type = p.r_type });
+    }
+    // Resolve every data pointer-init relocation. Its target is an internally defined
+    // global. It is an error if the target is missing.
+    for (data_pending.items) |p| {
+        const sym = oeIndex(symbols.items, p.name) orelse return error.Unsupported;
+        try reloc_lists.items[p.sec].append(a, .{ .offset = p.offset, .symbol = sym, .r_type = R_AARCH64_ABS64 });
+    }
+
+    // Attach each section's relocation list.
+    for (sections.items, 0..) |*sec, i| sec.relocs = reloc_lists.items[i].items;
+
+    return object_emit.emit(allocator, sections.items, symbols.items, .{ .class = .elf64, .machine = EM_AARCH64, .use_rela = true });
+}
+
+/// Like `writeModule`, but also emits inline DWARF (`.debug_abbrev`, `.debug_info`,
+/// `.debug_line`) describing each function's name and PC range. It also maps code offsets
+/// to `source_file` line numbers, taken from the `debug.line` IR attributes. The DWARF
+/// program numbers PC ranges from a single running text offset, so the line and range
+/// tables stay self-consistent across the per-function sections. The result is a real
+/// relocatable object that carries debug info for objdump or gdb. The caller owns the
+/// bytes.
+pub fn writeModuleWithDebug(allocator: std.mem.Allocator, module: *const link.Module, source_file: []const u8) Error![]u8 {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var sections: std.ArrayList(object_emit.OutSection) = .empty;
+    var symbols: std.ArrayList(object_emit.OutSymbol) = .empty;
+    var reloc_lists: std.ArrayList(std.ArrayList(object_emit.OutReloc)) = .empty;
+
+    const TextReloc = struct { sec: usize, offset: u64, name: []const u8, r_type: u32 };
+    var text_relocs: std.ArrayList(TextReloc) = .empty;
+
+    var rows: std.ArrayList(dwarf.LineRow) = .empty;
+    // Each function's DWARF PC range, numbered from one running text offset.
+    var func_low: std.ArrayList(u64) = .empty;
+    var func_high: std.ArrayList(u64) = .empty;
+    var text_off: u64 = 0;
+
+    const caps: isel.ModelCaps = if (module.model) |m| isel.capsForModel(m) else .{};
+    for (module.functions.items) |entry| {
+        var compiled = try isel.compileFunction(allocator, entry.func, caps);
+        defer compiled.deinit(allocator);
+        const code = try a.alloc(u8, compiled.code.len * 4);
+        for (compiled.code, 0..) |word, wi| putInt(code[wi * 4 ..][0..4], u32, word);
+        const sec_index = sections.items.len;
+        try sections.append(a, .{
+            .name = try std.fmt.allocPrint(a, ".text.{s}", .{entry.name}),
+            .sh_type = SHT_PROGBITS,
+            .flags = SHF_ALLOC | SHF_EXECINSTR,
+            .bytes = code,
+            .size = code.len,
+            .addralign = 4,
+        });
+        try reloc_lists.append(a, .empty);
+        const binding: object_emit.Binding = if (entry.func.is_local or std.mem.startsWith(u8, entry.name, ".")) .local else .global;
+        try symbols.append(a, .{ .name = entry.name, .section = @intCast(sec_index), .value = 0, .size = code.len, .binding = binding, .sym_type = .func, .defined = true });
+        for (compiled.relocs) |r| try text_relocs.append(a, .{ .sec = sec_index, .offset = @as(u64, r.offset) * 4, .name = r.symbol, .r_type = @intFromEnum(relocTypeOf(r.kind)) });
+        // The DWARF PC range and line rows use the running text offset.
+        try func_low.append(a, text_off);
+        try func_high.append(a, text_off + code.len);
+        for (compiled.lines) |e| try rows.append(a, .{ .address = text_off + e.offset, .line = e.line });
+        text_off += code.len;
+    }
+
+    // An undefined external callee, added once.
+    for (text_relocs.items) |p| {
+        if (oeIndex(symbols.items, p.name) == null) try symbols.append(a, .{ .name = p.name, .section = 0, .value = 0, .size = 0, .binding = .global, .sym_type = .notype, .defined = false });
+    }
+    for (text_relocs.items) |p| {
+        const sym = oeIndex(symbols.items, p.name).?;
+        try reloc_lists.items[p.sec].append(a, .{ .offset = p.offset, .symbol = sym, .r_type = p.r_type });
+    }
+    // Attach each function section's relocation list, before the debug sections append.
+    for (sections.items, 0..) |*sec, i| sec.relocs = reloc_lists.items[i].items;
+
+    // DWARF: one subprogram DIE per function. Its PC range is the function's running
+    // text placement. It carries the function's IR return type as a base-type reference,
+    // so a debugger can show a typed signature.
+    const subs = try a.alloc(dwarf.Subprogram, module.functions.items.len);
+    for (module.functions.items, 0..) |entry, i| subs[i] = .{
+        .name = entry.name,
+        .low_pc = func_low.items[i],
+        .high_pc = func_high.items[i],
+        .ret_type = returnBaseType(entry.func),
     };
 
-    const abbrev = try dwarf.emitAbbrev(allocator);
-    defer allocator.free(abbrev);
+    const abbrev = try dwarf.emitAbbrev(a);
     // The object carries one line program at offset 0 of .debug_line. Link the
     // compilation unit to it with DW_AT_stmt_list. A debugger can now go from a
     // subprogram DIE straight to its source lines.
-    const info = try dwarf.emitInfo(allocator, .{ .name = source_file, .low_pc = 0, .high_pc = text.items.len, .subprograms = subs, .stmt_list = 0 });
-    defer allocator.free(info);
-    const line = try dwarf.emitLine(allocator, source_file, rows.items, text.items.len);
-    defer allocator.free(line);
+    const info = try dwarf.emitInfo(a, .{ .name = source_file, .low_pc = 0, .high_pc = text_off, .subprograms = subs, .stmt_list = 0 });
+    const line = try dwarf.emitLine(a, source_file, rows.items, text_off);
 
-    return write(allocator, .{
-        .text = text.items,
-        .symbols = symbols.items,
-        .relocs = relocs,
-        .debug = &.{
-            .{ .name = ".debug_abbrev", .bytes = abbrev },
-            .{ .name = ".debug_info", .bytes = info },
-            .{ .name = ".debug_line", .bytes = line },
-        },
-    });
+    // The debug sections are plain non-alloc PROGBITS. No other section refers to them.
+    try sections.append(a, .{ .name = ".debug_abbrev", .sh_type = SHT_PROGBITS, .flags = 0, .bytes = abbrev, .size = abbrev.len, .addralign = 1 });
+    try sections.append(a, .{ .name = ".debug_info", .sh_type = SHT_PROGBITS, .flags = 0, .bytes = info, .size = info.len, .addralign = 1 });
+    try sections.append(a, .{ .name = ".debug_line", .sh_type = SHT_PROGBITS, .flags = 0, .bytes = line, .size = line.len, .addralign = 1 });
+
+    return object_emit.emit(allocator, sections.items, symbols.items, .{ .class = .elf64, .machine = EM_AARCH64, .use_rela = true });
 }
 
 /// Map a function's IR return type, the type of its `ret` value, to a DWARF base type.

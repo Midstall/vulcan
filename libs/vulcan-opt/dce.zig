@@ -23,7 +23,7 @@ fn isPure(op: ir.function.Opcode) bool {
 }
 
 /// Count uses of each value across live instructions, `if` edges, and terminators.
-fn countUses(func: *const Function, uses: []u32) void {
+pub fn countUses(func: *const Function, uses: []u32) void {
     @memset(uses, 0);
     for (0..func.blockCount()) |bi| {
         const block: ir.function.Block = @enumFromInt(bi);

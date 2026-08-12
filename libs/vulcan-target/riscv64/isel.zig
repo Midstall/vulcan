@@ -2240,6 +2240,7 @@ pub fn riscv64RegDescription(allocator: std.mem.Allocator, func: *const Function
         .classes = classes,
         .classOf = riscv64ClassOf,
         .useKind = riscv64UseKind,
+        .coalesce_spill_slots = true,
         .entry_fixed = entry_fixed,
         .call_sites = call_sites,
         .scratch = scratch,

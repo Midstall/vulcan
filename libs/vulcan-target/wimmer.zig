@@ -66,7 +66,42 @@ pub const RegDescription = struct {
     entry_fixed: []const FixedAssign,
     call_sites: []const CallSite,
     scratch: []const u16,
+    // OPTIONAL second per-class scratch register, one per class, reserved exactly like `scratch`
+    // (never allocatable, no raw edge move touches it). It exists ONLY to break a parallel-move CYCLE
+    // that involves a spill slot both a source and a destination on one edge: the cycle value is held
+    // here while `scratch` stays free to realize any slot-to-slot memory move drained during the hold.
+    // A backend provides it (a spare reserved temp) to let `coalesce_spill_slots` commit on high-
+    // pressure functions instead of reverting. Empty (the default) means "not provided": the resolver
+    // keeps its single-scratch reg-only cycle break and `coalesceSpillSlots` keeps its revert guard, so
+    // a backend without a spare temp (x86-32) is unaffected and byte-identical.
+    scratch2: []const u16 = &.{},
     ctx: *const anyopaque,
+    // OPTIONAL interference-aware copy coalescing hook. Given a value `v`, return the source value
+    // when the instruction that defines `v` is a PURE same-class register copy of that source (a
+    // plain `mov`/`fmov` the backend emits with no bit change), else null. The allocator uses it to
+    // place a copy destination and its source on one register when the source dies at the copy, so
+    // the copy becomes a no-op. Null (the default) keeps the allocator's behavior byte-identical, so
+    // a backend that does not opt in is unaffected. Only a case the backend lowers to an EXACT plain
+    // copy is safe to report. A widening or narrowing that changes bits must NOT be reported.
+    copySource: ?*const fn (ctx: *const anyopaque, func: *const Function, v: Value) ?Value = null,
+    // OPTIONAL block-argument coalescing. When true, the scan hints a block parameter toward the
+    // register of an incoming argument that is already placed, so the edge move that feeds the
+    // parameter becomes a same-register no-op the edge resolver drops. A parameter and its incoming
+    // argument live in different blocks and never interfere (the argument dies on the edge, before
+    // the parameter is born), so this is a pure PREFERENCE, never a correctness change. Combined with
+    // `copySource`, it lets a copy chain (source -> convert -> block parameter) collapse onto one
+    // register. False (the default) keeps the allocator byte-identical for a backend that does not
+    // opt in.
+    coalesce_block_params: bool = false,
+    // OPTIONAL spill-slot coalescing. When true, after the scan a block parameter that SPILLED shares
+    // ONE spill slot with an incoming argument that also spilled, when the two do not interfere. The
+    // edge move that fed the parameter then becomes a same-slot no-op the edge resolver drops, so a
+    // `ldr scratch,[arg_slot]; str scratch,[param_slot]` pair disappears. Coalescing is interference-
+    // checked (two simultaneously live values never share a slot) and guarded so the parallel-move
+    // ordering precondition still holds (no slot is both a source and a destination on one edge); if
+    // the guard ever fails the whole coalescing is dropped and the byte-identical distinct-slot
+    // placement stands. False (the default) keeps the allocator byte-identical for a non-opting backend.
+    coalesce_spill_slots: bool = false,
 
     /// Free every owned slice the backend builder allocated: each class's `allocatable` and
     /// `callee_saved`, the `classes` slice, each call site's per-class `regs` and its `clobbered`
@@ -85,6 +120,7 @@ pub const RegDescription = struct {
         allocator.free(self.call_sites);
         allocator.free(self.entry_fixed);
         allocator.free(self.scratch);
+        if (self.scratch2.len > 0) allocator.free(self.scratch2);
         self.* = undefined;
     }
 };
@@ -124,6 +160,13 @@ pub const Interval = struct {
     ranges: []Range, // ascending, disjoint, merged
     uses: []UsePos, // ascending by `pos`
     location: ?Location = null, // filled by the scan, null here
+    // For a value interval that is a COALESCABLE COPY DESTINATION, the source value the backend's
+    // `copySource` reported. It means: the instruction that defines this value is a pure register
+    // copy of `copy_src` in the same class (a plain `mov`/`fmov` that changes no bits). When the
+    // source dies AT the copy (its last live position is this value's def), the allocator may place
+    // both on ONE register, which turns the copy into a no-op the backend elides. Null for a
+    // non-copy value, and for every backend that does not set `RegDescription.copySource`.
+    copy_src: ?Value = null,
 
     /// The interval's first live position. Programmer error to call on an empty interval.
     pub fn start(self: *const Interval) u32 {
@@ -334,12 +377,20 @@ pub fn buildIntervals(allocator: std.mem.Allocator, func: *const Function, desc:
         err: ?Error = null,
 
         fn visit(self: *@This(), v: Value, is_edge_arg: bool) void {
-            _ = is_edge_arg;
             const vi = @intFromEnum(v);
             self.used_row[vi] = true;
-            const kind: UseKind = if (self.term_kind)
-                // A ret value or block-param move is a register move at the block boundary. No
-                // target folds a spill slot there, so it needs a register.
+            const kind: UseKind = if (is_edge_arg)
+                // An edge argument feeds a successor block parameter through the parallel move the
+                // resolver realizes on the edge. That move can load from or store to a spill slot
+                // (orderMoves routes a slot end through the class scratch), so an edge argument does
+                // NOT need a register. Marking it should_have lets a high-pressure loop back-edge
+                // leave a carried value in a slot instead of demanding a register for EVERY carried
+                // value at the single terminator position, a demand no register-poor target (i386,
+                // x86_64) can satisfy once the value count passes the register file size.
+                .should_have_register
+            else if (self.term_kind)
+                // A ret value goes to its ABI return register at the block boundary, so it needs a
+                // register.
                 .must_have_register
             else
                 self.desc.useKind(self.desc.ctx, self.func, self.inst, v);
@@ -508,12 +559,24 @@ pub fn buildIntervals(allocator: std.mem.Allocator, func: *const Function, desc:
         const us = try use_lists[v].toOwnedSlice(allocator);
         errdefer allocator.free(us);
         const value: Value = @enumFromInt(v);
+        const class = desc.classOf(desc.ctx, func, value);
+        // Record the copy source when the backend opts into coalescing and reports this value as a
+        // pure same-class copy. The same-class guard is defensive: a cross-class copy shares no
+        // register pool, so it can never coalesce. Whether the source actually DIES at the copy is
+        // checked later, at the allocation and verification sites, from the source's live range.
+        var copy_src: ?Value = null;
+        if (desc.copySource) |hook| {
+            if (hook(desc.ctx, func, value)) |s| {
+                if (desc.classOf(desc.ctx, func, s) == class) copy_src = s;
+            }
+        }
         try result.append(allocator, .{
             .value = value,
-            .class = desc.classOf(desc.ctx, func, value),
+            .class = class,
             .fixed_reg = null,
             .ranges = rs,
             .uses = us,
+            .copy_src = copy_src,
         });
     }
 
@@ -761,15 +824,17 @@ fn entryHint(desc: *const RegDescription, v: Value, class: u16) ?u16 {
 /// TRYALLOCATEFREEREG (Wimmer & Franz Fig 6), without the splitting tail. Compute `freeUntilPos` for
 /// every candidate register of `current`'s class, its class pool plus its entry-param hint
 /// register. Clamp it by the active and inactive intervals that occupy those registers, then pick
-/// the register free the longest, with ties broken toward the hint. Return that register when it
-/// covers `current`'s whole lifetime, otherwise null. A null result means either no register is
-/// free at all, or a register is free for a prefix only. Both cases require a split, which this
-/// function defers to the blocked-register path.
+/// the register free the longest, with ties broken toward a hint. `param_hint`, when set, is the
+/// register an incoming argument holds for a block parameter, so the tie breaks toward eliding the
+/// edge move. Return that register when it covers `current`'s whole lifetime, otherwise null. A null
+/// result means either no register is free at all, or a register is free for a prefix only. Both
+/// cases require a split, which this function defers to the blocked-register path.
 fn tryAllocateFreeReg(
     current: *const Interval,
     active: []const *Interval,
     inactive: []const *Interval,
     desc: *const RegDescription,
+    param_hint: ?u16,
 ) ?u16 {
     const class_idx = current.class;
     const class = desc.classes[class_idx];
@@ -790,10 +855,19 @@ fn tryAllocateFreeReg(
 
     // An active interval of this class occupies its register right now (free until position 0). An
     // entry-param fixed interval for `current`'s own value is the hint, not a block, so skip it.
+    // When `current` is a copy of an active interval that DIES at the copy, that active interval's
+    // register is NOT a block: the one instruction reads it and writes `current`, so sharing the
+    // register makes the copy a no-op. Keep the register free for `current` and record it as the
+    // preferred (coalesce) register, so the backend elides the move.
+    var coalesce_hint: ?u16 = null;
     for (active) |it| {
         if (it.class != class_idx) continue;
         if (sameValue(it, current)) continue;
         const r = assignedReg(it);
+        if (copyDiesAt(current, it)) {
+            if (r < max_phys_regs and is_candidate[r]) coalesce_hint = r;
+            continue;
+        }
         if (r < max_phys_regs and is_candidate[r]) free_until[r] = 0;
     }
     // An inactive interval of this class has a hole here, so its register is free only until the two
@@ -811,15 +885,20 @@ fn tryAllocateFreeReg(
         }
     }
 
-    // Pick the register free the longest, preferring the hint on a tie so a parameter keeps its ABI
-    // register.
+    // Pick the register free the longest, preferring a hint on a tie. Three hints can apply: the
+    // copy-coalesce hint (a copy destination keeps its source's register, eliding the move), the
+    // block-parameter hint (a parameter keeps an incoming argument's register, eliding the edge
+    // move), and the entry-parameter hint (a parameter keeps its ABI register). The coalesce hint
+    // wins, then the block-parameter hint, then the entry hint. These three never apply to the same
+    // value (a copy destination is not a parameter, and only a block-0 parameter has an entry hint).
+    const pref_hint = coalesce_hint orelse param_hint orelse hint;
     var best_free: u32 = 0;
     for (0..max_phys_regs) |r| {
         if (is_candidate[r] and free_until[r] > best_free) best_free = free_until[r];
     }
     if (best_free == 0) return null;
     var chosen: ?u16 = null;
-    if (hint) |h| {
+    if (pref_hint) |h| {
         if (is_candidate[h] and free_until[h] == best_free) chosen = h;
     }
     if (chosen == null) {
@@ -838,12 +917,457 @@ fn tryAllocateFreeReg(
     return null;
 }
 
+/// True iff `dst` is a coalescable copy of `src`, and `src` DIES at the copy. That is, `dst`'s
+/// defining instruction is a pure same-class copy of `src`'s value (the backend reported it through
+/// `copySource`), and `src`'s last live position is `dst`'s def position. The single instruction
+/// reads `src` and writes `dst`, and their live ranges touch at ONLY that one position (`src` covers
+/// `[.., P + 1)`, `dst` covers `[P, ..)`). So placing both on one register makes the copy a no-op the
+/// backend elides, with no loss of `src`, which is dead right after. `src` must be a real value
+/// interval, not a fixed one. This is the single safety test both the scan and the verifier key off.
+fn copyDiesAt(dst: *const Interval, src: *const Interval) bool {
+    const cs = dst.copy_src orelse return false;
+    if (src.fixed_reg != null) return false;
+    const sv = src.value orelse return false;
+    if (cs != sv) return false;
+    return src.end() == dst.start() + 1;
+}
+
+/// True iff the two intervals are a legitimate copy-coalesce pair: one is a copy destination, the
+/// other is its source that dies at the copy. Their only same-register overlap is the single copy
+/// position, which is a no-op move, so the verifier accepts them sharing one register. This is the
+/// coalescing analogue of `isEntryParamHintPair`.
+fn isCopyCoalescePair(a: *const Interval, b: *const Interval) bool {
+    return copyDiesAt(a, b) or copyDiesAt(b, a);
+}
+
 /// True iff both intervals describe the same value (used to skip a value's own entry-param hint
 /// interval while computing `freeUntilPos`).
 fn sameValue(a: *const Interval, b: *const Interval) bool {
     const av = a.value orelse return false;
     const bv = b.value orelse return false;
     return av == bv;
+}
+
+/// The physical register value `v` is placed in, or null when `v` has no placed register interval
+/// yet. Among `v`'s intervals (the original plus any split children), it returns the register of the
+/// one placed in a register that lives LATEST (the greatest `end`), which is the register `v` holds
+/// as it flows out toward a block edge. It is used only to seed a block-parameter register HINT, so
+/// an imprecise pick can cost optimality but never correctness. Fixed intervals are skipped.
+fn placedRegOf(intervals: []const Interval, children: []const *Interval, v: Value) ?u16 {
+    var best: ?u16 = null;
+    var best_end: u32 = 0;
+    for (intervals) |*it| {
+        if (it.fixed_reg != null) continue;
+        if (it.value != v) continue;
+        const loc = it.location orelse continue;
+        switch (loc) {
+            .reg => |r| if (best == null or it.end() >= best_end) {
+                best = r;
+                best_end = it.end();
+            },
+            .slot => {},
+        }
+    }
+    for (children) |it| {
+        if (it.fixed_reg != null) continue;
+        if (it.value != v) continue;
+        const loc = it.location orelse continue;
+        switch (loc) {
+            .reg => |r| if (best == null or it.end() >= best_end) {
+                best = r;
+                best_end = it.end();
+            },
+            .slot => {},
+        }
+    }
+    return best;
+}
+
+/// Maps each block-parameter value to the incoming ARGUMENT values its predecessors pass for it, one
+/// per in-edge. Built only when `coalesce_block_params` is on, and read to seed a parameter's
+/// register hint from an argument that is already placed.
+const ParamArgs = std.AutoHashMapUnmanaged(Value, std.ArrayListUnmanaged(Value));
+
+/// Record, for edge `edge`, that each successor parameter receives the argument at the same index.
+/// An arity mismatch is an IR invariant break, so this skips it defensively rather than pairing a
+/// parameter with the wrong argument.
+fn addParamArgEdge(allocator: std.mem.Allocator, func: *const Function, map: *ParamArgs, edge: Jump) Error!void {
+    const params = func.blockParams(edge.target);
+    const args = func.blockArgs(edge);
+    if (params.len != args.len) return;
+    for (params, args) |p, a| {
+        const gop = try map.getOrPut(allocator, p);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        try gop.value_ptr.append(allocator, a);
+    }
+}
+
+/// Build the block-parameter to incoming-argument map by walking every edge (both `if` arms and each
+/// `jump`). The caller owns the result and frees it with `freeParamArgs`.
+fn buildParamArgs(allocator: std.mem.Allocator, func: *const Function) Error!ParamArgs {
+    var map: ParamArgs = .empty;
+    errdefer freeParamArgs(allocator, &map);
+    for (0..func.blockCount()) |bi| {
+        const block: Block = @enumFromInt(bi);
+        for (func.blockInsts(block)) |inst| {
+            if (func.opcode(inst) == .@"if") {
+                const cf = func.opcode(inst).@"if";
+                try addParamArgEdge(allocator, func, &map, cf.then);
+                try addParamArgEdge(allocator, func, &map, cf.@"else");
+            }
+        }
+        if (func.terminator(block)) |term| switch (term) {
+            .jump => |j| try addParamArgEdge(allocator, func, &map, j),
+            .ret => {},
+        };
+    }
+    return map;
+}
+
+/// Free the per-parameter argument lists and the map itself.
+fn freeParamArgs(allocator: std.mem.Allocator, map: *ParamArgs) void {
+    var it = map.valueIterator();
+    while (it.next()) |list| list.deinit(allocator);
+    map.deinit(allocator);
+}
+
+/// The register to hint block parameter `current` toward: the register of the FIRST of its incoming
+/// arguments that is already placed in a register. The scan processes intervals by ascending start,
+/// so an argument from an earlier predecessor is already placed and yields a hint, while a not-yet-
+/// placed argument (for example one on a loop back-edge) is simply skipped. A parameter and its
+/// argument never interfere, so this is a pure preference. Null when `current` is not a parameter, or
+/// no incoming argument is placed yet.
+fn computeParamHint(map: *const ParamArgs, intervals: []const Interval, children: []const *Interval, current: *const Interval) ?u16 {
+    const v = current.value orelse return null;
+    const list = map.getPtr(v) orelse return null;
+    for (list.items) |arg| {
+        if (placedRegOf(intervals, children, arg)) |r| return r;
+    }
+    return null;
+}
+
+// ===========================================================================
+// SPILL-SLOT COALESCING. The scan hands every spilled interval its own fresh
+// slot, so a spilled block parameter and the spilled argument that feeds it
+// land on DIFFERENT slots. The edge move for the pair is then a slot-to-slot
+// copy, `ldr scratch,[arg_slot]; str scratch,[param_slot]`, two memory ops per
+// phi per in-edge. In a high-pressure function with many spilled loop-carried
+// phis this dominates the memory traffic. Giving the parameter and its argument
+// ONE slot makes the edge move same-slot, and the edge resolver drops a
+// same-location move, so the copy vanishes. This mirrors what a graph-coloring
+// allocator gets from phi coalescing, extended onto the stack.
+//
+// Two soundness properties are enforced:
+//   1. INTERFERENCE: two values that are simultaneously live never share a
+//      slot. A union is rejected unless every interval on one slot is disjoint
+//      from every interval on the other. A loop phi and its own back-edge
+//      argument, which overlap in the loop body, are correctly NOT coalesced.
+//   2. PARALLEL-MOVE PRECONDITION: `orderClassMoves` relies on no spill slot
+//      being both a source and a destination on one edge (its cycle-break
+//      routes only registers through the scratch). After coalescing this is
+//      re-verified over every edge's full move set; if any edge would break it,
+//      the WHOLE coalescing is dropped and the byte-identical distinct-slot
+//      placement stands.
+// Both checks run under the same numbering the scan and resolver use, so the
+// coalesced placement is exactly what `buildAllocation` and `resolveDataFlow`
+// then consume, with the redundant same-slot moves naturally absent.
+// ===========================================================================
+
+/// Union-find representative of `i` with path halving, over the flat per-class slot space.
+fn ufFind(parent: []u32, i: u32) u32 {
+    var x = i;
+    while (parent[x] != x) {
+        parent[x] = parent[parent[x]];
+        x = parent[x];
+    }
+    return x;
+}
+
+/// The location value `v` occupies at position `pos`, read from its intervals the way `locationAt`
+/// reads a segment list: the location of the interval with the greatest `start()` at or before `pos`.
+/// Null when `v` has no interval starting at or before `pos`. `all` holds every value interval
+/// (originals plus split children), each with a filled `location`.
+fn valueLocAt(all: []const *Interval, v: Value, pos: u32) ?Location {
+    var best: ?*const Interval = null;
+    for (all) |iv| {
+        if (iv.value.? != v) continue;
+        if (iv.start() > pos) continue;
+        if (best == null or iv.start() > best.?.start()) best = iv;
+    }
+    if (best) |b| return b.location.?;
+    return null;
+}
+
+/// True iff the two spill-slot groups (all class-`class` intervals whose slot's representative is
+/// `rep_a`, versus `rep_b`) contain a pair of intervals whose live ranges overlap. Such a pair
+/// cannot share a slot: they would hold two different live values at once. Reads the pre-rewrite
+/// slot numbers still stored in each interval's `location`.
+fn slotGroupsInterfere(all: []const *Interval, parent: []u32, class_off: []const u32, class: u16, rep_a: u32, rep_b: u32) bool {
+    for (all) |ia| {
+        if (ia.class != class) continue;
+        const sa = switch (ia.location.?) {
+            .slot => |s| s,
+            .reg => continue,
+        };
+        if (ufFind(parent, class_off[class] + sa) != rep_a) continue;
+        for (all) |ib| {
+            if (ib.class != class) continue;
+            const sb = switch (ib.location.?) {
+                .slot => |s| s,
+                .reg => continue,
+            };
+            if (ufFind(parent, class_off[class] + sb) != rep_b) continue;
+            if (ia.nextIntersection(ib) != null) return true;
+        }
+    }
+    return false;
+}
+
+/// Attempt to coalesce, for one edge `pred -> edge.target`, each spilled successor parameter with the
+/// spilled argument the predecessor passes for it. `pt` is the predecessor's branch position and `ss`
+/// the successor's parameter row, so a location read at `pt` is the argument's placement leaving
+/// `pred` and at `ss` the parameter's placement entering the successor. A union is taken only when the
+/// two slots are distinct and their groups do not interfere.
+fn coalesceEdgeParams(all: []const *Interval, parent: []u32, class_off: []const u32, func: *const Function, desc: *const RegDescription, block_from: []const u32, block_to: []const u32, pred: Block, edge: Jump) void {
+    const succ = edge.target;
+    const pt = block_to[@intFromEnum(pred)] - 1;
+    const ss = block_from[@intFromEnum(succ)];
+    const params = func.blockParams(succ);
+    const args = func.blockArgs(edge);
+    if (params.len != args.len) return;
+    for (params, args) |p, a| {
+        const p_loc = valueLocAt(all, p, ss) orelse continue;
+        const a_loc = valueLocAt(all, a, pt) orelse continue;
+        const p_slot = switch (p_loc) {
+            .slot => |s| s,
+            .reg => continue,
+        };
+        const a_slot = switch (a_loc) {
+            .slot => |s| s,
+            .reg => continue,
+        };
+        const c = desc.classOf(desc.ctx, func, p);
+        // A parameter and its argument carry the same IR type, so the same class. A mismatch would be
+        // an invariant break; skip it rather than union across classes.
+        if (desc.classOf(desc.ctx, func, a) != c) continue;
+        const rep_p = ufFind(parent, class_off[c] + p_slot);
+        const rep_a = ufFind(parent, class_off[c] + a_slot);
+        if (rep_p == rep_a) continue;
+        if (slotGroupsInterfere(all, parent, class_off, c, rep_p, rep_a)) continue;
+        parent[rep_p] = rep_a;
+    }
+}
+
+/// Accumulate, into `mark` (bit0 = used as a move SOURCE, bit1 = used as a move DESTINATION), every
+/// spill slot that one edge's move set reads or writes, and report whether any slot ends up BOTH. That
+/// is exactly the condition `orderClassMoves` forbids. Covers both parameter moves and the live-in
+/// (through) values whose location changes across the edge, matching `addEdgeMoves`. Reads the
+/// post-rewrite slot numbers now in each interval's `location`.
+fn edgeSlotBothSrcAndDst(all: []const *Interval, intervals: []const Interval, children: []const *Interval, func: *const Function, desc: *const RegDescription, class_off: []const u32, mark: []u8, block_from: []const u32, block_to: []const u32, pred: Block, edge: Jump) bool {
+    const succ = edge.target;
+    const pt = block_to[@intFromEnum(pred)] - 1;
+    const ss = block_from[@intFromEnum(succ)];
+
+    const Marker = struct {
+        fn go(m: []u8, coff: []const u32, cls: u16, from: Location, to: Location) bool {
+            if (locEql(from, to)) return false;
+            switch (from) {
+                .slot => |s| m[coff[cls] + s] |= 1,
+                .reg => {},
+            }
+            switch (to) {
+                .slot => |s| m[coff[cls] + s] |= 2,
+                .reg => {},
+            }
+            return false;
+        }
+    };
+
+    // (1) Parameter moves.
+    const params = func.blockParams(succ);
+    const args = func.blockArgs(edge);
+    if (params.len == args.len) {
+        for (params, args) |p, a| {
+            const from = valueLocAt(all, a, pt) orelse continue;
+            const to = valueLocAt(all, p, ss) orelse continue;
+            _ = Marker.go(mark, class_off, desc.classOf(desc.ctx, func, p), from, to);
+        }
+    }
+    // (2) Live-through moves: a value live-in to `succ`, not a parameter, whose location changes.
+    for (all) |iv| {
+        const v = iv.value.?;
+        if (isParamOf(func, succ, v)) continue;
+        if (!valueLiveAt(intervals, children, v, ss)) continue;
+        const from = valueLocAt(all, v, pt) orelse continue;
+        const to = valueLocAt(all, v, ss) orelse continue;
+        _ = Marker.go(mark, class_off, desc.classOf(desc.ctx, func, v), from, to);
+    }
+
+    for (mark) |x| {
+        if (x == 3) return true;
+    }
+    return false;
+}
+
+/// Coalesce spilled block parameters with their spilled incoming arguments onto shared slots, so the
+/// feeding edge moves become same-slot no-ops the resolver drops. Interference-checked (property 1)
+/// and guarded by the parallel-move precondition (property 2); an unsafe result reverts to the
+/// distinct-slot placement, keeping the allocation byte-identical to the non-coalescing path. A no-op
+/// unless the backend set `RegDescription.coalesce_spill_slots`. Rewrites the `location` of the
+/// spilled intervals in place and compacts `slots` to the reduced per-class count.
+fn coalesceSpillSlots(allocator: std.mem.Allocator, func: *const Function, intervals: []Interval, children: []const *Interval, slots: []u32, desc: *const RegDescription) Error!void {
+    if (!desc.coalesce_spill_slots) return;
+    const nclasses: u16 = @intCast(desc.classes.len);
+
+    var total: u32 = 0;
+    for (slots) |s| total += s;
+    if (total == 0) return; // nothing spilled
+
+    // Flatten every value interval (originals + split children); each has a filled location.
+    var all_list: std.ArrayList(*Interval) = .empty;
+    defer all_list.deinit(allocator);
+    for (intervals) |*iv| {
+        if (iv.fixed_reg != null) continue;
+        if (iv.value == null) continue;
+        try all_list.append(allocator, iv);
+    }
+    for (children) |iv| try all_list.append(allocator, iv);
+    const all = all_list.items;
+
+    // Per-class slot offsets and a union-find over the flat slot space (unions stay within a class).
+    const class_off = try allocator.alloc(u32, nclasses + 1);
+    defer allocator.free(class_off);
+    class_off[0] = 0;
+    for (0..nclasses) |c| class_off[c + 1] = class_off[c] + slots[c];
+    const parent = try allocator.alloc(u32, total);
+    defer allocator.free(parent);
+    for (0..total) |i| parent[i] = @intCast(i);
+
+    const bounds = try computeBlockBounds(allocator, func);
+    defer allocator.free(bounds.from);
+    defer allocator.free(bounds.to);
+
+    // PASS 0: union all spilled pieces of the SAME value onto one slot. The splitter hands each split
+    // child its own fresh slot, so a value split under pressure and spilled on both sides of a split
+    // lands on two slots and pays a slot-to-slot move where its location "changes" across an edge, even
+    // though it is one value. Its pieces have DISJOINT lifetimes (a split partitions a lifetime), so
+    // they never hold two live values at once; coalescing them is always interference-safe and removes
+    // that self-move. The interference check still runs as a guard.
+    var value_slot: std.AutoHashMapUnmanaged(Value, u32) = .empty;
+    defer value_slot.deinit(allocator);
+    for (all) |ia| {
+        const sa = switch (ia.location.?) {
+            .slot => |s| s,
+            .reg => continue,
+        };
+        const c = ia.class;
+        const gop = try value_slot.getOrPut(allocator, ia.value.?);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = sa;
+            continue;
+        }
+        const rep_a = ufFind(parent, class_off[c] + sa);
+        const rep_b = ufFind(parent, class_off[c] + gop.value_ptr.*);
+        if (rep_a == rep_b) continue;
+        if (slotGroupsInterfere(all, parent, class_off, c, rep_a, rep_b)) continue;
+        parent[rep_a] = rep_b;
+    }
+
+    // PASS 1: union each spilled parameter with a non-interfering spilled incoming argument.
+    for (0..func.blockCount()) |bi| {
+        const pred: Block = @enumFromInt(bi);
+        for (func.blockInsts(pred)) |inst| {
+            if (func.opcode(inst) == .@"if") {
+                const cf = func.opcode(inst).@"if";
+                coalesceEdgeParams(all, parent, class_off, func, desc, bounds.from, bounds.to, pred, cf.then);
+                coalesceEdgeParams(all, parent, class_off, func, desc, bounds.from, bounds.to, pred, cf.@"else");
+            }
+        }
+        if (func.terminator(pred)) |term| switch (term) {
+            .jump => |j| coalesceEdgeParams(all, parent, class_off, func, desc, bounds.from, bounds.to, pred, j),
+            .ret => {},
+        };
+    }
+
+    // Compact each class's live slots to a dense 0.. numbering (a rep gets the next free index).
+    const remap = try allocator.alloc(u32, total);
+    defer allocator.free(remap);
+    @memset(remap, std.math.maxInt(u32));
+    const new_counts = try allocator.alloc(u32, nclasses);
+    defer allocator.free(new_counts);
+    for (0..nclasses) |c| {
+        var next: u32 = 0;
+        for (0..slots[c]) |s| {
+            const flat = class_off[c] + @as(u32, @intCast(s));
+            const r = ufFind(parent, flat);
+            if (remap[r] == std.math.maxInt(u32)) {
+                remap[r] = next;
+                next += 1;
+            }
+            remap[flat] = remap[r];
+        }
+        new_counts[c] = next;
+    }
+
+    // Snapshot the original locations so an unsafe result can revert bit-for-bit.
+    const orig_loc = try allocator.alloc(Location, all.len);
+    defer allocator.free(orig_loc);
+    for (all, 0..) |iv, i| orig_loc[i] = iv.location.?;
+
+    // Apply the remap to every spilled interval.
+    for (all) |iv| {
+        switch (iv.location.?) {
+            .slot => |s| iv.location = .{ .slot = remap[class_off[iv.class] + s] },
+            .reg => {},
+        }
+    }
+
+    // PASS 2: re-verify the parallel-move precondition over every edge, on the rewritten locations.
+    // When the backend gives EVERY class a second scratch, the resolver breaks slot-involving cycles
+    // through it (`orderClassMoves`), so a slot being both a source and a destination on an edge is
+    // fully handled and this guard is not needed; the coalescing always commits. Without full scratch2
+    // (x86-32), keep the conservative all-or-nothing revert so the single-scratch resolver never faces
+    // a slot cycle it cannot break.
+    const full_scratch2 = desc.scratch2.len == nclasses;
+    if (!full_scratch2) {
+        const mark = try allocator.alloc(u8, total);
+        defer allocator.free(mark);
+        var unsafe = false;
+        walk: for (0..func.blockCount()) |bi| {
+            const pred: Block = @enumFromInt(bi);
+            for (func.blockInsts(pred)) |inst| {
+                if (func.opcode(inst) == .@"if") {
+                    const cf = func.opcode(inst).@"if";
+                    for ([_]Jump{ cf.then, cf.@"else" }) |e| {
+                        @memset(mark, 0);
+                        if (edgeSlotBothSrcAndDst(all, intervals, children, func, desc, class_off, mark, bounds.from, bounds.to, pred, e)) {
+                            unsafe = true;
+                            break :walk;
+                        }
+                    }
+                }
+            }
+            if (func.terminator(pred)) |term| switch (term) {
+                .jump => |j| {
+                    @memset(mark, 0);
+                    if (edgeSlotBothSrcAndDst(all, intervals, children, func, desc, class_off, mark, bounds.from, bounds.to, pred, j)) {
+                        unsafe = true;
+                        break :walk;
+                    }
+                },
+                .ret => {},
+            };
+        }
+
+        if (unsafe) {
+            // Revert to the distinct-slot placement; leave `slots` untouched.
+            for (all, 0..) |iv, i| iv.location = orig_loc[i];
+            return;
+        }
+    }
+
+    // Commit the reduced per-class slot counts.
+    for (0..nclasses) |c| slots[c] = new_counts[c];
 }
 
 /// Allocate registers for `func` using the shared linear scan with live-range splitting. It
@@ -898,6 +1422,11 @@ pub fn allocate(allocator: std.mem.Allocator, func: *const Function, desc: *cons
     }
     std.mem.sort(*Interval, unhandled.items, {}, intervalStartLessThan);
 
+    // Block-argument coalescing map. Empty (and unused) unless the backend opted in. It hints a
+    // parameter toward an incoming argument's register so the edge move becomes a no-op.
+    var param_args: ParamArgs = if (desc.coalesce_block_params) try buildParamArgs(allocator, func) else .empty;
+    defer freeParamArgs(allocator, &param_args);
+
     // The scan is a worklist loop. Every split child starts strictly after the interval it came
     // from, so the total interval count is bounded by (values x positions). The guard asserts that
     // bound, to catch a splitting bug that would otherwise loop forever.
@@ -948,14 +1477,25 @@ pub fn allocate(allocator: std.mem.Allocator, func: *const Function, desc: *cons
         }
 
         // A value interval: take a free register covering its whole lifetime, or fall back to the
-        // blocked-register path that splits and spills to make room.
-        if (tryAllocateFreeReg(current, active.items, inactive.items, desc)) |reg| {
+        // blocked-register path that splits and spills to make room. A block-parameter hint (from an
+        // already-placed incoming argument) biases the free-register pick toward eliding the edge move.
+        const param_hint: ?u16 = if (desc.coalesce_block_params)
+            computeParamHint(&param_args, intervals, children.items, current)
+        else
+            null;
+        if (tryAllocateFreeReg(current, active.items, inactive.items, desc, param_hint)) |reg| {
             current.location = .{ .reg = reg };
             try active.append(allocator, current);
         } else {
             try allocateBlockedReg(allocator, current, &active, &inactive, &unhandled, &children, slots, desc);
         }
     }
+
+    // Coalesce spilled block parameters with their spilled incoming arguments onto shared slots, so
+    // the feeding edge moves collapse to same-slot no-ops the resolver drops. A no-op unless the
+    // backend opted in; interference-checked and guarded so an unsafe result reverts to the
+    // distinct-slot placement. Runs before the verifier, so the verified intervals are the final ones.
+    try coalesceSpillSlots(allocator, func, intervals, children.items, slots, desc);
 
     // In a test or debug build, verify the completed allocation before lowering it. A firing assert
     // here means the scan produced an UNSOUND allocation, a real bug, caught now instead of as a
@@ -1750,7 +2290,8 @@ pub fn orderMoves(allocator: std.mem.Allocator, raw: []const Move, desc: *const 
     errdefer out.deinit(allocator);
     for (0..desc.classes.len) |ci| {
         const class_idx: u16 = @intCast(ci);
-        try orderClassMoves(allocator, class_idx, raw, desc.scratch[ci], &out);
+        const s2: ?u16 = if (ci < desc.scratch2.len) desc.scratch2[ci] else null;
+        try orderClassMoves(allocator, class_idx, raw, desc.scratch[ci], s2, &out);
     }
     return out.toOwnedSlice(allocator);
 }
@@ -1772,16 +2313,21 @@ fn readByOther(pending: []const Move, self_i: usize, loc: Location) bool {
 /// the cycle). A slot->slot move is expanded to `scratch <- slot` then `slot <- scratch` at emit time
 /// (memory cannot move to memory in one op). Appends the ordered primitive moves to `out`.
 ///
-/// Correctness rests on two structural facts about THIS allocator's edge moves: a spill slot names a
-/// unique interval, so a slot is never both a source and a destination on one edge. Therefore every
-/// cycle consists only of reg->reg moves (the scratch save/restore is reg->reg), and a slot->slot
-/// move is always independent (its slot destination is read by no other move), so it is emitted in
-/// the first drain while the scratch is free, never nested inside a scratch-held cycle.
+/// Cycle handling depends on whether any spill slot is BOTH a source and a destination among this
+/// class's moves. Without a slot conflict (the historical case: each slot names a unique interval, so
+/// slots never both send and receive), every cycle is reg->reg and the single class `scratch` breaks
+/// it, byte-identical to before. WITH a slot conflict (spill-slot coalescing merged a parameter and
+/// its argument, so a value in a slot and the same slot receiving another value can sit in one cycle),
+/// the cycle value is routed through the SECOND scratch `scratch2` instead, leaving `scratch` free to
+/// realize any slot->slot memory move drained while the cycle is held. A slot conflict only reaches
+/// here when the backend provided `scratch2` (coalescing commits such a placement only then), so the
+/// `scratch2 == null` branch is unreachable and fails closed.
 fn orderClassMoves(
     allocator: std.mem.Allocator,
     class_idx: u16,
     raw: []const Move,
     scratch_reg: u16,
+    scratch2_reg: ?u16,
     out: *std.ArrayList(Move),
 ) Error!void {
     var pending: std.ArrayList(Move) = .empty;
@@ -1792,14 +2338,29 @@ fn orderClassMoves(
     if (pending.items.len == 0) return;
 
     const scratch_loc: Location = .{ .reg = scratch_reg };
-    // The scratch register is reserved, so no value ever lives there: no raw move may touch it.
+    const scratch2_loc: ?Location = if (scratch2_reg) |r| .{ .reg = r } else null;
+    // Both scratch registers are reserved, so no value ever lives there: no raw move may touch either.
     for (pending.items) |m| {
         std.debug.assert(!locEql(m.src, scratch_loc));
         std.debug.assert(!locEql(m.dst, scratch_loc));
+        if (scratch2_loc) |s2| {
+            std.debug.assert(!locEql(m.src, s2));
+            std.debug.assert(!locEql(m.dst, s2));
+        }
     }
 
+    // A slot both source and destination means a cycle can contain a slot; break such cycles through
+    // scratch2. `cycle_loc` is where a broken cycle node's value is parked: scratch2 under a conflict,
+    // else the ordinary scratch (byte-identical single-scratch path).
+    // A slot is both a source and a destination only after spill-slot coalescing merged a slot, which
+    // `coalesceSpillSlots` commits ONLY when every class has a scratch2. So a conflict here guarantees
+    // scratch2 is present; the `orelse` is an unreachable invariant, not a runtime path.
+    const has_slot_conflict = slotBothSrcAndDst(pending.items);
+    const cycle_loc: Location = if (has_slot_conflict) (scratch2_loc orelse unreachable) else scratch_loc;
+
     const out_start = out.items.len;
-    var scratch_busy = false;
+    var scratch_busy = false; // scratch held: a slot->slot expansion, or a no-conflict cycle break
+    var scratch2_busy = false; // scratch2 held: a slot-conflict cycle break
     // Each loop iteration either emits one pending move (shrinking `pending`) or breaks one cycle
     // (which unblocks at least one emit next), so the count is bounded by twice the move count.
     const bound: usize = pending.items.len * 2 + 4;
@@ -1817,40 +2378,72 @@ fn orderClassMoves(
 
         if (free_idx) |i| {
             const m = pending.orderedRemove(i);
-            try emitPrimitive(allocator, out, m, scratch_loc, class_idx, &scratch_busy);
+            try emitPrimitive(allocator, out, m, scratch_loc, scratch2_loc, class_idx, &scratch_busy, &scratch2_busy);
             continue;
         }
 
-        // Only cycles remain, and every cycle node is reg->reg. Break one by saving its source into
-        // the scratch, then reading the scratch in its place.
-        std.debug.assert(!scratch_busy);
+        // Only cycles remain. Break one by saving its source into the cycle scratch, then reading the
+        // scratch in its place; the location it used to read is now free, unblocking the rest.
         const m0 = &pending.items[0];
-        std.debug.assert(locIsReg(m0.src) and locIsReg(m0.dst));
-        // The save routes m0's value through the scratch, so it carries m0's value for the width.
-        try out.append(allocator, .{ .src = m0.src, .dst = scratch_loc, .class = class_idx, .value = m0.value });
-        scratch_busy = true;
-        m0.src = scratch_loc;
+        if (has_slot_conflict) {
+            std.debug.assert(!scratch2_busy);
+            scratch2_busy = true;
+        } else {
+            std.debug.assert(!scratch_busy);
+            // Without a slot conflict every cycle node is reg->reg (the classic invariant).
+            std.debug.assert(locIsReg(m0.src) and locIsReg(m0.dst));
+            scratch_busy = true;
+        }
+        // The save routes m0's value through the cycle scratch, so it carries m0's value for the width.
+        // m0.src may be a slot under a conflict, making this a load rather than a reg move.
+        try out.append(allocator, .{ .src = m0.src, .dst = cycle_loc, .class = class_idx, .value = m0.value });
+        m0.src = cycle_loc;
     }
-    std.debug.assert(!scratch_busy);
+    std.debug.assert(!scratch_busy and !scratch2_busy);
 
     if (std.debug.runtime_safety) {
         try assertOrderingValid(allocator, class_idx, raw, out.items[out_start..]);
     }
 }
 
+/// True iff some spill slot in `moves` is the source of one move and the destination of a DIFFERENT
+/// move. That is the one situation the single-scratch cycle break cannot serve (a cycle may then
+/// contain a slot both sent and received), so it selects the scratch2 routing. A self-move (a slot to
+/// itself) is not a conflict: it moves nothing.
+fn slotBothSrcAndDst(moves: []const Move) bool {
+    for (moves, 0..) |a, i| {
+        const s = switch (a.src) {
+            .slot => |x| x,
+            .reg => continue,
+        };
+        for (moves, 0..) |b, j| {
+            if (i == j) continue;
+            switch (b.dst) {
+                .slot => |y| if (y == s and a.class == b.class) return true,
+                .reg => {},
+            }
+        }
+    }
+    return false;
+}
+
 /// Emit one ordered move as backend-primitive op(s): a reg source (reg->reg move or reg->slot store)
 /// and a slot->reg load pass through unchanged, while a slot->slot shuffle expands to a load into the
-/// scratch then a store out of it. A move that READS the scratch closes a broken cycle, so the
-/// scratch is free again after it.
+/// scratch then a store out of it. A move that READS either scratch closes a broken cycle, so that
+/// scratch is free again after it. A move retargeted onto scratch2 reads a register, so it never
+/// re-enters the slot->slot path and never needs `scratch` while scratch2 is held.
 fn emitPrimitive(
     allocator: std.mem.Allocator,
     out: *std.ArrayList(Move),
     m: Move,
     scratch_loc: Location,
+    scratch2_loc: ?Location,
     class_idx: u16,
     scratch_busy: *bool,
+    scratch2_busy: *bool,
 ) Error!void {
     const closes = locEql(m.src, scratch_loc);
+    const closes2 = if (scratch2_loc) |s2| locEql(m.src, s2) else false;
     switch (m.src) {
         .reg => try out.append(allocator, m),
         .slot => switch (m.dst) {
@@ -1865,6 +2458,7 @@ fn emitPrimitive(
         },
     }
     if (closes) scratch_busy.* = false;
+    if (closes2) scratch2_busy.* = false;
 }
 
 /// Validate an ordered class sequence realizes the raw parallel move: simulate each location's
@@ -2034,6 +2628,10 @@ pub fn verifyIntervals(allocator: std.mem.Allocator, intervals: []const Interval
             const rb = occupiedReg(ib) orelse continue;
             if (ra != rb) continue;
             if (isEntryParamHintPair(ia, ib)) continue;
+            // A coalesced copy destination and its source share one register over the single copy
+            // position, a no-op move. That is their only overlap (the source dies at the copy), so
+            // it is not a conflict.
+            if (isCopyCoalescePair(ia, ib)) continue;
             if (occupancyConflict(ia, ib)) |pos| {
                 try violations.append(allocator, .{ .kind = .reg_overlap, .a = i, .b = j, .pos = pos });
             }

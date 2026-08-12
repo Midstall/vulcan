@@ -174,7 +174,7 @@ test "object+ld+exec: i386 links through the Placement model, byte-identical (EL
     // Drive the Placement model directly: parse -> computeDefaultPlacement -> applyRelocs.
     var parsed = [_]ld.elf.ParsedObject{try ld.elf.parseObject(allocator, obj)};
     defer parsed[0].deinit(allocator);
-    var placement = try ld.x86.computeDefaultPlacement(allocator, &parsed, link_base, null, false);
+    var placement = try ld.x86.computeDefaultPlacement(allocator, &parsed, link_base, null, false, null);
     defer placement.deinit(allocator);
 
     // The default placement is exactly one R|W|X segment mapping the whole image at
@@ -217,7 +217,7 @@ test "object+ld+exec: i386 links through the Placement model, byte-identical (EL
 
     // Wrap the stub+image as a one-segment placement and emit via writeElfSegments.
     var run_segs = [_]ld.Segment{.{ .vaddr = base, .paddr = base, .bytes = program.items, .memsz = stub_len + placement.segments[0].memsz, .flags = 7 }};
-    var run_pl: ld.Placement = .{ .segments = &run_segs, .places = &.{}, .symbols = &.{}, .entry = base };
+    var run_pl: ld.Placement = .{ .segments = &run_segs, .symbols = &.{}, .entry = base };
     const exe = try ld.writeElfSegments(.x86, allocator, &run_pl, base);
     defer allocator.free(exe);
     try std.testing.expectEqualSlices(u8, "\x7fELF", exe[0..4]);

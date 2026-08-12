@@ -20,7 +20,7 @@ const std = @import("std");
 const elf = @import("elf.zig");
 const script = @import("script.zig");
 
-const SecKind = elf.SecKind;
+const ObjSection = elf.ObjSection;
 const ParsedObject = elf.ParsedObject;
 const ResolvedSymbol = elf.ResolvedSymbol;
 const Segment = elf.Segment;
@@ -29,9 +29,12 @@ const Placement = elf.Placement;
 const Arch = elf.Arch;
 const alignUp = elf.alignUp;
 const findSymbol = elf.findSymbol;
-const secIndex = elf.secIndex;
-const places_per_object = elf.places_per_object;
 const not_placed = elf.not_placed;
+
+/// The broad placement class of one section (text/rodata/data/bss), used for the default
+/// alignment and bss detection. The script layout places sections by NAME, not class, so
+/// this only classifies for those two decisions.
+const Class = enum { text, rodata, data, bss };
 
 /// Every failure `computeScriptPlacement`/`linkInputsScript` can report: the generic
 /// linker errors (`elf.Error`, including `DuplicateSymbol`/`UndefinedSymbol`), script-parse
@@ -53,9 +56,12 @@ pub const ScriptError = elf.Error || script.ParseError || error{
 /// placement and `p_paddr` use this). With no `AT`/`AT>` they are equal. An
 /// `AT(expr)`/`AT>region` splits them by a constant per-section delta. `flags` is the ELF
 /// `p_flags` the enclosing segment should carry (from its `>region`, else the default 7).
+/// `si` is the index into the owning object's `sections`, and `class` its broad placement
+/// class (used for byte copying and bss detection).
 const Placed = struct {
     oi: usize,
-    kind: SecKind,
+    si: usize,
+    class: Class,
     vaddr: u64,
     laddr: u64,
     len: u64,
@@ -84,41 +90,39 @@ fn regionPFlags(f: script.RegionFlags) u8 {
     return if (v == 0) 7 else v;
 }
 
-/// The bytes an object contributes for `kind` (`.bss` has none - it is memory-only).
-fn kindBytes(obj: *const ParsedObject, kind: SecKind) []const u8 {
-    return switch (kind) {
-        .text => obj.text,
-        .rodata => obj.rodata,
-        .data => obj.data,
-        .bss, .undef => &.{},
-    };
+/// The broad placement class of one `ObjSection`, from its flags: a NOBITS section is
+/// bss, an executable section text, a writable section data, else read-only. This is the
+/// section-model twin of `elf.sectionClass` (which needs the raw `sh_type`); here the
+/// NOBITS case is already flagged by `is_nobits`.
+fn classForSection(sec: *const ObjSection) Class {
+    if (sec.is_nobits) return .bss;
+    if ((sec.flags & elf.SHF_EXECINSTR) != 0) return .text;
+    if ((sec.flags & elf.SHF_WRITE) != 0) return .data;
+    return .rodata;
 }
 
-/// The in-memory length of `obj`'s `kind` section (bytes for text/rodata/data, the
+/// The bytes one section contributes to the file image. A NOBITS (bss) section has none
+/// (it is memory-only), and its `bytes` is already empty.
+fn sectionBytes(sec: *const ObjSection) []const u8 {
+    return sec.bytes;
+}
+
+/// The in-memory length of a section (its `sh_size`: bytes for a progbits section, the
 /// reserved size for bss).
-fn kindLen(obj: *const ParsedObject, kind: SecKind) u64 {
-    return switch (kind) {
-        .text => obj.text.len,
-        .rodata => obj.rodata.len,
-        .data => obj.data.len,
-        .bss => obj.bss_size,
-        .undef => 0,
-    };
+fn sectionLen(sec: *const ObjSection) u64 {
+    return sec.size;
 }
 
-/// True when `obj` actually has a `kind` section to place (non-empty bytes, or a
-/// non-zero bss reservation).
-fn kindPresent(obj: *const ParsedObject, kind: SecKind) bool {
-    return kindLen(obj, kind) > 0;
+/// True when a section has something to place (a non-zero in-memory size).
+fn sectionPresent(sec: *const ObjSection) bool {
+    return sec.size > 0;
 }
 
-/// The default alignment applied to the location counter before placing a `kind`
-/// section: instructions are 4-byte aligned, data 8-byte aligned.
-fn defaultAlign(kind: SecKind) u64 {
-    return switch (kind) {
-        .text => 4,
-        else => 8,
-    };
+/// The default alignment applied to the location counter before a section is placed:
+/// an instruction (text-class) section is 4-byte aligned, everything else 8-byte aligned.
+/// The class comes from the section flags, so the alignment matches the old per-class rule.
+fn defaultAlign(sec: *const ObjSection) u64 {
+    return if (classForSection(sec) == .text) 4 else 8;
 }
 
 /// Round `v` up to a multiple of `a`, tolerating `a == 0` (a no-op) so a script's
@@ -186,8 +190,8 @@ const EvalCtx = struct {
 /// constant delta (the LMA drives file byte placement + `p_paddr`; the VMA drives relocs,
 /// symbols, and `p_vaddr`). After the walk, the placed sections are grouped by contiguous
 /// (delta, flags) into loadable segments (bss contributing memory size only), the
-/// per-(object, section) `places` map is filled, and both the objects' own defined symbols
-/// and the script-defined symbols are resolved into the symbol table (script symbols
+/// per-(object, section) `section_places` map is filled, and both the objects' own defined
+/// symbols and the script-defined symbols are resolved into the symbol table (script symbols
 /// override an object symbol of the same name). `ENTRY(sym)` sets the entry (0 if none). The
 /// caller owns the returned placement (`placement.deinit`); it does not own `parsed`/`scr`.
 pub fn computeScriptPlacement(allocator: std.mem.Allocator, parsed: []ParsedObject, scr: *const script.Script, arch: Arch) ScriptError!Placement {
@@ -212,17 +216,26 @@ pub fn computeScriptPlacement(allocator: std.mem.Allocator, parsed: []ParsedObje
         try regions.put(allocator, region.name, .{ .origin = origin, .length = length, .cursor = origin, .flags = region.flags });
     }
 
-    // The placed (object, section) list, plus a per-(object, section) placed flag and its
-    // assigned VMA for building `places` without re-searching the list.
+    // The placed (object, section) list.
     var placed_list: std.ArrayList(Placed) = .empty;
     defer placed_list.deinit(allocator);
-    const slot_count = nobj * places_per_object;
-    var placed_flag = try allocator.alloc(bool, slot_count);
-    defer allocator.free(placed_flag);
-    @memset(placed_flag, false);
-    var placed_vaddr = try allocator.alloc(u64, slot_count);
-    defer allocator.free(placed_vaddr);
-    @memset(placed_vaddr, 0);
+
+    // A per-object base offset into the flat per-section arrays (also returned as the
+    // placement's `section_place_base`). Entry `nobj` holds the total section count.
+    var section_place_base = try allocator.alloc(usize, nobj + 1);
+    errdefer allocator.free(section_place_base);
+    var total_secs: usize = 0;
+    for (0..nobj) |oi| {
+        section_place_base[oi] = total_secs;
+        total_secs += parsed[oi].sections.len;
+    }
+    section_place_base[nobj] = total_secs;
+
+    // A per-(object, section) placed flag: a section is gathered at most once, even when
+    // it matches more than one input pattern.
+    var sec_placed = try allocator.alloc(bool, total_secs);
+    defer allocator.free(sec_placed);
+    @memset(sec_placed, false);
 
     var dot: u64 = 0;
 
@@ -263,35 +276,37 @@ pub fn computeScriptPlacement(allocator: std.mem.Allocator, parsed: []ParsedObje
                 for (sec.body) |scmd| switch (scmd) {
                     .input => |spec| {
                         for (spec.sections) |pat| {
-                            const kind = secKindForPattern(pat) orelse continue;
                             for (parsed, 0..) |*obj, oi| {
-                                const slot = oi * places_per_object + secIndex(kind);
-                                if (placed_flag[slot]) continue;
-                                if (!kindPresent(obj, kind)) continue;
-                                dot = alignUpTo(dot, defaultAlign(kind));
-                                if (!section_started) {
-                                    section_started = true;
-                                    if (sec.lma) |lma| {
-                                        var lma_base: u64 = undefined;
-                                        switch (lma) {
-                                            .addr => |ae| {
-                                                var ctx = EvalCtx{ .dot = dot, .env = &env, .regions = &regions };
-                                                lma_base = try ctx.eval(&ae);
-                                            },
-                                            .region => |lrn| {
-                                                const lri = regions.getPtr(lrn) orelse return error.ScriptUndefinedRegion;
-                                                lma_base = alignUpTo(lri.cursor, defaultAlign(kind));
-                                                at_region = lri;
-                                            },
+                                for (obj.sections, 0..) |*isec, si| {
+                                    if (!sectionMatchesPattern(pat, isec)) continue;
+                                    const gi = section_place_base[oi] + si;
+                                    if (sec_placed[gi]) continue;
+                                    if (!sectionPresent(isec)) continue;
+                                    const class = classForSection(isec);
+                                    dot = alignUpTo(dot, defaultAlign(isec));
+                                    if (!section_started) {
+                                        section_started = true;
+                                        if (sec.lma) |lma| {
+                                            var lma_base: u64 = undefined;
+                                            switch (lma) {
+                                                .addr => |ae| {
+                                                    var ctx = EvalCtx{ .dot = dot, .env = &env, .regions = &regions };
+                                                    lma_base = try ctx.eval(&ae);
+                                                },
+                                                .region => |lrn| {
+                                                    const lri = regions.getPtr(lrn) orelse return error.ScriptUndefinedRegion;
+                                                    lma_base = alignUpTo(lri.cursor, defaultAlign(isec));
+                                                    at_region = lri;
+                                                },
+                                            }
+                                            lma_delta = lma_base -% dot;
                                         }
-                                        lma_delta = lma_base -% dot;
                                     }
+                                    const len = sectionLen(isec);
+                                    try placed_list.append(allocator, .{ .oi = oi, .si = si, .class = class, .vaddr = dot, .laddr = dot +% lma_delta, .len = len, .flags = section_flags });
+                                    sec_placed[gi] = true;
+                                    dot += len;
                                 }
-                                const len = kindLen(obj, kind);
-                                try placed_list.append(allocator, .{ .oi = oi, .kind = kind, .vaddr = dot, .laddr = dot +% lma_delta, .len = len, .flags = section_flags });
-                                placed_flag[slot] = true;
-                                placed_vaddr[slot] = dot;
-                                dot += len;
                             }
                         }
                     },
@@ -374,7 +389,7 @@ pub fn computeScriptPlacement(allocator: std.mem.Allocator, parsed: []ParsedObje
         if (p.laddr < glma[g]) glma[g] = p.laddr;
         const end = p.vaddr + p.len;
         if (end > gmem_end[g]) gmem_end[g] = end;
-        if (p.kind != .bss and end > gfile_end[g]) gfile_end[g] = end;
+        if (p.class != .bss and end > gfile_end[g]) gfile_end[g] = end;
         gflags[g] = p.flags;
     }
     // An empty placement set: one empty segment at 0 (matching the historical empty image).
@@ -400,8 +415,8 @@ pub fn computeScriptPlacement(allocator: std.mem.Allocator, parsed: []ParsedObje
         @memset(bytes, 0);
         for (placements, 0..) |p, idx| {
             if (seg_of_placement[idx] != g) continue;
-            if (p.kind == .bss) continue;
-            const src = kindBytes(&parsed[p.oi], p.kind);
+            if (p.class == .bss) continue;
+            const src = sectionBytes(&parsed[p.oi].sections[p.si]);
             if (src.len == 0) continue;
             const off: usize = @intCast(p.vaddr - gvma[g]);
             @memcpy(bytes[off..][0..src.len], src);
@@ -411,23 +426,25 @@ pub fn computeScriptPlacement(allocator: std.mem.Allocator, parsed: []ParsedObje
     }
 
     // Per-(object, section) placement: each placed slot maps to its group's segment at
-    // (vaddr - gvma); absent slots get the not-placed sentinel.
-    var places = try allocator.alloc(SecPlace, slot_count);
-    errdefer allocator.free(places);
-    for (places) |*pl| pl.* = .{ .vaddr = 0, .seg = not_placed, .seg_off = 0 };
+    // (vaddr - gvma); absent slots get the not-placed sentinel. The precise per-section
+    // `section_places` is keyed by section index, so the appliers read a section's place
+    // uniformly on the script path too.
+    var section_places = try allocator.alloc(SecPlace, total_secs);
+    errdefer allocator.free(section_places);
+    for (section_places) |*pl| pl.* = .{ .vaddr = 0, .seg = not_placed, .seg_off = 0 };
     for (placements, 0..) |p, idx| {
-        const slot = p.oi * places_per_object + secIndex(p.kind);
         const g = seg_of_placement[idx];
-        places[slot] = .{ .vaddr = p.vaddr, .seg = g, .seg_off = p.vaddr - gvma[g] };
+        const sp = SecPlace{ .vaddr = p.vaddr, .seg = g, .seg_off = p.vaddr - gvma[g] };
+        section_places[section_place_base[p.oi] + p.si] = sp;
     }
 
     // The resolved symbol table. Script-defined symbols are authoritative: an object symbol
     // whose name a script assignment also defines is skipped here (the script value is
-    // injected below), so `findSymbol` (and thus reloc resolution) sees the script's value -
-    // the SAME rule `ENTRY` uses (`env.get(name) orelse findSymbol(...)`). This resolves the
-    // Task-1 inconsistency where reloc resolution preferred the object while ENTRY preferred
-    // the script. Duplicate DEFINED object symbols across objects (with no script override)
-    // remain an error.
+    // injected below), so `findSymbol` (and thus reloc resolution) sees the script's value.
+    // This is the SAME rule `ENTRY` uses (`env.get(name) orelse findSymbol(...)`). It resolves
+    // an earlier inconsistency where reloc resolution preferred the object while `ENTRY`
+    // preferred the script. Duplicate DEFINED object symbols across objects (with no script
+    // override) remain an error.
     var symbols: std.ArrayList(ResolvedSymbol) = .empty;
     errdefer {
         for (symbols.items) |s| allocator.free(s.name);
@@ -436,15 +453,19 @@ pub fn computeScriptPlacement(allocator: std.mem.Allocator, parsed: []ParsedObje
     for (parsed, 0..) |*obj, oi| {
         for (obj.symbols) |sym| {
             // Skip undefined/local/anonymous/ABS symbols and any whose section the script
-            // did not place (nothing to anchor an address to).
-            if (!sym.defined or sym.local or sym.name.len == 0 or sym.section == .undef) continue;
-            const slot = oi * places_per_object + secIndex(sym.section);
-            if (!placed_flag[slot]) continue;
+            // did not place (nothing to anchor an address to). Resolve through the symbol's
+            // OWN section (by `section_index`): its placed VMA plus the in-section value.
+            // With one section per class this is the old class VMA; with two same-class
+            // sections a symbol now resolves to the section that defines it.
+            if (!sym.defined or sym.local or sym.name.len == 0 or sym.section_index == std.math.maxInt(u32)) continue;
+            const sp = section_places[section_place_base[oi] + sym.section_index];
+            if (sp.seg == not_placed) continue;
             if (env.contains(sym.name)) continue; // a script symbol of this name overrides it
             if (findSymbol(symbols.items, sym.name) != null) return error.DuplicateSymbol;
             const name = try allocator.dupe(u8, sym.name);
             errdefer allocator.free(name);
-            try symbols.append(allocator, .{ .name = name, .address = placed_vaddr[slot] + sym.value, .section = sym.section });
+            const is_exec = (obj.sections[sym.section_index].flags & elf.SHF_EXECINSTR) != 0;
+            try symbols.append(allocator, .{ .name = name, .address = sp.vaddr + sym.value, .is_exec = is_exec });
         }
     }
     var it = env.iterator();
@@ -463,38 +484,58 @@ pub fn computeScriptPlacement(allocator: std.mem.Allocator, parsed: []ParsedObje
 
     return .{
         .segments = segments,
-        .places = places,
         .symbols = try symbols.toOwnedSlice(allocator),
         .entry = entry_addr,
+        .section_places = section_places,
+        .section_place_base = section_place_base,
     };
 }
 
-/// Map one `*(...)` input-section glob pattern to the allocatable `SecKind` it selects, or
-/// null when the pattern names a custom/unsupported section (an MVP limit: only the four
-/// standard section families are recognized). Handles the leading-dot glob families
-/// (`.text`/`.text*`/`.text.*`, `.rodata*`, `.data*`, `.bss*` - matched by prefix so the
-/// trailing wildcard form is covered) plus the special `COMMON` pseudo-section (tentative
-/// definitions), which maps to `.bss`.
-pub fn secKindForPattern(pat: []const u8) ?SecKind {
-    if (std.mem.eql(u8, pat, "COMMON")) return .bss;
-    if (std.mem.startsWith(u8, pat, ".text")) return .text;
-    if (std.mem.startsWith(u8, pat, ".rodata")) return .rodata;
-    if (std.mem.startsWith(u8, pat, ".data")) return .data;
-    if (std.mem.startsWith(u8, pat, ".bss")) return .bss;
-    return null;
+/// Decide whether a linker-script input pattern selects one object section, matching on
+/// the section NAME (so an arbitrary named section places, not only the four standard
+/// families). A pattern with a trailing `*` matches any name that starts with the text
+/// before the `*` (so `.text*` selects `.text`, `.text.startup`, and so on); a pattern
+/// with no `*` matches the name exactly. The special `COMMON` pseudo-section selects any
+/// bss-class section (tentative definitions), as before. The four standard families
+/// (`.text*`/`.rodata*`/`.data*`/`.bss*`) stay a subset of this rule, so an existing
+/// script places byte-for-byte as before.
+pub fn sectionMatchesPattern(pat: []const u8, sec: *const ObjSection) bool {
+    if (std.mem.eql(u8, pat, "COMMON")) return classForSection(sec) == .bss;
+    if (std.mem.endsWith(u8, pat, "*")) return std.mem.startsWith(u8, sec.name, pat[0 .. pat.len - 1]);
+    return std.mem.eql(u8, sec.name, pat);
 }
 
-test "secKindForPattern maps the standard families and rejects custom sections" {
-    try std.testing.expectEqual(@as(?SecKind, .text), secKindForPattern(".text"));
-    try std.testing.expectEqual(@as(?SecKind, .text), secKindForPattern(".text*"));
-    try std.testing.expectEqual(@as(?SecKind, .text), secKindForPattern(".text.*"));
-    try std.testing.expectEqual(@as(?SecKind, .rodata), secKindForPattern(".rodata*"));
-    try std.testing.expectEqual(@as(?SecKind, .rodata), secKindForPattern(".rodata.str1.1"));
-    try std.testing.expectEqual(@as(?SecKind, .data), secKindForPattern(".data*"));
-    try std.testing.expectEqual(@as(?SecKind, .bss), secKindForPattern(".bss*"));
-    try std.testing.expectEqual(@as(?SecKind, .bss), secKindForPattern("COMMON"));
-    try std.testing.expectEqual(@as(?SecKind, null), secKindForPattern(".init_array"));
-    try std.testing.expectEqual(@as(?SecKind, null), secKindForPattern(".mycustom"));
+test "sectionMatchesPattern matches by section name, arbitrary sections, and COMMON" {
+    const A = elf.SHF_ALLOC;
+    const X = elf.SHF_EXECINSTR;
+    const W = elf.SHF_WRITE;
+    const text = ObjSection{ .name = ".text", .flags = A | X, .size = 4, .is_nobits = false };
+    const text_startup = ObjSection{ .name = ".text.startup", .flags = A | X, .size = 4, .is_nobits = false };
+    const rodata = ObjSection{ .name = ".rodata", .flags = A, .size = 4, .is_nobits = false };
+    const rodata_str = ObjSection{ .name = ".rodata.str1.1", .flags = A, .size = 4, .is_nobits = false };
+    const data = ObjSection{ .name = ".data", .flags = A | W, .size = 4, .is_nobits = false };
+    const bss = ObjSection{ .name = ".bss", .flags = A | W, .size = 4, .is_nobits = true };
+    const init_array = ObjSection{ .name = ".init_array", .flags = A | W, .size = 8, .is_nobits = false };
+    const custom = ObjSection{ .name = ".mycustom", .flags = A, .size = 4, .is_nobits = false };
+
+    // The standard families still place through their wildcard patterns.
+    try std.testing.expect(sectionMatchesPattern(".text*", &text));
+    try std.testing.expect(sectionMatchesPattern(".text*", &text_startup));
+    try std.testing.expect(sectionMatchesPattern(".rodata*", &rodata));
+    try std.testing.expect(sectionMatchesPattern(".rodata*", &rodata_str));
+    try std.testing.expect(sectionMatchesPattern(".data*", &data));
+    try std.testing.expect(sectionMatchesPattern(".bss*", &bss));
+    // A no-wildcard pattern is an exact name match now, not a family merge.
+    try std.testing.expect(sectionMatchesPattern(".text", &text));
+    try std.testing.expect(!sectionMatchesPattern(".text", &text_startup));
+    // COMMON selects any bss-class section, and only those.
+    try std.testing.expect(sectionMatchesPattern("COMMON", &bss));
+    try std.testing.expect(!sectionMatchesPattern("COMMON", &text));
+    // Arbitrary named sections now MATCH their own pattern (the old mapper dropped them).
+    try std.testing.expect(sectionMatchesPattern(".init_array", &init_array));
+    try std.testing.expect(sectionMatchesPattern(".init_array*", &init_array));
+    try std.testing.expect(sectionMatchesPattern(".mycustom", &custom));
+    try std.testing.expect(!sectionMatchesPattern(".text*", &custom));
 }
 
 test "computeScriptPlacement: location counter, output sections, ALIGN, and boundary symbols" {
@@ -506,14 +547,21 @@ test "computeScriptPlacement: location counter, output sections, ALIGN, and boun
     var t1 = [_]u8{ 5, 6, 7, 8, 9, 10 }; // obj1 .text (6 bytes)
     var d1 = [_]u8{ 0xAA, 0xBB, 0xCC, 0xDD }; // obj1 .data (4 bytes)
 
-    var syms0 = [_]elf.ObjSymbol{.{ .name = "_start", .value = 0, .defined = true, .local = false, .section = .text }};
+    var syms0 = [_]elf.ObjSymbol{.{ .name = "_start", .value = 0, .defined = true, .local = false, .section_index = 0 }};
     var syms1 = [_]elf.ObjSymbol{
-        .{ .name = "main", .value = 0, .defined = true, .local = false, .section = .text },
-        .{ .name = "g", .value = 0, .defined = true, .local = false, .section = .data },
+        .{ .name = "main", .value = 0, .defined = true, .local = false, .section_index = 0 },
+        .{ .name = "g", .value = 0, .defined = true, .local = false, .section_index = 1 },
+    };
+    var secs0 = [_]elf.ObjSection{
+        .{ .name = ".text", .flags = elf.SHF_ALLOC | elf.SHF_EXECINSTR, .bytes = &t0, .size = t0.len, .is_nobits = false },
+    };
+    var secs1 = [_]elf.ObjSection{
+        .{ .name = ".text", .flags = elf.SHF_ALLOC | elf.SHF_EXECINSTR, .bytes = &t1, .size = t1.len, .is_nobits = false },
+        .{ .name = ".data", .flags = elf.SHF_ALLOC | elf.SHF_WRITE, .bytes = &d1, .size = d1.len, .is_nobits = false },
     };
     var parsed = [_]ParsedObject{
-        .{ .arch = .aarch64, .text = &t0, .symbols = &syms0, .relocs = &.{} },
-        .{ .arch = .aarch64, .text = &t1, .data = &d1, .symbols = &syms1, .relocs = &.{} },
+        .{ .arch = .aarch64, .symbols = &syms0, .sections = &secs0 },
+        .{ .arch = .aarch64, .symbols = &syms1, .sections = &secs1 },
     };
 
     const src =
@@ -561,11 +609,13 @@ test "computeScriptPlacement: a duplicate defined symbol across objects errors" 
     const allocator = std.testing.allocator;
     var t0 = [_]u8{ 0, 0, 0, 0 };
     var t1 = [_]u8{ 0, 0, 0, 0 };
-    var syms0 = [_]elf.ObjSymbol{.{ .name = "dup", .value = 0, .defined = true, .local = false, .section = .text }};
-    var syms1 = [_]elf.ObjSymbol{.{ .name = "dup", .value = 0, .defined = true, .local = false, .section = .text }};
+    var syms0 = [_]elf.ObjSymbol{.{ .name = "dup", .value = 0, .defined = true, .local = false, .section_index = 0 }};
+    var syms1 = [_]elf.ObjSymbol{.{ .name = "dup", .value = 0, .defined = true, .local = false, .section_index = 0 }};
+    var secs0 = [_]elf.ObjSection{.{ .name = ".text", .flags = elf.SHF_ALLOC | elf.SHF_EXECINSTR, .bytes = &t0, .size = t0.len, .is_nobits = false }};
+    var secs1 = [_]elf.ObjSection{.{ .name = ".text", .flags = elf.SHF_ALLOC | elf.SHF_EXECINSTR, .bytes = &t1, .size = t1.len, .is_nobits = false }};
     var parsed = [_]ParsedObject{
-        .{ .arch = .aarch64, .text = &t0, .symbols = &syms0, .relocs = &.{} },
-        .{ .arch = .aarch64, .text = &t1, .symbols = &syms1, .relocs = &.{} },
+        .{ .arch = .aarch64, .symbols = &syms0, .sections = &secs0 },
+        .{ .arch = .aarch64, .symbols = &syms1, .sections = &secs1 },
     };
     var scr = try script.parse(allocator, "SECTIONS { . = 0x1000; .text : { *(.text*) } }", null);
     defer scr.deinit();
@@ -575,8 +625,9 @@ test "computeScriptPlacement: a duplicate defined symbol across objects errors" 
 test "computeScriptPlacement: ENTRY naming an unresolved symbol errors" {
     const allocator = std.testing.allocator;
     var t0 = [_]u8{ 0, 0, 0, 0 };
-    var syms0 = [_]elf.ObjSymbol{.{ .name = "_start", .value = 0, .defined = true, .local = false, .section = .text }};
-    var parsed = [_]ParsedObject{.{ .arch = .aarch64, .text = &t0, .symbols = &syms0, .relocs = &.{} }};
+    var syms0 = [_]elf.ObjSymbol{.{ .name = "_start", .value = 0, .defined = true, .local = false, .section_index = 0 }};
+    var secs0 = [_]elf.ObjSection{.{ .name = ".text", .flags = elf.SHF_ALLOC | elf.SHF_EXECINSTR, .bytes = &t0, .size = t0.len, .is_nobits = false }};
+    var parsed = [_]ParsedObject{.{ .arch = .aarch64, .symbols = &syms0, .sections = &secs0 }};
     var scr = try script.parse(allocator, "ENTRY(nope) SECTIONS { . = 0x1000; .text : { *(.text*) } }", null);
     defer scr.deinit();
     try std.testing.expectError(error.ScriptUndefinedSymbol, computeScriptPlacement(allocator, &parsed, &scr, .aarch64));
@@ -585,8 +636,9 @@ test "computeScriptPlacement: ENTRY naming an unresolved symbol errors" {
 test "computeScriptPlacement: an ORIGIN of an undefined region (no MEMORY block) fails closed" {
     const allocator = std.testing.allocator;
     var t0 = [_]u8{ 0, 0, 0, 0 };
-    var syms0 = [_]elf.ObjSymbol{.{ .name = "_start", .value = 0, .defined = true, .local = false, .section = .text }};
-    var parsed = [_]ParsedObject{.{ .arch = .aarch64, .text = &t0, .symbols = &syms0, .relocs = &.{} }};
+    var syms0 = [_]elf.ObjSymbol{.{ .name = "_start", .value = 0, .defined = true, .local = false, .section_index = 0 }};
+    var secs0 = [_]elf.ObjSection{.{ .name = ".text", .flags = elf.SHF_ALLOC | elf.SHF_EXECINSTR, .bytes = &t0, .size = t0.len, .is_nobits = false }};
+    var parsed = [_]ParsedObject{.{ .arch = .aarch64, .symbols = &syms0, .sections = &secs0 }};
     var scr = try script.parse(allocator, "SECTIONS { . = ORIGIN(rom); .text : { *(.text*) } }", null);
     defer scr.deinit();
     try std.testing.expectError(error.ScriptUndefinedRegion, computeScriptPlacement(allocator, &parsed, &scr, .aarch64));
@@ -600,10 +652,14 @@ test "computeScriptPlacement: MEMORY regions place VMA from a region; AT>region 
     var t0 = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
     var d0 = [_]u8{ 0xAA, 0xBB, 0xCC, 0xDD };
     var syms0 = [_]elf.ObjSymbol{
-        .{ .name = "_start", .value = 0, .defined = true, .local = false, .section = .text },
-        .{ .name = "g", .value = 0, .defined = true, .local = false, .section = .data },
+        .{ .name = "_start", .value = 0, .defined = true, .local = false, .section_index = 0 },
+        .{ .name = "g", .value = 0, .defined = true, .local = false, .section_index = 1 },
     };
-    var parsed = [_]ParsedObject{.{ .arch = .aarch64, .text = &t0, .data = &d0, .symbols = &syms0, .relocs = &.{} }};
+    var secs0 = [_]elf.ObjSection{
+        .{ .name = ".text", .flags = elf.SHF_ALLOC | elf.SHF_EXECINSTR, .bytes = &t0, .size = t0.len, .is_nobits = false },
+        .{ .name = ".data", .flags = elf.SHF_ALLOC | elf.SHF_WRITE, .bytes = &d0, .size = d0.len, .is_nobits = false },
+    };
+    var parsed = [_]ParsedObject{.{ .arch = .aarch64, .symbols = &syms0, .sections = &secs0 }};
 
     const src =
         \\MEMORY {
@@ -650,8 +706,9 @@ test "computeScriptPlacement: a region too small for its sections errors with Sc
     const allocator = std.testing.allocator;
     // rom LENGTH = 4, but `.text` is 8 bytes: allocating it overruns the region.
     var t0 = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
-    var syms0 = [_]elf.ObjSymbol{.{ .name = "_start", .value = 0, .defined = true, .local = false, .section = .text }};
-    var parsed = [_]ParsedObject{.{ .arch = .aarch64, .text = &t0, .symbols = &syms0, .relocs = &.{} }};
+    var syms0 = [_]elf.ObjSymbol{.{ .name = "_start", .value = 0, .defined = true, .local = false, .section_index = 0 }};
+    var secs0 = [_]elf.ObjSection{.{ .name = ".text", .flags = elf.SHF_ALLOC | elf.SHF_EXECINSTR, .bytes = &t0, .size = t0.len, .is_nobits = false }};
+    var parsed = [_]ParsedObject{.{ .arch = .aarch64, .symbols = &syms0, .sections = &secs0 }};
     const src =
         \\MEMORY { rom (rx) : ORIGIN = 0x08000000, LENGTH = 4 }
         \\SECTIONS { .text : { *(.text*) } >rom }
@@ -668,10 +725,14 @@ test "computeScriptPlacement: a script-defined symbol overrides an object symbol
     var t0 = [_]u8{ 1, 2, 3, 4 };
     var d0 = [_]u8{ 9, 9, 9, 9 };
     var syms0 = [_]elf.ObjSymbol{
-        .{ .name = "_start", .value = 0, .defined = true, .local = false, .section = .text },
-        .{ .name = "g", .value = 0, .defined = true, .local = false, .section = .data },
+        .{ .name = "_start", .value = 0, .defined = true, .local = false, .section_index = 0 },
+        .{ .name = "g", .value = 0, .defined = true, .local = false, .section_index = 1 },
     };
-    var parsed = [_]ParsedObject{.{ .arch = .aarch64, .text = &t0, .data = &d0, .symbols = &syms0, .relocs = &.{} }};
+    var secs0 = [_]elf.ObjSection{
+        .{ .name = ".text", .flags = elf.SHF_ALLOC | elf.SHF_EXECINSTR, .bytes = &t0, .size = t0.len, .is_nobits = false },
+        .{ .name = ".data", .flags = elf.SHF_ALLOC | elf.SHF_WRITE, .bytes = &d0, .size = d0.len, .is_nobits = false },
+    };
+    var parsed = [_]ParsedObject{.{ .arch = .aarch64, .symbols = &syms0, .sections = &secs0 }};
     const src =
         \\ENTRY(_start)
         \\SECTIONS {
@@ -696,10 +757,14 @@ test "computeScriptPlacement: two regions with VMA == LMA yield two runnable seg
     var t0 = [_]u8{ 1, 2, 3, 4 };
     var d0 = [_]u8{ 5, 6, 7, 8 };
     var syms0 = [_]elf.ObjSymbol{
-        .{ .name = "_start", .value = 0, .defined = true, .local = false, .section = .text },
-        .{ .name = "g", .value = 0, .defined = true, .local = false, .section = .data },
+        .{ .name = "_start", .value = 0, .defined = true, .local = false, .section_index = 0 },
+        .{ .name = "g", .value = 0, .defined = true, .local = false, .section_index = 1 },
     };
-    var parsed = [_]ParsedObject{.{ .arch = .aarch64, .text = &t0, .data = &d0, .symbols = &syms0, .relocs = &.{} }};
+    var secs0 = [_]elf.ObjSection{
+        .{ .name = ".text", .flags = elf.SHF_ALLOC | elf.SHF_EXECINSTR, .bytes = &t0, .size = t0.len, .is_nobits = false },
+        .{ .name = ".data", .flags = elf.SHF_ALLOC | elf.SHF_WRITE, .bytes = &d0, .size = d0.len, .is_nobits = false },
+    };
+    var parsed = [_]ParsedObject{.{ .arch = .aarch64, .symbols = &syms0, .sections = &secs0 }};
     const src =
         \\MEMORY {
         \\  rom (rx) : ORIGIN = 0x400000, LENGTH = 64K

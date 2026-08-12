@@ -3,11 +3,17 @@
   flakever,
   stdenv,
   mkShell,
+  wrapCCWith,
   zig,
   lld,
   binutils,
   etsoc-sysemu,
 }:
+let
+  inherit (stdenv) targetPlatform hostPlatform;
+
+  targetPrefix = lib.optionalString (targetPlatform != hostPlatform) (targetPlatform.config + "-");
+in
 stdenv.mkDerivation (finalAttrs: {
   pname = "vulcan";
   inherit (flakever) version;
@@ -28,13 +34,25 @@ stdenv.mkDerivation (finalAttrs: {
   doCheck = true;
   nativeCheckInputs = lib.optional etsoc-sysemu.meta.available etsoc-sysemu;
 
-  passthru.shell = mkShell {
-    name = "vulcan-dev-shell";
+  postInstall = ''
+    ln -s $out/bin/vcc $out/bin/${targetPrefix}clang
+  '';
 
-    packages = [
-      zig
-      lld
-      binutils
-    ];
+  passthru = {
+    isClang = true;
+
+    shell = mkShell {
+      name = "vulcan-dev-shell";
+
+      packages = [
+        zig
+        lld
+        binutils
+      ];
+    };
+
+    cc = wrapCCWith {
+      cc = finalAttrs.finalPackage;
+    };
   };
 })
