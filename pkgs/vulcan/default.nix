@@ -34,13 +34,12 @@ stdenv.mkDerivation (finalAttrs: {
   doCheck = true;
   nativeCheckInputs = lib.optional etsoc-sysemu.meta.available etsoc-sysemu;
 
+  # Needed so `wrapCCWith` works, remove when nixpkgs supports `vcc`
   postInstall = ''
-    ln -s $out/bin/vcc $out/bin/${targetPrefix}clang
+    ln -s $out/bin/vcc $out/bin/${targetPrefix}gcc
   '';
 
   passthru = {
-    isClang = true;
-
     shell = mkShell {
       name = "vulcan-dev-shell";
 
@@ -53,6 +52,15 @@ stdenv.mkDerivation (finalAttrs: {
 
     cc = wrapCCWith {
       cc = finalAttrs.finalPackage;
+    };
+
+    vcc-stdenv = stdenv.override {
+      inherit (finalAttrs.finalPackage) cc;
+      allowedRequisites = stdenv.allowedRequisites ++ [
+        finalAttrs.finalPackage
+        finalAttrs.finalPackage.cc.expand-response-params
+        finalAttrs.finalPackage.cc.bintools
+      ];
     };
   };
 })

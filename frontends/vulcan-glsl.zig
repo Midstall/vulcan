@@ -14,11 +14,18 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const allocator = init.arena.allocator();
 
+    // The diagnostic sink for this invocation: usage and argument errors route here,
+    // to the real stderr, instead of writing to the process-global stderr directly.
+    var errbuf: [256]u8 = undefined;
+    var errfile = std.Io.File.stderr().writer(io, &errbuf);
+    const errw = &errfile.interface;
+
     var it = try init.minimal.args.iterateAllocator(allocator); // cross-platform (works on WASI)
     defer it.deinit();
     _ = it.skip(); // argv0
     const input = it.next() orelse {
-        std.debug.print("usage: vulcan-glsl <input.glsl> [fragment|vertex|compute] [-o <output.spv>]\n", .{});
+        errw.print("usage: vulcan-glsl <input.glsl> [fragment|vertex|compute] [-o <output.spv>]\n", .{}) catch {};
+        errw.flush() catch {};
         return error.Usage;
     };
 
@@ -27,7 +34,8 @@ pub fn main(init: std.process.Init) !void {
     while (it.next()) |arg| {
         if (std.mem.eql(u8, arg, "-o")) {
             output = it.next() orelse {
-                std.debug.print("error: -o needs an output path\n", .{});
+                errw.print("error: -o needs an output path\n", .{}) catch {};
+                errw.flush() catch {};
                 return error.Usage;
             };
         } else if (std.mem.eql(u8, arg, "fragment")) {
@@ -37,7 +45,8 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "compute")) {
             stage = .compute;
         } else {
-            std.debug.print("error: unknown argument '{s}'\n", .{arg});
+            errw.print("error: unknown argument '{s}'\n", .{arg}) catch {};
+            errw.flush() catch {};
             return error.Usage;
         }
     }

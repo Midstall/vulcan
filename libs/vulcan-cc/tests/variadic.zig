@@ -760,16 +760,38 @@ fn startObj(allocator: std.mem.Allocator, arch: ld.Arch) ![]u8 {
 
 // --- glibc / qemu discovery (mirrors external_linkage.zig) ----------------------------------
 
-/// Locate a real glibc file named `soname` anywhere in the Nix store. Allocated path or null.
+/// Locate a real glibc file named `soname` (a loader such as `ld-linux-aarch64.so.1`).
+/// Allocated absolute path or null.
+///
+/// Ask the C compiler for the file instead of scanning `/nix/store`: fast, cross-platform,
+/// and a target's test runs only where its toolchain exists. The `soname` names its own
+/// target arch; native `cc` answers for the host arch, a cross target needs its
+/// `<triple>-gcc` (absent here -> the query fails or echoes the bare name -> skip).
+/// `cc -print-file-name=<name>` returns an ABSOLUTE path (leading `/`) when the compiler
+/// has that glibc file, else it echoes the bare `<name>` (no leading `/`) -> skip.
 fn findFile(allocator: std.mem.Allocator, soname: []const u8) !?[]u8 {
-    const cmd = try std.fmt.allocPrint(allocator, "find /nix/store -maxdepth 3 -name {s} 2>/dev/null | head -1", .{soname});
-    defer allocator.free(cmd);
-    const proc = std.process.run(allocator, std.testing.io, .{ .argv = &.{ "sh", "-c", cmd } }) catch return null;
-    defer allocator.free(proc.stdout);
-    defer allocator.free(proc.stderr);
-    const trimmed = std.mem.trim(u8, proc.stdout, " \t\r\n");
-    if (trimmed.len == 0) return null;
-    return try allocator.dupe(u8, trimmed);
+    const host = @import("builtin").cpu.arch;
+    const target_arch: std.Target.Cpu.Arch =
+        if (std.mem.indexOf(u8, soname, "aarch64") != null) .aarch64 else if (std.mem.indexOf(u8, soname, "x86-64") != null) .x86_64 else if (std.mem.indexOf(u8, soname, "riscv64") != null) .riscv64 else .x86; // ld-linux.so.2
+    const ccs: []const []const u8 = if (host == target_arch)
+        &.{ "cc", "gcc" }
+    else switch (target_arch) {
+        .aarch64 => &.{ "aarch64-unknown-linux-gnu-gcc", "aarch64-linux-gnu-gcc" },
+        .riscv64 => &.{ "riscv64-unknown-linux-gnu-gcc", "riscv64-linux-gnu-gcc" },
+        .x86_64 => &.{ "x86_64-unknown-linux-gnu-gcc", "x86_64-linux-gnu-gcc" },
+        .x86 => &.{ "i686-unknown-linux-gnu-gcc", "i686-linux-gnu-gcc" },
+        else => &.{},
+    };
+    const arg = try std.fmt.allocPrint(allocator, "-print-file-name={s}", .{soname});
+    defer allocator.free(arg);
+    for (ccs) |ccname| {
+        const proc = std.process.run(allocator, std.testing.io, .{ .argv = &.{ ccname, arg } }) catch continue;
+        defer allocator.free(proc.stdout);
+        defer allocator.free(proc.stderr);
+        const t = std.mem.trim(u8, proc.stdout, " \t\r\n");
+        if (t.len > 0 and t[0] == '/') return try allocator.dupe(u8, t);
+    }
+    return null;
 }
 
 /// Locate a `qemu-<suffix>` user-mode emulator on PATH, or null if absent.

@@ -19,11 +19,24 @@ pub const CodeBuffer = platform.Buffer(syncICache);
 /// cache over the code span once `finalize` flips it to read+execute.
 pub const MappedImage = platform.MappedImage(syncICache);
 
+/// libSystem's instruction-cache flush (`<libkern/OSCacheControl.h>`). Apple platforms trap a
+/// userspace `mrs ctr_el0` read (SIGILL) and reserve `ic ivau` for the kernel, so the manual
+/// clean+invalidate below cannot run there; this call performs the whole point-of-unification sync
+/// through the OS instead. Only referenced on Darwin, so no symbol is needed on other systems.
+extern "c" fn sys_icache_invalidate(start: [*]const u8, len: usize) void;
+
 /// Synchronize the instruction stream with freshly written code: clean the D-cache
 /// and invalidate the I-cache to the point of unification (line sizes from `ctr_el0`).
 /// A no-op off aarch64 (the code could not run there anyway).
 fn syncICache(memory: []const u8) void {
     if (builtin.cpu.arch != .aarch64) return;
+    // Apple platforms SIGILL on a userspace `mrs ctr_el0` (Linux emulates that read; Darwin does
+    // not) and trap `ic ivau` at EL0, so the manual sequence below would fault before any guest
+    // code runs. Defer to libSystem, which does the D-cache clean and I-cache invalidate itself.
+    if (builtin.os.tag.isDarwin()) {
+        sys_icache_invalidate(memory.ptr, memory.len);
+        return;
+    }
     const ctr = asm volatile ("mrs %[r], ctr_el0"
         : [r] "=r" (-> usize),
     );
