@@ -18,19 +18,27 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const allocator = init.arena.allocator();
 
+    // The diagnostic sink for this invocation: usage and error lines route here, to the
+    // real stderr, instead of writing to the process-global stderr directly. The disassembly itself
+    // is the program's output and still goes to stdout below.
+    var errbuf: [256]u8 = undefined;
+    var errfile = std.Io.File.stderr().writer(io, &errbuf);
+    const errw = &errfile.interface;
+
     var it = try init.minimal.args.iterateAllocator(allocator);
     defer it.deinit();
     _ = it.skip(); // argv0
-    const input = it.next() orelse return usage();
+    const input = it.next() orelse return usage(errw);
 
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, input, allocator, .limited(64 * 1024 * 1024));
 
     const listing = if (isElf(bytes))
-        try disassembleElf(allocator, bytes)
+        try disassembleElf(allocator, errw, bytes)
     else if (isSpirv(bytes))
         try spirv.disassembleBytes(allocator, bytes)
     else {
-        std.debug.print("vulcan-disasm: '{s}' is not an ELF or SPIR-V binary\n", .{input});
+        errw.print("vulcan-disasm: '{s}' is not an ELF or SPIR-V binary\n", .{input}) catch {};
+        errw.flush() catch {};
         return error.NotBinary;
     };
 
@@ -41,8 +49,9 @@ pub fn main(init: std.process.Init) !void {
     try w.interface.flush();
 }
 
-fn usage() error{Usage} {
-    std.debug.print("usage: vulcan-disasm <file>   (an ELF or SPIR-V binary)\n", .{});
+fn usage(errw: *std.Io.Writer) error{Usage} {
+    errw.print("usage: vulcan-disasm <file>   (an ELF or SPIR-V binary)\n", .{}) catch {};
+    errw.flush() catch {};
     return error.Usage;
 }
 
@@ -59,10 +68,11 @@ fn isSpirv(b: []const u8) bool {
 /// Locate an ELF's `.text`, pick the decoder for its `e_machine`, and return a symbolized
 /// listing (functions labeled and calls annotated from `.symtab`; falls back to a plain listing
 /// for a stripped file).
-fn disassembleElf(allocator: std.mem.Allocator, image: []const u8) ![]u8 {
+fn disassembleElf(allocator: std.mem.Allocator, errw: *std.Io.Writer, image: []const u8) ![]u8 {
     const elf = target.elf_read;
     const t = elf.findText(image) catch |err| {
-        std.debug.print("vulcan-disasm: {s}\n", .{@errorName(err)});
+        errw.print("vulcan-disasm: {s}\n", .{@errorName(err)}) catch {};
+        errw.flush() catch {};
         return error.BadElf;
     };
     // aarch64 and riscv64 get the richer objdump-style listing: absolute addresses and
@@ -91,7 +101,8 @@ fn disassembleElf(allocator: std.mem.Allocator, image: []const u8) ![]u8 {
         elf.EM_X86_64 => return target.x86_64.disasm.formatModuleWithLines(allocator, t.bytes, try byteSyms(allocator, target.x86_64.disasm.Sym, funcs), try debugLines(allocator, image, target.x86_64.disasm.AddrLine)),
         elf.EM_386 => return target.x86.disasm.formatModuleWithLines(allocator, t.bytes, try byteSyms(allocator, target.x86.disasm.Sym, funcs), try debugLines(allocator, image, target.x86.disasm.AddrLine)),
         else => {
-            std.debug.print("vulcan-disasm: unsupported ELF machine 0x{x}\n", .{t.machine});
+            errw.print("vulcan-disasm: unsupported ELF machine 0x{x}\n", .{t.machine}) catch {};
+            errw.flush() catch {};
             return error.Unsupported;
         },
     }

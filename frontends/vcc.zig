@@ -181,8 +181,9 @@ fn classifyExt(path: []const u8) InputKind {
     return .unknown;
 }
 
-fn fail(comptime fmt: []const u8, args: anytype) error{Usage} {
-    std.debug.print("vcc: error: " ++ fmt ++ "\n", args);
+fn fail(errw: *std.Io.Writer, comptime fmt: []const u8, args: anytype) error{Usage} {
+    errw.print("vcc: error: " ++ fmt ++ "\n", args) catch {};
+    errw.flush() catch {};
     return error.Usage;
 }
 
@@ -229,7 +230,7 @@ fn appendDefine(allocator: std.mem.Allocator, defines: *std.ArrayList(preproc.De
     }
 }
 
-fn parseArgs(allocator: std.mem.Allocator, it: anytype) (error{Usage} || std.mem.Allocator.Error)!Options {
+fn parseArgs(allocator: std.mem.Allocator, errw: *std.Io.Writer, it: anytype) (error{Usage} || std.mem.Allocator.Error)!Options {
     var opts = Options{};
     // `-Bdynamic`/`-Bstatic` only steer `-l` search preference. The parser captures this
     // onto each `.lib` spec as it scans, matching `ld.vulcan`'s own scan-time state (see
@@ -240,12 +241,12 @@ fn parseArgs(allocator: std.mem.Allocator, it: anytype) (error{Usage} || std.mem
     var prefer_dynamic_pref = false;
     while (it.next()) |arg| {
         if (std.mem.eql(u8, arg, "-o")) {
-            opts.output = it.next() orelse return fail("-o requires an argument", .{});
+            opts.output = it.next() orelse return fail(errw, "-o requires an argument", .{});
         } else if (std.mem.eql(u8, arg, "-target")) {
-            const spec = it.next() orelse return fail("-target requires an argument", .{});
+            const spec = it.next() orelse return fail(errw, "-target requires an argument", .{});
             opts.target_triple = spec;
             opts.target_arch = parseTargetArch(spec) orelse
-                return fail("unknown -target architecture '{s}' (expected aarch64/x86_64/x86/riscv64, or a triple starting with one)", .{spec});
+                return fail(errw, "unknown -target architecture '{s}' (expected aarch64/x86_64/x86/riscv64, or a triple starting with one)", .{spec});
         } else if (std.mem.eql(u8, arg, "--emit-ir")) {
             opts.emit_ir = true;
         } else if (std.mem.eql(u8, arg, "-E")) {
@@ -253,26 +254,26 @@ fn parseArgs(allocator: std.mem.Allocator, it: anytype) (error{Usage} || std.mem
         } else if (std.mem.eql(u8, arg, "-freproducible-compile")) {
             opts.reproducible = true;
         } else if (std.mem.eql(u8, arg, "-I")) {
-            const dir = it.next() orelse return fail("-I requires an argument", .{});
+            const dir = it.next() orelse return fail(errw, "-I requires an argument", .{});
             try opts.includes.append(allocator, dir);
         } else if (std.mem.startsWith(u8, arg, "-I")) {
             try opts.includes.append(allocator, arg[2..]);
         } else if (std.mem.eql(u8, arg, "-isystem")) {
             // `-isystem <dir>` was once an accept-and-ignore flag. It is now a real search
             // directory. See `buildSystemDirs`.
-            const dir = it.next() orelse return fail("-isystem requires an argument", .{});
+            const dir = it.next() orelse return fail(errw, "-isystem requires an argument", .{});
             try opts.isystem.append(allocator, dir);
         } else if (std.mem.startsWith(u8, arg, "-isystem") and arg.len > "-isystem".len) {
             try opts.isystem.append(allocator, arg["-isystem".len..]);
         } else if (std.mem.eql(u8, arg, "-nostdinc")) {
             opts.no_stdinc = true;
         } else if (std.mem.eql(u8, arg, "-D")) {
-            const spec = it.next() orelse return fail("-D requires an argument", .{});
+            const spec = it.next() orelse return fail(errw, "-D requires an argument", .{});
             try appendDefine(allocator, &opts.defines, spec);
         } else if (std.mem.startsWith(u8, arg, "-D")) {
             try appendDefine(allocator, &opts.defines, arg[2..]);
         } else if (std.mem.eql(u8, arg, "-U")) {
-            const name = it.next() orelse return fail("-U requires an argument", .{});
+            const name = it.next() orelse return fail(errw, "-U requires an argument", .{});
             try opts.undefines.append(allocator, name);
         } else if (std.mem.startsWith(u8, arg, "-U")) {
             try opts.undefines.append(allocator, arg[2..]);
@@ -281,11 +282,11 @@ fn parseArgs(allocator: std.mem.Allocator, it: anytype) (error{Usage} || std.mem
         } else if (std.mem.eql(u8, arg, "-shared")) {
             opts.shared = true;
         } else if (std.mem.eql(u8, arg, "--dynamic-linker")) {
-            opts.dynamic_linker = it.next() orelse return fail("--dynamic-linker requires an argument", .{});
+            opts.dynamic_linker = it.next() orelse return fail(errw, "--dynamic-linker requires an argument", .{});
         } else if (std.mem.startsWith(u8, arg, "--dynamic-linker=")) {
             opts.dynamic_linker = arg["--dynamic-linker=".len..];
         } else if (std.mem.eql(u8, arg, "-soname")) {
-            opts.soname = it.next() orelse return fail("-soname requires an argument", .{});
+            opts.soname = it.next() orelse return fail(errw, "-soname requires an argument", .{});
         } else if (std.mem.eql(u8, arg, "-Bdynamic")) {
             prefer_dynamic_pref = true;
         } else if (std.mem.eql(u8, arg, "-Bstatic") or std.mem.eql(u8, arg, "--static")) {
@@ -295,25 +296,25 @@ fn parseArgs(allocator: std.mem.Allocator, it: anytype) (error{Usage} || std.mem
             // autolink discovery. This arm sits AFTER the `-Bdynamic`/`-Bstatic` arms above,
             // so those exact spellings still steer `-l` search preference. They do not
             // become a prefix named "dynamic" or "static".
-            const p = it.next() orelse return fail("-B requires an argument", .{});
+            const p = it.next() orelse return fail(errw, "-B requires an argument", .{});
             try opts.prefixes.append(allocator, p);
         } else if (std.mem.startsWith(u8, arg, "-B") and arg.len > 2) {
             try opts.prefixes.append(allocator, arg[2..]);
         } else if (std.mem.eql(u8, arg, "--sysroot")) {
-            opts.sysroot = it.next() orelse return fail("--sysroot requires an argument", .{});
+            opts.sysroot = it.next() orelse return fail(errw, "--sysroot requires an argument", .{});
         } else if (std.mem.startsWith(u8, arg, "--sysroot=")) {
             opts.sysroot = arg["--sysroot=".len..];
         } else if (std.mem.eql(u8, arg, "-L")) {
-            const dir = it.next() orelse return fail("-L requires an argument", .{});
+            const dir = it.next() orelse return fail(errw, "-L requires an argument", .{});
             try opts.lib_dirs.append(allocator, dir);
         } else if (std.mem.startsWith(u8, arg, "-L") and arg.len > 2) {
             try opts.lib_dirs.append(allocator, arg[2..]);
         } else if (std.mem.eql(u8, arg, "-T")) {
-            opts.script_path = it.next() orelse return fail("-T requires an argument", .{});
+            opts.script_path = it.next() orelse return fail(errw, "-T requires an argument", .{});
         } else if (std.mem.startsWith(u8, arg, "-T") and arg.len > 2) {
             opts.script_path = arg[2..];
         } else if (std.mem.eql(u8, arg, "-l")) {
-            const name = it.next() orelse return fail("-l requires an argument", .{});
+            const name = it.next() orelse return fail(errw, "-l requires an argument", .{});
             try opts.inputs.append(allocator, .{ .lib = .{ .name = name, .prefer_dynamic = prefer_dynamic_pref } });
         } else if (std.mem.startsWith(u8, arg, "-l") and arg.len > 2) {
             try opts.inputs.append(allocator, .{ .lib = .{ .name = arg[2..], .prefer_dynamic = prefer_dynamic_pref } });
@@ -323,11 +324,11 @@ fn parseArgs(allocator: std.mem.Allocator, it: anytype) (error{Usage} || std.mem
             // both flags act the same way here.
             opts.gen_depfile = true;
         } else if (std.mem.eql(u8, arg, "-MF")) {
-            opts.depfile = it.next() orelse return fail("-MF requires an argument", .{});
+            opts.depfile = it.next() orelse return fail(errw, "-MF requires an argument", .{});
         } else if (std.mem.startsWith(u8, arg, "-MF") and arg.len > 3) {
             opts.depfile = arg[3..];
         } else if (std.mem.eql(u8, arg, "-MT") or std.mem.eql(u8, arg, "-MQ")) {
-            opts.depfile_target = it.next() orelse return fail("'{s}' requires an argument", .{arg});
+            opts.depfile_target = it.next() orelse return fail(errw, "'{s}' requires an argument", .{arg});
         } else if ((std.mem.startsWith(u8, arg, "-MT") or std.mem.startsWith(u8, arg, "-MQ")) and arg.len > 3) {
             opts.depfile_target = arg[3..];
         } else if (std.mem.eql(u8, arg, "-MP") or std.mem.eql(u8, arg, "-MG") or
@@ -357,7 +358,7 @@ fn parseArgs(allocator: std.mem.Allocator, it: anytype) (error{Usage} || std.mem
             // Ignoring it would silently produce the wrong output type (see the
             // `-m32`/`-m64`/`-mabi=` note below), so it stays a hard, fail-closed error
             // rather than joining the accept-ignore families.
-            return fail("'{s}' is recognized but not implemented yet (needs the object/link phase)", .{arg});
+            return fail(errw, "'{s}' is recognized but not implemented yet (needs the object/link phase)", .{arg});
         } else if (std.mem.eql(u8, arg, "-m32") or std.mem.eql(u8, arg, "-m64") or
             std.mem.startsWith(u8, arg, "-mabi="))
         {
@@ -365,7 +366,7 @@ fn parseArgs(allocator: std.mem.Allocator, it: anytype) (error{Usage} || std.mem
             // `-target`. Silently dropping one of these risks a silent miscompile, so the
             // driver fails closed with a clear message instead of joining the
             // accept-ignore families below.
-            return fail("'{s}' changes the ABI/word size and is not supported (use -target instead)", .{arg});
+            return fail(errw, "'{s}' changes the ABI/word size and is not supported (use -target instead)", .{arg});
         } else if (std.mem.startsWith(u8, arg, "-mcpu=")) {
             opts.cpu_tune = arg["-mcpu=".len..]; // last wins
         } else if (std.mem.startsWith(u8, arg, "-mtune=")) {
@@ -401,7 +402,7 @@ fn parseArgs(allocator: std.mem.Allocator, it: anytype) (error{Usage} || std.mem
             // `-Xlinker <arg>` / `-Xassembler <arg>`: accepted, along with the one
             // argument each carries, but not yet forwarded anywhere. There is no separate
             // linker or assembler subprocess here to forward them to.
-            _ = it.next() orelse return fail("'{s}' requires an argument", .{arg});
+            _ = it.next() orelse return fail(errw, "'{s}' requires an argument", .{arg});
         } else if (flagTakesSeparateArg(arg)) {
             // ACCEPT-AND-IGNORE a gcc flag that carries its value as the NEXT token:
             // `-include foo.h`, `-idirafter dir`, `-iquote dir`, `-imacros foo.h`, `-x c`,
@@ -409,7 +410,7 @@ fn parseArgs(allocator: std.mem.Allocator, it: anytype) (error{Usage} || std.mem
             // flag and its argument, so the argument is not mistaken for a positional
             // input file. Misreading it that way would fail the `./configure`/gnulib
             // builds that pass these flags.
-            _ = it.next() orelse return fail("'{s}' requires an argument", .{arg});
+            _ = it.next() orelse return fail(errw, "'{s}' requires an argument", .{arg});
         } else if (isIgnoredFlag(arg)) {
             // ACCEPT-AND-IGNORE: a warning, optimization, debug, or standard-selection
             // flag that `./configure`-style builds throw at the compiler. VCC has one
@@ -425,7 +426,7 @@ fn parseArgs(allocator: std.mem.Allocator, it: anytype) (error{Usage} || std.mem
             try opts.inputs.append(allocator, .{ .path = arg });
         }
     }
-    if (opts.probe == null and opts.inputs.items.len == 0) return fail("no input file", .{});
+    if (opts.probe == null and opts.inputs.items.len == 0) return fail(errw, "no input file", .{});
     return opts;
 }
 
@@ -466,7 +467,7 @@ fn flagTakesSeparateArg(arg: []const u8) bool {
         "-include",  "-imacros", "-idirafter",     "-iquote",
         "-isysroot", "-iprefix", "-iwithprefix",   "-iwithprefixbefore",
         "-MJ",       "-x",       "-Xpreprocessor", "-aux-info",
-        "-dumpbase", "-dumpdir", "--param",
+        "-dumpbase", "-dumpdir", "--param",        "-cxx-isystem",
     };
     for (with_arg) |f| if (std.mem.eql(u8, arg, f)) return true;
     return false;
@@ -830,11 +831,9 @@ fn pickModel(selector: ?[]const u8, target_arch: link.Arch, host: link.Arch, det
 
 /// Writes a `vcc: warning: ...` line to stderr. Failures to write are swallowed: a warning
 /// that cannot print is not worth aborting the compile over.
-fn warn(io: std.Io, comptime fmt: []const u8, args: anytype) void {
-    var buf: [256]u8 = undefined;
-    var w = std.Io.File.stderr().writer(io, &buf);
-    w.interface.print("vcc: warning: " ++ fmt ++ "\n", args) catch return;
-    w.interface.flush() catch return;
+fn warn(errw: *std.Io.Writer, comptime fmt: []const u8, args: anytype) void {
+    errw.print("vcc: warning: " ++ fmt ++ "\n", args) catch return;
+    errw.flush() catch return;
 }
 
 /// Resolves the effective microarch model for this compile, or null when none applies.
@@ -842,7 +841,7 @@ fn warn(io: std.Io, comptime fmt: []const u8, args: anytype) void {
 /// applies `pickModel`'s pure decision. An opt-out or an unresolved implicit default warns
 /// (or stays silent) and returns null. A named part that does not exist for `arch` is a hard
 /// error, except on a 32-bit x86 target, where it only warns (x86 ships no model at all).
-fn resolveModel(opts: *const Options, arch: link.Arch, io: std.Io) !?*const mm.Model {
+fn resolveModel(opts: *const Options, arch: link.Arch, errw: *std.Io.Writer) !?*const mm.Model {
     const detected = mm.detectHost();
     const host = hostLinkArch() catch arch;
     switch (pickModel(opts.cpu_tune, arch, host, detected)) {
@@ -850,19 +849,19 @@ fn resolveModel(opts: *const Options, arch: link.Arch, io: std.Io) !?*const mm.M
         .none => {
             if (opts.cpu_tune) |v| {
                 if (std.mem.eql(u8, v, "native")) {
-                    warn(io, "-mcpu=native has no model for target {s}, ignoring", .{@tagName(arch)});
+                    warn(errw, "-mcpu=native has no model for target {s}, ignoring", .{@tagName(arch)});
                 } else if (!std.mem.eql(u8, v, "generic") and !std.mem.eql(u8, v, "none") and mm.Microarch.parse(v) == null) {
-                    warn(io, "unknown -mcpu/-mtune value '{s}', ignoring", .{v});
+                    warn(errw, "unknown -mcpu/-mtune value '{s}', ignoring", .{v});
                 }
             }
             return null;
         },
         .mismatch => {
             if (arch == .x86) {
-                warn(io, "-mcpu/-mtune has no model for a 32-bit x86 target, ignoring", .{});
+                warn(errw, "-mcpu/-mtune has no model for a 32-bit x86 target, ignoring", .{});
                 return null;
             }
-            return fail("-mcpu={s} is not valid for target {s}", .{ opts.cpu_tune.?, @tagName(arch) });
+            return fail(errw, "-mcpu={s} is not valid for target {s}", .{ opts.cpu_tune.?, @tagName(arch) });
         },
     }
 }
@@ -967,15 +966,98 @@ fn synthDsoHandleObject(allocator: std.mem.Allocator, pp_base: preproc.Options, 
 /// (`link.linkInputs`/`link.writeExecutable`, or `-T`'s script-driven layout), or, when
 /// `-shared`/`--dynamic-linker` is given or any input resolves to a `.so`, a dynamic image
 /// via `link.linkDynamic`.
+/// GCC/clang `@file` response-file expansion. Each argument that begins with `@` is replaced by
+/// the whitespace-separated tokens read from the named file, applied RECURSIVELY so a response file
+/// may itself name further `@files`. Every other argument passes through unchanged. This is exactly
+/// what nixpkgs `wrapCCWith` (and gcc/clang under an over-long command line) relies on: the wrapper
+/// invokes the compiler with a single `@/tmp/cc-params.XXXX` that holds the real arguments. An
+/// `@path` that cannot be read is left as a literal argument, matching gcc's own fallback.
+fn expandResponseFiles(allocator: std.mem.Allocator, io: std.Io, it: anytype) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    while (it.next()) |arg| try appendExpanded(allocator, io, &out, arg, 0);
+    return out.toOwnedSlice(allocator);
+}
+
+/// Append `arg` to `out`, expanding it in place when it is an `@response-file`. `depth` bounds the
+/// recursion so a response file that (directly or transitively) names itself cannot loop forever.
+fn appendExpanded(allocator: std.mem.Allocator, io: std.Io, out: *std.ArrayList([]const u8), arg: []const u8, depth: u8) !void {
+    if (depth >= 32 or arg.len < 2 or arg[0] != '@') {
+        try out.append(allocator, arg);
+        return;
+    }
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, arg[1..], allocator, .limited(16 * 1024 * 1024)) catch {
+        try out.append(allocator, arg); // not a readable file: a literal argument, as gcc treats it
+        return;
+    };
+    for (try tokenizeResponse(allocator, bytes)) |tok| try appendExpanded(allocator, io, out, tok, depth + 1);
+}
+
+/// Split response-file `bytes` into arguments by GCC's rules: whitespace separates arguments, single
+/// or double quotes group an argument that contains whitespace, and a backslash escapes the next
+/// byte (so a literal quote or space can appear in a token). Empty tokens are dropped.
+fn tokenizeResponse(allocator: std.mem.Allocator, bytes: []const u8) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    var cur: std.ArrayList(u8) = .empty;
+    var in_tok = false;
+    var quote: u8 = 0; // 0 = none, else the open-quote byte
+    var i: usize = 0;
+    while (i < bytes.len) : (i += 1) {
+        const c = bytes[i];
+        if (quote != 0) {
+            if (c == quote) {
+                quote = 0;
+            } else if (c == '\\' and i + 1 < bytes.len) {
+                i += 1;
+                try cur.append(allocator, bytes[i]);
+            } else {
+                try cur.append(allocator, c);
+            }
+            continue;
+        }
+        switch (c) {
+            ' ', '\t', '\n', '\r' => if (in_tok) {
+                try out.append(allocator, try cur.toOwnedSlice(allocator));
+                cur = .empty;
+                in_tok = false;
+            },
+            '\'', '"' => {
+                quote = c;
+                in_tok = true;
+            },
+            '\\' => if (i + 1 < bytes.len) {
+                i += 1;
+                try cur.append(allocator, bytes[i]);
+                in_tok = true;
+            },
+            else => {
+                try cur.append(allocator, c);
+                in_tok = true;
+            },
+        }
+    }
+    if (in_tok) try out.append(allocator, try cur.toOwnedSlice(allocator));
+    return out.toOwnedSlice(allocator);
+}
+
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const allocator = init.arena.allocator();
 
-    var it = try init.minimal.args.iterateAllocator(allocator);
-    defer it.deinit();
-    _ = it.skip(); // argv0
+    // The single diagnostic sink for this whole invocation: `fail` (errors) and `warn`
+    // (warnings) route through here. Production points it at the real stderr; the in-process
+    // tests point their own buffer-backed writer at the same functions, so nothing leaks.
+    var errbuf: [512]u8 = undefined;
+    var errfile = std.Io.File.stderr().writer(io, &errbuf);
+    const errw = &errfile.interface;
 
-    const opts = try parseArgs(allocator, &it);
+    var raw_it = try init.minimal.args.iterateAllocator(allocator);
+    defer raw_it.deinit();
+    _ = raw_it.skip(); // argv0
+
+    // Expand any `@response-file` arguments before parsing, so nixpkgs `wrapCCWith` (which passes a
+    // single `@/tmp/cc-params`) and any over-long command line work exactly as under gcc/clang.
+    var it = SliceArgs{ .items = try expandResponseFiles(allocator, io, &raw_it) };
+    const opts = try parseArgs(allocator, errw, &it);
 
     // Autoconf version probes: `--version`/`-v`/`-dumpversion`/`-dumpmachine` answer BEFORE
     // the normal compile/link pipeline runs. `AC_PROG_CC` and similar macros invoke the
@@ -989,7 +1071,7 @@ pub fn main(init: std.process.Init) !void {
             .dumpversion => try w.interface.print("{s}\n", .{vcc_version}),
             .dumpmachine => {
                 const probe_arch: link.Arch = opts.target_arch orelse
-                    (hostLinkArch() catch return fail("no native linker support for this host architecture (pass -target)", .{}));
+                    (hostLinkArch() catch return fail(errw, "no native linker support for this host architecture (pass -target)", .{}));
                 try w.interface.print("{s}\n", .{archTriple(probe_arch)});
             },
         }
@@ -1001,21 +1083,21 @@ pub fn main(init: std.process.Init) !void {
     // exclusive end products. The check happens up front rather than deep inside the `-c`
     // branch, so the diagnostic fires before any compilation work happens.
     if (opts.shared and opts.compile_only)
-        return fail("-shared and -c are mutually exclusive", .{});
+        return fail(errw, "-shared and -c are mutually exclusive", .{});
 
     // The compile target for this whole invocation: `-target <arch>` when given, else the
     // host's own arch. Both `-c`/the link step's per-source `.o` emission
     // (`compileToObject`), and the link step's `writeExecutable`, use this SAME arch. A
     // cross-emitted object always links against a matching-arch executable format.
     const arch: link.Arch = opts.target_arch orelse
-        (hostLinkArch() catch return fail("no native linker support for this host architecture (pass -target)", .{}));
+        (hostLinkArch() catch return fail(errw, "no native linker support for this host architecture (pass -target)", .{}));
 
     // The microarch model this whole invocation tunes for, or null when none applies (an
     // explicit opt-out, an unresolved implicit default, or a target with no model at all).
     // A native build with no `-mcpu`/`-mtune` resolves the detected host part BY DEFAULT,
     // so `compileToObject` below runs the IR microarch layer and hands the backend a model
     // even with no flags given. See `resolveModel`.
-    const model = try resolveModel(&opts, arch, io);
+    const model = try resolveModel(&opts, arch, errw);
 
     // Default system include directory: the host glibc dev tree when `arch` is the host's
     // own arch, else a CROSS glibc dev tree for `arch`'s triple. This lets `#include
@@ -1057,6 +1139,9 @@ pub fn main(init: std.process.Init) !void {
         // system set, see `preproc.zig`), so for example `-U__GNUC__` still strips it
         // exactly as it did before this field existed.
         .system = systemPredefFor(arch),
+        // Route `#warning` diagnostics to the driver's stderr sink so real warnings still
+        // reach the user in production. Tests leave `diag` null, so they stay silent.
+        .diag = errw,
     };
 
     var buf: [4096]u8 = undefined;
@@ -1065,10 +1150,10 @@ pub fn main(init: std.process.Init) !void {
     // `opts.inputs`.
     const single_source: ?[]const u8 = blk: {
         if (!opts.preprocess_only and !opts.compile_only and !opts.emit_ir) break :blk null;
-        if (opts.inputs.items.len != 1) return fail("this mode requires exactly one input file", .{});
+        if (opts.inputs.items.len != 1) return fail(errw, "this mode requires exactly one input file", .{});
         break :blk switch (opts.inputs.items[0]) {
             .path => |p| p,
-            .lib => return fail("this mode requires a source file, not -l", .{}),
+            .lib => return fail(errw, "this mode requires a source file, not -l", .{}),
         };
     };
 
@@ -1091,7 +1176,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (opts.compile_only) {
         const input = single_source.?;
-        if (classifyExt(input) != .c) return fail("-c requires a .c/.i source file, got '{s}'", .{input});
+        if (classifyExt(input) != .c) return fail(errw, "-c requires a .c/.i source file, got '{s}'", .{input});
         const obj = try compileToObject(allocator, io, input, pp_base, arch, model, opts.optimize);
         const out = opts.output orelse try derivedOutputName(allocator, input);
         try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out, .data = obj });
@@ -1111,7 +1196,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (opts.emit_ir) {
         const input = single_source.?;
-        if (classifyExt(input) != .c) return fail("--emit-ir requires a .c/.i source file, got '{s}'", .{input});
+        if (classifyExt(input) != .c) return fail(errw, "--emit-ir requires a .c/.i source file, got '{s}'", .{input});
         const source = try std.Io.Dir.cwd().readFileAlloc(io, input, allocator, .limited(16 * 1024 * 1024));
         var pp_opts = pp_base;
         pp_opts.filename = try filenameForPreproc(allocator, input);
@@ -1163,7 +1248,7 @@ pub fn main(init: std.process.Init) !void {
                 try dyn_inputs.append(allocator, .{ .shared = bytes });
                 try display_names.append(allocator, std.fs.path.basename(p));
             },
-            .unknown => return fail("unrecognized input file type '{s}' (expected .c/.i/.o/.a/.so)", .{p}),
+            .unknown => return fail(errw, "unrecognized input file type '{s}' (expected .c/.i/.o/.a/.so)", .{p}),
         },
         .lib => |l| {
             // Whole-link dynamic intent (`-shared`/`--dynamic-linker`) can appear anywhere
@@ -1174,8 +1259,8 @@ pub fn main(init: std.process.Init) !void {
             const prefer_dynamic = l.prefer_dynamic or opts.shared or opts.dynamic_linker != null;
             const found = (try resolveLib(allocator, io, l.name, opts.lib_dirs.items, prefer_dynamic)) orelse {
                 if (prefer_dynamic)
-                    return fail("cannot find -l{s}: no 'lib{s}.so' or 'lib{s}.a' in any -L search directory", .{ l.name, l.name, l.name });
-                return fail("cannot find -l{s}: no 'lib{s}.a' in any -L search directory", .{ l.name, l.name });
+                    return fail(errw, "cannot find -l{s}: no 'lib{s}.so' or 'lib{s}.a' in any -L search directory", .{ l.name, l.name, l.name });
+                return fail(errw, "cannot find -l{s}: no 'lib{s}.a' in any -L search directory", .{ l.name, l.name });
             };
             switch (found.kind) {
                 .archive => {
@@ -1208,7 +1293,7 @@ pub fn main(init: std.process.Init) !void {
         const add_libc = is_normal_exec and !opts.no_stdlib and !opts.no_defaultlibs;
         if (add_crt or add_libc) {
             const tc = (try discoverToolchain(allocator, io, arch, &opts)) orelse
-                return fail("cannot find the C runtime (crt1.o/libc.so.6/the dynamic linker); set VCC_SYSROOT or pass -B <dir>, or use -nostdlib to link freestanding", .{});
+                return fail(errw, "cannot find the C runtime (crt1.o/libc.so.6/the dynamic linker); set VCC_SYSROOT or pass -B <dir>, or use -nostdlib to link freestanding", .{});
             autolink_interp = tc.interp;
 
             // Rebuild the input list in gcc's order: `crt1.o` FIRST (it defines `_start`), then
@@ -1218,7 +1303,7 @@ pub fn main(init: std.process.Init) !void {
             var autolinked_names: std.ArrayList([]const u8) = .empty;
             if (add_crt) {
                 const crt1_bytes = std.Io.Dir.cwd().readFileAlloc(io, tc.crt1, allocator, .limited(64 * 1024 * 1024)) catch
-                    return fail("cannot read the discovered crt1.o at '{s}'", .{tc.crt1});
+                    return fail(errw, "cannot read the discovered crt1.o at '{s}'", .{tc.crt1});
                 try autolinked.append(allocator, .{ .object = crt1_bytes });
                 try autolinked_names.append(allocator, "");
             }
@@ -1235,7 +1320,7 @@ pub fn main(init: std.process.Init) !void {
             try autolinked_names.appendSlice(allocator, display_names.items);
             if (add_libc) {
                 const libc_bytes = std.Io.Dir.cwd().readFileAlloc(io, tc.libc, allocator, .limited(256 * 1024 * 1024)) catch
-                    return fail("cannot read the discovered libc.so.6 at '{s}'", .{tc.libc});
+                    return fail(errw, "cannot read the discovered libc.so.6 at '{s}'", .{tc.libc});
                 try autolinked.append(allocator, .{ .shared = libc_bytes });
                 try autolinked_names.append(allocator, "libc.so.6");
                 // `libc_nonshared.a` comes after `libc.so.6`, matching the real `-lc`
@@ -1264,7 +1349,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (dynamic_mode and opts.script_path != null)
-        return fail("-T (linker scripts) does not support dynamic linking (-shared/--dynamic-linker/.so inputs)", .{});
+        return fail(errw, "-T (linker scripts) does not support dynamic linking (-shared/--dynamic-linker/.so inputs)", .{});
 
     // The static/`-T` route's own input shape, built only when NOT dynamic. A `.shared`
     // entry can only appear in `dyn_inputs` when `dynamic_mode` is already true, so this
@@ -1288,18 +1373,18 @@ pub fn main(init: std.process.Init) !void {
     // this branch only ever runs with a static `link_inputs`.
     if (opts.script_path) |sp| {
         const script_bytes = std.Io.Dir.cwd().readFileAlloc(io, sp, allocator, .limited(16 * 1024 * 1024)) catch |e|
-            return fail("cannot read '{s}': {s}", .{ sp, @errorName(e) });
+            return fail(errw, "cannot read '{s}': {s}", .{ sp, @errorName(e) });
 
         var sdiag: link.ScriptDiagnostic = .{ .line = 0, .col = 0, .msg = "" };
         var parsed_script = link.parseScript(allocator, script_bytes, &sdiag) catch |e| {
             if (e == error.OutOfMemory) return e;
-            return fail("{s}:{d}:{d}: {s}", .{ sp, sdiag.line, sdiag.col, sdiag.msg });
+            return fail(errw, "{s}:{d}:{d}: {s}", .{ sp, sdiag.line, sdiag.col, sdiag.msg });
         };
         defer parsed_script.deinit();
 
         var linked = link.linkInputsScript(allocator, link_inputs.items, &parsed_script, null) catch |e| {
             if (e == error.OutOfMemory) return e;
-            return fail("{s}", .{scriptErrorMessage(e)});
+            return fail(errw, "{s}", .{scriptErrorMessage(e)});
         };
         defer linked.deinit(allocator);
 
@@ -1328,7 +1413,7 @@ pub fn main(init: std.process.Init) !void {
         // still needs one either way; a `-shared` object needs none.
         const interp = opts.dynamic_linker orelse autolink_interp;
         if (mode == .exec and interp == null)
-            return fail("a dynamic executable needs --dynamic-linker <path>", .{});
+            return fail(errw, "a dynamic executable needs --dynamic-linker <path>", .{});
 
         // DT_NEEDED: one entry per `.shared` input, preferring its own DT_SONAME and
         // falling back to its basename (the `.so` path's basename, or the `-l`-resolved
@@ -1338,7 +1423,7 @@ pub fn main(init: std.process.Init) !void {
             .shared => |bytes| {
                 var se = link.readSharedExports(allocator, bytes) catch |e| {
                     if (e == error.OutOfMemory) return e;
-                    return fail("cannot read a shared object's exports: {s}", .{@errorName(e)});
+                    return fail(errw, "cannot read a shared object's exports: {s}", .{@errorName(e)});
                 };
                 defer se.deinit(allocator);
                 const name = if (se.soname) |s| try allocator.dupe(u8, s) else try allocator.dupe(u8, disp);
@@ -1357,7 +1442,7 @@ pub fn main(init: std.process.Init) !void {
             .gc_sections = opts.gc_sections,
         }) catch |e| {
             if (e == error.OutOfMemory) return e;
-            return fail("{s}", .{linkErrorMessage(e)});
+            return fail(errw, "{s}", .{linkErrorMessage(e)});
         };
 
         // A `.so` gets exec permissions too: harmless (it is never invoked directly) and
@@ -1375,13 +1460,13 @@ pub fn main(init: std.process.Init) !void {
 
     var image = link.linkInputs(allocator, link_inputs.items, base) catch |e| {
         if (e == error.OutOfMemory) return e;
-        return fail("{s}", .{linkErrorMessage(e)});
+        return fail(errw, "{s}", .{linkErrorMessage(e)});
     };
     defer image.deinit(allocator);
 
     const elf_bytes = link.writeExecutable(arch, allocator, &image, "_start") catch |e| {
         if (e == error.OutOfMemory) return e;
-        return fail("{s}", .{linkErrorMessage(e)});
+        return fail(errw, "{s}", .{linkErrorMessage(e)});
     };
 
     const out = opts.output orelse "a.out";
@@ -1411,6 +1496,75 @@ const SliceArgs = struct {
     }
 };
 
+// A buffer-backed diagnostic sink for the in-process tests. It captures whatever `fail`/`warn`
+// would print, so a test never leaks a `vcc: error:`/`vcc: warning:` line to the real stderr.
+// Each call resets the buffer, so a test may inspect `test_errbuf[0..testErrw().end]` for the
+// last message if it wants to assert on the text.
+var test_errbuf: [512]u8 = undefined;
+var test_errw: std.Io.Writer = undefined;
+fn testErrw() *std.Io.Writer {
+    test_errw = std.Io.Writer.fixed(&test_errbuf);
+    return &test_errw;
+}
+
+test "parseArgs: a nixpkgs cc-wrapper cflag set does not leak an arg as a positional input" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // The exact arg-taking flags the nixpkgs `wrapCCWith` cc-wrapper feeds (see its nix-support
+    // cc-cflags / libc-cflags / libcxx-cxxflags): `-cxx-isystem <dir>` (C++ system include, unused
+    // by a C compile but its DIR must be consumed, not read as an input), `-idirafter <dir>`, `-B`,
+    // and the `-f*`/`-m*`/`-nostdlibinc` accept-ignore flags. Only `foo.c` is a real input.
+    var it = SliceArgs{ .items = &.{
+        "-cxx-isystem",                                          "/nix/store/g/include/c++/15",
+        "-fmacro-prefix-map=/a=/b",                              "-cxx-isystem",
+        "/nix/store/g/include/c++/15/aarch64-unknown-linux-gnu", "-idirafter",
+        "/nix/store/glibc-dev/include",                          "-nostdlibinc",
+        "-fno-omit-frame-pointer",                               "-mno-omit-leaf-frame-pointer",
+        "-B/nix/store/gcc/lib",                                  "-O2",
+        "-c",                                                    "-o",
+        "foo.o",                                                 "foo.c",
+    } };
+    const opts = try parseArgs(allocator, testErrw(), &it);
+
+    try std.testing.expect(opts.compile_only);
+    try std.testing.expectEqualStrings("foo.o", opts.output.?);
+    // The C++ include dirs and every other flag argument were consumed; only the source remains.
+    try std.testing.expectEqual(@as(usize, 1), opts.inputs.items.len);
+    try std.testing.expectEqualStrings("foo.c", opts.inputs.items[0].path);
+}
+
+test "tokenizeResponse: whitespace splits, quotes group, backslash escapes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Newlines and spaces both separate; empty runs are dropped.
+    const t1 = try tokenizeResponse(a, "-O2\n-c  -o\tout.o\n foo.c\n");
+    try std.testing.expectEqual(@as(usize, 5), t1.len);
+    try std.testing.expectEqualStrings("-O2", t1[0]);
+    try std.testing.expectEqualStrings("-c", t1[1]);
+    try std.testing.expectEqualStrings("-o", t1[2]);
+    try std.testing.expectEqualStrings("out.o", t1[3]);
+    try std.testing.expectEqualStrings("foo.c", t1[4]);
+
+    // A double-quoted token keeps its internal spaces as one argument.
+    const t2 = try tokenizeResponse(a, "-DFOO=\"a b c\" -I/x");
+    try std.testing.expectEqual(@as(usize, 2), t2.len);
+    try std.testing.expectEqualStrings("-DFOO=a b c", t2[0]);
+    try std.testing.expectEqualStrings("-I/x", t2[1]);
+
+    // A backslash escapes the next byte (a literal space inside an otherwise-unquoted token).
+    const t3 = try tokenizeResponse(a, "a\\ b c");
+    try std.testing.expectEqual(@as(usize, 2), t3.len);
+    try std.testing.expectEqualStrings("a b", t3[0]);
+    try std.testing.expectEqualStrings("c", t3[1]);
+
+    // Empty input yields no tokens.
+    try std.testing.expectEqual(@as(usize, 0), (try tokenizeResponse(a, "   \n\t ")).len);
+}
+
 test "parseArgs: a ./configure-style flag soup does not fatal" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1421,7 +1575,7 @@ test "parseArgs: a ./configure-style flag soup does not fatal" {
         "-MMD",       "-MF",   "x.d",     "-MT", "x.o", "-pipe", "-c",       "foo.c",
         "-o",         "foo.o",
     } };
-    const opts = try parseArgs(allocator, &it);
+    const opts = try parseArgs(allocator, testErrw(), &it);
 
     try std.testing.expect(opts.compile_only);
     try std.testing.expectEqualStrings("foo.o", opts.output.?);
@@ -1446,7 +1600,7 @@ test "parseArgs: an arg-taking gcc flag consumes its value, not the next input" 
     var it = SliceArgs{ .items = &.{
         "-isystem", "/usr/include", "-include", "prelude.h", "-c", "foo.c", "-o", "foo.o",
     } };
-    const opts = try parseArgs(allocator, &it);
+    const opts = try parseArgs(allocator, testErrw(), &it);
 
     try std.testing.expectEqual(@as(usize, 1), opts.inputs.items.len);
     try std.testing.expectEqualStrings("foo.c", opts.inputs.items[0].path);
@@ -1459,11 +1613,11 @@ test "parseArgs: --version and -v both set the version probe" {
     const allocator = arena.allocator();
 
     var it1 = SliceArgs{ .items = &.{"--version"} };
-    const o1 = try parseArgs(allocator, &it1);
+    const o1 = try parseArgs(allocator, testErrw(), &it1);
     try std.testing.expectEqual(Probe.version, o1.probe.?);
 
     var it2 = SliceArgs{ .items = &.{"-v"} };
-    const o2 = try parseArgs(allocator, &it2);
+    const o2 = try parseArgs(allocator, testErrw(), &it2);
     try std.testing.expectEqual(Probe.version, o2.probe.?);
 }
 
@@ -1473,11 +1627,11 @@ test "parseArgs: -dumpversion and -dumpmachine set their own probes" {
     const allocator = arena.allocator();
 
     var it1 = SliceArgs{ .items = &.{"-dumpversion"} };
-    const o1 = try parseArgs(allocator, &it1);
+    const o1 = try parseArgs(allocator, testErrw(), &it1);
     try std.testing.expectEqual(Probe.dumpversion, o1.probe.?);
 
     var it2 = SliceArgs{ .items = &.{"-dumpmachine"} };
-    const o2 = try parseArgs(allocator, &it2);
+    const o2 = try parseArgs(allocator, testErrw(), &it2);
     try std.testing.expectEqual(Probe.dumpmachine, o2.probe.?);
 }
 
@@ -1487,7 +1641,7 @@ test "parseArgs: a version probe alone (no input file) is not an error" {
     const allocator = arena.allocator();
 
     var it = SliceArgs{ .items = &.{"--version"} };
-    _ = try parseArgs(allocator, &it); // used to return error.Usage ("no input file")
+    _ = try parseArgs(allocator, testErrw(), &it); // used to return error.Usage ("no input file")
 }
 
 test "parseArgs: -m32/-m64/-mabi= are denylisted and fail closed" {
@@ -1496,13 +1650,13 @@ test "parseArgs: -m32/-m64/-mabi= are denylisted and fail closed" {
     const allocator = arena.allocator();
 
     var it1 = SliceArgs{ .items = &.{ "-m32", "foo.c" } };
-    try std.testing.expectError(error.Usage, parseArgs(allocator, &it1));
+    try std.testing.expectError(error.Usage, parseArgs(allocator, testErrw(), &it1));
 
     var it2 = SliceArgs{ .items = &.{ "-m64", "foo.c" } };
-    try std.testing.expectError(error.Usage, parseArgs(allocator, &it2));
+    try std.testing.expectError(error.Usage, parseArgs(allocator, testErrw(), &it2));
 
     var it3 = SliceArgs{ .items = &.{ "-mabi=lp64", "foo.c" } };
-    try std.testing.expectError(error.Usage, parseArgs(allocator, &it3));
+    try std.testing.expectError(error.Usage, parseArgs(allocator, testErrw(), &it3));
 }
 
 test "parseArgs: -mcpu= and -mtune= capture the value, last wins" {
@@ -1511,11 +1665,11 @@ test "parseArgs: -mcpu= and -mtune= capture the value, last wins" {
     const allocator = arena.allocator();
 
     var it = SliceArgs{ .items = &.{ "-mcpu=cascadelake-sp", "-c", "foo.c" } };
-    const o = try parseArgs(allocator, &it);
+    const o = try parseArgs(allocator, testErrw(), &it);
     try std.testing.expectEqualStrings("cascadelake-sp", o.cpu_tune.?);
 
     var it2 = SliceArgs{ .items = &.{ "-mtune=native", "-mcpu=et-soc", "-c", "foo.c" } };
-    const o2 = try parseArgs(allocator, &it2);
+    const o2 = try parseArgs(allocator, testErrw(), &it2);
     try std.testing.expectEqualStrings("et-soc", o2.cpu_tune.?); // last wins
 }
 
@@ -1525,7 +1679,7 @@ test "parseArgs: -march= is accepted and ignored (no model selector)" {
     const allocator = arena.allocator();
 
     var it = SliceArgs{ .items = &.{ "-march=armv8-a", "-c", "foo.c" } };
-    const o = try parseArgs(allocator, &it);
+    const o = try parseArgs(allocator, testErrw(), &it);
     try std.testing.expect(o.cpu_tune == null);
 }
 
@@ -1535,7 +1689,7 @@ test "parseArgs: gc_sections defaults to true" {
     const allocator = arena.allocator();
 
     var it = SliceArgs{ .items = &.{"foo.c"} };
-    const o = try parseArgs(allocator, &it);
+    const o = try parseArgs(allocator, testErrw(), &it);
     try std.testing.expect(o.gc_sections);
 }
 
@@ -1545,7 +1699,7 @@ test "parseArgs: --gc-sections sets gc_sections true" {
     const allocator = arena.allocator();
 
     var it = SliceArgs{ .items = &.{ "--gc-sections", "foo.c" } };
-    const o = try parseArgs(allocator, &it);
+    const o = try parseArgs(allocator, testErrw(), &it);
     try std.testing.expect(o.gc_sections);
 }
 
@@ -1555,7 +1709,7 @@ test "parseArgs: --no-gc-sections sets gc_sections false" {
     const allocator = arena.allocator();
 
     var it = SliceArgs{ .items = &.{ "--no-gc-sections", "foo.c" } };
-    const o = try parseArgs(allocator, &it);
+    const o = try parseArgs(allocator, testErrw(), &it);
     try std.testing.expect(!o.gc_sections);
 }
 
@@ -1565,7 +1719,7 @@ test "parseArgs: -Wl,--no-gc-sections sets gc_sections false" {
     const allocator = arena.allocator();
 
     var it = SliceArgs{ .items = &.{ "-Wl,--no-gc-sections", "foo.c" } };
-    const o = try parseArgs(allocator, &it);
+    const o = try parseArgs(allocator, testErrw(), &it);
     try std.testing.expect(!o.gc_sections);
 }
 
@@ -1575,7 +1729,7 @@ test "parseArgs: -Wl,--gc-sections sets gc_sections true after a prior --no-gc-s
     const allocator = arena.allocator();
 
     var it = SliceArgs{ .items = &.{ "--no-gc-sections", "-Wl,--gc-sections", "foo.c" } };
-    const o = try parseArgs(allocator, &it);
+    const o = try parseArgs(allocator, testErrw(), &it);
     try std.testing.expect(o.gc_sections);
 }
 
@@ -1585,7 +1739,7 @@ test "parseArgs: an unrelated -Wl, value leaves gc_sections at the default" {
     const allocator = arena.allocator();
 
     var it = SliceArgs{ .items = &.{ "-Wl,-z,now", "foo.c" } };
-    const o = try parseArgs(allocator, &it);
+    const o = try parseArgs(allocator, testErrw(), &it);
     try std.testing.expect(o.gc_sections);
 }
 
@@ -1623,8 +1777,8 @@ test "resolveModel: a named part mismatched with -target fails closed" {
     const allocator = arena.allocator();
 
     var it = SliceArgs{ .items = &.{ "-target", "riscv64", "-mcpu=cascadelake-sp", "foo.c" } };
-    const o = try parseArgs(allocator, &it);
-    try std.testing.expectError(error.Usage, resolveModel(&o, .riscv64, std.testing.io));
+    const o = try parseArgs(allocator, testErrw(), &it);
+    try std.testing.expectError(error.Usage, resolveModel(&o, .riscv64, testErrw()));
 }
 
 test "parseArgs: -S still fails closed, not silently ignored" {
@@ -1633,7 +1787,7 @@ test "parseArgs: -S still fails closed, not silently ignored" {
     const allocator = arena.allocator();
 
     var it = SliceArgs{ .items = &.{ "-S", "foo.c" } };
-    try std.testing.expectError(error.Usage, parseArgs(allocator, &it));
+    try std.testing.expectError(error.Usage, parseArgs(allocator, testErrw(), &it));
 }
 
 test "parseArgs: crt-suppression flags are parsed for M5c to consume" {
@@ -1642,7 +1796,7 @@ test "parseArgs: crt-suppression flags are parsed for M5c to consume" {
     const allocator = arena.allocator();
 
     var it = SliceArgs{ .items = &.{ "-nostdlib", "-nostartfiles", "-nodefaultlibs", "foo.c" } };
-    const opts = try parseArgs(allocator, &it);
+    const opts = try parseArgs(allocator, testErrw(), &it);
     try std.testing.expect(opts.no_stdlib);
     try std.testing.expect(opts.no_startfiles);
     try std.testing.expect(opts.no_defaultlibs);
@@ -1656,7 +1810,7 @@ test "parseArgs: every pre-M5a flag still parses exactly as before" {
     var it = SliceArgs{ .items = &.{
         "-target", "x86_64", "-I", "inc", "-Dfoo=bar", "-U", "baz", "-c", "-o", "out.o", "foo.c",
     } };
-    const opts = try parseArgs(allocator, &it);
+    const opts = try parseArgs(allocator, testErrw(), &it);
 
     try std.testing.expectEqual(link.Arch.x86_64, opts.target_arch.?);
     try std.testing.expectEqual(@as(usize, 1), opts.includes.items.len);
@@ -1671,11 +1825,11 @@ test "parseArgs: every pre-M5a flag still parses exactly as before" {
 
     // An unknown -target arch is still a hard error (unrelated to the new flag families).
     var it2 = SliceArgs{ .items = &.{ "-target", "sparc64", "foo.c" } };
-    try std.testing.expectError(error.Usage, parseArgs(allocator, &it2));
+    try std.testing.expectError(error.Usage, parseArgs(allocator, testErrw(), &it2));
 
     // A bare compile with no input is still a hard error (no probe requested).
     var it3 = SliceArgs{ .items = &.{"-Wall"} };
-    try std.testing.expectError(error.Usage, parseArgs(allocator, &it3));
+    try std.testing.expectError(error.Usage, parseArgs(allocator, testErrw(), &it3));
 }
 
 // ---------------------------------------------------------------------------------
@@ -1690,7 +1844,7 @@ test "parseArgs: -isystem <dir> and -isystem<dir> both populate opts.isystem" {
     const allocator = arena.allocator();
 
     var it = SliceArgs{ .items = &.{ "-isystem", "/usr/include", "-isystem/opt/include", "-c", "foo.c" } };
-    const opts = try parseArgs(allocator, &it);
+    const opts = try parseArgs(allocator, testErrw(), &it);
 
     try std.testing.expectEqual(@as(usize, 2), opts.isystem.items.len);
     try std.testing.expectEqualStrings("/usr/include", opts.isystem.items[0]);
@@ -1705,7 +1859,7 @@ test "parseArgs: -nostdinc is parsed" {
     const allocator = arena.allocator();
 
     var it = SliceArgs{ .items = &.{ "-nostdinc", "-c", "foo.c" } };
-    const opts = try parseArgs(allocator, &it);
+    const opts = try parseArgs(allocator, testErrw(), &it);
     try std.testing.expect(opts.no_stdinc);
 }
 

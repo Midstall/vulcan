@@ -32,8 +32,9 @@ const InputSpec = union(enum) {
     lib: struct { name: []const u8, prefer_dynamic: bool },
 };
 
-fn diag(comptime fmt: []const u8, args: anytype) u8 {
-    std.debug.print("ld.vulcan: error: " ++ fmt ++ "\n", args);
+fn diag(errw: *std.Io.Writer, comptime fmt: []const u8, args: anytype) u8 {
+    errw.print("ld.vulcan: error: " ++ fmt ++ "\n", args) catch {};
+    errw.flush() catch {};
     return 1;
 }
 
@@ -193,7 +194,7 @@ fn scriptErrorMessage(e: ld.ScriptError) []const u8 {
 /// `error.OutOfMemory` ever propagates as a real Zig error - every other failure mode
 /// (bad flag, unreadable input, missing `-l` library, link error) is reported and
 /// turned into a non-zero status here.
-pub fn run(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !u8 {
+pub fn run(allocator: std.mem.Allocator, io: std.Io, errw: *std.Io.Writer, args: []const []const u8) !u8 {
     var output: []const u8 = "a.out";
     var entry: []const u8 = "_start";
     // Whether `-e` was actually given on the command line, as opposed to `entry` still
@@ -266,23 +267,23 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !
         const arg = args[i];
         if (std.mem.eql(u8, arg, "-o")) {
             i += 1;
-            if (i >= args.len) return diag("-o requires an argument", .{});
+            if (i >= args.len) return diag(errw, "-o requires an argument", .{});
             output = args[i];
         } else if (std.mem.eql(u8, arg, "-e")) {
             i += 1;
-            if (i >= args.len) return diag("-e requires an argument", .{});
+            if (i >= args.len) return diag(errw, "-e requires an argument", .{});
             entry = args[i];
             entry_explicit = true;
         } else if (std.mem.eql(u8, arg, "-T")) {
             i += 1;
-            if (i >= args.len) return diag("-T requires an argument", .{});
+            if (i >= args.len) return diag(errw, "-T requires an argument", .{});
             script_path = args[i];
         } else if (std.mem.startsWith(u8, arg, "-T") and arg.len > 2) {
             script_path = arg[2..];
         } else if (std.mem.eql(u8, arg, "--image-base")) {
             i += 1;
-            if (i >= args.len) return diag("--image-base requires an argument", .{});
-            image_base = std.fmt.parseInt(u64, args[i], 0) catch return diag("--image-base: invalid value '{s}'", .{args[i]});
+            if (i >= args.len) return diag(errw, "--image-base requires an argument", .{});
+            image_base = std.fmt.parseInt(u64, args[i], 0) catch return diag(errw, "--image-base: invalid value '{s}'", .{args[i]});
         } else if (std.mem.eql(u8, arg, "--static") or std.mem.eql(u8, arg, "-Bstatic")) {
             prefer_dynamic_pref = false;
         } else if (std.mem.eql(u8, arg, "-Bdynamic")) {
@@ -291,34 +292,34 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !
             shared_flag = true;
         } else if (std.mem.eql(u8, arg, "--dynamic-linker")) {
             i += 1;
-            if (i >= args.len) return diag("--dynamic-linker requires an argument", .{});
+            if (i >= args.len) return diag(errw, "--dynamic-linker requires an argument", .{});
             dynamic_linker = args[i];
         } else if (std.mem.startsWith(u8, arg, "--dynamic-linker=")) {
             dynamic_linker = arg["--dynamic-linker=".len..];
         } else if (std.mem.eql(u8, arg, "-soname") or std.mem.eql(u8, arg, "-h")) {
             i += 1;
-            if (i >= args.len) return diag("-soname requires an argument", .{});
+            if (i >= args.len) return diag(errw, "-soname requires an argument", .{});
             soname = args[i];
         } else if (std.mem.eql(u8, arg, "-L")) {
             i += 1;
-            if (i >= args.len) return diag("-L requires an argument", .{});
+            if (i >= args.len) return diag(errw, "-L requires an argument", .{});
             try search_dirs.append(allocator, args[i]);
         } else if (std.mem.startsWith(u8, arg, "-L") and arg.len > 2) {
             try search_dirs.append(allocator, arg[2..]);
         } else if (std.mem.eql(u8, arg, "-l")) {
             i += 1;
-            if (i >= args.len) return diag("-l requires an argument", .{});
+            if (i >= args.len) return diag(errw, "-l requires an argument", .{});
             try specs.append(allocator, .{ .lib = .{ .name = args[i], .prefer_dynamic = prefer_dynamic_pref } });
         } else if (std.mem.startsWith(u8, arg, "-l") and arg.len > 2) {
             try specs.append(allocator, .{ .lib = .{ .name = arg[2..], .prefer_dynamic = prefer_dynamic_pref } });
         } else if (std.mem.startsWith(u8, arg, "-")) {
-            return diag("unknown argument '{s}'", .{arg});
+            return diag(errw, "unknown argument '{s}'", .{arg});
         } else {
             try specs.append(allocator, .{ .path = arg });
         }
     }
 
-    if (specs.items.len == 0) return diag("no input files", .{});
+    if (specs.items.len == 0) return diag(errw, "no input files", .{});
 
     // Classify every input in command order into `ld.DynInput`. This is a superset of
     // the OLD (static-only) resolution: when nothing here ever turns out `.shared`, the
@@ -327,7 +328,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !
     // route stays unaffected by this refactor.
     for (specs.items) |spec| switch (spec) {
         .path => |p| {
-            const bytes = readFile(allocator, io, p) catch |e| return diag("cannot read '{s}': {s}", .{ p, @errorName(e) });
+            const bytes = readFile(allocator, io, p) catch |e| return diag(errw, "cannot read '{s}': {s}", .{ p, @errorName(e) });
             try owned_bufs.append(allocator, bytes);
             if (ld.isArchive(bytes)) {
                 try dyn_inputs.append(allocator, .{ .archive = bytes });
@@ -351,11 +352,11 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !
             // while a plain static-intent link keeps the conservative `.a`-first default.
             const prefer_dynamic = l.prefer_dynamic or shared_flag or dynamic_linker != null;
             const found = resolveLib(allocator, io, l.name, search_dirs.items, prefer_dynamic) catch |e|
-                return diag("cannot search for -l{s}: {s}", .{ l.name, @errorName(e) });
+                return diag(errw, "cannot search for -l{s}: {s}", .{ l.name, @errorName(e) });
             const res = found orelse {
                 if (prefer_dynamic)
-                    return diag("cannot find -l{s}: no 'lib{s}.so' or 'lib{s}.a' in any -L search directory", .{ l.name, l.name, l.name });
-                return diag("cannot find -l{s}: no 'lib{s}.a' in any -L search directory", .{ l.name, l.name });
+                    return diag(errw, "cannot find -l{s}: no 'lib{s}.so' or 'lib{s}.a' in any -L search directory", .{ l.name, l.name, l.name });
+                return diag(errw, "cannot find -l{s}: no 'lib{s}.a' in any -L search directory", .{ l.name, l.name });
             };
             try owned_bufs.append(allocator, res.bytes);
             switch (res.kind) {
@@ -383,7 +384,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !
     }
 
     if (dynamic_mode and script_path != null)
-        return diag("-T (linker scripts) does not support dynamic linking (-shared/--dynamic-linker/.so inputs)", .{});
+        return diag(errw, "-T (linker scripts) does not support dynamic linking (-shared/--dynamic-linker/.so inputs)", .{});
 
     if (!dynamic_mode) {
         for (dyn_inputs.items) |di| switch (di) {
@@ -399,19 +400,19 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !
     // the default contiguous layout below - a script's own location-counter commands
     // control every address instead).
     if (script_path) |sp| {
-        const script_bytes = readFile(allocator, io, sp) catch |e| return diag("cannot read '{s}': {s}", .{ sp, @errorName(e) });
+        const script_bytes = readFile(allocator, io, sp) catch |e| return diag(errw, "cannot read '{s}': {s}", .{ sp, @errorName(e) });
         defer allocator.free(script_bytes);
 
         var sdiag: ld.ScriptDiagnostic = .{ .line = 0, .col = 0, .msg = "" };
         var parsed_script = ld.parseScript(allocator, script_bytes, &sdiag) catch |e| {
             if (e == error.OutOfMemory) return e;
-            return diag("{s}:{d}:{d}: {s}", .{ sp, sdiag.line, sdiag.col, sdiag.msg });
+            return diag(errw, "{s}:{d}:{d}: {s}", .{ sp, sdiag.line, sdiag.col, sdiag.msg });
         };
         defer parsed_script.deinit();
 
         var linked = ld.linkInputsScript(allocator, inputs.items, &parsed_script, null) catch |e| {
             if (e == error.OutOfMemory) return e;
-            return diag("{s}", .{scriptErrorMessage(e)});
+            return diag(errw, "{s}", .{scriptErrorMessage(e)});
         };
         defer linked.deinit(allocator);
 
@@ -420,7 +421,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !
         // problem to invent one).
         const entry_addr = if (entry_explicit)
             ld.elf.findSymbol(linked.placement.symbols, entry) orelse
-                return diag("undefined entry symbol '{s}'", .{entry})
+                return diag(errw, "undefined entry symbol '{s}'", .{entry})
         else
             linked.entry;
 
@@ -431,7 +432,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !
             .sub_path = output,
             .data = elf_bytes,
             .flags = .{ .permissions = .executable_file },
-        }) catch |e| return diag("cannot write '{s}': {s}", .{ output, @errorName(e) });
+        }) catch |e| return diag(errw, "cannot write '{s}': {s}", .{ output, @errorName(e) });
 
         return 0;
     }
@@ -443,7 +444,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !
     if (dynamic_mode) {
         const mode: ld.DynMode = if (shared_flag) .shared else .exec;
         if (mode == .exec and dynamic_linker == null)
-            return diag("a dynamic executable needs --dynamic-linker <path>", .{});
+            return diag(errw, "a dynamic executable needs --dynamic-linker <path>", .{});
 
         // DT_NEEDED: one entry per `.shared` input, preferring its own DT_SONAME and
         // falling back to its basename (the `.so` path's basename, or the `-l`-resolved
@@ -457,7 +458,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !
             .shared => |bytes| {
                 var se = ld.readSharedExports(allocator, bytes) catch |e| {
                     if (e == error.OutOfMemory) return e;
-                    return diag("cannot read a shared object's exports: {s}", .{@errorName(e)});
+                    return diag(errw, "cannot read a shared object's exports: {s}", .{@errorName(e)});
                 };
                 defer se.deinit(allocator);
                 const name = if (se.soname) |s| try allocator.dupe(u8, s) else try allocator.dupe(u8, disp);
@@ -475,7 +476,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !
             .entry = entry,
         }) catch |e| {
             if (e == error.OutOfMemory) return e;
-            return diag("{s}", .{linkErrorMessage(e)});
+            return diag(errw, "{s}", .{linkErrorMessage(e)});
         };
         defer allocator.free(dyn_bytes);
 
@@ -485,24 +486,24 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !
             .sub_path = output,
             .data = dyn_bytes,
             .flags = .{ .permissions = .executable_file },
-        }) catch |e| return diag("cannot write '{s}': {s}", .{ output, @errorName(e) });
+        }) catch |e| return diag(errw, "cannot write '{s}': {s}", .{ output, @errorName(e) });
 
         return 0;
     }
 
     const arch = detectArch(allocator, inputs.items) orelse
-        return diag("could not determine the target architecture (no valid object input found)", .{});
+        return diag(errw, "could not determine the target architecture (no valid object input found)", .{});
     const base = image_base orelse defaultBase(arch);
 
     var image = ld.linkInputs(allocator, inputs.items, base) catch |e| {
         if (e == error.OutOfMemory) return e;
-        return diag("{s}", .{linkErrorMessage(e)});
+        return diag(errw, "{s}", .{linkErrorMessage(e)});
     };
     defer image.deinit(allocator);
 
     const elf_bytes = ld.writeExecutable(arch, allocator, &image, entry) catch |e| {
         if (e == error.OutOfMemory) return e;
-        return diag("{s}", .{linkErrorMessage(e)});
+        return diag(errw, "{s}", .{linkErrorMessage(e)});
     };
     defer allocator.free(elf_bytes);
 
@@ -510,7 +511,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !
         .sub_path = output,
         .data = elf_bytes,
         .flags = .{ .permissions = .executable_file },
-    }) catch |e| return diag("cannot write '{s}': {s}", .{ output, @errorName(e) });
+    }) catch |e| return diag(errw, "cannot write '{s}': {s}", .{ output, @errorName(e) });
 
     return 0;
 }
@@ -526,7 +527,15 @@ pub fn main(init: std.process.Init) !void {
     var args: std.ArrayList([]const u8) = .empty;
     while (it.next()) |a| try args.append(allocator, a);
 
-    const status = try run(allocator, io, args.items);
+    // The single diagnostic sink for this invocation: `diag` routes every error line
+    // through here to the real stderr. In-process tests instead point their own
+    // buffer-backed writer at `run`, so a negative test never leaks an `ld.vulcan:
+    // error:` line to the test runner's stderr.
+    var errbuf: [512]u8 = undefined;
+    var errfile = std.Io.File.stderr().writer(io, &errbuf);
+    const errw = &errfile.interface;
+
+    const status = try run(allocator, io, errw, args.items);
     std.process.exit(status);
 }
 
@@ -540,6 +549,17 @@ pub fn main(init: std.process.Init) !void {
 const ir = @import("vulcan-ir");
 const target = @import("vulcan-target");
 const Function = ir.function.Function;
+
+// A buffer-backed diagnostic sink for the in-process tests: `run` writes any `ld.vulcan:
+// error:` line here instead of the real stderr, so a negative test asserts on the returned
+// status without leaking error text that would make a passing test look failed. Each call
+// resets the buffer, so a test may inspect `test_errbuf[0..testErrw().end]` if it wants.
+var test_errbuf: [512]u8 = undefined;
+var test_errw: std.Io.Writer = undefined;
+fn testErrw() *std.Io.Writer {
+    test_errw = std.Io.Writer.fixed(&test_errbuf);
+    return &test_errw;
+}
 
 /// How many times `runExpectExit` attempts a run before giving up. Only a non-`.exited`
 /// term consumes an attempt; a clean `.exited` result is checked and returned on
@@ -666,19 +686,32 @@ fn startStubCallAddAArch64(allocator: std.mem.Allocator) ![]u8 {
     return object.write(allocator, .{ .text = &text, .symbols = &symbols, .relocs = &relocs });
 }
 
-/// Locate a real glibc `ld-linux-aarch64.so.1` in the Nix store (the interpreter to
-/// embed in a dynamic exe via `--dynamic-linker`), matching the task brief's own probe
-/// command. Returns an allocated absolute path, or `null` if none is found (the E2E
-/// test then skips cleanly rather than failing on an environment gap).
+/// Locate a real glibc `ld-linux-aarch64.so.1` (the interpreter to embed in a dynamic
+/// exe via `--dynamic-linker`). Returns an allocated absolute path, or `null` if none is
+/// found (the E2E test then skips cleanly rather than failing on an environment gap).
+///
+/// Ask the C compiler for the target's loader instead of scanning `/nix/store`: fast,
+/// cross-platform, and a target's test runs only where its toolchain exists. Native `cc`
+/// answers for the host arch; a cross target needs its `<triple>-gcc`, absent here -> the
+/// query fails or echoes the bare name -> skip. `cc -print-file-name=<name>` returns an
+/// ABSOLUTE path (leading `/`) when the compiler has that glibc file, else it echoes the
+/// bare `<name>` (no leading `/`), which means "not available" -> skip.
 fn findGlibcInterpAArch64(allocator: std.mem.Allocator, io: std.Io) !?[]u8 {
-    const proc = std.process.run(allocator, io, .{
-        .argv = &.{ "sh", "-c", "find /nix/store -maxdepth 3 -name ld-linux-aarch64.so.1 2>/dev/null | grep glibc | head -1" },
-    }) catch return null;
-    defer allocator.free(proc.stdout);
-    defer allocator.free(proc.stderr);
-    const trimmed = std.mem.trim(u8, proc.stdout, " \t\r\n");
-    if (trimmed.len == 0) return null;
-    return try allocator.dupe(u8, trimmed);
+    const host = @import("builtin").cpu.arch;
+    const ccs: []const []const u8 = if (host == .aarch64)
+        &.{ "cc", "gcc" }
+    else
+        &.{ "aarch64-unknown-linux-gnu-gcc", "aarch64-linux-gnu-gcc" };
+    const arg = try std.fmt.allocPrint(allocator, "-print-file-name={s}", .{"ld-linux-aarch64.so.1"});
+    defer allocator.free(arg);
+    for (ccs) |ccname| {
+        const proc = std.process.run(allocator, io, .{ .argv = &.{ ccname, arg } }) catch continue;
+        defer allocator.free(proc.stdout);
+        defer allocator.free(proc.stderr);
+        const t = std.mem.trim(u8, proc.stdout, " \t\r\n");
+        if (t.len > 0 and t[0] == '/') return try allocator.dupe(u8, t);
+    }
+    return null;
 }
 
 /// Read the `DT_NEEDED` soname list straight out of an ELF64 file's `.dynamic` section
@@ -837,7 +870,7 @@ test "ld.vulcan CLI: links main.o + libhelper.a + start.o into a runnable exe, n
     const out_path = try std.fmt.allocPrint(allocator, "{s}/out", .{tmpdir});
     defer allocator.free(out_path);
 
-    const status = try run(allocator, io, &.{
+    const status = try run(allocator, io, testErrw(), &.{
         "-o", out_path, "-e", "_start", "-L", tmpdir, start_path, main_path, "-lhelper",
     });
     try std.testing.expectEqual(@as(u8, 0), status);
@@ -879,7 +912,7 @@ test "ld.vulcan CLI: an undefined symbol (no library given) returns a non-zero s
     defer allocator.free(out_path);
 
     // No `-L`/`-l`: `helper` is never satisfied.
-    const status = try run(allocator, io, &.{ "-o", out_path, "-e", "_start", start_path, main_path });
+    const status = try run(allocator, io, testErrw(), &.{ "-o", out_path, "-e", "_start", start_path, main_path });
     try std.testing.expect(status != 0);
 }
 
@@ -926,7 +959,7 @@ test "ld.vulcan CLI: a plain link (no -shared/--dynamic-linker) prefers a same-n
     const out_path = try std.fmt.allocPrint(allocator, "{s}/out", .{tmpdir});
     defer allocator.free(out_path);
 
-    const status = try run(allocator, io, &.{
+    const status = try run(allocator, io, testErrw(), &.{
         "-o", out_path, "-e", "_start", "-L", tmpdir, start_path, main_path, "-lhelper",
     });
     try std.testing.expectEqual(@as(u8, 0), status);
@@ -1020,7 +1053,7 @@ test "ld.vulcan CLI: -shared builds libadd.so, --dynamic-linker links a dynexe, 
     defer allocator.free(prog_path);
 
     // Step A: `-shared` builds `libadd.so`, exporting `add`.
-    const shared_status = try run(allocator, io, &.{
+    const shared_status = try run(allocator, io, testErrw(), &.{
         "-shared", add_path, "-o", libadd_path, "-soname", "libadd.so",
     });
     try std.testing.expectEqual(@as(u8, 0), shared_status);
@@ -1041,7 +1074,7 @@ test "ld.vulcan CLI: -shared builds libadd.so, --dynamic-linker links a dynexe, 
     const ld_so_path = (try findGlibcInterpAArch64(allocator, io)) orelse return error.SkipZigTest;
     defer allocator.free(ld_so_path);
 
-    const link_status = try run(allocator, io, &.{
+    const link_status = try run(allocator, io, testErrw(), &.{
         "--dynamic-linker", ld_so_path, "-L", tmpdir, "-ladd", "-e", "_start", "-o", prog_path, start_path,
     });
     try std.testing.expectEqual(@as(u8, 0), link_status);
@@ -1093,12 +1126,12 @@ test "ld.vulcan CLI: a .exec dynamic link with no --dynamic-linker returns a cle
 
     // Build a real `.so` first, so this is a genuine ".so input with no
     // --dynamic-linker" case, not just "the -shared flag is missing".
-    const shared_status = try run(allocator, io, &.{ "-shared", add_path, "-o", libadd_path, "-soname", "libadd.so" });
+    const shared_status = try run(allocator, io, testErrw(), &.{ "-shared", add_path, "-o", libadd_path, "-soname", "libadd.so" });
     try std.testing.expectEqual(@as(u8, 0), shared_status);
 
     // A `.so` input alone (no `-shared`, no `--dynamic-linker`) still triggers the
     // dynamic route (a `.exec` dynamic link) - which then has no interpreter to embed.
-    const status = try run(allocator, io, &.{
+    const status = try run(allocator, io, testErrw(), &.{
         "-L", tmpdir, "-ladd", "-e", "_start", "-o", prog_path, start_path,
     });
     try std.testing.expect(status != 0);
@@ -1143,9 +1176,9 @@ test "ld.vulcan CLI: DT_NEEDED includes a linked .so that is never CALLED, provi
     defer allocator.free(prog_path);
 
     // Build both `.so`s.
-    const add_shared_status = try run(allocator, io, &.{ "-shared", add_path, "-o", libadd_path, "-soname", "libadd.so" });
+    const add_shared_status = try run(allocator, io, testErrw(), &.{ "-shared", add_path, "-o", libadd_path, "-soname", "libadd.so" });
     try std.testing.expectEqual(@as(u8, 0), add_shared_status);
-    const unused_shared_status = try run(allocator, io, &.{ "-shared", unused_path, "-o", libunused_path, "-soname", "libunused.so" });
+    const unused_shared_status = try run(allocator, io, testErrw(), &.{ "-shared", unused_path, "-o", libunused_path, "-soname", "libunused.so" });
     try std.testing.expectEqual(@as(u8, 0), unused_shared_status);
 
     const ld_so_path = (try findGlibcInterpAArch64(allocator, io)) orelse return error.SkipZigTest;
@@ -1153,7 +1186,7 @@ test "ld.vulcan CLI: DT_NEEDED includes a linked .so that is never CALLED, provi
 
     // Link a dynexe against BOTH `.so`s - `-lunused` only ever contributes a `DT_NEEDED`
     // entry, no imports (nothing calls into it).
-    const link_status = try run(allocator, io, &.{
+    const link_status = try run(allocator, io, testErrw(), &.{
         "--dynamic-linker", ld_so_path, "-L", tmpdir, "-ladd", "-lunused", "-e", "_start", "-o", prog_path, start_path,
     });
     try std.testing.expectEqual(@as(u8, 0), link_status);
@@ -1262,7 +1295,7 @@ test "ld.vulcan CLI: -T links via a linker script, natively runs to exit 42" {
     const out_path = try std.fmt.allocPrint(allocator, "{s}/out", .{tmpdir});
     defer allocator.free(out_path);
 
-    const status = try run(allocator, io, &.{
+    const status = try run(allocator, io, testErrw(), &.{
         "-T", script_path, "-o", out_path, start_path, main_path,
     });
     try std.testing.expectEqual(@as(u8, 0), status);
@@ -1301,7 +1334,7 @@ test "ld.vulcan CLI: -T with a malformed script returns a non-zero status withou
     const out_path = try std.fmt.allocPrint(allocator, "{s}/out", .{tmpdir});
     defer allocator.free(out_path);
 
-    const status = try run(allocator, io, &.{ "-T", script_path, "-o", out_path, start_path });
+    const status = try run(allocator, io, testErrw(), &.{ "-T", script_path, "-o", out_path, start_path });
     try std.testing.expect(status != 0);
 }
 
@@ -1336,13 +1369,13 @@ test "ld.vulcan CLI: -T with -e overrides the script's ENTRY (smoke: links witho
     // symbol (defined in main.o, placed by the script), so the link itself must still
     // succeed - not run natively (entering at `main` skips the `_start` exit-syscall
     // wrapper, so its behavior after `ret` is undefined and not meaningfully assertable).
-    const status = try run(allocator, io, &.{
+    const status = try run(allocator, io, testErrw(), &.{
         "-T", script_path, "-e", "main", "-o", out_path, start_path, main_path,
     });
     try std.testing.expectEqual(@as(u8, 0), status);
 
     // An unresolved `-e` name is a clean error, not a crash.
-    const bad_status = try run(allocator, io, &.{
+    const bad_status = try run(allocator, io, testErrw(), &.{
         "-T", script_path, "-e", "no_such_symbol", "-o", out_path, start_path, main_path,
     });
     try std.testing.expect(bad_status != 0);

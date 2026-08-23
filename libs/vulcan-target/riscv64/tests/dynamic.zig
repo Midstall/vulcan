@@ -118,17 +118,31 @@ fn buildDataStartObj(allocator: std.mem.Allocator) ![]u8 {
     return object.write(allocator, .{ .text = &text, .symbols = &symbols, .relocs = &relocs });
 }
 
-/// Locate a real cross glibc `ld-linux-riscv64-lp64d.so.1` in the Nix store (the interpreter
-/// to embed in the dynexe). Returns an allocated absolute path, or null if none is found.
+/// Locate a real cross glibc `ld-linux-riscv64-lp64d.so.1` (the interpreter to embed in
+/// the dynexe). Returns an allocated absolute path, or null if none is found.
+///
+/// Ask the C compiler for the target's loader instead of scanning `/nix/store`: fast,
+/// cross-platform, and a target's test runs only where its toolchain exists. Native `cc`
+/// answers for the host arch; a cross target needs its `<triple>-gcc`, absent here -> the
+/// query fails or echoes the bare name -> skip. `cc -print-file-name=<name>` returns an
+/// ABSOLUTE path (leading `/`) when the compiler has that glibc file, else it echoes the
+/// bare `<name>` (no leading `/`), which means "not available" -> skip.
 fn findCrossInterp(allocator: std.mem.Allocator) !?[]u8 {
-    const proc = std.process.run(allocator, std.testing.io, .{
-        .argv = &.{ "sh", "-c", "find /nix/store -maxdepth 3 -name ld-linux-riscv64-lp64d.so.1 2>/dev/null | head -1" },
-    }) catch return null;
-    defer allocator.free(proc.stdout);
-    defer allocator.free(proc.stderr);
-    const trimmed = std.mem.trim(u8, proc.stdout, " \t\r\n");
-    if (trimmed.len == 0) return null;
-    return try allocator.dupe(u8, trimmed);
+    const host = @import("builtin").cpu.arch;
+    const ccs: []const []const u8 = if (host == .riscv64)
+        &.{ "cc", "gcc" }
+    else
+        &.{ "riscv64-unknown-linux-gnu-gcc", "riscv64-linux-gnu-gcc" };
+    const arg = try std.fmt.allocPrint(allocator, "-print-file-name={s}", .{"ld-linux-riscv64-lp64d.so.1"});
+    defer allocator.free(arg);
+    for (ccs) |ccname| {
+        const proc = std.process.run(allocator, std.testing.io, .{ .argv = &.{ ccname, arg } }) catch continue;
+        defer allocator.free(proc.stdout);
+        defer allocator.free(proc.stderr);
+        const t = std.mem.trim(u8, proc.stdout, " \t\r\n");
+        if (t.len > 0 and t[0] == '/') return try allocator.dupe(u8, t);
+    }
+    return null;
 }
 
 /// Locate the `qemu-riscv64` user-mode emulator on PATH. Returns an allocated absolute path,

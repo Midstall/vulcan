@@ -77,6 +77,7 @@
 
           checks = {
             default = pkgs.vulcan;
+            inherit (pkgs.vulcan) cc vcc-stdenv;
             inherit (pkgs) erbium-hal etsoc-sysemu;
           };
         };

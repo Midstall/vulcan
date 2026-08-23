@@ -21,11 +21,18 @@ fn hostedMain(init: std.process.Init) !void {
     const io = init.io;
     const allocator = init.arena.allocator();
 
+    // The diagnostic sink for this invocation: usage and error lines route here, to the
+    // real stderr, instead of writing to the process-global stderr directly.
+    var errbuf: [256]u8 = undefined;
+    var errfile = std.Io.File.stderr().writer(io, &errbuf);
+    const errw = &errfile.interface;
+
     var it = try init.minimal.args.iterateAllocator(allocator); // cross-platform (works on WASI)
     defer it.deinit();
     _ = it.skip(); // argv0
     const path = it.next() orelse {
-        std.debug.print("usage: vulcan-wasm <file.wasm> [export] [i32 args...]\n", .{});
+        errw.print("usage: vulcan-wasm <file.wasm> [export] [i32 args...]\n", .{}) catch {};
+        errw.flush() catch {};
         return error.Usage;
     };
 
@@ -44,7 +51,8 @@ fn hostedMain(init: std.process.Init) !void {
     if (is_wasi) {
         const host_imports = try allocator.alloc(usize, module.imports.len);
         for (module.imports, 0..) |n, i| host_imports[i] = engine.wasi.resolve(n) orelse {
-            std.debug.print("vulcan-wasm: unsupported import '{s}'\n", .{n});
+            errw.print("vulcan-wasm: unsupported import '{s}'\n", .{n}) catch {};
+            errw.flush() catch {};
             module.deinit(allocator);
             return error.Unsupported;
         };
@@ -57,7 +65,8 @@ fn hostedMain(init: std.process.Init) !void {
         var wasi_ctx = engine.wasi.Ctx{ .mem = inst.memory, .args = &.{path}, .io = io, .allocator = allocator };
         inst.setImportContext(&wasi_ctx);
         inst.call0(void, "_start") catch |e| {
-            std.debug.print("vulcan-wasm: {s}\n", .{@errorName(e)});
+            errw.print("vulcan-wasm: {s}\n", .{@errorName(e)}) catch {};
+            errw.flush() catch {};
             return e;
         };
         return; // _start returned, or proc_exit already exited the process

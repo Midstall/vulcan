@@ -117,6 +117,9 @@ pub const Options = struct {
     defines: []const Define = &.{},
     undefines: []const []const u8 = &.{},
     system: ?SystemPredef = null,
+    /// Optional sink for `#warning` diagnostics. When null (the default) a `#warning`
+    /// prints nothing, so tests stay silent. Production callers pass a real stderr writer.
+    diag: ?*std.Io.Writer = null,
 };
 
 pub const Error = lexer.Error || error{ PreprocError, Unsupported };
@@ -635,7 +638,7 @@ fn handleUndef(allocator: std.mem.Allocator, macros: *MacroTable, args: []const 
 /// of that same identity entirely. A `#pragma` argument other than `once` (or `#pragma
 /// once` from the top-level source, which cannot be "skipped" anyway) is a no-op, matching
 /// this preprocessor's best-effort `#pragma` handling.
-fn processDirective(allocator: std.mem.Allocator, macros: *MacroTable, rest: []const PToken, included: *std.StringHashMapUnmanaged(void), current_identity: ?[]const u8) Error!void {
+fn processDirective(allocator: std.mem.Allocator, macros: *MacroTable, rest: []const PToken, included: *std.StringHashMapUnmanaged(void), current_identity: ?[]const u8, diag: ?*std.Io.Writer) Error!void {
     if (rest.len == 0) return; // null directive
     if (rest[0].kind != .ident) return error.Unsupported;
     const dname = rest[0].text;
@@ -645,9 +648,12 @@ fn processDirective(allocator: std.mem.Allocator, macros: *MacroTable, rest: []c
     if (std.mem.eql(u8, dname, "undef")) return handleUndef(allocator, macros, args);
     if (std.mem.eql(u8, dname, "error")) return error.PreprocError;
     if (std.mem.eql(u8, dname, "warning")) {
-        std.debug.print("warning:", .{});
-        for (args) |t| std.debug.print(" {s}", .{t.text});
-        std.debug.print("\n", .{});
+        if (diag) |w| {
+            w.writeAll("warning:") catch {};
+            for (args) |t| w.print(" {s}", .{t.text}) catch {};
+            w.writeAll("\n") catch {};
+            w.flush() catch {};
+        }
         return;
     }
     if (std.mem.eql(u8, dname, "line")) return; // best-effort no-op
@@ -1941,7 +1947,7 @@ fn processLines(p: *Proc, ptoks: []const PToken, includer_dir: ?[]const u8, iden
                     // to reach the compiler's `<limits.h>`.
                     try handleInclude(p, rest[1..], includer_dir, identity orelse p.opts.filename);
                 } else {
-                    try processDirective(p.allocator, p.macros, rest, p.included, identity);
+                    try processDirective(p.allocator, p.macros, rest, p.included, identity, p.opts.diag);
                 }
             } // else: inactive branch, a non-conditional directive is silently ignored.
         } else if (condEmitting(p.cond_stack.items)) {
