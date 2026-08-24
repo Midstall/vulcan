@@ -207,6 +207,46 @@ fn computeArgLocs(func: *const Function, values: []const Value, out: []ArgLoc, s
     }
 }
 
+/// The stack footprint (byte size and alignment) of an argument of `p`'s type under the Apple arm64
+/// ABI, which packs a stack argument at its natural size and alignment rather than padding it to an
+/// 8-byte slot. AAPCS64 always uses 8 bytes.
+fn appleStackFootprint(func: *const Function, p: Value) struct { size: u15, alignment: u15 } {
+    return switch (func.types.type_kind(func.valueType(p))) {
+        .int => |i| if (i.bits > 32) .{ .size = 8, .alignment = 8 } else .{ .size = 4, .alignment = 4 },
+        .float => |f| switch (f) {
+            .f64 => .{ .size = 8, .alignment = 8 },
+            .f128 => .{ .size = 16, .alignment = 16 },
+            else => .{ .size = 4, .alignment = 4 }, // f32, and an f16 held as its f32 widening
+        },
+        .vector => .{ .size = 16, .alignment = 16 },
+        .ptr => .{ .size = 8, .alignment = 8 },
+        else => .{ .size = 8, .alignment = 8 }, // bool and anything else: a conservative 8-byte slot
+    };
+}
+
+/// The byte offset, from the incoming argument-area base, of a stack-passed parameter `p` at ABI
+/// location `l` (whose `idx` is 8 or more). AAPCS64 gives every stack argument an 8-byte slot. The
+/// Apple ABI packs them at their natural sizes, so those offsets are precomputed into `apple_off`.
+fn incomingStackByteOff(caps: ModelCaps, apple_off: *const std.AutoHashMapUnmanaged(Value, u15), p: Value, l: ArgLoc) usize {
+    return switch (caps.abi) {
+        .aapcs64 => 8 * (l.idx - 8),
+        .apple => apple_off.get(p).?,
+    };
+}
+
+/// Load a stack-passed gpr parameter `p` from `[sp + off]` into `dst`. Under the Apple ABI a 4-byte
+/// integer is packed into 4 stack bytes, so a 64-bit `ldr` would pull in the adjacent argument's
+/// bytes; load exactly the natural width, sign- or zero-extended by the value's signedness, instead.
+/// AAPCS64 keeps the plain 64-bit load (its 8-byte slot holds the value in the low bytes), so it
+/// stays byte-identical. A pointer or an i64 always loads 64-bit; a smaller integer loads narrow.
+fn emitGprStackLoad(allocator: std.mem.Allocator, code: *std.ArrayList(u32), dst: Reg, off: usize, caps: ModelCaps, func: *const Function, p: Value) Error!void {
+    if (caps.abi == .apple and func.types.type_kind(func.valueType(p)) == .int and intBitsOf(func, p) <= 32) {
+        try code.append(allocator, if (isSignedInt(func, p)) encode.ldrsw(dst, sp, @intCast(off)) else encode.ldrW(dst, sp, @intCast(off)));
+    } else {
+        try code.append(allocator, encode.ldrOff(dst, sp, @intCast(off)));
+    }
+}
+
 const Move = struct { src: Reg, dst: Reg };
 pub const Fixup = struct { at: usize, target: u32 };
 
@@ -333,7 +373,19 @@ const Allocation = struct {
 /// `fcvt`), and the `fuse_*` flags at their base-ISA-available defaults. `fuse_cmp_branch` gates
 /// the compare-into-branch fold (see `fusesIntoNextIf`). The rest are foundation only. No fold
 /// reads them yet, so they are inert either way.
+/// The aarch64 calling convention. `aapcs64` is the standard ARM64 ABI (ELF/Linux): every
+/// stack-passed argument gets an 8-byte slot. `apple` is Apple's ARM64 ABI (macOS/iOS): a
+/// stack-passed argument is packed at its natural size and alignment (a 4-byte `int` or `float`
+/// occupies 4 stack bytes, not 8), so the on-stack layout differs once arguments spill past the
+/// registers. Register passing (x0-x7 / v0-v7) is identical between the two. The object/ELF path
+/// always uses `aapcs64`; the in-process JIT selects the HOST convention (see `native.zig`), so a
+/// function JIT-executed on a Darwin host must read and write its stack arguments Apple-packed.
+pub const Abi = enum { aapcs64, apple };
+
 pub const ModelCaps = struct {
+    /// The calling convention for argument passing. Defaults to `aapcs64` (every non-JIT caller and
+    /// the object path). The JIT path passes the host's convention.
+    abi: Abi = .aapcs64,
     /// Loop-header alignment in bytes (0 disables it). See `compileFunction`'s doc comment.
     fetch_align: u16 = 0,
     /// Use NATIVE half-precision arithmetic (H-form ops, an f16 held in an H register, single-
@@ -858,6 +910,25 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
     const plocs = try allocator.alloc(ArgLoc, eparams.len);
     defer allocator.free(plocs);
     computeArgLocs(func, eparams, plocs, func.sret);
+    // Under the Apple ABI, precompute each stack-passed parameter's packed byte offset in the
+    // incoming argument area (a per-file, alignment-respecting running sum of natural sizes). AAPCS64
+    // uses fixed 8-byte slots instead, computed inline at the read sites, so this map stays empty and
+    // unused there (byte-identical). The gpr-overflow and fpr-overflow args keep separate running
+    // offsets, matching the per-file `idx` the read sites already use.
+    var apple_stack_off: std.AutoHashMapUnmanaged(Value, u15) = .empty;
+    defer apple_stack_off.deinit(allocator);
+    if (caps.abi == .apple) {
+        var gpr_run: u15 = 0;
+        var fpr_run: u15 = 0;
+        for (eparams, plocs) |p, l| {
+            if (l.sret_ptr or l.idx < 8) continue;
+            const fp = appleStackFootprint(func, p);
+            const run = if (l.class == .fpr) &fpr_run else &gpr_run;
+            run.* = std.mem.alignForward(u15, run.*, fp.alignment);
+            try apple_stack_off.put(allocator, p, run.*);
+            run.* += fp.size;
+        }
+    }
     for (eparams, plocs) |p, l| {
         // The hidden result pointer arrives in `x8` (the AAPCS64 indirect-result
         // register), NOT an x0-x7 argument register. Home it into wherever the allocator placed
@@ -910,9 +981,9 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                                 encode.mov(first_reg, incoming));
                         }
                     } else if (l.class == .fpr) {
-                        try code.append(allocator, if (vec) encode.ldrQ(first_reg, sp, @intCast(frame + 8 * (l.idx - 8))) else encode.ldrFp(first_reg, sp, @intCast(frame + 8 * (l.idx - 8)), false));
+                        try code.append(allocator, if (vec) encode.ldrQ(first_reg, sp, @intCast(frame + incomingStackByteOff(caps, &apple_stack_off, p, l))) else encode.ldrFp(first_reg, sp, @intCast(frame + incomingStackByteOff(caps, &apple_stack_off, p, l)), false));
                     } else {
-                        try code.append(allocator, encode.ldrOff(first_reg, sp, @intCast(frame + 8 * (l.idx - 8))));
+                        try emitGprStackLoad(allocator, &code, first_reg, frame + incomingStackByteOff(caps, &apple_stack_off, p, l), caps, func, p);
                     }
                 },
                 .slot => |slot| {
@@ -926,14 +997,14 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                         }
                     } else if (l.class == .fpr) {
                         if (vec) {
-                            try code.append(allocator, encode.ldrQ(fp_spill_op[0], sp, @intCast(frame + 8 * (l.idx - 8))));
+                            try code.append(allocator, encode.ldrQ(fp_spill_op[0], sp, @intCast(frame + incomingStackByteOff(caps, &apple_stack_off, p, l))));
                             try code.append(allocator, encode.strQ(fp_spill_op[0], sp, slot_off));
                         } else {
-                            try code.append(allocator, encode.ldrFp(fp_spill_op[0], sp, @intCast(frame + 8 * (l.idx - 8)), false));
+                            try code.append(allocator, encode.ldrFp(fp_spill_op[0], sp, @intCast(frame + incomingStackByteOff(caps, &apple_stack_off, p, l)), false));
                             try code.append(allocator, encode.strFp(fp_spill_op[0], sp, slot_off, true));
                         }
                     } else {
-                        try code.append(allocator, encode.ldrOff(spill_op[0], sp, @intCast(frame + 8 * (l.idx - 8))));
+                        try emitGprStackLoad(allocator, &code, spill_op[0], frame + incomingStackByteOff(caps, &apple_stack_off, p, l), caps, func, p);
                         try code.append(allocator, encode.strOff(spill_op[0], sp, slot_off));
                     }
                 },
@@ -956,10 +1027,10 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                 // An incoming stack parameter that is also spilled: load from the caller's
                 // outgoing area into a scratch, then store to our spill slot.
                 if (l.class == .fpr) {
-                    try code.append(allocator, encode.ldrFp(fp_spill_op[0], sp, @intCast(frame + 8 * (l.idx - 8)), false));
+                    try code.append(allocator, encode.ldrFp(fp_spill_op[0], sp, @intCast(frame + incomingStackByteOff(caps, &apple_stack_off, p, l)), false));
                     try code.append(allocator, encode.strFp(fp_spill_op[0], sp, slot_off, true));
                 } else {
-                    try code.append(allocator, encode.ldrOff(spill_op[0], sp, @intCast(frame + 8 * (l.idx - 8))));
+                    try emitGprStackLoad(allocator, &code, spill_op[0], frame + incomingStackByteOff(caps, &apple_stack_off, p, l), caps, func, p);
                     try code.append(allocator, encode.strOff(spill_op[0], sp, slot_off));
                 }
             }
@@ -981,9 +1052,9 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
             // its outgoing-argument area, now just below our frame. Load it into the
             // parameter's FP register. (A graphics shader with many scalarized varyings +
             // synthesized derivative gradient inputs can exceed the 8 FP arg registers.)
-            try code.append(allocator, encode.ldrFp(pr, sp, @intCast(frame + 8 * (l.idx - 8)), false));
+            try code.append(allocator, encode.ldrFp(pr, sp, @intCast(frame + incomingStackByteOff(caps, &apple_stack_off, p, l)), false));
         } else {
-            try code.append(allocator, encode.ldrOff(pr, sp, @intCast(frame + 8 * (l.idx - 8))));
+            try emitGprStackLoad(allocator, &code, pr, frame + incomingStackByteOff(caps, &apple_stack_off, p, l), caps, func, p);
         }
     }
 
@@ -3084,6 +3155,14 @@ pub fn aarch64RegDescription(allocator: std.mem.Allocator, func: *const Function
 /// differential caller that must keep an unmutated reference builds two identical functions and
 /// compiles one each way (see the cross-block tests).
 pub fn compileFunctionWimmer(allocator: std.mem.Allocator, func: *Function) Error!Compiled {
+    return compileFunctionWimmerAbi(allocator, func, .{});
+}
+
+/// Like `compileFunctionWimmer`, but with an explicit `caps` (only its `abi` field matters here).
+/// A native-execution test that JIT-runs the result on the host passes the HOST calling convention,
+/// so the compiled function reads its stack arguments the way the host caller passed them. The
+/// default `.{}` is AAPCS64, which the differential (byte-comparison) callers use unchanged.
+pub fn compileFunctionWimmerAbi(allocator: std.mem.Allocator, func: *Function, caps: ModelCaps) Error!Compiled {
     if (ir.function.functionUsesCompositeF16(func)) return error.Unsupported;
     if (func.blockCount() == 0) return error.Unsupported;
 
@@ -3106,8 +3185,9 @@ pub fn compileFunctionWimmer(allocator: std.mem.Allocator, func: *Function) Erro
     var alloc = try translateAllocation(allocator, func, &walloc);
     defer alloc.deinit(allocator);
     // The Wimmer differential path never folds addresses, so it emits through the empty analysis and
-    // stays byte-identical to the pre-fold emission.
-    return emitFromAllocation(allocator, func, .{}, &alloc, &empty_fold);
+    // stays byte-identical to the pre-fold emission. `caps` carries only the calling convention (the
+    // differential callers pass the default AAPCS64; a native-execution caller passes the host ABI).
+    return emitFromAllocation(allocator, func, caps, &alloc, &empty_fold);
 }
 
 /// The aarch64 (uniform 16-byte) spill-slot index for a Wimmer per-class slot: GPR (class 0) slots

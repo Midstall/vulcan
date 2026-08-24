@@ -841,7 +841,7 @@ fn startStubAArch64(allocator: std.mem.Allocator) ![]u8 {
 }
 
 test "ld.vulcan CLI: links main.o + libhelper.a + start.o into a runnable exe, natively runs to exit 42" {
-    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest; // executes the produced AArch64 ELF directly
+    if (builtin.cpu.arch != .aarch64 or builtin.os.tag != .linux) return error.SkipZigTest; // executes the produced AArch64 ELF directly
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -925,7 +925,7 @@ test "ld.vulcan CLI: an undefined symbol (no library given) returns a non-zero s
 // silent alternate path.
 
 test "ld.vulcan CLI: a plain link (no -shared/--dynamic-linker) prefers a same-named .a over a colliding .so, no dynamic diversion" {
-    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest; // executes the produced AArch64 ELF directly
+    if (builtin.cpu.arch != .aarch64 or builtin.os.tag != .linux) return error.SkipZigTest; // executes the produced AArch64 ELF directly
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -1027,7 +1027,7 @@ test "resolveLib tries the preferred kind then the other kind WITHIN each -L dir
 // at runtime, an independent, off-the-shelf dynamic loader.
 
 test "ld.vulcan CLI: -shared builds libadd.so, --dynamic-linker links a dynexe, the real host ld.so runs it to exit 42" {
-    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest; // executes the produced AArch64 ELF directly
+    if (builtin.cpu.arch != .aarch64 or builtin.os.tag != .linux) return error.SkipZigTest; // executes the produced AArch64 ELF directly
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -1138,7 +1138,7 @@ test "ld.vulcan CLI: a .exec dynamic link with no --dynamic-linker returns a cle
 }
 
 test "ld.vulcan CLI: DT_NEEDED includes a linked .so that is never CALLED, proving the CLI's own derivation (not linkDynamic's call-driven one)" {
-    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest; // executes the produced AArch64 ELF directly
+    if (builtin.cpu.arch != .aarch64 or builtin.os.tag != .linux) return error.SkipZigTest; // executes the produced AArch64 ELF directly
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -1269,7 +1269,7 @@ const script_a_text =
 ;
 
 test "ld.vulcan CLI: -T links via a linker script, natively runs to exit 42" {
-    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest; // executes the produced AArch64 ELF directly
+    if (builtin.cpu.arch != .aarch64 or builtin.os.tag != .linux) return error.SkipZigTest; // executes the produced AArch64 ELF directly
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 

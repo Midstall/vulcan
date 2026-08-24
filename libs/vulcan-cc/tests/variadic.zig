@@ -1390,7 +1390,7 @@ fn oracleExitNative(allocator: std.mem.Allocator, io: std.Io, source: []const u8
 }
 
 test "aarch64: vcc variadic sum() reads its int varargs (register + overflow) to exit 42 natively" {
-    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest; // native aarch64 host only
+    if (builtin.cpu.arch != .aarch64 or builtin.os.tag != .linux) return error.SkipZigTest; // native aarch64 host only
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -1410,7 +1410,7 @@ test "aarch64: vcc variadic sum() reads its int varargs (register + overflow) to
 }
 
 test "aarch64: vcc variadic favg() reads its double varargs (VR save) to exit 42 natively" {
-    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+    if (builtin.cpu.arch != .aarch64 or builtin.os.tag != .linux) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -2154,37 +2154,41 @@ fn shOutput(allocator: std.mem.Allocator, script: []const u8) !?[]u8 {
 }
 
 /// Locate the HOST (aarch64) glibc dev include dir (the one with a real `stdio.h`). Same search
-/// order as `preproc_glibc.zig`'s `findHostGlibcIncludeDir`: `VCC_GLIBC_INCLUDE`, then real gcc's
-/// own `-E -v` system-include list, then a non-cross `/nix/store/*-glibc-*-dev/include`, then the
-/// one store path confirmed present when this was written. Null (clean skip) if none pans out.
+/// order as `preproc_glibc.zig`'s `findHostGlibcIncludeDir`: `VCC_GLIBC_INCLUDE`, then the host C
+/// compiler's own `-E -v` system-include list, taking the last directory in it that holds a
+/// `stdio.h`. Null (clean skip) if none pans out.
 fn findHostGlibcIncludeDir(allocator: std.mem.Allocator) !?[]u8 {
     const script =
         \\if [ -n "${VCC_GLIBC_INCLUDE:-}" ] && [ -f "$VCC_GLIBC_INCLUDE/stdio.h" ]; then
         \\  echo "$VCC_GLIBC_INCLUDE"; exit 0
         \\fi
-        \\if command -v gcc >/dev/null 2>&1; then
-        \\  d=$(echo | gcc -E -v -xc - 2>&1 | grep -E '^ .*/glibc-[0-9][^/]*-dev/include$' | tail -1 | sed -e 's/^ //')
-        \\  if [ -n "$d" ] && [ -f "$d/stdio.h" ]; then echo "$d"; exit 0; fi
-        \\fi
-        \\for d in /nix/store/*-glibc-[0-9]*-dev/include; do
-        \\  if [ -f "$d/stdio.h" ]; then echo "$d"; exit 0; fi
+        \\for cc_ in cc gcc; do
+        \\  command -v "$cc_" >/dev/null 2>&1 || continue
+        \\  last=""
+        \\  for d in $(echo | LC_ALL=C "$cc_" -E -v -xc - 2>&1 | awk '/search starts here/{f=1;next} /End of search/{f=0} f{sub(/^ +/,"");print}'); do
+        \\    [ -f "$d/features.h" ] && last="$d"
+        \\  done
+        \\  if [ -n "$last" ]; then echo "$last"; exit 0; fi
         \\done
-        \\known=/nix/store/11azz9spqc81walgg0mq9wjxrgbi4xqz-glibc-2.42-61-dev/include
-        \\if [ -f "$known/stdio.h" ]; then echo "$known"; exit 0; fi
         \\exit 1
     ;
     return shOutput(allocator, script);
 }
 
 /// Locate a CROSS glibc dev include dir for `triple`. Mirrors `preproc_glibc.zig`'s
-/// `findCrossGlibcIncludeDir`. Null (clean skip) when this Nix profile has no such tree.
+/// `findCrossGlibcIncludeDir`. Null (clean skip) when the cross toolchain is absent.
 fn findCrossGlibcIncludeDir(allocator: std.mem.Allocator, triple: []const u8) !?[]u8 {
     const script = try std.fmt.allocPrint(allocator,
-        \\for d in /nix/store/*-glibc-{s}-*-dev/include; do
-        \\  if [ -f "$d/stdio.h" ]; then echo "$d"; exit 0; fi
+        \\for cc_ in {s}-gcc {s}-cc; do
+        \\  command -v "$cc_" >/dev/null 2>&1 || continue
+        \\  last=""
+        \\  for d in $(echo | LC_ALL=C "$cc_" -E -v -xc - 2>&1 | awk '/search starts here/{{f=1;next}} /End of search/{{f=0}} f{{sub(/^ +/,"");print}}'); do
+        \\    [ -f "$d/features.h" ] && last="$d"
+        \\  done
+        \\  if [ -n "$last" ]; then echo "$last"; exit 0; fi
         \\done
         \\exit 1
-    , .{triple});
+    , .{ triple, triple });
     defer allocator.free(script);
     return shOutput(allocator, script);
 }

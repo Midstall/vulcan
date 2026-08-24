@@ -113,7 +113,7 @@ test "linkInputsScript lays out via a linker script; the .data global resolves a
     const g_addr = ld.elf.findSymbol(linked.placement.symbols, "g").?;
     try std.testing.expect(g_addr >= 0x400000);
 
-    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest; // executes the AArch64 ELF directly
+    if (builtin.cpu.arch != .aarch64 or builtin.os.tag != .linux) return error.SkipZigTest; // executes the AArch64 ELF directly
 
     const exe = try ld.writeElfSegments(linked.arch, allocator, &linked.placement, linked.entry);
     defer allocator.free(exe);
@@ -260,7 +260,7 @@ test "linkInputsScript: a two-region script (.text >rom, .data >ram, VMA == LMA)
     try std.testing.expectEqual(@as(usize, 2), linked.placement.segments.len);
     try std.testing.expectEqual(@as(u64, 0x500000), ld.elf.findSymbol(linked.placement.symbols, "g").?);
 
-    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest; // executes the AArch64 ELF directly
+    if (builtin.cpu.arch != .aarch64 or builtin.os.tag != .linux) return error.SkipZigTest; // executes the AArch64 ELF directly
 
     const exe = try ld.writeElfSegments(linked.arch, allocator, &linked.placement, linked.entry);
     defer allocator.free(exe);

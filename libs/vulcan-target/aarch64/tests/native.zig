@@ -2946,7 +2946,7 @@ test "uefi: IR -> aarch64 -> PE32+ image, and the embedded code runs" {
 
 test "object+ld+exec: link two functions into a runnable ELF and execute it natively" {
     const allocator = std.testing.allocator;
-    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest; // executes the AArch64 ELF directly
+    if (builtin.cpu.arch != .aarch64 or builtin.os.tag != .linux) return error.SkipZigTest; // executes the AArch64 ELF directly
     const object = @import("../object.zig");
     const ld = @import("vulcan-link");
     const i32k = ir.types.TypeKind{ .int = .{ .signedness = .signed, .bits = 32 } };
@@ -3019,7 +3019,7 @@ test "object+ld+exec: link two functions into a runnable ELF and execute it nati
 
 test "object+ld+exec: link a program with a global (data section) and execute it natively" {
     const allocator = std.testing.allocator;
-    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest; // executes the AArch64 ELF directly
+    if (builtin.cpu.arch != .aarch64 or builtin.os.tag != .linux) return error.SkipZigTest; // executes the AArch64 ELF directly
     const object = @import("../object.zig");
     const ld = @import("vulcan-link");
     const i32k = ir.types.TypeKind{ .int = .{ .signedness = .signed, .bits = 32 } };
@@ -3153,7 +3153,7 @@ test "object+ld+exec: aarch64 links through the Placement model, byte-identical,
         try std.testing.expect(std.mem.eql(u8, via_exec, via_seg));
     }
 
-    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest; // executes the AArch64 ELF directly
+    if (builtin.cpu.arch != .aarch64 or builtin.os.tag != .linux) return error.SkipZigTest; // executes the AArch64 ELF directly
 
     // A tiny entry stub in front of the relocated image: set the argument, call main,
     // then exit with its result. main sits right past the 16-byte stub.
@@ -3250,6 +3250,8 @@ test "disasm: source-annotated listing of a real -g object (full DWARF-read pipe
     // cc -g a real function, then run the whole vulcan-disasm pipeline on it: findText ->
     // sectionByName(.debug_line) -> decodeLine -> formatElfWithLines, and confirm the source-line
     // markers land in the listing. Host must be aarch64 for cc to emit an aarch64 object.
+    // Darwin cc emits Mach-O, so the ELF+DWARF reader needs a Linux host.
+    if (builtin.cpu.arch != .aarch64 or builtin.os.tag != .linux) return error.SkipZigTest;
     const a = std.testing.allocator;
     const io = std.testing.io;
     const dwarf = @import("../../dwarf.zig");

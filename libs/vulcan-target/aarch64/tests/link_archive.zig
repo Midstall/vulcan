@@ -121,7 +121,7 @@ test "linkInputs pulls a referenced archive member and resolves the call, native
     try std.testing.expect(image.addressOf("helper") != null);
     try std.testing.expect(image.addressOf("dead") == null);
 
-    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest; // executes the AArch64 ELF directly
+    if (builtin.cpu.arch != .aarch64 or builtin.os.tag != .linux) return error.SkipZigTest; // executes the AArch64 ELF directly
 
     // A tiny entry stub: call main, then exit with its result. main sits right past
     // the 12-byte stub; bl is the first instruction (site offset 0), x0 already
@@ -253,7 +253,7 @@ test "linkInputs fixpoint pulls a two-hop inter-member archive dependency (main 
     try std.testing.expect(image.addressOf("helper") != null);
     try std.testing.expect(image.addressOf("helper2") != null);
 
-    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest; // executes the AArch64 ELF directly
+    if (builtin.cpu.arch != .aarch64 or builtin.os.tag != .linux) return error.SkipZigTest; // executes the AArch64 ELF directly
 
     // Same entry stub shape as the one-hop test above: call main, then exit with its
     // result. main sits right past the 12-byte stub.

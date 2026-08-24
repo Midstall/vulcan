@@ -2467,7 +2467,7 @@ fn linkAndRun(allocator: std.mem.Allocator, io: std.Io, objs: []const []const u8
 }
 
 test "compile to object, link, and natively run" {
-    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest; // host-only
+    if (builtin.cpu.arch != .aarch64 or builtin.os.tag != .linux) return error.SkipZigTest; // host-only
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -2500,7 +2500,7 @@ test "compile to object, link, and natively run" {
 // call site's spelling. It still resolves through the same `findFunc` path, since the
 // callee expression is still a `.name` underneath the parens.
 test "parenthesized callee (add)(1, 41) agrees with a plain call, natively runs to exit 42" {
-    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest; // host-only
+    if (builtin.cpu.arch != .aarch64 or builtin.os.tag != .linux) return error.SkipZigTest; // host-only
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -2556,7 +2556,7 @@ fn linkInputsAndRun(allocator: std.mem.Allocator, io: std.Io, inputs: []const @i
 }
 
 test "vcc driver link path: linkInputs multi-object links start.o + main.o, natively runs to exit 42" {
-    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest; // hand-assembled AArch64 stub + native exec
+    if (builtin.cpu.arch != .aarch64 or builtin.os.tag != .linux) return error.SkipZigTest; // hand-assembled AArch64 stub + native exec
 
     const allocator = std.testing.allocator;
     const io = std.testing.io;

@@ -22,8 +22,7 @@ const Arg = union(enum) { int: i64, float: f32 };
 /// Locate a Node.js binary: PATH first, then a Nix-store nodejs. Returns the path (caller
 /// owns it) or `error.NoEngine` to skip.
 fn findNode(io: std.Io, allocator: std.mem.Allocator) ![]u8 {
-    const script =
-        "command -v node 2>/dev/null || ls /nix/store/*nodejs-slim-2*/bin/node 2>/dev/null | head -n1 || ls /nix/store/*nodejs-2*/bin/node 2>/dev/null | head -n1";
+    const script = "command -v node 2>/dev/null";
     const res = std.process.run(allocator, io, .{ .argv = &.{ "sh", "-c", script } }) catch |err| switch (err) {
         error.FileNotFound => return error.NoEngine,
         else => return err,

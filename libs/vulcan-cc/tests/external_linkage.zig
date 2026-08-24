@@ -301,7 +301,7 @@ fn startObjAArch64(allocator: std.mem.Allocator) ![]u8 {
 }
 
 test "aarch64: vcc external call to add() links against a .so and the REAL glibc ld.so runs it to exit 42" {
-    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest; // native execution
+    if (builtin.cpu.arch != .aarch64 or builtin.os.tag != .linux) return error.SkipZigTest; // native execution
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -346,7 +346,7 @@ fn counterObjAArch64(allocator: std.mem.Allocator) ![]u8 {
 }
 
 test "aarch64: vcc external data read of counter (extern, via GOT) links against a .so and the REAL glibc ld.so runs it to exit 42" {
-    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest; // native execution
+    if (builtin.cpu.arch != .aarch64 or builtin.os.tag != .linux) return error.SkipZigTest; // native execution
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -1073,7 +1073,7 @@ test "riscv64: vcc external data read of counter (extern, via GOT) links against
 // (`writeAndRun`) exactly like `extern_src`, but through `fnptr_extern_src`.
 
 test "aarch64: same-TU function pointer call natively runs to exit 42" {
-    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest; // native execution
+    if (builtin.cpu.arch != .aarch64 or builtin.os.tag != .linux) return error.SkipZigTest; // native execution
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -1086,7 +1086,7 @@ test "aarch64: same-TU function pointer call natively runs to exit 42" {
 }
 
 test "aarch64: function pointer to an extern function links against a .so and the REAL glibc ld.so runs it to exit 42" {
-    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest; // native execution
+    if (builtin.cpu.arch != .aarch64 or builtin.os.tag != .linux) return error.SkipZigTest; // native execution
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 

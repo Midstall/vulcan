@@ -1018,8 +1018,11 @@ test "wimmer: a 14-param spill-across-call clusters a same-position store/reload
     defer caller.deinit();
 
     // Wimmer compiles the caller (native cannot, since it will not spill a param), linked against
-    // the helper.
-    var wcaller = try isel.compileFunctionWimmer(allocator, &caller);
+    // the helper. It is JIT-executed below with 14 i32 arguments (6 on the stack), so it must be
+    // compiled for the HOST calling convention: Apple's arm64 ABI packs those stack arguments, AAPCS64
+    // pads them to 8 bytes. On a non-Darwin host the host ABI is AAPCS64 (byte-identical).
+    const host_abi: isel.Abi = if (builtin.os.tag.isDarwin()) .apple else .aapcs64;
+    var wcaller = try isel.compileFunctionWimmerAbi(allocator, &caller, .{ .abi = host_abi });
     defer wcaller.deinit(allocator);
     var wlinked = try linkWithCompiledEntry(allocator, wcaller.code, wcaller.relocs, "wimmer_inc", &helper);
     defer wlinked.deinit(allocator);

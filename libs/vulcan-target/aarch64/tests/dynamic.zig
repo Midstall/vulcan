@@ -523,14 +523,24 @@ test "linkDynamic's PT_LOAD covering a writable global is itself writable (regre
 /// embed in the dynamic exe. Returns an allocated absolute path, or null if none is found
 /// (the end-to-end test then skips). Prefers a native glibc build.
 fn findGlibcInterp(allocator: std.mem.Allocator) !?[]u8 {
-    const proc = std.process.run(allocator, std.testing.io, .{
-        .argv = &.{ "sh", "-c", "ls /nix/store/*glibc*/lib/ld-linux-aarch64.so.1 2>/dev/null | head -1" },
-    }) catch return null;
-    defer allocator.free(proc.stdout);
-    defer allocator.free(proc.stderr);
-    const trimmed = std.mem.trim(u8, proc.stdout, " \t\r\n");
-    if (trimmed.len == 0) return null;
-    return try allocator.dupe(u8, trimmed);
+    // Ask the C compiler for the aarch64 glibc dynamic loader, rather than globbing `/nix/store`
+    // (too broad and slow, and specific to one store layout). On aarch64-linux the native `cc`/`gcc`
+    // prints the absolute path; a cross host uses the aarch64 cross gcc. A host whose `cc` has no such
+    // file prints just the bare name, so the caller skips: this includes Apple clang on Darwin, which
+    // returns the name unchanged and could not exec a Linux ELF anyway.
+    const host = builtin.cpu.arch;
+    const ccs: []const []const u8 = if (host == .aarch64)
+        &.{ "cc", "gcc" }
+    else
+        &.{ "aarch64-unknown-linux-gnu-gcc", "aarch64-linux-gnu-gcc" };
+    for (ccs) |ccname| {
+        const proc = std.process.run(allocator, std.testing.io, .{ .argv = &.{ ccname, "-print-file-name=ld-linux-aarch64.so.1" } }) catch continue;
+        defer allocator.free(proc.stdout);
+        defer allocator.free(proc.stderr);
+        const trimmed = std.mem.trim(u8, proc.stdout, " \t\r\n");
+        if (trimmed.len > 0 and trimmed[0] == '/') return try allocator.dupe(u8, trimmed);
+    }
+    return null;
 }
 
 test "linkDynamic dynexe imports add() from a .so and the REAL glibc ld.so resolves+runs it to exit 42" {
