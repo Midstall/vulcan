@@ -74,6 +74,22 @@ fn compileAndRunMulti(io: std.Io, allocator: std.mem.Allocator, sources: []const
     return allocator.dupe(u8, std.mem.trim(u8, ran.stdout, " \n\r\t"));
 }
 
+/// Whether the host `cc` accepts the `_Float128` type. Apple clang on aarch64-darwin does not
+/// (that target has no 128-bit floating type at all: `long double` is 64-bit and there is no
+/// `_Float128`/`__float128`), so the binary128 C-oracle test skips there rather than failing.
+fn ccSupportsFloat128(io: std.Io, allocator: std.mem.Allocator) bool {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    tmp.dir.writeFile(io, .{ .sub_path = "probe.c", .data = "_Float128 x;\n" }) catch return false;
+    const r = std.process.run(allocator, io, .{
+        .argv = &.{ "cc", "-std=c99", "-w", "-fsyntax-only", "probe.c" },
+        .cwd = .{ .dir = tmp.dir },
+    }) catch return false;
+    defer allocator.free(r.stdout);
+    defer allocator.free(r.stderr);
+    return r.term == .exited and r.term.exited == 0;
+}
+
 /// Wrap an emitted function in a full C program: headers, the function itself under name
 /// `f`, and a `main` that calls it with `args` and prints the result. Integer results
 /// print as a decimal; float results print their raw 32-bit pattern so the check is exact.
@@ -631,6 +647,9 @@ test "C backend: i64->f128 multiply compiled+run with cc, bit-exact against Zig'
     // binary128 keeps: two integers just under 2^41 whose product needs ~81 mantissa bits,
     // more than f64's 53 but well inside f128's 112.
     const allocator = std.testing.allocator;
+    // Apple clang (aarch64-darwin) has no `_Float128`, so the emitted C would not compile there.
+    // Skip cleanly when the host cc cannot accept the type.
+    if (!ccSupportsFloat128(std.testing.io, allocator)) return error.SkipZigTest;
     var func = Function.init(allocator);
     defer func.deinit();
 
