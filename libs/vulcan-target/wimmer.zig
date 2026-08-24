@@ -40,6 +40,14 @@ pub const RegClass = struct {
     allocatable: []const u16,
     callee_saved: []const u16,
     slot_bytes: u16,
+    // OPTIONAL subset of registers whose CALL clobber only destroys a WIDE value, preserving a
+    // NARROW one (a value the backend's `RegDescription.isNarrow` flags). This models an ABI that
+    // saves only the low half of certain callee-saved registers across a call: aarch64 AAPCS64
+    // preserves the low 64 bits of v8..v15, so a scalar float there survives a call while a 128-bit
+    // vector loses its upper half. A value flagged `narrow` therefore does NOT conflict with a call
+    // clobber of a register in this set, so it may stay resident across the call. Empty (the default)
+    // means every clobber destroys every value, byte-identical to the prior behavior.
+    narrow_preserved: []const u16 = &.{},
 };
 
 /// A per-class set of register indices clobbered at some point. Used by `CallSite`.
@@ -84,6 +92,12 @@ pub const RegDescription = struct {
     // a backend that does not opt in is unaffected. Only a case the backend lowers to an EXACT plain
     // copy is safe to report. A widening or narrowing that changes bits must NOT be reported.
     copySource: ?*const fn (ctx: *const anyopaque, func: *const Function, v: Value) ?Value = null,
+    // OPTIONAL narrow-value predicate. Return true when value `v` survives a call clobber of a
+    // register in its class's `narrow_preserved` set (i.e. it fits in the preserved low half). On
+    // aarch64 this is a SCALAR float (not a 128-bit vector), which AAPCS64 preserves in v8..v15
+    // across a call. Consulted once per value at interval-build time to set `Interval.narrow`. Null
+    // (the default) flags nothing narrow, byte-identical to the prior behavior.
+    isNarrow: ?*const fn (ctx: *const anyopaque, func: *const Function, v: Value) bool = null,
     // OPTIONAL block-argument coalescing. When true, the scan hints a block parameter toward the
     // register of an incoming argument that is already placed, so the edge move that feeds the
     // parameter becomes a same-register no-op the edge resolver drops. A parameter and its incoming
@@ -111,6 +125,7 @@ pub const RegDescription = struct {
         for (self.classes) |c| {
             allocator.free(c.allocatable);
             allocator.free(c.callee_saved);
+            if (c.narrow_preserved.len > 0) allocator.free(c.narrow_preserved);
         }
         allocator.free(self.classes);
         for (self.call_sites) |cs| {
@@ -167,6 +182,15 @@ pub const Interval = struct {
     // both on ONE register, which turns the copy into a no-op the backend elides. Null for a
     // non-copy value, and for every backend that does not set `RegDescription.copySource`.
     copy_src: ?Value = null,
+    // For a VALUE interval, true when the backend's `RegDescription.isNarrow` flagged this value as
+    // one that survives a clobber of a `RegClass.narrow_preserved` register (e.g. a scalar float in
+    // aarch64 v8..v15, whose low 64 bits AAPCS64 preserves across a call). A narrow value may stay
+    // register-resident across such a clobber. Inherited by split children. False by default.
+    narrow: bool = false,
+    // For a FIXED call-clobber interval, true when its register is in the class's `narrow_preserved`
+    // set, so the clobber spares a `narrow` value. False by default (a full clobber, or a value
+    // interval).
+    preserves_narrow: bool = false,
 
     /// The interval's first live position. Programmer error to call on an empty interval.
     pub fn start(self: *const Interval) u32 {
@@ -570,6 +594,7 @@ pub fn buildIntervals(allocator: std.mem.Allocator, func: *const Function, desc:
                 if (desc.classOf(desc.ctx, func, s) == class) copy_src = s;
             }
         }
+        const narrow = if (desc.isNarrow) |hook| hook(desc.ctx, func, value) else false;
         try result.append(allocator, .{
             .value = value,
             .class = class,
@@ -577,6 +602,7 @@ pub fn buildIntervals(allocator: std.mem.Allocator, func: *const Function, desc:
             .ranges = rs,
             .uses = us,
             .copy_src = copy_src,
+            .narrow = narrow,
         });
     }
 
@@ -651,12 +677,14 @@ fn appendFixedIntervals(allocator: std.mem.Allocator, func: *const Function, des
         errdefer allocator.free(rs);
         const us = try allocator.alloc(UsePos, 0);
         errdefer allocator.free(us);
+        const preserves_narrow = containsReg(desc.classes[key.class].narrow_preserved, key.reg);
         try result.append(allocator, .{
             .value = null,
             .class = key.class,
             .fixed_reg = key.reg,
             .ranges = rs,
             .uses = us,
+            .preserves_narrow = preserves_narrow,
         });
     }
 
@@ -802,6 +830,11 @@ fn containsReg(set: []const u16, reg: u16) bool {
 /// cuts across `current`. Programmer error unless `fixed` is a call-clobber interval (`value` null).
 fn fixedClobberConflict(current: *const Interval, fixed: *const Interval) ?u32 {
     std.debug.assert(fixed.value == null);
+    // A NARROW value survives a clobber that only preserves the low half (aarch64: a scalar float in
+    // a v8..v15 whose low 64 bits AAPCS64 keeps across a call). Such a value stays register-resident
+    // across the call, so the clobber never forces it out. A WIDE value (e.g. a 128-bit vector) is
+    // NOT flagged narrow and still conflicts, since the call destroys its upper half.
+    if (fixed.preserves_narrow and current.narrow) return null;
     for (fixed.ranges) |r| {
         var c = r.from;
         while (c < r.to) : (c += 1) {
@@ -1640,6 +1673,7 @@ fn splitInterval(allocator: std.mem.Allocator, parent: *Interval, pos: u32, chil
         .ranges = tr,
         .uses = tu,
         .location = null,
+        .narrow = parent.narrow,
     };
     try children.append(allocator, child);
 
