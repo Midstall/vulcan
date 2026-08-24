@@ -2720,6 +2720,16 @@ fn aarch64ClassOf(ctx: *const anyopaque, func: *const Function, v: Value) u16 {
     return @intFromEnum(regClass(func, v));
 }
 
+/// `RegDescription.isNarrow` for aarch64: a value survives a clobber of a `narrow_preserved` register
+/// (v8..v15) iff it is a SCALAR float. AAPCS64 preserves the low 64 bits of v8..v15 across a call, so
+/// an f16/f32/f64 there is intact afterward and may stay register-resident across the call. A 128-bit
+/// SIMD vector reports `.fpr` too but loses its upper half, so it is NOT narrow. A GPR value is not in
+/// the fpr class at all, so it never meets a `narrow_preserved` register; report false for it.
+fn aarch64IsNarrow(ctx: *const anyopaque, func: *const Function, v: Value) bool {
+    _ = ctx;
+    return regClass(func, v) == .fpr and !isVector(func, v);
+}
+
 /// `RegDescription.useKind` for aarch64: every operand needs a register (aarch64 cannot fold a spill
 /// slot into an arithmetic operand). This is the conservative default. A backend that can read memory
 /// operands relaxes specific opcodes. Unused parameters are the generic hook shape.
@@ -2857,6 +2867,16 @@ pub fn aarch64RegDescription(allocator: std.mem.Allocator, func: *const Function
     errdefer allocator.free(fpr_cs);
     for (0..8) |i| fpr_cs[i] = @intCast(8 + i);
 
+    // Narrow-preserved fpr set: v8..v15. AAPCS64 preserves their low 64 bits across a call, so a
+    // SCALAR float placed there survives (see `aarch64IsNarrow`). This lets the shared allocator keep
+    // a scalar float register-resident across calls instead of forcing every call-crossing scalar out
+    // of v8..v15, which had no legal home in the fpr class (nothing else survives a call) and drove
+    // `spillCurrent` into its must-have-at-start bail-out. A 128-bit vector is not narrow and is still
+    // clobbered, since a call destroys its upper half.
+    const fpr_narrow = try allocator.alloc(u16, 8);
+    errdefer allocator.free(fpr_narrow);
+    for (0..8) |i| fpr_narrow[i] = @intCast(8 + i);
+
     const gpr_alloc_owned = try gpr_alloc.toOwnedSlice(allocator);
     errdefer allocator.free(gpr_alloc_owned);
     const fpr_alloc_owned = try fpr_alloc.toOwnedSlice(allocator);
@@ -2866,7 +2886,7 @@ pub fn aarch64RegDescription(allocator: std.mem.Allocator, func: *const Function
     errdefer allocator.free(classes);
     // aarch64 uses uniform 16-byte spill slots for both classes (see the existing spill/frame code).
     classes[0] = .{ .name = "gpr", .allocatable = gpr_alloc_owned, .callee_saved = gpr_cs, .slot_bytes = 16 };
-    classes[1] = .{ .name = "fpr", .allocatable = fpr_alloc_owned, .callee_saved = fpr_cs, .slot_bytes = 16 };
+    classes[1] = .{ .name = "fpr", .allocatable = fpr_alloc_owned, .callee_saved = fpr_cs, .slot_bytes = 16, .narrow_preserved = fpr_narrow };
 
     // Entry params: the first 8 gpr params pin x0..x7, the first 8 fp params pin v0..v7. Params with
     // arg index >= 8 arrive on the stack and are left for the interval builder.
@@ -2938,6 +2958,7 @@ pub fn aarch64RegDescription(allocator: std.mem.Allocator, func: *const Function
         .classOf = aarch64ClassOf,
         .useKind = aarch64UseKind,
         .copySource = aarch64CopySource,
+        .isNarrow = aarch64IsNarrow,
         .coalesce_block_params = true,
         .coalesce_spill_slots = true,
         .entry_fixed = entry_fixed,
