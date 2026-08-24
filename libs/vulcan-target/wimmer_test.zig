@@ -1558,3 +1558,54 @@ test "scan: a scalar fp value live across many calls stays valid via the narrow-
         try std.testing.expect(segs.len >= 1);
     }
 }
+
+test "x86_64: a clamped pin hint never makes a param steal another param's pin" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const b = try func.appendBlock();
+    // Four gpr params pin rdi, rsi, rdx, rcx. The div clobbers rax+rdx at
+    // position 1, which clamps p2's pin (rdx) below its lifetime: p2's hint
+    // misses and the free-register fallback used to land it on rcx, whose pin
+    // (p3) had not been realized yet. The entry fixed intervals popped LAST at
+    // position 0 (buildIntervals appends them after every value interval), so
+    // the scan never saw the pin, and the verifier flagged two values on rcx.
+    // prism's spirv_jit hit exactly this with the real vkcube fragment shader.
+    const p0 = try func.appendBlockParam(b, i32t);
+    const p1 = try func.appendBlockParam(b, i32t);
+    const p2 = try func.appendBlockParam(b, i32t);
+    const p3 = try func.appendBlockParam(b, i32t);
+    // The div first: it clobbers rax+rdx at its position, clamping p2's hint.
+    const quot = try func.appendInst(b, i32t, .{ .arith = .{ .op = .div, .lhs = p0, .rhs = p1 } });
+    // Every param stays live past the div.
+    var acc = try func.appendInst(b, i32t, .{ .arith = .{ .op = .add, .lhs = quot, .rhs = p2 } });
+    acc = try func.appendInst(b, i32t, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = p3 } });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(acc) });
+
+    var desc = try x86_64.x86_64RegDescription(allocator, &func);
+    defer desc.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 4), desc.entry_fixed.len);
+
+    var alloc = try wimmer.allocate(allocator, &func, &desc);
+    defer alloc.deinit(allocator);
+
+    const entryLoc = struct {
+        fn at(a: *const wimmer.Allocation, v: Value) wimmer.Location {
+            const segs = a.segments.get(v) orelse unreachable;
+            std.debug.assert(segs.len > 0);
+            std.debug.assert(segs[0].from == 0);
+            return segs[0].loc;
+        }
+    }.at;
+
+    // p0, p1 and p3 sit on their pins at entry: rdi, rsi and rcx respectively.
+    // rcx (index 1) is the one the buggy scan let p2 steal.
+    try std.testing.expectEqual(@as(u16, 7), entryLoc(&alloc, p0).reg);
+    try std.testing.expectEqual(@as(u16, 6), entryLoc(&alloc, p1).reg);
+    try std.testing.expectEqual(@as(u16, 1), entryLoc(&alloc, p3).reg);
+    // p2's pin is rdx, which the div clobbers at position 1, so p2 must move off
+    // it. What it may never do is take rcx, which is p3's ABI register.
+    try std.testing.expect(entryLoc(&alloc, p2) == .reg);
+    try std.testing.expect(entryLoc(&alloc, p2).reg != 1);
+}
