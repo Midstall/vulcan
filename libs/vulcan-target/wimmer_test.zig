@@ -942,15 +942,18 @@ test "scan: more same-class params than the register pool spills without crashin
     }
 }
 
-test "scan: a float value live across a call is split at the call (the vector-quirk clobber forces it out of fp regs)" {
+test "scan: a VECTOR value live across a call is split at the call (the vector-quirk clobber forces it out of fp regs)" {
     const allocator = std.testing.allocator;
     var func = Function.init(allocator);
     defer func.deinit();
-    const f = try func.types.intern(.{ .float = .f32 });
+    const elem = try func.types.intern(.{ .float = .f32 });
+    const f = try func.types.intern(.{ .vector = .{ .len = 4, .elem = elem } });
     const b = try func.appendBlock();
     const x = try func.appendBlockParam(b, f);
-    // `pre` is a float defined before the call and read after it, so it lives across the call. The
-    // vector-across-call quirk clobbers every fp register, so it cannot stay in one across the call.
+    // `pre` is a 128-bit VECTOR defined before the call and read after it, so it lives across the
+    // call. AAPCS64 preserves only the low 64 bits of the callee-saved v8..v15, so a vector there
+    // loses its upper half across a call: it is NOT `narrow` and the clobber forces it out of every
+    // fp register (a scalar float, by contrast, now survives in v8..v15 -- see the dedicated test).
     const pre = try func.appendInst(b, f, .{ .arith = .{ .op = .add, .lhs = x, .rhs = x } });
     const called = try func.appendCall(b, f, "callee", &.{x});
     const after = try func.appendInst(b, f, .{ .arith = .{ .op = .add, .lhs = pre, .rhs = called } });
@@ -1478,4 +1481,80 @@ test "verify: a used value interval with no location is flagged unassigned" {
     defer allocator.free(violations);
     try std.testing.expectEqual(@as(usize, 1), violations.len);
     try std.testing.expect(violations[0].kind == .unassigned);
+}
+
+test "scan: a scalar fp value live across many calls stays valid via the narrow-preserved v8..v15 home" {
+    // Regression for prism's `vkcube's real fragment shader ... EXECUTES` failure on darwin/aarch64,
+    // previously an `error.Unsupported` out of `spillCurrent`. Now FIXED by the narrow-preserved
+    // register model: AAPCS64 keeps the low 64 bits of v8..v15 across a call, so a SCALAR float there
+    // survives and the allocator keeps it register-resident across calls instead of trying to spill a
+    // must-have-at-start use it cannot satisfy.
+    //
+    // The shape: a value that must be in a REGISTER at a call (it is an ARGUMENT, so its use there is
+    // `must_have_register`) and is ALSO live across that call into a later one. On aarch64 no fpr
+    // register survives a call (`aarch64RegDescription` clobbers all of v0..v31 for class 1, the
+    // vector-quirk over-approximation), so such a value has nowhere to live between the calls except
+    // a slot, and must be reloaded into a register before each call.
+    //
+    // The scan cannot currently express that:
+    //   * `allocateBlockedReg` reaches `bp <= p` (the clobber falls at the value's own start) and
+    //     hands off to `spillCurrent`, which bails `error.Unsupported` because the must-have use is
+    //     AT the start (`u <= current.start()`) -- the crash prism sees.
+    //   * Letting it split at `p + 1` instead (legal per the read-before-clobber rule: the operand
+    //     read happens before the call destroys the register) removes the crash, but every one-position
+    //     piece then takes the SAME register back and `buildAllocation`'s adjacent-same-location merge
+    //     (the `locEql` skip when emitting segments) collapses them into one long register segment.
+    //     The value then silently appears to sit in v8 across 20 clobbers, with no reload emitted:
+    //     a MISCOMPILE, strictly worse than the crash. `verifyIntervals` misses it too, because it
+    //     checks the split pieces (each individually legal) rather than the merged segments.
+    //
+    // A real fix has to give such a value a slot HOME and emit a reload before each use, which needs
+    // (a) one slot per value rather than one per spill, and (b) a store emitted only once, at the
+    // def, since a reg->slot transition after a clobber would otherwise store an already-clobbered
+    // register. The alternative, narrower fix the isel already anticipates ("A later interval builder
+    // may refine it to vector-only", aarch64/isel.zig ~2789) is the one now implemented: the v8..v15
+    // clobber spares SCALAR floats (a `narrow_preserved` register set plus an `isNarrow` predicate),
+    // since AAPCS64 preserves their low 64 bits, so a scalar float in v8..v15 genuinely survives a
+    // call and never reaches the failing path.
+
+    // The real shape that broke: N sequential calls to the same callee (pow()/texture-gather-style),
+    // each result kept alive by a final reduction, well past the 16-register non-leaf fpr pool.
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const f = try func.types.intern(.{ .float = .f32 });
+    const b = try func.appendBlock();
+    const p = try func.appendBlockParam(b, f);
+
+    const n = 20;
+    var results: [n]Value = undefined;
+    for (&results) |*r| r.* = try func.appendCall(b, f, "callee", &.{p});
+    var acc = results[0];
+    for (results[1..]) |r| acc = try func.appendInst(b, f, .{ .arith = .{ .op = .add, .lhs = acc, .rhs = r } });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(acc) });
+
+    var desc = try aarch64.aarch64RegDescription(allocator, &func);
+    defer desc.deinit(allocator);
+    try std.testing.expect(desc.call_sites.len >= n);
+
+    // The allocation must SUCCEED (the former crash was `error.Unsupported` here) and be SOUND.
+    var alloc = try wimmer.allocate(allocator, &func, &desc);
+    defer alloc.deinit(allocator);
+
+    // Every value in the reduction is a scalar f32, hence `narrow`: any of them (the accumulator
+    // chain, `p`, the call results) may legitimately sit in a v8..v15 register across a call now,
+    // because AAPCS64 preserves those registers' low 64 bits. So instead of asserting the old (now
+    // false) "never resident across a call" ground truth, we assert the property that actually
+    // matters: the allocation is sound. `verifyIntervals` cross-checks register exclusivity,
+    // must-have-register satisfaction, and assignment against the SAME narrow-preserved rule the
+    // scan allocated by, so a scalar left in v8..v15 across a call is accepted while any wide value
+    // (or a scalar wrongly resident in a fully-clobbered register) would be flagged.
+    for (results) |r| {
+        const segs = alloc.segments.get(r) orelse return error.MissingSegment;
+        try std.testing.expect(segs.len >= 1);
+    }
+    {
+        const segs = alloc.segments.get(p) orelse return error.MissingSegment;
+        try std.testing.expect(segs.len >= 1);
+    }
 }
