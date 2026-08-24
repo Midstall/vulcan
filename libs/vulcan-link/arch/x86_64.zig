@@ -85,8 +85,22 @@ pub fn applyRelocs(allocator: std.mem.Allocator, placement: *Placement, parsed: 
             const seg = &placement.segments[sp.seg];
             for (isec.relocs) |r| {
                 if (r.symbol >= obj.symbols.len) return error.MalformedObject;
-                const name = obj.symbols[r.symbol].name;
-                const target = findSymbol(placement.symbols, name) orelse return error.UndefinedSymbol;
+                const sym = obj.symbols[r.symbol];
+                // Resolve the reloc target. A GLOBAL symbol comes from the merged symbol table by
+                // name. A LOCAL DEFINED symbol (a `.str.N` string literal, made local so per-object
+                // duplicate numbering never collides at link time; a `lea rd, [rip+.str.N]` becomes
+                // a PC32 to it) is not in the global table, so it resolves through THIS object's own
+                // placement of the symbol's defining section plus its in-section value - the same
+                // fallback the aarch64 backend and `collectDataFixups` use. The global lookup is
+                // tried FIRST, so every pre-existing (global-name) reloc resolves exactly as before.
+                const target = findSymbol(placement.symbols, sym.name) orelse blk: {
+                    if (sym.defined and sym.local and sym.section_index != std.math.maxInt(u32)) {
+                        const sp2 = placement.sectionPlace(oi, sym.section_index);
+                        if (sp2.seg == not_placed or sp2.seg >= placement.segments.len) return error.MalformedObject;
+                        break :blk placement.segments[sp2.seg].vaddr + sp2.seg_off + sym.value;
+                    }
+                    return error.UndefinedSymbol;
+                };
                 // Offset of the patched word within this segment's bytes. Derive both the
                 // in-segment write offset and the site's runtime address from the segment
                 // actually being patched, so they stay in lockstep (see the aarch64 backend
@@ -98,11 +112,37 @@ pub fn applyRelocs(allocator: std.mem.Allocator, placement: *Placement, parsed: 
                         const resolved = @as(i64, @intCast(target)) + r.addend - @as(i64, @intCast(site_addr));
                         try applyDisp32(seg.bytes, site, resolved);
                     },
+                    // A GOTPCRELX/REX_GOTPCRELX site only reaches `applyRelocs` when its target
+                    // is defined IN-IMAGE: a shared-export one is diverted to a `.got` slot (a
+                    // data import) and filtered out before this pass. For an in-image,
+                    // non-preemptible symbol the psABI lets the linker relax the GOT indirection
+                    // away, exactly as a real linker does - rewrite `mov sym@GOTPCREL(%rip), %reg`
+                    // to `lea sym(%rip), %reg` and patch the disp32 as a plain PC32 to the symbol.
+                    .gotpcrelx, .rex_gotpcrelx => {
+                        try relaxGotMovToLea(seg.bytes, site);
+                        const resolved = @as(i64, @intCast(target)) + r.addend - @as(i64, @intCast(site_addr));
+                        try applyDisp32(seg.bytes, site, resolved);
+                    },
                     else => return error.UnsupportedReloc,
                 }
             }
         }
     }
+}
+
+/// Relax a GOT-indirect `mov sym@GOTPCREL(%rip), %reg` at disp32 image offset `site` into a
+/// direct `lea sym(%rip), %reg`, the x86-64 psABI GOTPCRELX/REX_GOTPCRELX relaxation for a
+/// locally-bound target. The `mov r64, m64` opcode byte (`8B`) sits two bytes ahead of the
+/// disp32 (opcode, ModRM, then disp32), and `lea r64, m` (`8D`) shares the exact ModRM (a
+/// `mod=00 rm=101` RIP-relative operand), so only the opcode byte flips; the caller then writes
+/// the disp32 as a plain PC32 to the symbol. Only the `mov` form is relaxed here - the sole one
+/// a real `crt1.o` uses for an in-image target. Any other opcode (a `call`/`jmp` indirect form,
+/// which never targets an in-image symbol) is fail-closed as unsupported, never mis-patched.
+fn relaxGotMovToLea(code: []u8, site: u64) Error!void {
+    const s = std.math.cast(usize, site) orelse return error.MalformedObject;
+    if (s < 2 or s > code.len or 4 > code.len - s) return error.MalformedObject;
+    if (code[s - 2] != 0x8b) return error.UnsupportedReloc;
+    code[s - 2] = 0x8d;
 }
 
 /// Patch a 4-byte PC-relative displacement (`R_X86_64_PC32`/`R_X86_64_PLT32`) at
