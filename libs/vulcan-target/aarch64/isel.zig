@@ -2837,6 +2837,16 @@ pub fn aarch64RegDescription(allocator: std.mem.Allocator, func: *const Function
         // they are the isel's fixed reload/immediate/move scratch (see their `const` definitions).
         for (9..13) |r| try gpr_alloc.append(allocator, @intCast(r)); // caller-saved temps x9..x12
         for (8..16) |r| try fpr_alloc.append(allocator, @intCast(r)); // callee-saved v8..v15
+        // ALSO offer the caller-saved temporaries v16..v23 to a non-leaf function, mirroring the
+        // GPR widening above. Every call clobbers them, so the allocator can only place a value
+        // there when it does NOT live across a call, same as x9..x12. Without them a non-leaf
+        // function had only 8 FPRs versus 14 GPRs, and every aarch64 FPR operand is
+        // `must_have_register` (no spill-slot folding), so a shader with several simultaneously
+        // live float/vector temporaries at one program point (e.g. a loop header or merge point)
+        // could exceed the pool and hit `spillCurrent`'s "too many live params" bail-out even
+        // though the value class had headroom on real hardware. v24..v31 stay out: v26/v27 are the
+        // isel's fixed scratch registers, and v24/v25/v28..v31 are simply not offered here.
+        for (16..24) |r| try fpr_alloc.append(allocator, @intCast(r)); // caller-saved temps v16..v23
     }
 
     // Callee-saved sets: x19..x28 (gpr), v8..v15 (fpr).
