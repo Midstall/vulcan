@@ -544,9 +544,11 @@ pub fn modelFor(tag: Microarch) *const Model {
 
 /// True when the aarch64 MIDR_EL1 names an ARM Neoverse N1 (implementer 0x41, part 0xd0c). Reads the
 /// register directly, no I/O. On arm64 Linux the mrs read is emulated for EL0 and does not trap on
-/// any supported kernel, so detectHost stays a pure query with no injected dependencies.
+/// any supported kernel, so detectHost stays a pure query with no injected dependencies. macOS traps
+/// the read as an illegal instruction, which killed the darwin CI as a SIGILL; a macOS host is Apple
+/// Silicon and never a Neoverse part, so false there is the right answer and not a fallback.
 fn midrPartIsN1() bool {
-    if (builtin.cpu.arch != .aarch64) return false;
+    if (builtin.cpu.arch != .aarch64 or builtin.os.tag != .linux) return false;
     const midr = asm volatile ("mrs %[out], MIDR_EL1"
         : [out] "=r" (-> u64),
     );
@@ -671,6 +673,14 @@ test "cascadelakeDiscriminator matches model 85 with VNNI, rejects Skylake-SP (n
     try std.testing.expect(!cascadelakeDiscriminator(6, 85, false)); // Skylake-SP: model 85 but no VNNI
     try std.testing.expect(!cascadelakeDiscriminator(6, 94, true)); // different model
     try std.testing.expect(!cascadelakeDiscriminator(15, 85, true)); // different family
+}
+
+test "midrPartIsN1 never traps off linux" {
+    // On darwin the MRS would trap as a SIGILL, which is what the darwin CI died
+    // with. The gate must answer false there without ever reading the register.
+    if (builtin.os.tag != .linux) {
+        try std.testing.expect(!midrPartIsN1());
+    }
 }
 
 test "detectHost identifies this box when it is a Neoverse N1, else null or a matching-arch tag" {

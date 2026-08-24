@@ -61,7 +61,9 @@ fn runElf(allocator: std.mem.Allocator, io: std.Io, elf: []const u8, argv: []con
 test "cross-target: writeObjectDataFor(.aarch64, ...) emits+links+runs to exit 42" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest; // executes the AArch64 ELF directly
+    // Executes the AArch64 ELF directly, which needs a Linux host: the image is a
+    // Linux ELF with a Linux svc exit, and a darwin aarch64 host cannot exec it.
+    if (builtin.cpu.arch != .aarch64 or builtin.os.tag != .linux) return error.SkipZigTest;
 
     var main_fn = try buildMain(allocator);
     defer main_fn.deinit();
