@@ -63,6 +63,17 @@ pub const Error = backend.isel.Error || backend.jit.Error || backend.link.Error 
 /// Compile `func` to host machine code (bytes). The caller owns the slice. The
 /// `[]u32`-emitting backends (aarch64, riscv64) are reinterpreted as bytes.
 pub fn compile(allocator: std.mem.Allocator, func: *const Function) Error![]u8 {
+    // The in-process JIT runs the code on THIS host, so it must be compiled for the host calling
+    // convention. On an aarch64 Darwin host that is Apple's arm64 ABI (packed stack arguments), which
+    // differs from AAPCS64 once arguments spill past the registers; a function JIT-executed there must
+    // read and write its stack arguments the way the host caller passes them. Everywhere else the host
+    // ABI is AAPCS64, so this is byte-identical to the plain `selectFunction` path.
+    if (comptime arch == .aarch64) {
+        const abi: backend.isel.Abi = if (builtin.os.tag.isDarwin()) .apple else .aapcs64;
+        var compiled = try backend.isel.compileFunction(allocator, func, .{ .abi = abi });
+        defer compiled.deinit(allocator);
+        return allocator.dupe(u8, std.mem.sliceAsBytes(compiled.code));
+    }
     const raw = try backend.isel.selectFunction(allocator, func);
     if (comptime @TypeOf(raw) == []u8) return raw;
     defer allocator.free(raw);

@@ -567,27 +567,26 @@ fn shOutput(allocator: std.mem.Allocator, io: std.Io, script: []const u8) !?[]u8
 /// `features.h`, `sys/cdefs.h`, and similar files, so `#include <stdio.h>` resolves with no
 /// explicit `-I`/`-isystem`. The function tries candidates in order, and validates each one
 /// by checking for a real `stdio.h` inside it before trusting it: (1) `VCC_GLIBC_INCLUDE`,
-/// an explicit override for a host where the search below doesn't apply; (2) a real
-/// `gcc`'s own `-E -v` system-include search list, whose LAST entry is always the glibc dev
-/// tree gcc itself was built against; (3) any `/nix/store/*-glibc-*-dev/include` path. Step
-/// 3 skips the arch-suffixed CROSS trees, see `findCrossGlibcIncludeDir`. Mirrors
-/// `preproc_glibc.zig`'s own discovery, minus that test's hardcoded last-resort store path.
-/// That path is already covered by step 3's glob; a store hash belongs in a test's
-/// fallback, not production driver code, where it would only rot. This function never
-/// fails: `null` means no default system dir is added, so `#include <stdio.h>` then fails
-/// later, AT the `#include` itself, with a clear "not found" error (`fs_resolver.zig`'s
-/// contract), not a hard driver error.
+/// an explicit override for a host where the search below doesn't apply; (2) the host C
+/// compiler's own `-E -v` system-include search list, taking the LAST directory in it that
+/// actually holds a `stdio.h` (the C library's include dir). This asks the compiler where its
+/// headers are rather than assuming a filesystem layout, so it works on any host (a nix store
+/// path, `/usr/include`, a cross sysroot) with no store globbing. This function never fails:
+/// `null` means no default system dir is added, so `#include <stdio.h>` then fails later, AT
+/// the `#include` itself, with a clear "not found" error (`fs_resolver.zig`'s contract), not a
+/// hard driver error.
 fn findHostGlibcIncludeDir(allocator: std.mem.Allocator, io: std.Io) !?[]u8 {
     const script =
         \\if [ -n "${VCC_GLIBC_INCLUDE:-}" ] && [ -f "$VCC_GLIBC_INCLUDE/stdio.h" ]; then
         \\  echo "$VCC_GLIBC_INCLUDE"; exit 0
         \\fi
-        \\if command -v gcc >/dev/null 2>&1; then
-        \\  d=$(echo | gcc -E -v -xc - 2>&1 | grep -E '^ .*/glibc-[0-9][^/]*-dev/include$' | tail -1 | sed -e 's/^ //')
-        \\  if [ -n "$d" ] && [ -f "$d/stdio.h" ]; then echo "$d"; exit 0; fi
-        \\fi
-        \\for d in /nix/store/*-glibc-[0-9]*-dev/include; do
-        \\  if [ -f "$d/stdio.h" ]; then echo "$d"; exit 0; fi
+        \\for cc_ in cc gcc; do
+        \\  command -v "$cc_" >/dev/null 2>&1 || continue
+        \\  last=""
+        \\  for d in $(echo | LC_ALL=C "$cc_" -E -v -xc - 2>&1 | awk '/search starts here/{f=1;next} /End of search/{f=0} f{sub(/^ +/,"");print}'); do
+        \\    [ -f "$d/features.h" ] && last="$d"
+        \\  done
+        \\  if [ -n "$last" ]; then echo "$last"; exit 0; fi
         \\done
         \\exit 1
     ;
@@ -600,12 +599,20 @@ fn findHostGlibcIncludeDir(allocator: std.mem.Allocator, io: std.Io) !?[]u8 {
 /// is not a VCC bug. Mirrors `findHostGlibcIncludeDir`'s "not found means null, never fail"
 /// contract.
 fn findCrossGlibcIncludeDir(allocator: std.mem.Allocator, io: std.Io, triple: []const u8) !?[]u8 {
+    // Ask the cross C compiler (`<triple>-gcc`/`<triple>-cc`) for its own system-include search
+    // list, and take the last directory in it that holds a `stdio.h` (the cross glibc's headers).
+    // No store globbing: absent cross toolchain -> no output -> caller skips.
     const script = try std.fmt.allocPrint(allocator,
-        \\for d in /nix/store/*-glibc-{s}-*-dev/include; do
-        \\  if [ -f "$d/stdio.h" ]; then echo "$d"; exit 0; fi
+        \\for cc_ in {s}-gcc {s}-cc; do
+        \\  command -v "$cc_" >/dev/null 2>&1 || continue
+        \\  last=""
+        \\  for d in $(echo | LC_ALL=C "$cc_" -E -v -xc - 2>&1 | awk '/search starts here/{{f=1;next}} /End of search/{{f=0}} f{{sub(/^ +/,"");print}}'); do
+        \\    [ -f "$d/features.h" ] && last="$d"
+        \\  done
+        \\  if [ -n "$last" ]; then echo "$last"; exit 0; fi
         \\done
         \\exit 1
-    , .{triple});
+    , .{ triple, triple });
     defer allocator.free(script);
     return shOutput(allocator, io, script);
 }
@@ -654,9 +661,9 @@ const Toolchain = struct {
 /// unrunnable binary. The search is LAYERED, and it accepts each candidate directory only
 /// when it holds all three files: (1) `-B` prefixes and `--sysroot`/`$VCC_SYSROOT`
 /// (`<root>/lib`, `<root>/usr/lib`) and an explicit `$VCC_CRT_DIR`; (2) the directory of
-/// `gcc -print-file-name=crt1.o` (the host glibc lib dir, which on this Nix host holds
-/// `crt1.o`, `libc.so.6`, and `ld-linux-*.so.*` together); (3) any
-/// `/nix/store/*-glibc-*/lib`. The per-arch loader soname (`interpSoname`) gates each
+/// the host C compiler's `cc`/`gcc -print-file-name=crt1.o` (the host glibc lib dir, which
+/// holds `crt1.o`, `libc.so.6`, and `ld-linux-*.so.*` together). Asking the compiler avoids
+/// any store globbing. The per-arch loader soname (`interpSoname`) gates each
 /// directory, so a host glibc dir is only accepted for the arch whose loader it actually
 /// contains. A cross `-target` simply finds nothing here, and the caller reports it; cross
 /// autolink is best-effort. This function never fails: a probe that cannot run degrades to
@@ -692,11 +699,11 @@ fn discoverToolchain(allocator: std.mem.Allocator, io: std.Io, arch: link.Arch, 
     try script.appendSlice(allocator,
         \\; do try "$d"; done
         \\if [ -n "$VCC_SYSROOT" ]; then try "$VCC_SYSROOT/lib"; try "$VCC_SYSROOT/usr/lib"; fi
-        \\if command -v gcc >/dev/null 2>&1; then
-        \\  c=$(gcc -print-file-name=crt1.o 2>/dev/null)
+        \\for cc_ in cc gcc; do
+        \\  command -v "$cc_" >/dev/null 2>&1 || continue
+        \\  c=$("$cc_" -print-file-name=crt1.o 2>/dev/null)
         \\  case "$c" in /*) try "$(dirname "$c")";; esac
-        \\fi
-        \\for d in /nix/store/*-glibc-[0-9]*/lib; do try "$d"; done
+        \\done
         \\exit 1
     );
 

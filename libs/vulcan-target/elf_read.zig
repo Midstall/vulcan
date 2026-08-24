@@ -280,6 +280,11 @@ test "decodes little-endian header fields to host order on either host endiannes
 }
 
 test "reads function symbols from a real cc-compiled .o" {
+    // Darwin cc emits Mach-O, not an ELF object, so read the real cc output on Linux only.
+    // Reads a real host-`cc` object: works on any Linux (x86_64 or aarch64), but macOS `cc` emits
+    // Mach-O, not ELF, which this reader does not parse. Skip off Linux only, so x86_64-linux keeps
+    // its coverage.
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
     const a = std.testing.allocator;
     const io = std.testing.io;
 

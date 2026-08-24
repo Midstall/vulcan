@@ -9,6 +9,7 @@
 //! and, where `readelf` is present, by wrapping the sections in a minimal ELF and dumping.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 // DWARF constants (the subset this slice emits).
 const DW_TAG_compile_unit: u8 = 0x11;
@@ -794,6 +795,11 @@ test "decodeLine handles special opcodes (compact clang-style encoding)" {
 }
 
 test "decodeLine reads a real compiler's .debug_line (gcc/cc -g)" {
+    // Darwin cc emits Mach-O with no ELF .debug_line section, so read the real cc output on Linux only.
+    // Reads a real host-`cc` `-g` object: works on any Linux (x86_64 or aarch64), but macOS `cc`
+    // emits Mach-O + Apple DWARF, which this ELF/DWARF reader does not parse. Skip off Linux only,
+    // so x86_64-linux keeps its coverage.
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
     const a = std.testing.allocator;
     const io = std.testing.io;
     const elf_read = @import("elf_read.zig");

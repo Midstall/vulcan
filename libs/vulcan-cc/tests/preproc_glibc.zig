@@ -58,34 +58,28 @@ fn shOutput(allocator: std.mem.Allocator, script: []const u8) !?[]u8 {
 }
 
 /// Locates the host (aarch64) glibc "dev" include directory. This is the directory that
-/// holds a real `stdio.h`, `features.h`, `sys/cdefs.h`, and so on. The function tries four
-/// methods in order. It validates each candidate by checking for a real `stdio.h` inside
-/// it, so a stale or wrong hit never gets returned.
-/// (1) `VCC_GLIBC_INCLUDE`, an explicit override for a host where the other methods do
-/// not apply.
-/// (2) A real `gcc`'s own `-E -v` system-include search list. The last entry in that list
-/// is always the glibc dev tree that gcc itself was built against.
-/// (3) Any `/nix/store/*-glibc-*-dev/include` path. This skips arch-suffixed cross trees,
-/// like `glibc-riscv64-unknown-linux-gnu-*-dev`. `findCrossGlibcIncludeDir` below covers
-/// those separately.
-/// (4) The one store path confirmed present when this test was written. This is a
-/// last-resort fallback only. A store hash rots as soon as this package is rebuilt, so
-/// this path must never be the only path tried.
+/// holds a real `stdio.h`, `features.h`, `sys/cdefs.h`, and so on. It tries two methods, and
+/// validates each candidate by checking for a real `stdio.h` inside it, so a stale or wrong
+/// hit never gets returned.
+/// (1) `VCC_GLIBC_INCLUDE`, an explicit override for a host where the search below does not
+/// apply.
+/// (2) The host C compiler's own `-E -v` system-include search list: the last directory in it
+/// that holds a `stdio.h` is the C library include dir. Asking the compiler (rather than
+/// globbing `/nix/store`) works on any host and never rots on a store rebuild.
 /// This function never fails the test. A caller that gets `null` back skips cleanly.
 fn findHostGlibcIncludeDir(allocator: std.mem.Allocator) !?[]u8 {
     const script =
         \\if [ -n "${VCC_GLIBC_INCLUDE:-}" ] && [ -f "$VCC_GLIBC_INCLUDE/stdio.h" ]; then
         \\  echo "$VCC_GLIBC_INCLUDE"; exit 0
         \\fi
-        \\if command -v gcc >/dev/null 2>&1; then
-        \\  d=$(echo | gcc -E -v -xc - 2>&1 | grep -E '^ .*/glibc-[0-9][^/]*-dev/include$' | tail -1 | sed -e 's/^ //')
-        \\  if [ -n "$d" ] && [ -f "$d/stdio.h" ]; then echo "$d"; exit 0; fi
-        \\fi
-        \\for d in /nix/store/*-glibc-[0-9]*-dev/include; do
-        \\  if [ -f "$d/stdio.h" ]; then echo "$d"; exit 0; fi
+        \\for cc_ in cc gcc; do
+        \\  command -v "$cc_" >/dev/null 2>&1 || continue
+        \\  last=""
+        \\  for d in $(echo | LC_ALL=C "$cc_" -E -v -xc - 2>&1 | awk '/search starts here/{f=1;next} /End of search/{f=0} f{sub(/^ +/,"");print}'); do
+        \\    [ -f "$d/features.h" ] && last="$d"
+        \\  done
+        \\  if [ -n "$last" ]; then echo "$last"; exit 0; fi
         \\done
-        \\known=/nix/store/11azz9spqc81walgg0mq9wjxrgbi4xqz-glibc-2.42-61-dev/include
-        \\if [ -f "$known/stdio.h" ]; then echo "$known"; exit 0; fi
         \\exit 1
     ;
     return shOutput(allocator, script);
@@ -97,11 +91,16 @@ fn findHostGlibcIncludeDir(allocator: std.mem.Allocator) !?[]u8 {
 /// simply not have a given arch's cross glibc installed, which is not a VCC bug.
 fn findCrossGlibcIncludeDir(allocator: std.mem.Allocator, triple: []const u8) !?[]u8 {
     const script = try std.fmt.allocPrint(allocator,
-        \\for d in /nix/store/*-glibc-{s}-*-dev/include; do
-        \\  if [ -f "$d/stdio.h" ]; then echo "$d"; exit 0; fi
+        \\for cc_ in {s}-gcc {s}-cc; do
+        \\  command -v "$cc_" >/dev/null 2>&1 || continue
+        \\  last=""
+        \\  for d in $(echo | LC_ALL=C "$cc_" -E -v -xc - 2>&1 | awk '/search starts here/{{f=1;next}} /End of search/{{f=0}} f{{sub(/^ +/,"");print}}'); do
+        \\    [ -f "$d/features.h" ] && last="$d"
+        \\  done
+        \\  if [ -n "$last" ]; then echo "$last"; exit 0; fi
         \\done
         \\exit 1
-    , .{triple});
+    , .{ triple, triple });
     defer allocator.free(script);
     return shOutput(allocator, script);
 }
