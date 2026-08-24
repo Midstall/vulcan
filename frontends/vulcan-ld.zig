@@ -821,8 +821,8 @@ fn buildArchive(allocator: std.mem.Allocator, members: []const ld.Member) ![]u8 
 /// on any in-process address patching. Mirrors `libs/vulcan-cc/tests/native.zig`'s
 /// `startStubAArch64`.
 fn startStubAArch64(allocator: std.mem.Allocator) ![]u8 {
-    const encode = target.native.backend.encode;
-    const object = target.native.backend.object;
+    const encode = target.aarch64.encode;
+    const object = target.aarch64.object;
 
     const code = [_]u32{
         encode.bl(0), // bl main (offset 0) - patched by the linker's CALL26 reloc
@@ -1313,6 +1313,8 @@ test "ld.vulcan CLI: -T links via a linker script, natively runs to exit 42" {
 }
 
 test "ld.vulcan CLI: -T with a malformed script returns a non-zero status without crashing" {
+    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -1340,6 +1342,7 @@ test "ld.vulcan CLI: -T with a malformed script returns a non-zero status withou
 
 test "ld.vulcan CLI: -T with -e overrides the script's ENTRY (smoke: links without crashing)" {
     if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
