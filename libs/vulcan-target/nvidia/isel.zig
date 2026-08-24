@@ -369,6 +369,7 @@ pub fn compileShader(allocator: std.mem.Allocator, func: *Function, stage: Stage
     // silently treating it as f64. This check covers both this direct entry
     // and compileKernel, which calls this function.
     if (ir.function.functionUsesF16(func)) return error.Unsupported;
+    if (ir.function.functionUsesF128(func)) return error.Unsupported;
 
     const nblocks = func.blockCount();
     if (nblocks == 0) return error.Unsupported;
@@ -2499,7 +2500,7 @@ fn markUse(last_use: []u32, v: Value, pos: u32) void {
 
 fn forEachUse(func: *const Function, inst: ir.function.Inst, last_use: []u32, pos: u32) void {
     switch (func.opcode(inst)) {
-        .iconst, .fconst, .alloca, .global_addr => {},
+        .iconst, .fconst, .fconst128, .alloca, .global_addr => {},
         .arith => |a| {
             markUse(last_use, a.lhs, pos);
             markUse(last_use, a.rhs, pos);
@@ -2563,7 +2564,7 @@ fn setUsed(row: []bool, v: Value) void {
 
 fn markUsedBitset(func: *const Function, inst: ir.function.Inst, row: []bool) void {
     switch (func.opcode(inst)) {
-        .iconst, .fconst, .alloca, .global_addr => {},
+        .iconst, .fconst, .fconst128, .alloca, .global_addr => {},
         .arith => |a| {
             setUsed(row, a.lhs);
             setUsed(row, a.rhs);

@@ -160,7 +160,7 @@ fn rv(vmap: *const std.AutoHashMapUnmanaged(Value, Value), v: Value) Value {
 
 fn remapOp(func: *Function, op: Opcode, vmap: *const std.AutoHashMapUnmanaged(Value, Value), allocator: std.mem.Allocator) Error!Opcode {
     return switch (op) {
-        .iconst, .fconst, .alloca, .global_addr => op,
+        .iconst, .fconst, .fconst128, .alloca, .global_addr => op,
         .arith => |a| .{ .arith = .{ .op = a.op, .lhs = rv(vmap, a.lhs), .rhs = rv(vmap, a.rhs) } },
         .arith_imm => |a| .{ .arith_imm = .{ .op = a.op, .lhs = rv(vmap, a.lhs), .imm = a.imm } },
         .icmp => |c| .{ .icmp = .{ .op = c.op, .lhs = rv(vmap, c.lhs), .rhs = rv(vmap, c.rhs) } },
@@ -224,7 +224,7 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, model: *const mm.Mod
             if (if_inst != null) return null;
             if_inst = inst;
         },
-        .iconst, .fconst, .arith, .arith_imm, .icmp, .select, .convert, .unary => {},
+        .iconst, .fconst, .fconst128, .arith, .arith_imm, .icmp, .select, .convert, .unary => {},
         else => return null,
     };
     const cf = func.opcode(if_inst orelse return null).@"if";
@@ -271,7 +271,7 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, model: *const mm.Mod
                 try accesses.append(allocator, .{ .base = sa.base, .stride = sa.stride, .addr_inst = sa.addr_inst, .scale_inst = sa.scale_inst, .is_store = true });
                 try scale_insts.append(allocator, sa.scale_inst);
             },
-            .arith, .arith_imm, .iconst, .fconst, .icmp, .select, .convert, .unary => {},
+            .arith, .arith_imm, .iconst, .fconst, .fconst128, .icmp, .select, .convert, .unary => {},
             else => return bail(&accesses, allocator), // call/alloca/dot/matmul/etc: not handled
         }
     }
@@ -372,6 +372,7 @@ fn byteSize(func: *const Function, ty: ir.types.Type) i64 {
             .f16 => 2,
             .f32 => 4,
             .f64 => 8,
+            .f128 => 16,
         },
         .ptr => 8,
         else => 0,
@@ -484,7 +485,7 @@ fn recognizeReduction(func: *const Function, model: *const mm.Model, loop: *cons
             if (if_inst != null) return null;
             if_inst = inst;
         },
-        .iconst, .fconst, .arith, .arith_imm, .icmp, .select, .convert, .unary => {},
+        .iconst, .fconst, .fconst128, .arith, .arith_imm, .icmp, .select, .convert, .unary => {},
         else => return null,
     };
     const cf = func.opcode(if_inst orelse return null).@"if";

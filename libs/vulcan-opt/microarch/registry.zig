@@ -37,7 +37,7 @@ fn altraLatency(op: ir.function.Opcode) u32 {
         // A matmul (et-soc tensor tile) is a big multicycle op, priced well above a
         // scalar mul/dot: not native to this arch, a placeholder pending real timing.
         .matmul => 64,
-        .iconst, .fconst, .icmp, .select, .struct_new, .extract, .alloca, .call, .call_indirect, .global_addr, .store, .prefetch, .@"if" => 1,
+        .iconst, .fconst, .fconst128, .icmp, .select, .struct_new, .extract, .alloca, .call, .call_indirect, .global_addr, .store, .prefetch, .@"if" => 1,
         // SM12 T3: no backend expands these yet (Tasks 4a-d), so the microarch optimizer
         // never actually schedules one today - priced like any other cheap bookkeeping op
         // (`iconst`/`store`/...) so a future backend expansion doesn't silently under-model.
@@ -81,7 +81,7 @@ fn altraThroughput(op: ir.function.Opcode, elem_float: bool) u32 {
         .dot => 1,
         // A matmul is not native here; a placeholder, non-pipelined (== latency).
         .matmul => 64,
-        .iconst, .fconst, .icmp, .select, .struct_new, .extract, .alloca, .call, .call_indirect, .global_addr, .store, .prefetch, .@"if" => 1,
+        .iconst, .fconst, .fconst128, .icmp, .select, .struct_new, .extract, .alloca, .call, .call_indirect, .global_addr, .store, .prefetch, .@"if" => 1,
         // SM12 T3: no backend expands these yet (Tasks 4a-d), so the microarch optimizer
         // never actually schedules one today - priced like any other cheap bookkeeping op
         // (`iconst`/`store`/...) so a future backend expansion doesn't silently under-model.
@@ -105,7 +105,7 @@ fn cascadelakeLatency(op: ir.function.Opcode) u32 {
         .convert, .unary => 4,
         .dot => 3, // mul-class
         .matmul => 64, // non-native placeholder
-        .iconst, .fconst, .icmp, .select, .struct_new, .extract, .alloca, .call, .call_indirect, .global_addr, .store, .prefetch, .@"if" => 1,
+        .iconst, .fconst, .fconst128, .icmp, .select, .struct_new, .extract, .alloca, .call, .call_indirect, .global_addr, .store, .prefetch, .@"if" => 1,
         // SM12 T3: no backend expands these yet (Tasks 4a-d), so the microarch optimizer
         // never actually schedules one today - priced like any other cheap bookkeeping op
         // (`iconst`/`store`/...) so a future backend expansion doesn't silently under-model.
@@ -134,7 +134,7 @@ fn cascadelakeThroughput(op: ir.function.Opcode, elem_float: bool) u32 {
         .convert, .unary => 1,
         .dot => 1,
         .matmul => 64,
-        .iconst, .fconst, .icmp, .select, .struct_new, .extract, .alloca, .call, .call_indirect, .global_addr, .store, .prefetch, .@"if" => 1,
+        .iconst, .fconst, .fconst128, .icmp, .select, .struct_new, .extract, .alloca, .call, .call_indirect, .global_addr, .store, .prefetch, .@"if" => 1,
         // SM12 T3: no backend expands these yet (Tasks 4a-d), so the microarch optimizer
         // never actually schedules one today - priced like any other cheap bookkeeping op
         // (`iconst`/`store`/...) so a future backend expansion doesn't silently under-model.
@@ -162,7 +162,7 @@ fn etsocLatency(op: ir.function.Opcode) u32 {
         // fma, wait, store) is many times an arith latency; 64 is a placeholder pending
         // a cycle-accurate model of the CSR protocol (isel lowering is a later task).
         .matmul => 64,
-        .iconst, .fconst, .icmp, .select, .struct_new, .extract, .alloca, .call, .call_indirect, .global_addr, .store, .prefetch, .@"if" => 1,
+        .iconst, .fconst, .fconst128, .icmp, .select, .struct_new, .extract, .alloca, .call, .call_indirect, .global_addr, .store, .prefetch, .@"if" => 1,
         // SM12 T3: no backend expands these yet (Tasks 4a-d), so the microarch optimizer
         // never actually schedules one today - priced like any other cheap bookkeeping op
         // (`iconst`/`store`/...) so a future backend expansion doesn't silently under-model.
@@ -203,7 +203,7 @@ fn etsocThroughput(op: ir.function.Opcode, elem_float: bool) u32 {
         .dot => 8,
         // Matmul is the async CSR-write tensor sequence: non-pipelined, throughput == latency.
         .matmul => 64,
-        .iconst, .fconst, .icmp, .select, .struct_new, .extract, .alloca, .call, .call_indirect, .global_addr, .store, .prefetch, .@"if" => 1,
+        .iconst, .fconst, .fconst128, .icmp, .select, .struct_new, .extract, .alloca, .call, .call_indirect, .global_addr, .store, .prefetch, .@"if" => 1,
         // SM12 T3: no backend expands these yet (Tasks 4a-d), so the microarch optimizer
         // never actually schedules one today - priced like any other cheap bookkeeping op
         // (`iconst`/`store`/...) so a future backend expansion doesn't silently under-model.
@@ -232,7 +232,7 @@ fn riverInorderLatency(op: ir.function.Opcode) u32 {
         .dot => 3,
         // River carries no tensor unit; a placeholder in case one is added.
         .matmul => 64,
-        .iconst, .fconst, .icmp, .select, .struct_new, .extract, .alloca, .call, .call_indirect, .global_addr, .store, .prefetch, .@"if" => 1,
+        .iconst, .fconst, .fconst128, .icmp, .select, .struct_new, .extract, .alloca, .call, .call_indirect, .global_addr, .store, .prefetch, .@"if" => 1,
         // SM12 T3: no backend expands these yet (Tasks 4a-d), so the microarch optimizer
         // never actually schedules one today - priced like any other cheap bookkeeping op
         // (`iconst`/`store`/...) so a future backend expansion doesn't silently under-model.
@@ -263,7 +263,7 @@ fn riverMacroLatency(op: ir.function.Opcode) u32 {
         .dot => 3,
         // River carries no tensor unit; a placeholder in case one is added.
         .matmul => 64,
-        .iconst, .fconst, .icmp, .select, .struct_new, .extract, .alloca, .call, .call_indirect, .global_addr, .store, .prefetch, .@"if" => 1,
+        .iconst, .fconst, .fconst128, .icmp, .select, .struct_new, .extract, .alloca, .call, .call_indirect, .global_addr, .store, .prefetch, .@"if" => 1,
         // SM12 T3: no backend expands these yet (Tasks 4a-d), so the microarch optimizer
         // never actually schedules one today - priced like any other cheap bookkeeping op
         // (`iconst`/`store`/...) so a future backend expansion doesn't silently under-model.
@@ -294,7 +294,7 @@ fn riverInorderThroughput(op: ir.function.Opcode, elem_float: bool) u32 {
         .convert, .unary => 1,
         .dot => 3, // mul-class placeholder, non-pipelined here
         .matmul => 64, // no tensor unit here; non-pipelined placeholder
-        .iconst, .fconst, .icmp, .select, .struct_new, .extract, .alloca, .call, .call_indirect, .global_addr, .store, .prefetch, .@"if" => 1,
+        .iconst, .fconst, .fconst128, .icmp, .select, .struct_new, .extract, .alloca, .call, .call_indirect, .global_addr, .store, .prefetch, .@"if" => 1,
         // SM12 T3: no backend expands these yet (Tasks 4a-d), so the microarch optimizer
         // never actually schedules one today - priced like any other cheap bookkeeping op
         // (`iconst`/`store`/...) so a future backend expansion doesn't silently under-model.
@@ -326,7 +326,7 @@ fn riverPipelinedThroughput(op: ir.function.Opcode, elem_float: bool) u32 {
         .convert, .unary => 1,
         .dot => 1, // pipelined mul-accumulate on the wider profile
         .matmul => 64, // no tensor unit here; non-pipelined placeholder
-        .iconst, .fconst, .icmp, .select, .struct_new, .extract, .alloca, .call, .call_indirect, .global_addr, .store, .prefetch, .@"if" => 1,
+        .iconst, .fconst, .fconst128, .icmp, .select, .struct_new, .extract, .alloca, .call, .call_indirect, .global_addr, .store, .prefetch, .@"if" => 1,
         // SM12 T3: no backend expands these yet (Tasks 4a-d), so the microarch optimizer
         // never actually schedules one today - priced like any other cheap bookkeeping op
         // (`iconst`/`store`/...) so a future backend expansion doesn't silently under-model.
@@ -346,7 +346,7 @@ fn unitOfShared(op: ir.function.Opcode) UnitClass {
     return switch (op) {
         .arith => |a| sharedArithUnit(a.op),
         .arith_imm => |a| sharedArithUnit(a.op),
-        .icmp, .select, .iconst, .fconst, .global_addr => .alu,
+        .icmp, .select, .iconst, .fconst, .fconst128, .global_addr => .alu,
         .convert => .fpsimd,
         .unary => |u| switch (u.op) {
             .reinterpret => .alu,

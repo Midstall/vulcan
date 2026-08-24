@@ -363,6 +363,9 @@ const Emitter = struct {
         switch (op) {
             .iconst => |val| try self.print("    v{d} = {d};\n", .{ self.name(res.?), val }),
             .fconst => |val| try self.emitFconst(res.?, val),
+            // The u128 payload is the binary128 bit pattern; decode it and print the
+            // decimal with the C23 f128 literal suffix.
+            .fconst128 => |val| try self.print("    v{d} = {d}f128;\n", .{ self.name(res.?), @as(f128, @bitCast(val)) }),
             .arith => |a| if (self.vectorLen(func.valueType(res.?))) |n| {
                 // An element-wise vector op: one C statement per lane.
                 for (0..n) |k| try self.print("    v{d}.f{d} = v{d}.f{d} {s} v{d}.f{d};\n", .{
@@ -525,6 +528,9 @@ const Emitter = struct {
             .f16 => try self.print("    v{d} = (_Float16){e};\n", .{ self.name(res), @as(f64, @as(f16, @floatCast(val))) }),
             .f32 => try self.print("    v{d} = {e}f;\n", .{ self.name(res), @as(f32, @floatCast(val)) }),
             .f64 => try self.print("    v{d} = {e};\n", .{ self.name(res), val }),
+            // The IR fconst carrier is an f64, so this prints the carrier's value into an
+            // f128 context; the cast makes the widening explicit in the emitted C.
+            .f128 => try self.print("    v{d} = (_Float128){e};\n", .{ self.name(res), val }),
         }
     }
 
@@ -584,6 +590,7 @@ const Emitter = struct {
                 .f16 => "_Float16",
                 .f32 => "float",
                 .f64 => "double",
+                .f128 => "_Float128",
             }),
             .ptr => try self.w("void*"),
             .@"struct", .vector, .array, .slice => try self.aggName(&self.out, t),

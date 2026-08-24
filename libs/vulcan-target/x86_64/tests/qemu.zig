@@ -7,11 +7,64 @@ const ir = @import("vulcan-ir");
 const cases = @import("cases.zig");
 const harness = @import("harness.zig");
 const link = @import("../link.zig");
+const isel = @import("../isel.zig");
 
 const Function = ir.function.Function;
 
 test "x86-64 cases run under qemu-x86_64" {
     try cases.runAll(std.testing.io, std.testing.allocator, harness.qemu);
+}
+
+// A binary128 operation has no SSE form; the soft-fp pass lowers it to a libgcc call before
+// isel, so the backend must emit a call relocation against the undefined soft-fp symbol. The
+// in-memory JIT linker leaves that symbol unresolved (error.UndefinedSymbol); the object path
+// writes it as an undefined symbol the final system link resolves from libgcc/compiler-rt.
+test "an f128 add compiles to an undefined __addtf3 soft-fp call relocation" {
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const t = try f.types.intern(.{ .float = .f128 });
+    const b = try f.appendBlock();
+    const x = try f.appendBlockParam(b, t);
+    const y = try f.appendBlockParam(b, t);
+    const r = try f.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = y } });
+    f.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
+
+    var compiled = try isel.compile(allocator, &f);
+    defer compiled.deinit(allocator);
+
+    var addtf3: usize = 0;
+    for (compiled.relocs) |rel| {
+        if (std.mem.eql(u8, rel.symbol, "__addtf3")) {
+            addtf3 += 1;
+            try std.testing.expectEqual(isel.Kind.call, rel.kind);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), addtf3);
+}
+
+// An f128 `select` is a conditional data move, not an arithmetic libcall, so the softfp pass
+// leaves it in place. x86-64 lowers select as a two-armed branch whose arms move the whole
+// value with 128-bit movups (see `selectInto`), so an f128 select compiles natively (no
+// libcall, no error). This is the x86-64 counterpart of aarch64's fail-closed f128 select,
+// whose `fcsel` has no 128-bit form.
+test "an f128 select compiles natively on x86-64 with no soft-fp call" {
+    const allocator = std.testing.allocator;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const t = try f.types.intern(.{ .float = .f128 });
+    const i1_t = try f.types.intern(.bool);
+    const b = try f.appendBlock();
+    const cond = try f.appendBlockParam(b, i1_t);
+    const x = try f.appendBlockParam(b, t);
+    const y = try f.appendBlockParam(b, t);
+    const r = try f.appendInst(b, t, .{ .select = .{ .cond = cond, .then = x, .@"else" = y } });
+    f.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
+
+    var compiled = try isel.compile(allocator, &f);
+    defer compiled.deinit(allocator);
+    try std.testing.expect(compiled.code.len > 0);
+    for (compiled.relocs) |rel| try std.testing.expect(!std.mem.startsWith(u8, rel.symbol, "__")); // no soft-fp call
 }
 
 test "an unreachable block that uses a reachable value compiles and the reachable path runs" {

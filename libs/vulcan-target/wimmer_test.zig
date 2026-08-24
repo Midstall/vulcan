@@ -202,12 +202,13 @@ test "riscv64 description: non-vpu int + float pools and entry param pinning" {
     var desc = try riscv64.riscv64RegDescription(allocator, &func, false, false);
     defer desc.deinit(allocator);
 
-    // Four classes: 0 int, 1 float, 2 RVV-vector, 3 VPU-vector.
-    try std.testing.expectEqual(@as(usize, 4), desc.classes.len);
+    // Five classes: 0 int, 1 float, 2 RVV-vector, 3 VPU-vector, 4 quad (f128, memory-resident).
+    try std.testing.expectEqual(@as(usize, 5), desc.classes.len);
     try std.testing.expectEqualStrings("int", desc.classes[0].name);
     try std.testing.expectEqualStrings("float", desc.classes[1].name);
     try std.testing.expectEqualStrings("vector", desc.classes[2].name);
     try std.testing.expectEqualStrings("vpu_vector", desc.classes[3].name);
+    try std.testing.expectEqualStrings("quad", desc.classes[4].name);
 
     // Class 0 (int): allocatable is the caller-saved temps x5/x7/x28..x31 plus the callee-saved
     // x9/x18..x27. Slot size 8 bytes.
@@ -234,6 +235,11 @@ test "riscv64 description: non-vpu int + float pools and entry param pinning" {
     try std.testing.expectEqual(@as(usize, 0), desc.classes[3].allocatable.len);
     try std.testing.expectEqual(@as(u16, 32), desc.classes[3].slot_bytes);
 
+    // Class 4 (quad / f128): a memory-resident class, so its register pool is empty (every f128
+    // value spills to a 16-byte slot and moves into its GPR pair only at an ABI boundary).
+    try std.testing.expectEqual(@as(usize, 0), desc.classes[4].allocatable.len);
+    try std.testing.expectEqual(@as(u16, 16), desc.classes[4].slot_bytes);
+
     // Entry params: the int param pins a0 (class 0, reg x10 = index 10), the float param pins fa0
     // (class 1, reg f10 = index 10).
     try std.testing.expectEqual(@as(usize, 2), desc.entry_fixed.len);
@@ -253,12 +259,14 @@ test "riscv64 description: non-vpu int + float pools and entry param pinning" {
     const first_inst = func.blockInsts(b)[0];
     try std.testing.expectEqual(wimmer.UseKind.must_have_register, desc.useKind(desc.ctx, &func, first_inst, ip));
 
-    // Scratch per class: int x6 (6), float f31 (31), RVV v31 (31), VPU f31 (31).
-    try std.testing.expectEqual(@as(usize, 4), desc.scratch.len);
+    // Scratch per class: int x6 (6), float f31 (31), RVV v31 (31), VPU f31 (31), quad reuses the
+    // int scratch x6 (6) since a memory-resident f128 never realizes a class-4 register move.
+    try std.testing.expectEqual(@as(usize, 5), desc.scratch.len);
     try std.testing.expectEqual(@as(u16, 6), desc.scratch[0]);
     try std.testing.expectEqual(@as(u16, 31), desc.scratch[1]);
     try std.testing.expectEqual(@as(u16, 31), desc.scratch[2]);
     try std.testing.expectEqual(@as(u16, 31), desc.scratch[3]);
+    try std.testing.expectEqual(@as(u16, 6), desc.scratch[4]);
 }
 
 test "riscv64 description: a call clobbers caller-saved of every class incl all vector regs" {

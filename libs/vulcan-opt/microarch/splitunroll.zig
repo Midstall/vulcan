@@ -116,7 +116,7 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, model: *const mm.Mod
             if (if_inst != null) return null;
             if_inst = inst;
         },
-        .iconst, .fconst, .arith, .arith_imm, .icmp, .select, .convert, .unary => {},
+        .iconst, .fconst, .fconst128, .arith, .arith_imm, .icmp, .select, .convert, .unary => {},
         else => return null, // impure/memory op in the header
     };
     const iff = if_inst orelse return null;
@@ -444,7 +444,7 @@ fn rv(vmap: *const std.AutoHashMapUnmanaged(Value, Value), v: Value) Value {
 
 fn remapOp(func: *Function, op: Opcode, vmap: *const std.AutoHashMapUnmanaged(Value, Value), allocator: std.mem.Allocator) Error!Opcode {
     return switch (op) {
-        .iconst, .fconst, .alloca, .global_addr => op,
+        .iconst, .fconst, .fconst128, .alloca, .global_addr => op,
         .arith => |a| .{ .arith = .{ .op = a.op, .lhs = rv(vmap, a.lhs), .rhs = rv(vmap, a.rhs) } },
         .arith_imm => |a| .{ .arith_imm = .{ .op = a.op, .lhs = rv(vmap, a.lhs), .imm = a.imm } },
         .icmp => |c| .{ .icmp = .{ .op = c.op, .lhs = rv(vmap, c.lhs), .rhs = rv(vmap, c.rhs) } },
@@ -491,7 +491,7 @@ fn useCounts(allocator: std.mem.Allocator, func: *const Function) Error![]u32 {
     }.f;
     for (0..func.instCount()) |i| {
         switch (func.opcode(@enumFromInt(i))) {
-            .iconst, .fconst, .alloca, .global_addr => {},
+            .iconst, .fconst, .fconst128, .alloca, .global_addr => {},
             .arith => |x| {
                 bump(counts, x.lhs);
                 bump(counts, x.rhs);

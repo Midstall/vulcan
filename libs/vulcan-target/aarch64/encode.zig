@@ -753,6 +753,13 @@ pub fn movVec(rd: Reg, rn: Reg) u32 {
     return 0x4EA01C00 | (n(rn) << 16) | (n(rn) << 5) | n(rd);
 }
 
+/// `ins vd.d[1], xn` (INS general): write the high 64-bit lane of a vector register from a GPR.
+/// With `fmov d, x` (which sets the low lane and zeroes the high) it assembles a 128-bit value
+/// from two 64-bit halves, the way a binary128 (`f128`) constant is built (low half first).
+pub fn insD1FromGpr(rd: Reg, rn: Reg) u32 {
+    return 0x4E181C00 | (n(rn) << 5) | n(rd);
+}
+
 /// NEON `sdot Vd.4S, Vn.16B, Vm.16B` (Altra: `features.aarch64.dotprod`): the 4-way
 /// signed INT8 dot-product-accumulate. For each 32-bit lane d in 0..3, Vd[d] +=
 /// sum over k in 0..3 of sext(Vn.b[4d+k]) * sext(Vm.b[4d+k]). ACCUMULATES into Vd,
@@ -971,6 +978,10 @@ test "NEON vector op encodings" {
     try std.testing.expectEqual(@as(u32, 0x4E040C20), dupFromGpr(.x0, .x1)); // dup v0.4s, w1
     try std.testing.expectEqual(@as(u32, 0x4E140420), dupVecLane(.x0, .x1, 2)); // dup v0.4s, v1.s[2]
     try std.testing.expectEqual(@as(u32, 0x6E205820), mvnVec(.x0, .x1)); // mvn v0.16b, v1.16b
+    // INS general (`ins vd.d[1], xn`): the high-lane insert that builds the top 64 bits of an
+    // f128 constant. rd bits[4:0], rn bits[9:5]; the base 0x4E181C00 has every register field 0.
+    try std.testing.expectEqual(@as(u32, 0x4E181C20), insD1FromGpr(.x0, .x1)); // ins v0.d[1], x1
+    try std.testing.expectEqual(@as(u32, 0x4E181D34), insD1FromGpr(.x20, .x9)); // ins v20.d[1], x9
 }
 
 test "FMLA/FMLS vector encodings (NEON accumulate-into-Vd)" {

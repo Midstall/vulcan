@@ -76,6 +76,9 @@ pub fn emitFunction(allocator: std.mem.Allocator, func: *const Function, name: [
     // backends draw the same line, so this composite case still rejects cleanly. This
     // covers both this direct entry and emitModule, which delegates here per function.
     if (ir.function.functionUsesCompositeF16(func)) return error.Unsupported;
+    // JS has no f128 at all, not even a rounding twin: numbers are f64. Reject the
+    // whole function up front so no emission arm ever sees one.
+    if (ir.function.functionUsesF128(func)) return error.Unsupported;
 
     var e = Emitter{ .allocator = allocator, .func = func };
     defer e.deinit();
@@ -236,6 +239,9 @@ const Emitter = struct {
         const res = func.instResult(inst);
         switch (op) {
             .iconst => |val| try self.emitIconst(res.?, val, indent),
+            // JS numbers are f64; there is no f128. emitFunction's gate rejects any
+            // function using f128 first, and this arm is the belt to its suspenders.
+            .fconst128 => return error.Unsupported,
             .fconst => |val| {
                 try self.print("{s}v{d} = ", .{ indent, self.name(res.?) });
                 // A literal prints already rounded to its own type, so the JS constant is
@@ -244,6 +250,8 @@ const Emitter = struct {
                     .f16 => try self.print("Math.f16round({e})", .{@as(f64, @as(f16, @floatCast(val)))}),
                     .f32 => try self.print("Math.fround({e})", .{@as(f32, @floatCast(val))}),
                     .f64 => try self.print("{e}", .{val}),
+                    // JS numbers are f64; there is no f128 to round to.
+                    .f128 => return error.Unsupported,
                 }
                 try self.w(";\n");
             },
@@ -395,6 +403,8 @@ const Emitter = struct {
                 .f16 => try self.print("Math.f16round(Number(v{d}))", .{self.name(src)}),
                 .f32 => try self.print("Math.fround(Number(v{d}))", .{self.name(src)}),
                 .f64 => try self.print("Number(v{d})", .{self.name(src)}),
+                // emitFunction rejects any function using f128 before emission starts.
+                .f128 => unreachable,
             },
             .int => {
                 try self.wrapPre(rty);
@@ -435,6 +445,8 @@ const Emitter = struct {
             .f16 => try self.print("Math.f16round({s}(v{d}))", .{ fname, self.name(u.value) }),
             .f32 => try self.print("Math.fround({s}(v{d}))", .{ fname, self.name(u.value) }),
             .f64 => try self.print("{s}(v{d})", .{ fname, self.name(u.value) }),
+            // emitFunction rejects any function using f128 before emission starts.
+            .f128 => unreachable,
         }
         try self.w(";\n");
     }
@@ -516,6 +528,7 @@ const Emitter = struct {
                 .f16 => try self.w("Math.f16round("),
                 .f32 => try self.w("Math.fround("),
                 .f64 => {},
+                .f128 => return error.Unsupported,
             },
             else => {},
         }
@@ -527,6 +540,7 @@ const Emitter = struct {
             .float => |f| switch (f) {
                 .f16, .f32 => try self.w(")"),
                 .f64 => {},
+                .f128 => return error.Unsupported,
             },
             else => {},
         }
@@ -553,6 +567,8 @@ const Emitter = struct {
                 .f16 => "f16",
                 .f32 => "f32",
                 .f64 => "f64",
+                // emitFunction rejects any function using f128 before emission starts.
+                .f128 => unreachable,
             },
             .ptr => "i64",
             else => "i32",
@@ -568,6 +584,8 @@ const Emitter = struct {
                 .f16 => 2,
                 .f32 => 4,
                 .f64 => 8,
+                // emitFunction rejects any function using f128 before emission starts.
+                .f128 => unreachable,
             },
             .ptr => 8,
             .vector => |v| v.len * self.typeSize(v.elem),

@@ -47,6 +47,7 @@ const op_matmul: u8 = 19;
 const op_va_start: u8 = 20;
 const op_va_arg: u8 = 21;
 const op_va_end: u8 = 22;
+const op_fconst128: u8 = 23;
 
 const Writer = struct {
     bytes: std.ArrayList(u8) = .empty,
@@ -148,6 +149,7 @@ fn writeType(w: *Writer, kind: types.TypeKind) Error!void {
                 std.debug.assert(@intFromEnum(types.FloatKind.f32) == 0);
                 std.debug.assert(@intFromEnum(types.FloatKind.f64) == 1);
                 std.debug.assert(@intFromEnum(types.FloatKind.f16) == 2);
+                std.debug.assert(@intFromEnum(types.FloatKind.f128) == 3);
             }
             try w.u8v(@intFromEnum(f));
         },
@@ -187,6 +189,11 @@ fn writeInst(w: *Writer, func: *const Function, inst: Inst, serial: []const u32,
         .fconst => |v| {
             try w.u8v(op_fconst);
             try w.u64v(@bitCast(v));
+        },
+        .fconst128 => |v| {
+            try w.u8v(op_fconst128);
+            try w.u64v(@truncate(v));
+            try w.u64v(@truncate(v >> 64));
         },
         .arith => |a| {
             try w.u8v(op_arith);
@@ -484,6 +491,7 @@ fn readType(r: *Reader, func: *Function, type_map: []const Type, valid: usize) E
                 0 => .f32,
                 1 => .f64,
                 2 => .f16,
+                3 => .f128,
                 else => return error.MalformedBitcode,
             };
             break :blk try func.types.intern(.{ .float = kind });
@@ -537,7 +545,7 @@ const Fixup = struct {
             .inst => |inst| {
                 const op = func.opcodeMut(inst);
                 switch (op.*) {
-                    .iconst, .fconst, .alloca, .global_addr => {},
+                    .iconst, .fconst, .fconst128, .alloca, .global_addr => {},
                     .arith => |*a| {
                         a.lhs = next(&i, self.slots, serial);
                         a.rhs = next(&i, self.slots, serial);
@@ -619,6 +627,11 @@ fn readInst(r: *Reader, func: *Function, block: Block, type_map: []const Type, b
     const inst: Inst = switch (tag) {
         op_iconst => try appendRes(func, block, serial, rty, .{ .iconst = @bitCast(try r.take(u64)) }),
         op_fconst => try appendRes(func, block, serial, rty, .{ .fconst = @bitCast(try r.take(u64)) }),
+        op_fconst128 => blk: {
+            const lo: u128 = try r.take(u64);
+            const hi: u128 = try r.take(u64);
+            break :blk try appendRes(func, block, serial, rty, .{ .fconst128 = (hi << 64) | lo });
+        },
         op_arith => blk: {
             const op = std.enums.fromInt(function.BinOp, try r.take(u8)) orelse return error.MalformedBitcode;
             try slots.append(allocator, try r.take(u32));

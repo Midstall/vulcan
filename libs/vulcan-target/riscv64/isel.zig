@@ -157,6 +157,12 @@ const Allocation = struct {
     /// occupies the low 4 bytes). Populated when the scalar float file is exhausted.
     float_spill: std.AutoHashMapUnmanaged(Value, u32),
     float_spill_count: u32,
+    /// Spilled f128 (binary128) values, mapped to their 16-byte spill-slot index (0-based). f128 is
+    /// register class 4 with an empty pool, so EVERY f128 value is spill-resident and lands here (never
+    /// in a register map and never split). The frame layout turns the index into an `sp` offset via
+    /// `quad_spill_base`, and the two 64-bit halves sit at `+0` (low) and `+8` (high).
+    quad_spill: std.AutoHashMapUnmanaged(Value, u32) = .empty,
+    quad_spill_count: u32 = 0,
     /// Entry integer parameters beyond the 8 argument registers: each maps to its
     /// incoming stack-argument index (0 = the 9th arg). The selector loads it from
     /// the caller's frame at function entry.
@@ -206,6 +212,7 @@ const Allocation = struct {
         self.vpu_vector_spill.deinit(allocator);
         self.int_spill.deinit(allocator);
         self.float_spill.deinit(allocator);
+        self.quad_spill.deinit(allocator);
         self.incoming_stack.deinit(allocator);
         var seg_it = self.segments.valueIterator();
         while (seg_it.next()) |segs| allocator.free(segs.*);
@@ -387,6 +394,22 @@ fn isUnsignedIntVector(func: *const Function, ty: ir.types.Type) bool {
 fn is64Float(func: *const Function, ty: ir.types.Type) bool {
     return switch (func.types.type_kind(ty)) {
         .float => |f| f == .f64,
+        else => false,
+    };
+}
+
+/// Whether `ty` is a binary128 (`f128`). On lp64d an f128 is 16 bytes wide (2xXLEN) and wider than
+/// ABI_FLEN, so it is never held in one register: it is passed and returned by the INTEGER convention
+/// in a pair of a-registers (low half in the lower-numbered register), and modeled here as a
+/// memory-resident value (register class 4, empty pool) that always lives in a 16-byte stack slot and
+/// materializes into the a-register pair only at ABI boundaries. Every f128 arithmetic, compare, and
+/// conversion is rewritten to a soft-fp libcall before isel by the shared `softfp` pass (see
+/// `ir.softfp.lower`), so only f128 DATA MOVEMENT (a `.fconst128`, a `.load`/`.store`, a param, a
+/// `.call` argument or result, a `.ret`) reaches this backend. NOTE `isFloat` also matches f128, so
+/// every scalar-float site must test `isQuad` FIRST.
+fn isQuad(func: *const Function, ty: ir.types.Type) bool {
+    return switch (func.types.type_kind(ty)) {
+        .float => |f| f == .f128,
         else => false,
     };
 }
@@ -824,6 +847,13 @@ fn storeFloat(allocator: std.mem.Allocator, code: *std.ArrayList(u32), alloc: *c
     }
 }
 
+/// The sp-relative byte offset of f128 value `v`'s LOW 64-bit half in its 16-byte class-4 slot (the
+/// HIGH half sits at `+8`). Every f128 value is spill-resident (its register pool is empty), so it
+/// always has a `quad_spill` entry. A missing one is a codegen bug, not a runtime condition.
+fn quadSlotOff(alloc: *const Allocation, quad_spill_base: u32, v: Value) i12 {
+    return @intCast(quad_spill_base + alloc.quad_spill.get(v).? * 16);
+}
+
 /// Emit one split-boundary action (see `SplitAction`). Class 0 is the integer file (sd/ld to
 /// `spill_base`, `mv` for a re-home). Class 1 is the scalar-float file (fsd|fsw / fld|flw to
 /// `float_spill_base`, `fmv` for a re-home, with the width taken from the value's type). The native
@@ -1234,6 +1264,8 @@ fn typeSize(func: *const Function, ty: ir.types.Type) Error!u32 {
             .f64 => 8,
             // Size only, not lowering: riscv64 has no f16 codegen yet.
             .f16 => 2,
+            // Size only, not lowering: riscv64 has no f128 codegen yet.
+            .f128 => 16,
         },
         .ptr => 8,
         // A blob-typed alloca, sized for its stack slot only (element count times element size,
@@ -1877,7 +1909,7 @@ fn countUses(func: *const Function, v: Value) usize {
 fn usesInInst(func: *const Function, inst: ir.function.Inst, v: Value) usize {
     var c: usize = 0;
     switch (func.opcode(inst)) {
-        .iconst, .fconst, .alloca, .global_addr => {},
+        .iconst, .fconst, .fconst128, .alloca, .global_addr => {},
         .arith => |a| {
             if (a.lhs == v) c += 1;
             if (a.rhs == v) c += 1;
@@ -2015,6 +2047,9 @@ const riscv64_reg_ctx_vpu: Riscv64RegCtx = .{ .vpu = true };
 fn riscv64ClassOf(ctx: *const anyopaque, func: *const Function, v: Value) u16 {
     const rc: *const Riscv64RegCtx = @ptrCast(@alignCast(ctx));
     const ty = func.valueType(v);
+    // f128 is class 4 (a memory-resident value with an empty register pool). Test it BEFORE `isFloat`,
+    // which also matches f128.
+    if (isQuad(func, ty)) return 4;
     if (isVector(func, ty)) return if (rc.vpu) 3 else 2;
     if (isFloat(func, ty)) return 1;
     return 0;
@@ -2025,9 +2060,12 @@ fn riscv64ClassOf(ctx: *const anyopaque, func: *const Function, v: Value) u16 {
 /// `must_have_register` is both conservative and correct. Unused params are the generic hook shape.
 fn riscv64UseKind(ctx: *const anyopaque, func: *const Function, inst: ir.function.Inst, operand: Value) wimmer.UseKind {
     _ = ctx;
-    _ = func;
     _ = inst;
-    _ = operand;
+    // An f128 operand (class 4) has no register to occupy: its class pool is empty, so it is always
+    // read from its 16-byte slot. Forcing `must_have_register` would make the allocator try to place it
+    // in a register the class does not have. It must be `should_have_register` (the shared allocator
+    // then leaves it in its slot, which the f128 isel sites read directly).
+    if (isQuad(func, func.valueType(operand))) return .should_have_register;
     return .must_have_register;
 }
 
@@ -2119,12 +2157,21 @@ pub fn riscv64RegDescription(allocator: std.mem.Allocator, func: *const Function
     const vpu_cs = try allocator.alloc(u16, 0);
     errdefer allocator.free(vpu_cs);
 
-    const classes = try allocator.alloc(wimmer.RegClass, 4);
+    // --- Class 4 (f128): an EMPTY register pool. Every f128 value therefore spills to a 16-byte slot
+    // (a 2xXLEN scalar the lp64d integer convention passes in a GPR pair, not a register). The empty
+    // pool makes `tryAllocateFreeReg`/`allocateBlockedReg` fall straight to a clean spill. ---
+    const quad_alloc = try allocator.alloc(u16, 0);
+    errdefer allocator.free(quad_alloc);
+    const quad_cs = try allocator.alloc(u16, 0);
+    errdefer allocator.free(quad_cs);
+
+    const classes = try allocator.alloc(wimmer.RegClass, 5);
     errdefer allocator.free(classes);
     classes[0] = .{ .name = "int", .allocatable = int_alloc, .callee_saved = int_cs, .slot_bytes = 8 };
     classes[1] = .{ .name = "float", .allocatable = float_alloc, .callee_saved = float_cs, .slot_bytes = 8 };
     classes[2] = .{ .name = "vector", .allocatable = vec_alloc, .callee_saved = vec_cs, .slot_bytes = 16 };
     classes[3] = .{ .name = "vpu_vector", .allocatable = vpu_alloc, .callee_saved = vpu_cs, .slot_bytes = 32 };
+    classes[4] = .{ .name = "quad", .allocatable = quad_alloc, .callee_saved = quad_cs, .slot_bytes = 16 };
 
     // --- Entry params: the first 8 int params pin a0..a7 (x10..x17), the first 8 float params pin
     // fa0..fa7 (f10..f17). A vector entry param has no ABI register (riscv64 rejects it downstream),
@@ -2138,6 +2185,15 @@ pub fn riscv64RegDescription(allocator: std.mem.Allocator, func: *const Function
         for (func.blockParams(@enumFromInt(0))) |p| {
             const ty = func.valueType(p);
             if (isVector(func, ty)) continue; // no ABI vector register, not pre-colored
+            // An f128 param arrives in an INTEGER a-register PAIR (2xXLEN), not one register and not an
+            // FP register, so it is not pre-colored (class 4 has no register). It still consumes two
+            // integer arg registers, so advance `int_idx` by two to keep a following int param's ABI
+            // register correct. Test before `isFloat`, which also matches f128.
+            if (isQuad(func, ty)) {
+                if (int_idx & 1 != 0) int_idx += 1; // lp64d: a 2xXLEN arg uses an even-aligned register pair
+                int_idx += 2;
+                continue;
+            }
             if (isFloat(func, ty)) {
                 // In vpu mode fa6/fa7 (f16/f17) sit inside the VPU vector partition (class 3), so
                 // pinning a 7th/8th float param there as a class-1 hint could land a scalar-float
@@ -2217,11 +2273,15 @@ pub fn riscv64RegDescription(allocator: std.mem.Allocator, func: *const Function
         else
             try allocator.alloc(u16, 0);
         errdefer allocator.free(vpu_clob);
-        const clob = try allocator.alloc(wimmer.ClassRegs, 4);
+        // Class 4 (f128): no register exists, so a call clobbers none. An empty set.
+        const quad_clob = try allocator.alloc(u16, 0);
+        errdefer allocator.free(quad_clob);
+        const clob = try allocator.alloc(wimmer.ClassRegs, 5);
         clob[0] = .{ .class = 0, .regs = int_clob };
         clob[1] = .{ .class = 1, .regs = float_clob };
         clob[2] = .{ .class = 2, .regs = vec_clob };
         clob[3] = .{ .class = 3, .regs = vpu_clob };
+        clob[4] = .{ .class = 4, .regs = quad_clob };
         call_sites[i] = .{ .pos = cpos, .clobbered = clob };
         built = i + 1;
     }
@@ -2229,12 +2289,16 @@ pub fn riscv64RegDescription(allocator: std.mem.Allocator, func: *const Function
     // --- Scratch, indexed by class: the reserved registers the backend already keeps out of every
     // pool for parallel-move cycle breaking / spill reload. Int x6, float f31 (f8 in vpu, where f31
     // sits inside the VPU partition), RVV v31, VPU f31 (reserved partition headroom). ---
-    const scratch = try allocator.alloc(u16, 4);
+    const scratch = try allocator.alloc(u16, 5);
     errdefer allocator.free(scratch);
     scratch[0] = @intFromEnum(spill_scratch0);
     scratch[1] = if (vpu) @intFromEnum(float_spill_scratch0_vpu) else @intFromEnum(float_scratch);
     scratch[2] = @intFromEnum(vector_scratch);
     scratch[3] = @intFromEnum(float_scratch);
+    // Class 4 (f128) never realizes a register move (it lives only in a slot, and the f128 isel sites
+    // move it half-by-half through the int scratch), so this class scratch is never read. Any index in
+    // range is fine; reuse the int spill scratch.
+    scratch[4] = @intFromEnum(spill_scratch0);
 
     return .{
         .classes = classes,
@@ -2262,6 +2326,7 @@ pub fn riscv64RegDescription(allocator: std.mem.Allocator, func: *const Function
 /// vector (the last two selected by `vpu`). Mirrors `riscv64ClassOf` without the type-erased ctx.
 fn wimmerClassOf(func: *const Function, v: Value, vpu: bool) u16 {
     const ty = func.valueType(v);
+    if (isQuad(func, ty)) return 4; // f128: memory-resident class, empty pool (test before isFloat)
     if (isVector(func, ty)) return if (vpu) 3 else 2;
     if (isFloat(func, ty)) return 1;
     return 0;
@@ -2432,13 +2497,15 @@ fn translateAllocation(allocator: std.mem.Allocator, func: *const Function, vpu:
     };
     errdefer alloc.deinit(allocator);
 
-    std.debug.assert(walloc.slot_count_per_class.len == 4);
+    std.debug.assert(walloc.slot_count_per_class.len == 5);
     alloc.spill_count = walloc.slot_count_per_class[0];
     alloc.float_spill_count = walloc.slot_count_per_class[1];
     // Class 2 (RVV vector) 16-byte slots and class 3 (et-soc VPU vector) 32-byte slots. Exactly one of
     // the two is ever non-zero (RVV xor VPU, per the per-function `vpu` mode).
     alloc.vector_spill_count = walloc.slot_count_per_class[2];
     alloc.vpu_vector_spill_count = walloc.slot_count_per_class[3];
+    // Class 4 (f128) 16-byte slots. Every f128 value spills (empty pool), so this counts all of them.
+    alloc.quad_spill_count = walloc.slot_count_per_class[4];
 
     // def_pos in the same single-step numbering the shared allocator and `emitFromAllocation` use
     // (block-param row, one position per instruction, one terminator slot, over every block). Every
@@ -2476,6 +2543,13 @@ fn translateAllocation(allocator: std.mem.Allocator, func: *const Function, vpu:
         for (func.blockParams(@enumFromInt(0))) |p| {
             const ty = func.valueType(p);
             if (isVector(func, ty)) return error.Unsupported; // no ABI vector register (riscv64 rejects it too)
+            // An f128 param takes an integer a-register PAIR (2xXLEN), so it consumes two int slots of
+            // the ABI counter. Test before `isFloat` (which also matches f128).
+            if (isQuad(func, ty)) {
+                if (int_idx & 1 != 0) int_idx += 1; // lp64d: a 2xXLEN arg uses an even-aligned register pair
+                int_idx += 2;
+                continue;
+            }
             if (isFloat(func, ty)) {
                 // Match the entry-param pin in `riscv64RegDescription`: in vpu mode fa6/fa7 (f16/f17)
                 // lie in the VPU vector partition, so a 7th/8th float param there would alias a class-3
@@ -2502,7 +2576,16 @@ fn translateAllocation(allocator: std.mem.Allocator, func: *const Function, vpu:
         // (mirrors the native path's `isVpuWidth` gate).
         if (class == 3 and !isVpuWidth(func, func.valueType(value))) return error.Unsupported;
 
-        if (class == 0) {
+        if (class == 4) {
+            // class 4: f128. Its pool is empty, so the shared allocator always leaves it whole-life in a
+            // 16-byte slot (one segment, a `.slot`). A register or split placement is impossible for an
+            // empty-pool class, so reject it defensively rather than mis-emit.
+            if (wsegs.len != 1) return error.Unsupported;
+            switch (wsegs[0].loc) {
+                .slot => |s| try alloc.quad_spill.put(allocator, value, s),
+                .reg => return error.Unsupported,
+            }
+        } else if (class == 0) {
             if (wsegs.len == 1) {
                 switch (wsegs[0].loc) {
                     .reg => |ri| {
@@ -2615,7 +2698,9 @@ fn translateAllocation(allocator: std.mem.Allocator, func: *const Function, vpu:
             1 => try transitionFloatAction(wa.value, floatLocFromWimmer(wa.src), floatLocFromWimmer(wa.dst), at),
             2 => try transitionVectorAction(wa.value, vectorLocFromWimmer(wa.src), vectorLocFromWimmer(wa.dst), at),
             3 => try transitionVpuAction(wa.value, vpuLocFromWimmer(wa.src), vpuLocFromWimmer(wa.dst), at),
-            else => unreachable,
+            // Class 4 (f128) is always slot-resident, so the allocator never re-homes it (no register
+            // transition). A class-4 action would mean an unexpected split, so reject it defensively.
+            else => return error.Unsupported,
         };
         try alloc.actions.append(allocator, act);
     }
@@ -2638,6 +2723,10 @@ fn translateAllocation(allocator: std.mem.Allocator, func: *const Function, vpu:
         errdefer allocator.free(moves);
         for (wem.moves, 0..) |wm, i| {
             if (wm.class == 1 and (wm.src == .slot or wm.dst == .slot)) return error.Unsupported;
+            // A class-4 (f128) edge move would be a 16-byte block-param shuffle (an f128 block param on
+            // a control-flow edge). `emitOneEdgeMove` has no class-4 arm, so reject it rather than mis-
+            // emit. softfp never produces an f128 block param, so this is defensive.
+            if (wm.class == 4) return error.Unsupported;
             moves[i] = .{ .class = @intCast(wm.class), .src = edgeLocFromWimmer(wm.src), .dst = edgeLocFromWimmer(wm.dst) };
         }
         try edge_sets.append(allocator, .{ .pred = wem.pred, .succ = wem.succ, .moves = moves });
@@ -2656,6 +2745,13 @@ fn translateAllocation(allocator: std.mem.Allocator, func: *const Function, vpu:
         var int_idx: usize = 0;
         for (func.blockParams(@enumFromInt(0))) |p| {
             const ty = func.valueType(p);
+            // An f128 param takes an integer a-register PAIR, so advance the counter by two. Test before
+            // the `isFloat` skip below (which also matches f128).
+            if (isQuad(func, ty)) {
+                if (int_idx & 1 != 0) int_idx += 1; // lp64d: a 2xXLEN arg uses an even-aligned register pair
+                int_idx += 2;
+                continue;
+            }
             if (isVector(func, ty) or isFloat(func, ty)) continue;
             if (int_idx >= 8) {
                 if (!alloc.int.contains(p)) return error.Unsupported; // slot/split 9th+ param unmodeled
@@ -2798,6 +2894,12 @@ pub fn compileFunctionWimmerRiscv(allocator: std.mem.Allocator, func: *Function,
     // Only scalar f16 is handled (mirrors `compileFunction`'s own composite-f16 gate). f16 nested in a
     // vector/aggregate would fall through to the raw-vector path and miscompile the half lanes.
     if (ir.function.functionUsesCompositeF16(func)) return error.Unsupported;
+    // Lower binary128 arithmetic, compares, conversions, and sqrt to soft-fp libcalls before any
+    // numbering or edge splitting, so the call clobbers and the f128 argument placement are visible to
+    // the allocator. f128 DATA MOVEMENT (const, load, store, param, call arg/result, ret) stays native
+    // GPR-pair traffic and is emitted below, untouched by this pass. This entry mutates `func` in place
+    // (like its critical-edge split below), so a differential caller keeps a separate reference.
+    _ = try ir.softfp.lower(allocator, func);
     // Software f16 (no Zfh, this entry has no model capability input, so it is always the software
     // emulation path, exactly like `compileFunction`'s default `.{}` caps). The convert routines need
     // x28..x31 as dedicated scratch, so this shrinks class 0's pool the same way `compileFunction` does
@@ -2858,6 +2960,10 @@ pub fn compileFunctionWimmerRiscv(allocator: std.mem.Allocator, func: *Function,
 pub fn compileFunctionWimmerRiscvFold(allocator: std.mem.Allocator, func: *Function, vpu: bool) Error!Compiled {
     if (func.blockCount() == 0) return error.Unsupported;
     if (ir.function.functionUsesCompositeF16(func)) return error.Unsupported;
+    // Lower binary128 arithmetic, compares, conversions, and sqrt to soft-fp libcalls before any
+    // numbering, exactly as `compileFunctionWimmerRiscv` does. f128 data movement stays native
+    // GPR-pair traffic. This entry mutates `func` in place (like its critical-edge split below).
+    _ = try ir.softfp.lower(allocator, func);
     const uses_f16 = ir.function.functionUsesF16(func);
 
     // Split edges first (mutating `func`), matching `compileFunctionWimmerRiscv` (both passes).
@@ -3183,6 +3289,7 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
     // integer pool, byte-identical to before f16 support.
     const uses_f16 = ir.function.functionUsesF16(func);
     const reserve_f16_scratch = uses_f16 and !caps.zfh;
+    // No f128 codegen: riscv64 has no 128-bit float instruction.
     // Only scalar f16 is handled. f16 nested in a vector/aggregate would fall through to the
     // raw-vector path and miscompile the half lanes, so reject that composite case cleanly.
     if (ir.function.functionUsesCompositeF16(func)) return error.Unsupported;
@@ -3203,6 +3310,13 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
     // `*const` signature unchanged.
     var work = try func.clone(allocator);
     defer work.deinit();
+
+    // Lower binary128 arithmetic, compares, conversions, and sqrt to soft-fp libcalls on the clone,
+    // before any numbering or edge splitting, so the call clobbers and the f128 GPR-pair argument
+    // placement are visible to the allocator. f128 data movement stays native and is emitted below.
+    // `rebindSymbolName` re-points the soft-fp reloc names (added to the clone, whose storage frees on
+    // return) to `ir.softfp.staticName`'s static literals.
+    _ = try ir.softfp.lower(allocator, &work);
 
     // Split edges first, before any numbering is built. Two passes, exactly as the differential entries
     // do: `ir.critical_edge` splits every genuinely critical edge (giving the resolver a block for its
@@ -3272,14 +3386,17 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
 
 /// The `func`-owned symbol string equal to `name`. Every emitted relocation names a callee or global
 /// the function interned (a `call`/`global_addr`'s `symbol` indexes `func`'s symbol table), so a match
-/// always exists. A miss would be a codegen bug, not a runtime condition.
+/// normally exists there. A soft-fp libcall symbol (`__addtf3`, ...) is added to the CLONE by
+/// `softfp.lower`, not the caller's `func`, so it has no match here: it is one of the pass's static
+/// string literals, which outlive every `Compiled`, so fall back to that literal. Any other miss is a
+/// codegen bug, not a runtime condition.
 fn rebindSymbolName(func: *const Function, name: []const u8) []const u8 {
     var i: u32 = 0;
     while (i < func.symbolCount()) : (i += 1) {
         const s = func.symbolName(i);
         if (std.mem.eql(u8, s, name)) return s;
     }
-    unreachable;
+    return ir.softfp.staticName(name) orelse unreachable;
 }
 
 /// Emit machine code from a finished `Allocation` (the second half of `compileFunction`, split out
@@ -3487,6 +3604,13 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
     frame = alignUp(frame, 8);
     const float_spill_base: u32 = frame;
     frame += alloc.float_spill_count * 8;
+    // f128 (class 4) spill slots: one 16-byte slot per f128 value, 16-aligned. An f128 has an empty
+    // register pool, so every f128 value is spill-resident and gets a slot here. The low 64 bits sit at
+    // `+0`, the high 64 at `+8`. `alloc.quad_spill_count` is 0 for any function with no f128 value, so
+    // this reserves nothing (and adds no alignment padding) there: byte-identical to before f128.
+    frame = alignUp(frame, 16);
+    const quad_spill_base: u32 = frame;
+    frame += alloc.quad_spill_count * 16;
     // Vector spill slots: one 16-byte (a <4 x f32>) slot per spilled vector, 16-aligned.
     frame = alignUp(frame, 16);
     const vspill_base: u32 = frame;
@@ -3590,6 +3714,21 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
         var ia: usize = 0;
         var fa: usize = 0;
         for (func.blockParams(@enumFromInt(0))) |p| {
+            if (isQuad(func, func.valueType(p))) {
+                // An f128 param arrives in an integer a-register PAIR (2xXLEN): the low 64 bits in
+                // argReg(ia), the high 64 in argReg(ia+1). Store both into the param's 16-byte class-4
+                // slot, then advance the integer ABI counter by two. The one-register split (ia == 7:
+                // low in a7, high on the incoming stack) and the all-stack case (ia >= 8) are not
+                // modeled, so fail closed rather than read a nonexistent a-register.
+                if (ia & 1 != 0) ia += 1; // lp64d: a 2xXLEN arg uses an even-aligned register pair
+                if (ia + 1 >= 8) return error.Unsupported;
+                const off_lo = quadSlotOff(alloc, quad_spill_base, p);
+                const off_hi: i12 = @intCast(@as(i32, off_lo) + 8);
+                try code.append(allocator, encode.sd(argReg(ia), .x2, off_lo));
+                try code.append(allocator, encode.sd(argReg(ia + 1), .x2, off_hi));
+                ia += 2;
+                continue;
+            }
             if (isFloat(func, func.valueType(p))) {
                 const arg = fargReg(fa);
                 const d64 = is64Float(func, func.valueType(p));
@@ -3903,6 +4042,11 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                             try storeVector(allocator, &code, alloc, vspill_base, result, inst_pos, rd, spill_scratch1);
                         }
                     } else if (isFloat(func, func.valueType(a.lhs))) {
+                        // f128 arithmetic has no riscv64 instruction: the softfp pass rewrites it to a
+                        // libcall (`__addtf3`, ...) before isel, so a real f128 arith never reaches this
+                        // scalar-float path. Reject defensively rather than emit a wrong-width `_s` op if
+                        // the pass was skipped.
+                        if (isQuad(func, func.valueType(a.lhs))) return error.Unsupported;
                         // Fused multiply-add/sub, the add/sub side: when the immediately-
                         // preceding instruction is a single-use float mul that is exactly one
                         // of this add/sub's operands (the same predicate the mul case above used
@@ -4156,6 +4300,20 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     try code.append(allocator, encode.fmv_w_x(fr, scratch_reg));
                     try storeFloat(allocator, &code, alloc, float_spill_base, result, inst_pos, false, fr);
                 },
+                .fconst128 => |val| {
+                    // A binary128 constant is 16 bytes: materialize each 64-bit half in the int scratch
+                    // and store both into the result's 16-byte class-4 slot (low half at `+0`, high at
+                    // `+8`). The f128 stays memory-resident, so no register move follows.
+                    const result = func.instResult(inst).?;
+                    const off_lo = quadSlotOff(alloc, quad_spill_base, result);
+                    const off_hi: i12 = @intCast(@as(i32, off_lo) + 8);
+                    const lo: u64 = @truncate(val);
+                    const hi: u64 = @truncate(val >> 64);
+                    try loadImm64(allocator, &code, scratch_reg, lo);
+                    try code.append(allocator, encode.sd(scratch_reg, .x2, off_lo));
+                    try loadImm64(allocator, &code, scratch_reg, hi);
+                    try code.append(allocator, encode.sd(scratch_reg, .x2, off_hi));
+                },
                 .alloca => {
                     // The slot address is `sp + offset` into the frame.
                     const result = func.instResult(inst).?;
@@ -4231,6 +4389,10 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     const result = func.instResult(inst).?;
                     const src_ty = func.valueType(cv.value);
                     const dst_ty = func.valueType(result);
+                    // Any conversion touching f128 has no riscv64 form: the softfp pass rewrites it to an
+                    // `__extend*`/`__trunc*`/`__float*`/`__fix*` libcall before isel, so a real f128
+                    // convert never reaches here. Reject defensively rather than emit a wrong `fcvt`.
+                    if (isQuad(func, src_ty) or isQuad(func, dst_ty)) return error.Unsupported;
                     const src_float = isFloat(func, src_ty);
                     const dst_float = isFloat(func, dst_ty);
                     const src_half = isHalf(func, src_ty);
@@ -4386,6 +4548,19 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                             try code.append(allocator, encode.fmv_w_x(rd, spill_scratch1));
                         }
                         try storeFloat(allocator, &code, alloc, float_spill_base, result, inst_pos, false, rd);
+                    } else if (isQuad(func, func.valueType(result))) {
+                        // A 16-byte f128 load: copy both 64-bit halves from `disp(base)`/`disp+8(base)`
+                        // into the result's class-4 slot (low at `+0`, high at `+8`). Test before the
+                        // scalar-float branch (`isFloat` also matches f128). `base` is never the int
+                        // scratch (it is reserved out of the allocatable pool).
+                        if (@as(i32, disp) + 8 > 2047) return error.Unsupported; // folded disp too large for the high half
+                        const off_lo = quadSlotOff(alloc, quad_spill_base, result);
+                        const off_hi: i12 = @intCast(@as(i32, off_lo) + 8);
+                        const disp_hi: i12 = @intCast(@as(i32, disp) + 8);
+                        try code.append(allocator, encode.ld(scratch_reg, base, disp));
+                        try code.append(allocator, encode.sd(scratch_reg, .x2, off_lo));
+                        try code.append(allocator, encode.ld(scratch_reg, base, disp_hi));
+                        try code.append(allocator, encode.sd(scratch_reg, .x2, off_hi));
                     } else if (isFloat(func, func.valueType(result))) {
                         const d = is64Float(func, func.valueType(result));
                         const rd = dstFloat(alloc, result, inst_pos, fspill0);
@@ -4441,6 +4616,18 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                             try emitFloatToHalf(allocator, &code, spill_scratch1, scratch_reg, fspill0, fspill1);
                             try code.append(allocator, encode.sh(spill_scratch1, base, disp));
                         }
+                    } else if (isQuad(func, func.valueType(st.value))) {
+                        // A 16-byte f128 store: copy both 64-bit halves from the value's class-4 slot to
+                        // `disp(base)`/`disp+8(base)`. Test before the scalar-float branch (`isFloat`
+                        // also matches f128). `base` is never the int scratch.
+                        if (@as(i32, disp) + 8 > 2047) return error.Unsupported; // folded disp too large for the high half
+                        const off_lo = quadSlotOff(alloc, quad_spill_base, st.value);
+                        const off_hi: i12 = @intCast(@as(i32, off_lo) + 8);
+                        const disp_hi: i12 = @intCast(@as(i32, disp) + 8);
+                        try code.append(allocator, encode.ld(scratch_reg, .x2, off_lo));
+                        try code.append(allocator, encode.sd(scratch_reg, base, disp));
+                        try code.append(allocator, encode.ld(scratch_reg, .x2, off_hi));
+                        try code.append(allocator, encode.sd(scratch_reg, base, disp_hi));
                     } else if (isFloat(func, func.valueType(st.value))) {
                         const d = is64Float(func, func.valueType(st.value));
                         const vr = try reloadFloat(allocator, &code, alloc, float_spill_base, st.value, inst_pos, d, fspill0);
@@ -4489,6 +4676,10 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     // predicate and emits the native compare-and-branch on these operands,
                     // so the comparison is emitted exactly once.
                 } else if (isFloat(func, func.valueType(cmp.lhs))) {
+                    // f128 has no `feq`/`flt`/`fle`: the softfp pass rewrites an f128 compare to a
+                    // `__*tf2` libcall plus an integer compare-against-zero before isel, so a real f128
+                    // compare never reaches here. Reject defensively rather than emit a wrong `_s` op.
+                    if (isQuad(func, func.valueType(cmp.lhs))) return error.Unsupported;
                     // Float comparison: float operands, integer (bool) result.
                     const rd = switch (intLocationAt(alloc, func.instResult(inst).?, inst_pos)) {
                         .reg => |r| r,
@@ -4645,6 +4836,23 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     var int_i: usize = 0;
                     var float_i: usize = 0;
                     for (func.valueList(c.args), 0..) |arg, arg_idx| {
+                        if (isQuad(func, func.valueType(arg))) {
+                            // An f128 argument goes by the INTEGER convention in an a-register PAIR: low
+                            // half in argReg(int_i), high in argReg(int_i+1). Queue both half-loads into
+                            // `int_spilled`, which drains AFTER `parallelMoveInt`, so loading the pair
+                            // cannot clobber a not-yet-read source of the integer permutation. Consuming
+                            // two integer arg registers shifts every following integer arg by two. The
+                            // split (int_i == 7) and all-stack (int_i >= 8) cases are not modeled: fail
+                            // closed. Test before the float arms (`isFloat` also matches f128).
+                            if (int_i & 1 != 0) int_i += 1; // lp64d: a 2xXLEN arg uses an even-aligned register pair
+                            if (int_i + 1 >= 8) return error.Unsupported;
+                            const off_lo = quadSlotOff(alloc, quad_spill_base, arg);
+                            const off_hi: i12 = @intCast(@as(i32, off_lo) + 8);
+                            try int_spilled.append(allocator, .{ .dst = argReg(int_i), .off = off_lo });
+                            try int_spilled.append(allocator, .{ .dst = argReg(int_i + 1), .off = off_hi });
+                            int_i += 2;
+                            continue;
+                        }
                         const anonymous = c.is_variadic and arg_idx >= c.num_fixed;
                         if (isFloat(func, func.valueType(arg)) and anonymous) {
                             // Anonymous float/double -> next integer a-register (lp64d). Overflow to
@@ -4706,7 +4914,14 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
 
                     // A result returns in a0 / fa0. Route it to its register or slot.
                     if (func.instResult(inst)) |result| {
-                        if (isFloat(func, func.valueType(result))) {
+                        if (isQuad(func, func.valueType(result))) {
+                            // An f128 result returns in the a0:a1 pair (low in a0, high in a1). Store
+                            // both into the result's class-4 slot. Test before the scalar-float arm.
+                            const off_lo = quadSlotOff(alloc, quad_spill_base, result);
+                            const off_hi: i12 = @intCast(@as(i32, off_lo) + 8);
+                            try code.append(allocator, encode.sd(.x10, .x2, off_lo));
+                            try code.append(allocator, encode.sd(.x11, .x2, off_hi));
+                        } else if (isFloat(func, func.valueType(result))) {
                             const d = is64Float(func, func.valueType(result));
                             if (alloc.float.get(result)) |rd| {
                                 if (rd != .f10) try code.append(allocator, if (d) encode.fmv_d(rd, .f10) else encode.fmv_s(rd, .f10));
@@ -5390,6 +5605,21 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     var int_i: usize = 0;
                     var float_i: usize = 0;
                     for (func.valueList(cl.args)) |arg| {
+                        if (isQuad(func, func.valueType(arg))) {
+                            // An f128 argument goes by the INTEGER convention in an a-register PAIR (low
+                            // half in argReg(int_i), high in argReg(int_i+1)). Queue both half-loads into
+                            // `int_spilled` (drained after `parallelMoveInt`), consuming two integer arg
+                            // registers. The split/all-stack cases are not modeled: fail closed. Test
+                            // before the float arm (`isFloat` also matches f128).
+                            if (int_i & 1 != 0) int_i += 1; // lp64d: a 2xXLEN arg uses an even-aligned register pair
+                            if (int_i + 1 >= 8) return error.Unsupported;
+                            const off_lo = quadSlotOff(alloc, quad_spill_base, arg);
+                            const off_hi: i12 = @intCast(@as(i32, off_lo) + 8);
+                            try int_spilled.append(allocator, .{ .dst = argReg(int_i), .off = off_lo });
+                            try int_spilled.append(allocator, .{ .dst = argReg(int_i + 1), .off = off_hi });
+                            int_i += 2;
+                            continue;
+                        }
                         if (isFloat(func, func.valueType(arg))) {
                             if (float_i >= 8) return error.Unsupported;
                             const d = is64Float(func, func.valueType(arg));
@@ -5431,7 +5661,13 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     // A result returns in a0 / fa0. Route it to its register or slot (identical
                     // to the direct `.call` case's own result routing).
                     if (func.instResult(inst)) |result| {
-                        if (isFloat(func, func.valueType(result))) {
+                        if (isQuad(func, func.valueType(result))) {
+                            // An f128 result returns in the a0:a1 pair. Store both into its class-4 slot.
+                            const off_lo = quadSlotOff(alloc, quad_spill_base, result);
+                            const off_hi: i12 = @intCast(@as(i32, off_lo) + 8);
+                            try code.append(allocator, encode.sd(.x10, .x2, off_lo));
+                            try code.append(allocator, encode.sd(.x11, .x2, off_hi));
+                        } else if (isFloat(func, func.valueType(result))) {
                             const d = is64Float(func, func.valueType(result));
                             if (alloc.float.get(result)) |rd| {
                                 if (rd != .f10) try code.append(allocator, if (d) encode.fmv_d(rd, .f10) else encode.fmv_s(rd, .f10));
@@ -5518,7 +5754,15 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                         0 => {},
                         1 => {
                             const v = ret_vals.values[0];
-                            if (isFloat(func, func.valueType(v))) {
+                            if (isQuad(func, func.valueType(v))) {
+                                // An f128 return goes in the a0:a1 pair (low in a0, high in a1): load
+                                // both halves from the value's class-4 slot. Test before the scalar-float
+                                // arm (`isFloat` also matches f128).
+                                const off_lo = quadSlotOff(alloc, quad_spill_base, v);
+                                const off_hi: i12 = @intCast(@as(i32, off_lo) + 8);
+                                try code.append(allocator, encode.ld(.x10, .x2, off_lo));
+                                try code.append(allocator, encode.ld(.x11, .x2, off_hi));
+                            } else if (isFloat(func, func.valueType(v))) {
                                 // fmv fa0, freg  (skipped when already in fa0). A spilled return value
                                 // reloads from its slot into the scratch first.
                                 const d = is64Float(func, func.valueType(v));

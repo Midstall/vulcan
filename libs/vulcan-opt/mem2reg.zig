@@ -503,7 +503,7 @@ fn markEscapes(func: *const Function, promotable: []bool) void {
                 esc(promotable, st.value);
                 if (st.@"volatile") esc(promotable, st.ptr);
             },
-            .alloca, .iconst, .fconst, .global_addr => {},
+            .alloca, .iconst, .fconst, .fconst128, .global_addr => {},
             .arith => |a| {
                 esc(promotable, a.lhs);
                 esc(promotable, a.rhs);

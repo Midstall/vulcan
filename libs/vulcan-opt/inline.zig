@@ -190,7 +190,7 @@ fn mapOpcode(caller: *Function, callee: *const Function, vmap: std.AutoHashMapUn
         }
     }.v;
     return switch (op) {
-        .iconst, .fconst => op,
+        .iconst, .fconst, .fconst128 => op,
         .arith => |a| .{ .arith = .{ .op = a.op, .lhs = m(vmap, a.lhs), .rhs = m(vmap, a.rhs) } },
         .arith_imm => |a| .{ .arith_imm = .{ .op = a.op, .lhs = m(vmap, a.lhs), .imm = a.imm } },
         .icmp => |c| .{ .icmp = .{ .op = c.op, .lhs = m(vmap, c.lhs), .rhs = m(vmap, c.rhs) } },
@@ -222,7 +222,7 @@ fn substituteValue(func: *Function, from: Value, to: Value) void {
     for (0..func.instCount()) |i| {
         const op = func.opcodeMut(@enumFromInt(i));
         switch (op.*) {
-            .iconst, .fconst, .alloca, .global_addr => {},
+            .iconst, .fconst, .fconst128, .alloca, .global_addr => {},
             .arith => |*a| {
                 a.lhs = r(from, to, a.lhs);
                 a.rhs = r(from, to, a.rhs);

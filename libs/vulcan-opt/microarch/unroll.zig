@@ -82,6 +82,7 @@ pub fn cloneBlocks(
             const rebuilt: Opcode = switch (op) {
                 .iconst => |v| .{ .iconst = v },
                 .fconst => |v| .{ .fconst = v },
+                .fconst128 => |v| .{ .fconst128 = v },
                 .arith => |a| .{ .arith = .{
                     .op = a.op,
                     .lhs = remapValue(value_map, a.lhs),
@@ -351,7 +352,7 @@ fn eligible(
                 if (idx != h_insts.len - 1) return null; // the `if` must end the block
                 if_inst = inst;
             },
-            .iconst, .fconst, .arith, .arith_imm, .icmp, .select, .convert, .unary, .extract, .struct_new, .dot => {},
+            .iconst, .fconst, .fconst128, .arith, .arith_imm, .icmp, .select, .convert, .unary, .extract, .struct_new, .dot => {},
             // load/store/call/call_indirect/alloca/global_addr are impure or memory ops.
             else => return null,
         }
@@ -662,7 +663,7 @@ fn collectOperands(
 ) Error!void {
     for (func.blockInsts(block)) |inst| {
         switch (func.opcode(inst)) {
-            .iconst, .fconst, .alloca, .global_addr => {},
+            .iconst, .fconst, .fconst128, .alloca, .global_addr => {},
             .arith => |x| {
                 try set.put(a, x.lhs, {});
                 try set.put(a, x.rhs, {});
@@ -729,7 +730,7 @@ fn replaceInBlock(func: *Function, block: Block, from: Value, to: Value) void {
     for (func.blockInsts(block)) |inst| {
         const op = func.opcodeMut(inst);
         switch (op.*) {
-            .iconst, .fconst, .alloca, .global_addr => {},
+            .iconst, .fconst, .fconst128, .alloca, .global_addr => {},
             .arith => |*x| {
                 x.lhs = rep(from, to, x.lhs);
                 x.rhs = rep(from, to, x.rhs);

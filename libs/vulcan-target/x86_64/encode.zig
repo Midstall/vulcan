@@ -156,6 +156,27 @@ pub fn divps(dst: Xmm, src: Xmm) Inst {
 pub fn movupsRR(dst: Xmm, src: Xmm) Inst {
     return ssePacked(0x10, dst, src);
 }
+/// A two-xmm packed op with the mandatory `66` operand-size prefix (`66 [REX] 0F op modrm`).
+/// This covers the 128-bit integer-domain SSE2 forms, such as `punpcklqdq`. The `66` sits
+/// first; a REX byte, when a register index is 8 or higher, follows it, per the x86 prefix
+/// order.
+fn sse66Packed(op: u8, dst: Xmm, src: Xmm) Inst {
+    const r = xn(dst);
+    const b = xn(src);
+    const mod: u8 = 0xC0 | ((r & 7) << 3) | (b & 7);
+    if (r >= 8 or b >= 8) {
+        const rex: u8 = 0x40 | (@as(u8, @intFromBool(r >= 8)) << 2) | @intFromBool(b >= 8);
+        return Inst.of(&.{ 0x66, rex, 0x0F, op, mod });
+    }
+    return Inst.of(&.{ 0x66, 0x0F, op, mod });
+}
+/// `punpcklqdq dst, src` (66 0F 6C /r): interleave the low quadwords, so `dst[63:0]` stays
+/// and `dst[127:64]` becomes `src[63:0]`. It builds a 128-bit value from two 64-bit halves
+/// (low half already in dst's low lane, high half in src's low lane), the SSE2 way to
+/// assemble a binary128 constant without SSE4.1's `pinsrq`.
+pub fn punpcklqdq(dst: Xmm, src: Xmm) Inst {
+    return sse66Packed(0x6C, dst, src);
+}
 /// Packed bitwise `andps`/`andnps`/`orps dst, src` (0F 54/55/56 /r). andnps computes
 /// `dst = (NOT dst) AND src`. All three are SSE1, so every x86-64 CPU has them.
 pub fn andps(dst: Xmm, src: Xmm) Inst {
@@ -1269,6 +1290,8 @@ test "known SSE encodings" {
     try std.testing.expectEqualSlices(u8, &.{ 0xF2, 0x0F, 0x2A, 0xC0 }, cvtsi2sd(.xmm0, .rax).slice()); // cvtsi2sd xmm0, eax
     try std.testing.expectEqualSlices(u8, &.{ 0xF2, 0x0F, 0x2C, 0xC0 }, cvttsd2si(.rax, .xmm0).slice()); // cvttsd2si eax, xmm0
     try std.testing.expectEqualSlices(u8, &.{ 0x66, 0x48, 0x0F, 0x6E, 0xC0 }, movqToXmm(.xmm0, .rax).slice()); // movq xmm0, rax
+    try std.testing.expectEqualSlices(u8, &.{ 0x66, 0x0F, 0x6C, 0xC1 }, punpcklqdq(.xmm0, .xmm1).slice()); // punpcklqdq xmm0, xmm1
+    try std.testing.expectEqualSlices(u8, &.{ 0x66, 0x45, 0x0F, 0x6C, 0xC1 }, punpcklqdq(.xmm8, .xmm9).slice()); // REX.RB for xmm8/xmm9
     try std.testing.expectEqualSlices(u8, &.{ 0x48, 0xB8, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11 }, movImm64(.rax, 0x1122334455667788).slice()); // movabs rax, imm64
     try std.testing.expectEqualSlices(u8, &.{ 0xF3, 0x0F, 0x10, 0x84, 0x24, 0x10, 0x00, 0x00, 0x00 }, movssLoad(.xmm0, 0x10).slice()); // movss xmm0, [rsp+16]
     try std.testing.expectEqualSlices(u8, &.{ 0x0F, 0x11, 0x8C, 0x24, 0x20, 0x00, 0x00, 0x00 }, movupsStore(0x20, .xmm1).slice()); // movups [rsp+32], xmm1

@@ -11,6 +11,7 @@ pub const builder = @import("vulcan-ir/builder.zig");
 pub const parser = @import("vulcan-ir/parser.zig");
 pub const verify = @import("vulcan-ir/verify.zig");
 pub const legalize = @import("vulcan-ir/legalize.zig");
+pub const softfp = @import("vulcan-ir/softfp.zig");
 pub const critical_edge = @import("vulcan-ir/critical_edge.zig");
 pub const reachable = @import("vulcan-ir/reachable.zig");
 pub const expand = @import("vulcan-ir/expand.zig");

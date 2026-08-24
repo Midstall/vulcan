@@ -28,7 +28,7 @@ const UnitClass = mm.UnitClass;
 /// Model.
 fn movable(op: ir.function.Opcode) bool {
     return switch (op) {
-        .iconst, .fconst, .arith, .arith_imm, .icmp, .select, .struct_new, .extract, .convert, .unary, .alloca, .global_addr, .dot => true,
+        .iconst, .fconst, .fconst128, .arith, .arith_imm, .icmp, .select, .struct_new, .extract, .convert, .unary, .alloca, .global_addr, .dot => true,
         // matmul writes the `c` memory: a barrier, like store/prefetch, not reordered.
         .load, .store, .prefetch, .matmul, .@"if", .call, .call_indirect => false,
         // SM12 T3: `va_start`/`va_arg`/`va_end` all read/mutate the `va_list` object at
@@ -47,7 +47,7 @@ fn collectOperands(
 ) std.mem.Allocator.Error!void {
     buf.clearRetainingCapacity();
     switch (func.opcode(inst)) {
-        .iconst, .fconst, .alloca, .global_addr => {},
+        .iconst, .fconst, .fconst128, .alloca, .global_addr => {},
         .arith => |a| {
             try buf.append(allocator, a.lhs);
             try buf.append(allocator, a.rhs);
@@ -374,7 +374,7 @@ fn windowTestLatency(op: ir.function.Opcode) u32 {
             .mul, .mulh => 5,
             .div, .rem, .add, .sub, .bit_and, .bit_or, .bit_xor, .shl, .shr => 1,
         },
-        .arith_imm, .iconst, .fconst, .icmp, .select, .struct_new, .extract, .convert, .unary, .alloca, .global_addr, .load, .store, .prefetch, .dot, .matmul, .@"if", .call, .call_indirect, .va_start, .va_arg, .va_end => 1,
+        .arith_imm, .iconst, .fconst, .fconst128, .icmp, .select, .struct_new, .extract, .convert, .unary, .alloca, .global_addr, .load, .store, .prefetch, .dot, .matmul, .@"if", .call, .call_indirect, .va_start, .va_arg, .va_end => 1,
     };
 }
 fn windowTestUnit(op: ir.function.Opcode) UnitClass {

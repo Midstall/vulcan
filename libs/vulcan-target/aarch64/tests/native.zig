@@ -5632,3 +5632,129 @@ test "an unreachable block that uses a reachable value compiles and the reachabl
     // aarch64 (the native runner returns error.SkipZigTest there).
     try expectRun(a, &func, &.{ 5, 3 }, 8);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Binary128 (`_Float128`) DATA MOVEMENT. On AAPCS64 an f128 fills a whole 128-bit v register,
+// passed by value in v0..v7 and returned in v0, exactly the Q-register traffic a SIMD vector
+// uses. So its argument passing, register move, constant, spill/reload, and memory load/store
+// must all move 16 bytes. f128 arithmetic, compares, conversions, and sqrt have no aarch64
+// instruction and lower to soft-fp libcalls before isel, so none appears in these cases: they
+// prove only that the 16-byte value survives every data-movement path intact. The host is
+// aarch64 and Zig's C ABI places an `f128` in a Q register exactly as the backend expects, so
+// the JIT-mapped function is called directly (its own oracle), like the f32/f64 runners above.
+
+/// Compile a binary128 function, JIT-map it, and call it with `qargs` (each an f128 passed by
+/// value in v0..). Returns the full 16-byte result read from v0. Skips off aarch64.
+fn runQuad(allocator: std.mem.Allocator, func: *const Function, qargs: []const f128) !f128 {
+    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+    const code = try isel.selectFunction(allocator, func);
+    defer allocator.free(code);
+    var buf = try jit.CodeBuffer.map(std.mem.sliceAsBytes(code));
+    defer buf.deinit();
+    const ptr = buf.memory.ptr; // page-aligned, satisfies the function-pointer alignment
+    return switch (qargs.len) {
+        0 => @as(*const fn () callconv(.c) f128, @ptrCast(ptr))(),
+        1 => @as(*const fn (f128) callconv(.c) f128, @ptrCast(ptr))(qargs[0]),
+        2 => @as(*const fn (f128, f128) callconv(.c) f128, @ptrCast(ptr))(qargs[0], qargs[1]),
+        else => error.Unsupported,
+    };
+}
+
+/// Assert a binary128 function returns exactly `expected` (all 128 bits, compared as raw bits so
+/// a single dropped or zeroed half is caught).
+fn expectRunQuad(allocator: std.mem.Allocator, func: *const Function, qargs: []const f128, expected: f128) !void {
+    const got = try runQuad(allocator, func, qargs);
+    try std.testing.expectEqual(@as(u128, @bitCast(expected)), @as(u128, @bitCast(got)));
+}
+
+test "native f128: identity carries all 128 bits through v0" {
+    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    // The argument arrives in v0 and returns in v0. A messy value (nonzero in every byte) proves
+    // no half is dropped or zeroed.
+    const v: f128 = 0.1;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const t = try f.types.intern(.{ .float = .f128 });
+    const b = try f.appendBlock();
+    const a = try f.appendBlockParam(b, t);
+    f.setTerminator(b, .{ .ret = ir.function.Ret.one(a) });
+    try expectRunQuad(allocator, &f, &.{v}, v);
+}
+
+test "native f128: return the second argument (v1 -> v0, whole 128-bit move)" {
+    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const v0: f128 = 2.5;
+    const v1: f128 = 0.3;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const t = try f.types.intern(.{ .float = .f128 });
+    const b = try f.appendBlock();
+    _ = try f.appendBlockParam(b, t);
+    const bb = try f.appendBlockParam(b, t);
+    f.setTerminator(b, .{ .ret = ir.function.Ret.one(bb) });
+    try expectRunQuad(allocator, &f, &.{ v0, v1 }, v1);
+}
+
+test "native f128: constant materialized from its two 64-bit halves" {
+    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    // An f128 constant is built with `fmov d, x` (low half, high lane zeroed) then
+    // `ins vd.d[1], x` (high half). A messy value proves both halves reach v0.
+    const c: f128 = 3.141592653589793238462643383279502884;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const t = try f.types.intern(.{ .float = .f128 });
+    const b = try f.appendBlock();
+    const k = try f.appendInst(b, t, .{ .fconst128 = @bitCast(c) });
+    f.setTerminator(b, .{ .ret = ir.function.Ret.one(k) });
+    try expectRunQuad(allocator, &f, &.{}, c);
+}
+
+test "native f128: alloca store then load round-trips all 16 bytes" {
+    if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    // alloca a 16-byte slot, store the argument (strQ), load it back (ldrQ), return it. Proves the
+    // memory store and load move the full width, not the 4/8-byte scalar form.
+    const v: f128 = 1.0 / 3.0;
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const t = try f.types.intern(.{ .float = .f128 });
+    const ptr_t = try f.types.intern(.ptr);
+    const b = try f.appendBlock();
+    const a = try f.appendBlockParam(b, t);
+    const slot = try f.appendInst(b, ptr_t, .{ .alloca = .{ .elem = t } });
+    try f.appendStore(b, a, slot);
+    const r = try f.appendInst(b, t, .{ .load = .{ .ptr = slot } });
+    f.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
+    try expectRunQuad(allocator, &f, &.{v}, v);
+}
+
+test "native f128: an add lowers to an undefined __addtf3 soft-fp call relocation" {
+    const allocator = std.testing.allocator;
+    // f128 arithmetic has no aarch64 instruction; the soft-fp pass lowers it to a libgcc call
+    // before isel, so the backend must emit a `bl` call relocation against the undefined soft-fp
+    // symbol. `rebindSymbolName` re-points that borrowed name to the pass's static literal after
+    // the clone's storage is freed. This runs on any host (it never executes the code).
+    var f = Function.init(allocator);
+    defer f.deinit();
+    const t = try f.types.intern(.{ .float = .f128 });
+    const b = try f.appendBlock();
+    const x = try f.appendBlockParam(b, t);
+    const y = try f.appendBlockParam(b, t);
+    const r = try f.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = y } });
+    f.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
+
+    var compiled = try isel.compileFunction(allocator, &f, .{});
+    defer compiled.deinit(allocator);
+
+    var addtf3: usize = 0;
+    for (compiled.relocs) |rel| {
+        if (std.mem.eql(u8, rel.symbol, "__addtf3")) {
+            addtf3 += 1;
+            try std.testing.expectEqual(isel.Kind.call, rel.kind);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), addtf3);
+}

@@ -371,7 +371,7 @@ fn checkDominance(func: *const Function, diags: *Diagnostics) std.mem.Allocator.
         const block: Block = @enumFromInt(bi);
         for (func.blockInsts(block)) |inst| {
             switch (func.opcode(inst)) {
-                .iconst, .fconst, .alloca, .global_addr => {},
+                .iconst, .fconst, .fconst128, .alloca, .global_addr => {},
                 .arith => |a| {
                     try checkUse(&dominance, def_block, diags, a.lhs, bi);
                     try checkUse(&dominance, def_block, diags, a.rhs, bi);

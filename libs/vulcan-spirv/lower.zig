@@ -1004,6 +1004,8 @@ fn lowerFunction(allocator: std.mem.Allocator, func: *Function, module: *Module,
                     .f32 => @as(f64, @as(f32, @bitCast(@as(u32, @truncate(bits))))),
                     // An f16 constant is packed into the low 16 bits of a single literal word.
                     .f16 => @as(f64, @as(f16, @bitCast(@as(u16, @truncate(bits))))),
+                    // SPIR-V has no 128-bit float, so no SPIR-V constant ever decodes to f128.
+                    .f128 => return error.Unsupported,
                 },
             }),
             else => try func.appendInst(entry, ty, .{ .iconst = @bitCast(bits) }),

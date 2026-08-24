@@ -531,7 +531,7 @@ fn valueUseCount(func: *const Function, v: Value) usize {
         const block: Block = @enumFromInt(bi);
         for (func.blockInsts(block)) |inst| {
             switch (func.opcode(inst)) {
-                .iconst, .fconst, .alloca, .global_addr => {},
+                .iconst, .fconst, .fconst128, .alloca, .global_addr => {},
                 .arith => |x| {
                     if (x.lhs == v) n += 1;
                     if (x.rhs == v) n += 1;
@@ -817,7 +817,7 @@ fn cleanup(allocator: std.mem.Allocator, func: *Function, coalesced_loads: *cons
 /// loads/stores/prefetch/calls/`if` are impure and kept (coalesced loads are handled separately).
 fn isPure(op: ir.function.Opcode) bool {
     return switch (op) {
-        .iconst, .fconst, .arith, .arith_imm, .icmp, .select, .struct_new, .extract, .convert, .unary, .alloca, .global_addr, .dot => true,
+        .iconst, .fconst, .fconst128, .arith, .arith_imm, .icmp, .select, .struct_new, .extract, .convert, .unary, .alloca, .global_addr, .dot => true,
         .load, .store, .prefetch, .matmul, .@"if", .call, .call_indirect => false,
         // SM12 T3: mutate/read the `va_list` object at `list`, like `load`/`store` above.
         .va_start, .va_arg, .va_end => false,
@@ -833,7 +833,7 @@ fn countUses(func: *const Function, uses: []u32) void {
         const block: Block = @enumFromInt(bi);
         for (func.blockInsts(block)) |inst| {
             switch (func.opcode(inst)) {
-                .iconst, .fconst, .alloca, .global_addr => {},
+                .iconst, .fconst, .fconst128, .alloca, .global_addr => {},
                 .arith => |x| {
                     uses[@intFromEnum(x.lhs)] += 1;
                     uses[@intFromEnum(x.rhs)] += 1;

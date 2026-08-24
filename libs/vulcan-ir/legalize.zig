@@ -319,7 +319,7 @@ fn foldArith(op: function.BinOp, lhs: i64, rhs: i64) ?i64 {
 /// Whether an instruction has no side effects, so it may be dropped when unused.
 fn isPure(op: function.Opcode) bool {
     return switch (op) {
-        .iconst, .fconst, .arith, .arith_imm, .icmp, .select, .struct_new, .extract, .convert, .unary, .alloca, .global_addr, .dot => true,
+        .iconst, .fconst, .fconst128, .arith, .arith_imm, .icmp, .select, .struct_new, .extract, .convert, .unary, .alloca, .global_addr, .dot => true,
         // Loads are kept conservatively. Stores, `if`, and calls have effects.
         // A prefetch hint behaves like store here (effectful, not droppable).
         // A matmul writes the `c` memory, likewise effectful.
@@ -375,7 +375,7 @@ fn applySubst(func: *Function, subst: *const Subst) void {
     for (0..func.instCount()) |i| {
         const op = func.opcodeMut(@enumFromInt(i));
         switch (op.*) {
-            .iconst, .fconst, .alloca, .global_addr => {},
+            .iconst, .fconst, .fconst128, .alloca, .global_addr => {},
             .arith => |*a| {
                 a.lhs = sub(subst, a.lhs);
                 a.rhs = sub(subst, a.rhs);
@@ -481,7 +481,7 @@ fn countUses(func: *const Function, uses: []u32) void {
         const block: function.Block = @enumFromInt(bi);
         for (func.blockInsts(block)) |inst| {
             switch (func.opcode(inst)) {
-                .iconst, .fconst, .alloca, .global_addr => {},
+                .iconst, .fconst, .fconst128, .alloca, .global_addr => {},
                 .arith => |a| {
                     uses[@intFromEnum(a.lhs)] += 1;
                     uses[@intFromEnum(a.rhs)] += 1;

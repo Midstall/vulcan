@@ -461,6 +461,8 @@ fn returnBaseType(func: *const Function) ?dwarf.BaseType {
             // This name is for debug info only. It does not affect lowering. AArch64 f16
             // codegen is future work.
             .f16 => .{ .name = "half", .encoding = .float, .byte_size = 2 },
+            // Same rule for f128: debug naming only, no lowering claim.
+            .f128 => .{ .name = "__float128", .encoding = .float, .byte_size = 16 },
         },
         .int => |i| blk: {
             const bytes: u8 = @intCast((i.bits + 7) / 8);

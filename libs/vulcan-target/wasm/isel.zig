@@ -129,6 +129,9 @@ fn typeSize(types: *const ir.types.TypeTable, ty: ir.types.Type) u32 {
             .f16 => 2,
             .f32 => 4,
             .f64 => 8,
+            // An f128 in memory is a 16-byte IEEE quad. Wasm locals cannot hold one,
+            // so this sizes memory only; value-holding rejects f128 before it is read.
+            .f128 => 16,
         },
         .array => |a| @as(u32, @intCast(a.len)) * typeSize(types, a.elem),
         .vector => |v| @as(u32, v.len) * typeSize(types, v.elem),
@@ -884,6 +887,8 @@ fn emitInst(
     const result = func.instResult(inst);
 
     switch (op) {
+        // Wasm has no 128-bit float to hold one in.
+        .fconst128 => return error.Unsupported,
         .iconst => |val| {
             const vt = encode.irTypeToWasm(types, func.valueType(result.?)).?;
             switch (vt) {
@@ -967,6 +972,8 @@ fn emitInst(
                 .bool => try code.append(allocator, arithI32(a.op, .unsigned)),
                 .float => |f| {
                     const op_byte = switch (f) {
+                        // Wasm has no 128-bit float arithmetic op to select.
+                        .f128 => return error.Unsupported,
                         .f32 => switch (a.op) {
                             .add => encode.F32Op.add,
                             .sub => encode.F32Op.sub,
@@ -1126,6 +1133,7 @@ fn emitInst(
                         .f32 => try code.append(allocator, encode.F32Op.reinterpret_i32),
                         .f64 => try code.append(allocator, encode.F64Op.reinterpret_i64),
                         .f16 => return error.Unsupported,
+                        .f128 => return error.Unsupported,
                     },
                     else => return error.Unsupported,
                 },
@@ -1136,26 +1144,31 @@ fn emitInst(
                                 .f32 => encode.F32Op.sqrt,
                                 .f64 => encode.F64Op.sqrt,
                                 .f16 => return error.Unsupported,
+                                .f128 => return error.Unsupported,
                             },
                             .ceil => switch (f) {
                                 .f32 => encode.F32Op.ceil,
                                 .f64 => encode.F64Op.ceil,
                                 .f16 => return error.Unsupported,
+                                .f128 => return error.Unsupported,
                             },
                             .floor => switch (f) {
                                 .f32 => encode.F32Op.floor,
                                 .f64 => encode.F64Op.floor,
                                 .f16 => return error.Unsupported,
+                                .f128 => return error.Unsupported,
                             },
                             .trunc => switch (f) {
                                 .f32 => encode.F32Op.trunc,
                                 .f64 => encode.F64Op.trunc,
                                 .f16 => return error.Unsupported,
+                                .f128 => return error.Unsupported,
                             },
                             .nearest => switch (f) {
                                 .f32 => encode.F32Op.nearest,
                                 .f64 => encode.F64Op.nearest,
                                 .f16 => return error.Unsupported,
+                                .f128 => return error.Unsupported,
                             },
                             .reinterpret => unreachable,
                         },
@@ -1461,6 +1474,8 @@ fn emitArith(
         .bool => try code.append(func.allocator, arithI32(op, .unsigned)),
         .float => |f| {
             const op_byte = switch (f) {
+                // Wasm has no 128-bit float arithmetic op to select.
+                .f128 => return error.Unsupported,
                 .f32 => switch (op) {
                     .add => encode.F32Op.add,
                     .sub => encode.F32Op.sub,

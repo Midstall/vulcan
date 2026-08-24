@@ -13,7 +13,7 @@ pub const pass_def = pass.Pass{ .name = "dce", .run = run };
 /// Whether an instruction has no side effects, so it may be dropped when unused.
 fn isPure(op: ir.function.Opcode) bool {
     return switch (op) {
-        .iconst, .fconst, .arith, .arith_imm, .icmp, .select, .struct_new, .extract, .convert, .unary, .alloca, .global_addr, .dot => true,
+        .iconst, .fconst, .fconst128, .arith, .arith_imm, .icmp, .select, .struct_new, .extract, .convert, .unary, .alloca, .global_addr, .dot => true,
         // A prefetch hint has no result but must be kept, like a store. A
         // matmul writes the `c` memory, likewise kept.
         .load, .store, .prefetch, .matmul, .@"if", .call, .call_indirect => false,
@@ -29,7 +29,7 @@ pub fn countUses(func: *const Function, uses: []u32) void {
         const block: ir.function.Block = @enumFromInt(bi);
         for (func.blockInsts(block)) |inst| {
             switch (func.opcode(inst)) {
-                .iconst, .fconst, .alloca, .global_addr => {},
+                .iconst, .fconst, .fconst128, .alloca, .global_addr => {},
                 .arith => |a| {
                     uses[@intFromEnum(a.lhs)] += 1;
                     uses[@intFromEnum(a.rhs)] += 1;

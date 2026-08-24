@@ -229,10 +229,12 @@ const Emitter = struct {
         switch (kind) {
             .int => |i| try self.emit(&self.decls, op.TypeInt, &.{ id, i.bits, if (i.signedness == .signed) 1 else 0 }),
             // SPIR-V's Float16 capability makes f16 a native OpTypeFloat width, same as f32/f64.
+            // There is no 128-bit OpTypeFloat width, so an f128 cannot lower to SPIR-V at all.
             .float => |f| try self.emit(&self.decls, op.TypeFloat, &.{ id, switch (f) {
                 .f16 => @as(u32, 16),
                 .f32 => 32,
                 .f64 => 64,
+                .f128 => return error.UnsupportedConstruct,
             } }),
             else => return error.UnsupportedConstruct,
         }
@@ -604,6 +606,9 @@ const Emitter = struct {
                             const bits: u16 = @bitCast(@as(f16, @floatCast(v)));
                             try self.emit(&self.decls, op.Constant, &.{ tid, id, @as(u32, bits) });
                         },
+                        // An f128 constant is an fconst128 opcode, never an fconst. If one
+                        // arrives here the value would silently truncate to f64, so refuse.
+                        .f128 => return error.UnsupportedConstruct,
                     }
                     self.setVal(result, id);
                 },

@@ -43,7 +43,7 @@ const empty_fold: addrfold.Analysis = addrfold.Analysis.empty;
 /// both the divisibility and the range check. Vector is a 16-byte Q access, an fp half a 2-byte H,
 /// fp single/double a 4/8-byte S/D, and an integer its 1/2/4/8-byte bucket.
 fn aarch64AccessScale(func: *const Function, v: Value) usize {
-    if (isVector(func, v)) return 16;
+    if (isVector(func, v) or isQuad(func, v)) return 16; // a 16-byte Q access (f128 too)
     if (regClass(func, v) == .fpr) {
         if (isHalf(func, v)) return 2;
         return if (isDouble(func, v)) 8 else 4;
@@ -141,6 +141,20 @@ fn isDouble(func: *const Function, v: Value) bool {
 fn isHalf(func: *const Function, v: Value) bool {
     return switch (func.types.type_kind(func.valueType(v))) {
         .float => |f| f == .f16,
+        else => false,
+    };
+}
+
+/// Whether `v` is a binary128 (`f128`) scalar float. On AAPCS64 it occupies a whole 128-bit
+/// Q register (16 bytes), passed by value in v0..v7 and returned in v0, so its constant,
+/// register move, spill/reload, memory load and store, and call placement all use the 128-bit
+/// vector forms (`movVec`/`ldrQ`/`strQ`) an f32 or f64 does NOT, exactly like a SIMD vector.
+/// Its arithmetic, compares, conversions, and sqrt have no aarch64 instruction and lower to
+/// soft-fp libcalls before isel (see the shared `softfp` pass), so no f128 value reaches the
+/// scalar-arithmetic path here.
+fn isQuad(func: *const Function, v: Value) bool {
+    return switch (func.types.type_kind(func.valueType(v))) {
+        .float => |f| f == .f128,
         else => false,
     };
 }
@@ -548,6 +562,13 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
     // public *const signature (`selectFunction`, `selectFunctionForModel`, link/object) unchanged.
     var work = try func.clone(allocator);
     defer work.deinit();
+
+    // Lower binary128 arithmetic, compares, conversions, and sqrt to soft-fp libcalls before any
+    // numbering is built, so the call clobbers and the f128 argument placement are visible to the
+    // register allocator. f128 DATA MOVEMENT (constant, move, spill, memory load and store, call
+    // placement) stays native 128-bit Q traffic and is emitted below, untouched by this pass.
+    _ = try ir.softfp.lower(allocator, &work);
+
     try ir.critical_edge.splitCriticalEdges(allocator, &work);
 
     // Neutralize every block unreachable from the entry BEFORE any numbering is built. A pass that
@@ -600,16 +621,19 @@ pub fn compileFunction(allocator: std.mem.Allocator, func: *const Function, caps
     return compiled;
 }
 
-/// The `func`-owned symbol string equal to `name`. Every emitted relocation names a callee the
-/// function interned (a `call`'s `symbol` indexes `func.symbols`), so a match always exists. A miss
-/// would be a codegen bug, not a runtime condition.
+/// The longer-lived symbol string equal to `name`. Most relocations name a callee the function
+/// itself interned (a `call`'s `symbol` indexes `func.symbols`), so the match is `func`'s own copy.
+/// A soft-fp libcall symbol (`__addtf3`, ...) is added to the CLONE by `softfp.lower`, not the
+/// caller's function, so it has no match there; it is one of the pass's static string literals,
+/// which outlive every `Compiled`, so the code re-points it to that literal. Any other miss is a
+/// codegen bug, not a runtime condition.
 fn rebindSymbolName(func: *const Function, name: []const u8) []const u8 {
     var i: u32 = 0;
     while (i < func.symbolCount()) : (i += 1) {
         const s = func.symbolName(i);
         if (std.mem.eql(u8, s, name)) return s;
     }
-    unreachable;
+    return ir.softfp.staticName(name) orelse unreachable;
 }
 
 /// Emit one split-boundary action's machine code: a `store` writes `reg` to its slot, a `reload`
@@ -625,7 +649,7 @@ fn emitSplitAction(allocator: std.mem.Allocator, code: *std.ArrayList(u32), func
     switch (act.kind) {
         .store => {
             const off: u15 = @intCast(spill_base + act.slot * 16);
-            if (isVector(func, act.value)) {
+            if (isVector(func, act.value) or isQuad(func, act.value)) {
                 try code.append(allocator, encode.strQ(act.reg, sp, off));
             } else if (regClass(func, act.value) == .fpr) {
                 try code.append(allocator, encode.strFp(act.reg, sp, off, true));
@@ -635,7 +659,7 @@ fn emitSplitAction(allocator: std.mem.Allocator, code: *std.ArrayList(u32), func
         },
         .reload => {
             const off: u15 = @intCast(spill_base + act.slot * 16);
-            if (isVector(func, act.value)) {
+            if (isVector(func, act.value) or isQuad(func, act.value)) {
                 try code.append(allocator, encode.ldrQ(act.reg, sp, off));
             } else if (regClass(func, act.value) == .fpr) {
                 try code.append(allocator, encode.ldrFp(act.reg, sp, off, true));
@@ -647,7 +671,7 @@ fn emitSplitAction(allocator: std.mem.Allocator, code: *std.ArrayList(u32), func
             // A register-to-register re-home (Wimmer path only): copy `move_from` into `reg`. Same
             // value, so the copy width follows the value type. An identity move emits nothing.
             if (act.move_from == act.reg) return;
-            if (isVector(func, act.value)) {
+            if (isVector(func, act.value) or isQuad(func, act.value)) {
                 try code.append(allocator, encode.movVec(act.reg, act.move_from));
             } else if (regClass(func, act.value) == .fpr) {
                 try code.append(allocator, encode.fmovReg(act.reg, act.move_from));
@@ -665,7 +689,7 @@ fn emitSplitAction(allocator: std.mem.Allocator, code: *std.ArrayList(u32), func
             // it either). The scratch is reserved, so this touch can never conflict with a live value.
             const off_src: u15 = @intCast(spill_base + act.move_from_slot * 16);
             const off_dst: u15 = @intCast(spill_base + act.slot * 16);
-            if (isVector(func, act.value)) {
+            if (isVector(func, act.value) or isQuad(func, act.value)) {
                 try code.append(allocator, encode.ldrQ(fp_move, sp, off_src));
                 try code.append(allocator, encode.strQ(fp_move, sp, off_dst));
             } else if (regClass(func, act.value) == .fpr) {
@@ -872,8 +896,9 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
             // must pick its op width by `isVector`: a vector needs the 128-bit form (`movVec`/`ldrQ`/
             // `strQ`) or lanes 2-3 are dropped, a scalar float the 64-bit form (`fmovReg`/`ldrFp`/
             // `strFp`). This mirrors the whole-life-spilled-param branch below and `emitSplitAction`'s
-            // `.move` arm exactly. The gpr paths are width-agnostic (`mov`/`ldrOff`/`strOff`).
-            const vec = isVector(func, p);
+            // `.move` arm exactly. An f128 uses the SAME 128-bit Q form (it fills a whole Q register).
+            // The gpr paths are width-agnostic (`mov`/`ldrOff`/`strOff`).
+            const vec = isVector(func, p) or isQuad(func, p);
             switch (segs[0].loc) {
                 .reg => |first_reg| {
                     if (l.idx < 8) {
@@ -923,7 +948,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
             if (l.idx < 8) {
                 const incoming: Reg = @enumFromInt(@as(u5, @intCast(l.idx)));
                 if (l.class == .fpr) {
-                    try code.append(allocator, if (isVector(func, p)) encode.strQ(incoming, sp, slot_off) else encode.strFp(incoming, sp, slot_off, true));
+                    try code.append(allocator, if (isVector(func, p) or isQuad(func, p)) encode.strQ(incoming, sp, slot_off) else encode.strFp(incoming, sp, slot_off, true));
                 } else {
                     try code.append(allocator, encode.strOff(incoming, sp, slot_off));
                 }
@@ -1097,7 +1122,30 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     }
                     try storeResult(allocator, &code, ctx, result, rd);
                 },
+                .fconst128 => |val| {
+                    // A binary128 constant is 16 bytes, too wide for one gpr and with no aarch64
+                    // 128-bit immediate. Build the Q register from its two 64-bit halves: load the
+                    // low half in a gpr scratch and `fmov d, x` it into rd (this sets rd.D[0] and
+                    // ZEROES rd.D[1]), then load the high half in a second gpr scratch and `ins
+                    // rd.D[1], x` it into the high lane. Result: rd = [lo, hi], the low 64 bits
+                    // first. No parallel move is in flight during a constant, so `scratch_move`
+                    // (x17) is free as the second gpr scratch alongside `scratch_imm` (x16).
+                    const result = func.instResult(inst).?;
+                    const rd = ctx.resultReg(result);
+                    const lo: u64 = @truncate(val);
+                    const hi: u64 = @truncate(val >> 64);
+                    try loadConst64(allocator, &code, scratch_imm, lo);
+                    try code.append(allocator, encode.fmovFromGpr(rd, scratch_imm, true)); // rd.D[0]=lo, rd.D[1]=0
+                    try loadConst64(allocator, &code, scratch_move, hi);
+                    try code.append(allocator, encode.insD1FromGpr(rd, scratch_move)); // rd.D[1]=hi
+                    try storeResult(allocator, &code, ctx, result, rd);
+                },
                 .arith => |a| {
+                    // f128 arithmetic has no aarch64 instruction; the softfp pass rewrites it to a
+                    // libcall (`__addtf3`, ...) before isel, so a real f128 arith never reaches this
+                    // scalar path. Reject one defensively rather than emit a wrong-width scalar op if
+                    // the pass was skipped.
+                    if (isQuad(func, func.instResult(inst).?)) return error.Unsupported;
                     // Fused multiply-add/sub: when this is a float `mul` that is the
                     // single-use, immediately-preceding operand of the next add/sub, skip
                     // its materialization entirely. `emitFusedArith` re-checks the SAME
@@ -1204,6 +1252,10 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                         continue;
                     }
                     if (regClass(func, cmp.lhs) == .fpr) {
+                        // f128 has no `fcmp`; the softfp pass rewrites an f128 compare to a libcall
+                        // (`__eqtf2` and friends) plus a signed integer compare of its status result
+                        // before isel, so a real one never reaches here. Reject defensively.
+                        if (isQuad(func, cmp.lhs)) return error.Unsupported;
                         const rl = try ctx.loadOp(allocator, &code, cmp.lhs, fp_spill_op[0]);
                         const rr = try ctx.loadOp(allocator, &code, cmp.rhs, fp_spill_op[1]);
                         const rd = ctx.resultReg(result);
@@ -1252,6 +1304,12 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     }
                     const c = try ctx.loadOp(allocator, &code, s.cond, spill_op[0]); // cond is a gpr bool
                     if (regClass(func, result) == .fpr) {
+                        // `fcsel` selects in the S/D view (32/64-bit); it has no 128-bit form, so it
+                        // would narrow an f128 to its low 64 bits. The softfp pass does not lower a
+                        // select (it is a conditional data move, not an arithmetic libcall), so reject
+                        // an f128 select rather than miscompile it. A 128-bit conditional select
+                        // (mask + `bsl`, like the vector arm) is a later addition.
+                        if (isQuad(func, result)) return error.Unsupported;
                         const tr = try ctx.loadOp(allocator, &code, s.then, fp_spill_op[0]);
                         const el = try ctx.loadOp(allocator, &code, s.@"else", fp_spill_op[1]);
                         const rd = ctx.resultReg(result);
@@ -1271,6 +1329,11 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                 },
                 .convert => |cv| {
                     const result = func.instResult(inst).?;
+                    // Any conversion touching f128 has no aarch64 form; the softfp pass rewrites it
+                    // to an `__extend*`/`__trunc*`/`__float*`/`__fix*` libcall before isel, so a real
+                    // f128 convert never reaches here. Reject defensively rather than emit a wrong
+                    // convert of a scalar view of the value.
+                    if (isQuad(func, cv.value) or isQuad(func, result)) return error.Unsupported;
                     const sc = regClass(func, cv.value);
                     const dc = regClass(func, result);
                     const src = try ctx.loadOp(allocator, &code, cv.value, if (sc == .fpr) fp_spill_op[0] else spill_op[0]);
@@ -1362,6 +1425,10 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     try storeResult(allocator, &code, ctx, result, rd);
                 } else {
                     const result = func.instResult(inst).?;
+                    // An f128 unary (sqrt) has no aarch64 instruction; the softfp pass rewrites it to
+                    // `__sqrttf2` before isel. A reinterpret to/from f128 would also need a 128-bit
+                    // move, not the scalar `fmov`. Reject any f128 operand or result defensively.
+                    if (isQuad(func, result) or isQuad(func, u.value)) return error.Unsupported;
                     const sc = regClass(func, u.value);
                     const dc = regClass(func, result);
                     const src = try ctx.loadOp(allocator, &code, u.value, if (sc == .fpr) fp_spill_op[0] else spill_op[0]);
@@ -1489,7 +1556,13 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     try code.append(allocator, encode.bl(0));
                     if (func.instResult(inst)) |result| {
                         const rd = ctx.resultReg(result);
-                        try code.append(allocator, if (regClass(func, result) == .fpr) encode.fmovReg(rd, @enumFromInt(0)) else encode.mov(rd, .x0));
+                        // An f128 result comes back in the whole 128-bit v0 (a soft-fp `__*tf*` call
+                        // returns its quad in v0), so capture it with the 128-bit `movVec`, not the
+                        // 64-bit `fmovReg` an f32/f64 uses.
+                        try code.append(allocator, if (regClass(func, result) == .fpr)
+                            (if (isQuad(func, result)) encode.movVec(rd, @enumFromInt(0)) else encode.fmovReg(rd, @enumFromInt(0)))
+                        else
+                            encode.mov(rd, .x0));
                         try storeResult(allocator, &code, ctx, result, rd);
                     }
                     if (c.ret_dest) |dest| {
@@ -1512,7 +1585,12 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                     try code.append(allocator, encode.blr(scratch_imm));
                     if (func.instResult(inst)) |result| {
                         const rd = ctx.resultReg(result);
-                        try code.append(allocator, if (regClass(func, result) == .fpr) encode.fmovReg(rd, @enumFromInt(0)) else encode.mov(rd, .x0));
+                        // An f128 result comes back in the whole 128-bit v0, so capture it with the
+                        // 128-bit `movVec`, not the 64-bit `fmovReg` an f32/f64 uses.
+                        try code.append(allocator, if (regClass(func, result) == .fpr)
+                            (if (isQuad(func, result)) encode.movVec(rd, @enumFromInt(0)) else encode.fmovReg(rd, @enumFromInt(0)))
+                        else
+                            encode.mov(rd, .x0));
                         try storeResult(allocator, &code, ctx, result, rd);
                     }
                     if (c.ret_dest) |dest| {
@@ -1586,7 +1664,9 @@ fn emitFromAllocation(allocator: std.mem.Allocator, func: *const Function, caps:
                             // `locationAt` at the terminator position (ctx.pos == block_end here). With no
                             // splits this is byte-identical to today's direct `reg`/`spill` reads.
                             if (regClass(func, value) == .fpr) {
-                                const vec = isVector(func, value);
+                                // An f128 return fills the whole 128-bit v0, so move/reload it with
+                                // the Q form exactly like a SIMD vector, not the 64-bit scalar form.
+                                const vec = isVector(func, value) or isQuad(func, value);
                                 switch (ctx.locationAt(value)) {
                                     .slot => |slot| {
                                         const off: u15 = @intCast(spill_base + slot * 16);
@@ -1752,8 +1832,8 @@ const Ctx = struct {
             .reg => |r| return r,
             .slot => |slot| {
                 const off: u15 = @intCast(self.spill_base + slot * 16);
-                if (isVector(self.func, v)) {
-                    try code.append(allocator, encode.ldrQ(scratch, sp, off));
+                if (isVector(self.func, v) or isQuad(self.func, v)) {
+                    try code.append(allocator, encode.ldrQ(scratch, sp, off)); // f128 reloads all 128 bits
                 } else if (regClass(self.func, v) == .fpr) {
                     try code.append(allocator, encode.ldrFp(scratch, sp, off, true));
                 } else {
@@ -2386,7 +2466,10 @@ const Ctx = struct {
                 if (loc.class == .fpr) {
                     const src = try self.loadOp(allocator, code, arg, fp_spill_op[0]);
                     if (loc.idx >= 8) return error.Unsupported; // fp stack args not handled
-                    try code.append(allocator, encode.fmovReg(target, src));
+                    // Copy the whole 128-bit register (`movVec`), so an f128 argument reaches the
+                    // callee's v-register with all 16 bytes; a scalar float's unused high lane is
+                    // harmless. Mirrors the block-edge fpr move, which is `movVec` for the same reason.
+                    try code.append(allocator, encode.movVec(target, src));
                 } else {
                     const src = try self.loadOp(allocator, code, arg, spill_op[0]);
                     if (loc.idx < 8) {
@@ -2433,9 +2516,11 @@ const Ctx = struct {
             }
         }
         try parallelMove(allocator, code, gpr_moves.items, encode.mov, scratch_move);
-        // `fmovReg` copies the low 64 bits, matching the native sequential path's `fmovReg` exactly, so
-        // a float argument round-trips identically whichever allocator placed it.
-        try parallelMove(allocator, code, fpr_moves.items, encode.fmovReg, fp_move);
+        // `movVec` copies the whole 128-bit register, matching the native sequential path so a float
+        // argument round-trips identically whichever allocator placed it, and carrying an f128
+        // argument's full 16 bytes (a scalar float's unused high lane is harmless). This mirrors the
+        // block-edge fpr parallel move, which is `movVec` for exactly the same reason.
+        try parallelMove(allocator, code, fpr_moves.items, encode.movVec, fp_move);
 
         // Phase 2b: slot-resident register arguments reload into their ABI register (the permutation
         // above has already read every source register, so overwriting one now is safe).
@@ -2446,8 +2531,8 @@ const Ctx = struct {
             switch (self.locationAt(arg)) {
                 .slot => |slot| {
                     const off: u15 = @intCast(self.spill_base + slot * 16);
-                    if (isVector(self.func, arg)) {
-                        try code.append(allocator, encode.ldrQ(target, sp, off));
+                    if (isVector(self.func, arg) or isQuad(self.func, arg)) {
+                        try code.append(allocator, encode.ldrQ(target, sp, off)); // f128 reloads all 128 bits
                     } else if (loc.class == .fpr) {
                         try code.append(allocator, encode.ldrFp(target, sp, off, true));
                     } else {
@@ -2484,8 +2569,8 @@ fn storeResult(allocator: std.mem.Allocator, code: *std.ArrayList(u32), ctx: Ctx
         .reg => {},
         .slot => |slot| {
             const off: u15 = @intCast(ctx.spill_base + slot * 16);
-            if (isVector(ctx.func, result)) {
-                try code.append(allocator, encode.strQ(reg, sp, off));
+            if (isVector(ctx.func, result) or isQuad(ctx.func, result)) {
+                try code.append(allocator, encode.strQ(reg, sp, off)); // f128 stores all 128 bits
             } else if (regClass(ctx.func, result) == .fpr) {
                 try code.append(allocator, encode.strFp(reg, sp, off, true));
             } else {
@@ -3002,6 +3087,13 @@ pub fn compileFunctionWimmer(allocator: std.mem.Allocator, func: *Function) Erro
     if (ir.function.functionUsesCompositeF16(func)) return error.Unsupported;
     if (func.blockCount() == 0) return error.Unsupported;
 
+    // Lower binary128 arithmetic, compares, conversions, and sqrt to soft-fp libcalls in place,
+    // before any numbering is built, so the call clobbers and f128 argument placement are visible to
+    // the register allocator. f128 DATA MOVEMENT stays native 128-bit Q traffic (an f128 fills a
+    // whole Q register), emitted below unchanged; any f128 arith/compare/convert that slips through
+    // is rejected per-op rather than miscompiled.
+    _ = try ir.softfp.lower(allocator, func);
+
     // Split critical edges FIRST (mutating `func`), before any numbering is built, so the resolver's
     // no-critical-edge precondition holds and the RegDescription/scan/emission all see one CFG.
     try ir.critical_edge.splitCriticalEdges(allocator, func);
@@ -3251,7 +3343,7 @@ fn forEachOperand(
     comptime f: fn (@TypeOf(ctx), Value, bool) void,
 ) void {
     switch (func.opcode(inst)) {
-        .iconst, .fconst, .alloca, .global_addr => {},
+        .iconst, .fconst, .fconst128, .alloca, .global_addr => {},
         .arith => |a| {
             f(ctx, a.lhs, false);
             f(ctx, a.rhs, false);
@@ -3684,7 +3776,7 @@ fn countUses(func: *const Function, v: Value) usize {
 fn usesOfInInst(func: *const Function, inst: ir.function.Inst, v: Value) usize {
     var c: usize = 0;
     switch (func.opcode(inst)) {
-        .iconst, .fconst, .alloca, .global_addr => {},
+        .iconst, .fconst, .fconst128, .alloca, .global_addr => {},
         .arith => |a| {
             if (a.lhs == v) c += 1;
             if (a.rhs == v) c += 1;
@@ -3783,7 +3875,7 @@ fn setUsed(row: []bool, v: Value) void {
 
 fn markUsedBitset(func: *const Function, inst: ir.function.Inst, fold: *const addrfold.Analysis, row: []bool) void {
     switch (func.opcode(inst)) {
-        .iconst, .fconst, .alloca, .global_addr => {},
+        .iconst, .fconst, .fconst128, .alloca, .global_addr => {},
         .arith => |a| {
             setUsed(row, a.lhs);
             setUsed(row, a.rhs);
@@ -3976,6 +4068,9 @@ fn typeSize(func: *const Function, ty: ir.types.Type) usize {
             .f16 => 2,
             .f32 => 4,
             .f64 => 8,
+            // An f128 is a 16-byte IEEE quad in memory. aarch64 has no f128 codegen
+            // yet; this sizes alloca/struct layout only.
+            .f128 => 16,
         },
         .array => |a| @as(usize, @intCast(a.len)) * typeSize(func, a.elem),
         .vector => |v| @as(usize, v.len) * typeSize(func, v.elem),
@@ -4023,8 +4118,8 @@ fn emitLoad(
     // A folded load addresses `[base, #off]`. A non-folded load passes off = 0, which every encoder
     // below reproduces byte-identically to its old zero-displacement form. `aarch64FoldOffset`
     // guarantees off fits the per-size scaled range, so the `@intCast`es cannot truncate.
-    if (isVector(func, result)) {
-        try code.append(allocator, encode.ldrQ(rd, base, @intCast(off))); // 128-bit NEON load
+    if (isVector(func, result) or isQuad(func, result)) {
+        try code.append(allocator, encode.ldrQ(rd, base, @intCast(off))); // 128-bit NEON / f128 load
         return;
     }
     if (regClass(func, result) == .fpr) {
@@ -4065,8 +4160,8 @@ fn emitStore(
     // A folded store addresses `[base, #off]`. A non-folded store passes off = 0, which every encoder
     // below reproduces byte-identically to its old zero-displacement form. `aarch64FoldOffset`
     // guarantees off fits the per-size scaled range, so the `@intCast`es cannot truncate.
-    if (isVector(func, value)) {
-        try code.append(allocator, encode.strQ(val, base, @intCast(off))); // 128-bit NEON store
+    if (isVector(func, value) or isQuad(func, value)) {
+        try code.append(allocator, encode.strQ(val, base, @intCast(off))); // 128-bit NEON / f128 store
         return;
     }
     if (regClass(func, value) == .fpr) {

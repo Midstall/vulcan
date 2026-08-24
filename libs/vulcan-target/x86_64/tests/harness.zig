@@ -468,6 +468,81 @@ pub fn expectRunDouble(io: std.Io, allocator: std.mem.Allocator, func: *const Fu
     try std.testing.expectEqual(want, try runDoubleFunc(io, allocator, func, dargs, backend));
 }
 
+/// Load each binary128 argument's 16 bytes into xmm0.., appending onto `s`. Each half goes
+/// into an xmm low lane via movq (which zeroes the high lane); punpcklqdq then splices the
+/// two halves through a scratch xmm (xmm15, never an argument register).
+fn appendQuadArgs(allocator: std.mem.Allocator, s: *std.ArrayList(u8), qargs: []const u128) std.mem.Allocator.Error!void {
+    const xmm_args = [_]encode.Xmm{ .xmm0, .xmm1, .xmm2, .xmm3, .xmm4, .xmm5, .xmm6, .xmm7 };
+    for (qargs, 0..) |q, i| {
+        try s.appendSlice(allocator, encode.movImm64(.rax, @truncate(q)).slice());
+        try s.appendSlice(allocator, encode.movqToXmm(xmm_args[i], .rax).slice()); // [lo, 0]
+        try s.appendSlice(allocator, encode.movImm64(.rax, @truncate(q >> 64)).slice());
+        try s.appendSlice(allocator, encode.movqToXmm(.xmm15, .rax).slice()); // [hi, 0]
+        try s.appendSlice(allocator, encode.punpcklqdq(xmm_args[i], .xmm15).slice()); // [lo, hi]
+    }
+}
+
+/// The 16-byte result tail: spill xmm0 to a stack window and write all 16 bytes to stdout,
+/// then exit 0. A binary128 result is too wide for the register-in-rax tail.
+fn appendWriteQuadTail(allocator: std.mem.Allocator, s: *std.ArrayList(u8)) std.mem.Allocator.Error!void {
+    try s.appendSlice(allocator, encode.aluImm(5, .rsp, 16, true).slice()); // sub rsp, 16
+    try s.appendSlice(allocator, encode.movupsStore(0, .xmm0).slice()); // movups [rsp], xmm0
+    try s.appendSlice(allocator, encode.movImm(.rdi, 1, true).slice()); // fd = stdout
+    try s.appendSlice(allocator, encode.movReg(.rsi, .rsp).slice()); // buf = rsp
+    try s.appendSlice(allocator, encode.movImm(.rdx, 16, true).slice()); // count = 16
+    try s.appendSlice(allocator, encode.movImm(.rax, 1, true).slice()); // sys_write
+    try s.appendSlice(allocator, encode.syscall().slice());
+    try s.appendSlice(allocator, encode.movImm(.rax, 60, true).slice()); // sys_exit
+    try s.appendSlice(allocator, encode.xorr(.rdi, .rdi, false).slice()); // status = 0
+    try s.appendSlice(allocator, encode.syscall().slice());
+}
+
+/// Like `buildDoubleStubFull`, but for a binary128 function: load each 16-byte argument into
+/// xmm0.., then write the full 16-byte xmm0 result to stdout.
+fn buildQuadStubFull(allocator: std.mem.Allocator, qargs: []const u128) std.mem.Allocator.Error![]u8 {
+    var s: std.ArrayList(u8) = .empty;
+    errdefer s.deinit(allocator);
+    try appendQuadArgs(allocator, &s, qargs);
+
+    var tail: std.ArrayList(u8) = .empty;
+    defer tail.deinit(allocator);
+    try appendWriteQuadTail(allocator, &tail);
+
+    try s.appendSlice(allocator, encode.callRel(@intCast(tail.items.len)).slice());
+    try s.appendSlice(allocator, tail.items);
+    return s.toOwnedSlice(allocator);
+}
+
+/// Run a program and read a full 16-byte little-endian result from its stdout.
+fn runProgramFull128(io: std.Io, allocator: std.mem.Allocator, stub: []const u8, code: []const u8, backend: Backend) !u128 {
+    const img = try runImage(io, allocator, stub, code, backend);
+    defer allocator.free(img.stdout);
+    switch (img.term) {
+        .exited => |c| if (c != 0) return error.BackendFailed,
+        else => return error.BackendFailed,
+    }
+    std.debug.assert(img.stdout.len >= 16);
+    var v: u128 = 0;
+    for (0..16) |i| v |= @as(u128, img.stdout[i]) << @intCast(i * 8);
+    return v;
+}
+
+/// Run a binary128 function with u128 `qargs` (the raw bit patterns) and return its full
+/// 16-byte result bits. qemu only, like the other float runners.
+pub fn runQuadFuncFull(io: std.Io, allocator: std.mem.Allocator, func: *const Function, qargs: []const u128, backend: Backend) !u128 {
+    if (backend.qemu_cmd == null) return error.SkipZigTest;
+    const code = try isel.selectFunction(allocator, func);
+    defer allocator.free(code);
+    const stub = try buildQuadStubFull(allocator, qargs);
+    defer allocator.free(stub);
+    return runProgramFull128(io, allocator, stub, code, backend);
+}
+
+/// Assert a binary128 function returns exactly `expected` (all 128 bits).
+pub fn expectRunQuadFull(io: std.Io, allocator: std.mem.Allocator, func: *const Function, qargs: []const u128, expected: f128, backend: Backend) !void {
+    try std.testing.expectEqual(@as(u128, @bitCast(expected)), try runQuadFuncFull(io, allocator, func, qargs, backend));
+}
+
 /// Run a scalar-double function with f64 `dargs` and return its FULL f64 result (no mod-256
 /// limit on its bits). Qemu only, like `runDoubleFunc`.
 pub fn runDoubleFuncFull(io: std.Io, allocator: std.mem.Allocator, func: *const Function, dargs: []const f64, backend: Backend) !f64 {
