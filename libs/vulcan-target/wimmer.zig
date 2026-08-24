@@ -1431,13 +1431,16 @@ pub fn allocate(allocator: std.mem.Allocator, func: *const Function, desc: *cons
     defer allocator.free(slots);
     @memset(slots, 0);
 
-    // The worklist (`unhandled`) is a priority queue. It holds value intervals and entry-param
-    // fixed intervals sorted ascending by start, popped from the front, with split children
-    // re-inserted in sorted position. A CALL-CLOBBER fixed interval (`value == null`) is taken OUT
-    // of the worklist and seeded directly into `inactive`, since its first range is at a call, a
-    // hole at position 0. This lets `tryAllocateFreeReg` and `allocateBlockedReg` see the clobber
-    // at every EARLIER position. An entry-param fixed interval stays in the worklist. It is a hint
-    // realized when popped, skip-clamped for its own value, never a hard block.
+    // The worklist (`unhandled`) is a priority queue. It holds value intervals sorted ascending
+    // by start, popped from the front, with split children re-inserted in sorted position. Fixed
+    // intervals never enter it. A CALL-CLOBBER fixed interval (`value == null`) is seeded into
+    // `inactive`, since its first range is at a call, a hole at position 0. This lets
+    // `tryAllocateFreeReg` and `allocateBlockedReg` see the clobber at every EARLIER position. An
+    // entry-param fixed interval is seeded into `active`: it lives at position 0, and it must
+    // block its ABI register from the first value pop. In the worklist it popped LAST at position
+    // 0 (buildIntervals appends fixed intervals after every value interval), so a value whose own
+    // hint was clamped, by a div or shift clobber for example, could take another parameter's pin
+    // before the pin was ever seen. The verifier caught exactly that overlap.
     var unhandled: std.ArrayList(*Interval) = .empty;
     defer unhandled.deinit(allocator);
     var active: std.ArrayList(*Interval) = .empty;
@@ -1446,9 +1449,13 @@ pub fn allocate(allocator: std.mem.Allocator, func: *const Function, desc: *cons
     defer inactive.deinit(allocator);
 
     for (intervals) |*iv| {
-        if (iv.fixed_reg != null and iv.value == null) {
+        if (iv.fixed_reg != null) {
             iv.location = .{ .reg = iv.fixed_reg.? };
-            try inactive.append(allocator, iv);
+            if (iv.value == null) {
+                try inactive.append(allocator, iv);
+            } else {
+                try active.append(allocator, iv);
+            }
         } else {
             try unhandled.append(allocator, iv);
         }
@@ -1501,13 +1508,9 @@ pub fn allocate(allocator: std.mem.Allocator, func: *const Function, desc: *cons
             }
         }
 
-        // An entry-param fixed interval realizes its ABI pin: occupy its register over `[0, 1)`.
-        // Call-clobber fixed intervals never enter the worklist. They were seeded into `inactive`.
-        if (current.fixed_reg != null) {
-            current.location = .{ .reg = current.fixed_reg.? };
-            try active.append(allocator, current);
-            continue;
-        }
+        // Every fixed interval was seeded at the start: call clobbers into `inactive`,
+        // entry-param pins into `active`. The worklist holds value intervals only.
+        std.debug.assert(current.fixed_reg == null);
 
         // A value interval: take a free register covering its whole lifetime, or fall back to the
         // blocked-register path that splits and spills to make room. A block-parameter hint (from an
