@@ -10,7 +10,9 @@ const mm = @import("vulcan-opt").microarch;
 
 const Function = ir.function.Function;
 
-pub const Error = isel.Error || error{UndefinedSymbol};
+// UnsupportedReloc matches aarch64's link Error, so a GOT-form import fails with
+// the same tag on both backends and a frontend never maps backend-specific tags.
+pub const Error = isel.Error || error{ UndefinedSymbol, UnsupportedReloc };
 
 const Entry = struct { name: []const u8, func: *const Function };
 
@@ -230,8 +232,9 @@ pub fn compileModule(allocator: std.mem.Allocator, module: *const Module) Error!
                 // A GOT-indirect data import (`via_got`) needs a dynamic GOT + GLOB_DAT the
                 // real `ld.so` fills, which this in-memory JIT linker cannot synthesize. It is
                 // only produced on the object/dynamic-link path (see `object.zig` +
-                // `vulcan-link`), so it never reaches here; reject it fail-closed.
-                .got_pcrel => return error.Unsupported,
+                // `vulcan-link`), so it never reaches here; reject it fail-closed with the
+                // same tag aarch64 uses for its GOT forms.
+                .got_pcrel => return error.UnsupportedReloc,
             }
         }
     }
