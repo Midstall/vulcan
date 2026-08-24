@@ -27,6 +27,12 @@ pub const CodeBuffer = platform.Buffer(syncICache);
 /// the code span (via `fence.i` on RISC-V) once `finalize` flips it to read+execute.
 pub const MappedImage = platform.MappedImage(syncICache);
 
+/// libSystem's instruction-cache flush (`<libkern/OSCacheControl.h>`). Apple platforms trap a
+/// userspace `mrs ctr_el0` read (SIGILL) and reserve `ic ivau` for the kernel, so the manual
+/// clean+invalidate below cannot run there; this call performs the whole point-of-unification sync
+/// through the OS instead. Only referenced on an aarch64 Darwin host.
+extern "c" fn sys_icache_invalidate(start: [*]const u8, len: usize) void;
+
 /// Synchronize the instruction stream with freshly written code. RISC-V uses
 /// `fence.i` (mandatory before executing JIT output on real hardware). aarch64
 /// cleans the D-cache and invalidates the I-cache to the point of unification.
@@ -35,6 +41,13 @@ fn syncICache(memory: []const u8) void {
     switch (builtin.cpu.arch) {
         .riscv32, .riscv64 => asm volatile ("fence.i" ::: .{ .memory = true }),
         .aarch64 => {
+            // Apple platforms SIGILL on a userspace `mrs ctr_el0` and trap `ic ivau` at EL0, so the
+            // manual sequence below faults before any code runs. Defer to libSystem, which does the
+            // D-cache clean and I-cache invalidate itself.
+            if (builtin.os.tag.isDarwin()) {
+                sys_icache_invalidate(memory.ptr, memory.len);
+                return;
+            }
             const ctr = asm volatile ("mrs %[r], ctr_el0"
                 : [r] "=r" (-> usize),
             );
