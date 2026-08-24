@@ -365,10 +365,15 @@ const FunctionParser = struct {
         self.skipWs();
         try self.eat('=');
         self.skipWs();
-        const op: function.Opcode = if (self.func.types.type_kind(ty) == .float)
-            .{ .fconst = try self.readFloat() }
-        else
-            .{ .iconst = try self.readSigned() };
+        const op: function.Opcode = switch (self.func.types.type_kind(ty)) {
+            .float => |fk| if (fk == .f128)
+                // The f64 carrier cannot hold 128 bits, so the text form parses the
+                // decimal at f128 width and keeps the binary128 bit pattern.
+                .{ .fconst128 = @bitCast(try self.readFloat128()) }
+            else
+                .{ .fconst = try self.readFloat() },
+            else => .{ .iconst = try self.readSigned() },
+        };
         const result = try self.func.appendInst(block, ty, op);
         try self.recordValue(result);
         return result;
@@ -384,6 +389,18 @@ const FunctionParser = struct {
             }
         }
         return std.fmt.parseFloat(f64, self.src[start..self.pos]) catch error.InvalidSyntax;
+    }
+
+    /// The f128 form of readFloat: the same character set, parsed at binary128 width.
+    fn readFloat128(self: *FunctionParser) Error!f128 {
+        const start = self.pos;
+        while (self.pos < self.src.len) : (self.pos += 1) {
+            switch (self.src[self.pos]) {
+                '0'...'9', '.', '-', '+', 'e', 'E' => {},
+                else => break,
+            }
+        }
+        return std.fmt.parseFloat(f128, self.src[start..self.pos]) catch error.InvalidSyntax;
     }
 
     /// Finish a binary op `lhs <bop> rhs` after the operator: a numeric rhs makes

@@ -390,6 +390,11 @@ pub const Opcode = union(enum) {
     iconst: i64,
     /// A floating-point constant of the instruction's result type.
     fconst: f64,
+    /// An f128 constant of the instruction's result type, as its binary128 bit
+    /// pattern. A separate opcode because `fconst`'s f64 carrier cannot hold 128
+    /// bits, and widening every existing fconst reader to a 128-bit carrier would
+    /// churn them for a type they never produce.
+    fconst128: u128,
     /// A binary arithmetic/bitwise operation.
     arith: Arith,
     /// Arithmetic against a constant operand (`lhs <op> imm`).
@@ -1061,7 +1066,7 @@ pub const Function = struct {
         for (0..self.instCount()) |i| {
             const op = self.opcodeMut(@enumFromInt(i));
             switch (op.*) {
-                .iconst, .fconst, .alloca, .global_addr => {},
+                .iconst, .fconst, .fconst128, .alloca, .global_addr => {},
                 .arith => |*a| {
                     a.lhs = r(from, to, a.lhs);
                     a.rhs = r(from, to, a.rhs);
@@ -1296,7 +1301,7 @@ pub const Function = struct {
     /// `replaceAllUses` and `verify.zig`'s dominance check above.
     fn remapOpcode(self: *Function, allocator: std.mem.Allocator, op: Opcode, map: *const std.AutoHashMapUnmanaged(Value, Value)) std.mem.Allocator.Error!Opcode {
         return switch (op) {
-            .iconst, .fconst, .alloca, .global_addr => op,
+            .iconst, .fconst, .fconst128, .alloca, .global_addr => op,
             .arith => |a| .{ .arith = .{ .op = a.op, .lhs = remapValue(map, a.lhs), .rhs = remapValue(map, a.rhs) } },
             .arith_imm => |a| .{ .arith_imm = .{ .op = a.op, .lhs = remapValue(map, a.lhs), .imm = a.imm } },
             .icmp => |c| .{ .icmp = .{ .op = c.op, .lhs = remapValue(map, c.lhs), .rhs = remapValue(map, c.rhs) } },
@@ -1518,6 +1523,21 @@ fn typeContainsF16(table: *const TypeTable, ty: Type) bool {
     };
 }
 
+/// True when `ty` is f128 itself, or a vector/array/slice/struct that contains f128 anywhere
+/// in its structure. Same argument as typeContainsF16: the type table has no cycles.
+fn typeContainsF128(table: *const TypeTable, ty: Type) bool {
+    return switch (table.type_kind(ty)) {
+        .float => |f| f == .f128,
+        .vector => |v| typeContainsF128(table, v.elem),
+        .array => |a| typeContainsF128(table, a.elem),
+        .slice => |s| typeContainsF128(table, s.elem),
+        .@"struct" => |fields| for (fields) |field| {
+            if (typeContainsF128(table, field)) break true;
+        } else false,
+        .bool, .int, .ptr => false,
+    };
+}
+
 /// True when any value in `func` (a block param or an instruction result) has a type that
 /// contains f16, at any depth. No backend lowers f16 yet, and several would silently size or
 /// treat it as f64 if it reached them (a miscompile), so every backend's compile/emit entry
@@ -1529,6 +1549,17 @@ pub fn functionUsesF16(func: *const Function) bool {
     while (i < func.valueCount()) : (i += 1) {
         const value: Value = @enumFromInt(@as(u32, @intCast(i)));
         if (typeContainsF16(&func.types, func.valueType(value))) return true;
+    }
+    return false;
+}
+
+/// True when any value of `func` is or contains f128. The backends without f128 codegen
+/// reject such functions with a clear error instead of silently miscompiling them.
+pub fn functionUsesF128(func: *const Function) bool {
+    var i: usize = 0;
+    while (i < func.valueCount()) : (i += 1) {
+        const value: Value = @enumFromInt(@as(u32, @intCast(i)));
+        if (typeContainsF128(&func.types, func.valueType(value))) return true;
     }
     return false;
 }
@@ -1589,6 +1620,11 @@ fn printInst(self: *const Function, w: *std.Io.Writer, inst: Inst) std.Io.Writer
             self.valueName(data.result.?),
             self.types.fmt(self.valueType(data.result.?)),
             value,
+        }),
+        .fconst128 => |value| try w.print("const v{d}: {f} = {d}", .{
+            self.valueName(data.result.?),
+            self.types.fmt(self.valueType(data.result.?)),
+            @as(f128, @bitCast(value)),
         }),
         .arith => |a| try w.print("let v{d} = v{d} {s} v{d}", .{
             self.valueName(data.result.?),

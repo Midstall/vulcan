@@ -87,7 +87,7 @@ fn singleBlockWidenable(func: *const Function) bool {
     }
     for (func.blockInsts(entry)) |inst| {
         switch (func.opcode(inst)) {
-            .fconst, .iconst => {},
+            .fconst, .fconst128, .iconst => {},
             .arith => |a| if (!isF32(func, func.valueType(a.lhs))) return false,
             .icmp => |c| if (!isF32(func, func.valueType(c.lhs))) return false,
             .select => |s| if (!isF32(func, func.valueType(s.then))) return false,
@@ -397,6 +397,8 @@ fn widenFlattened(func: *Function) Error!void {
         switch (op) {
             // ptr-offset selectors / op codes: stay scalar.
             .iconst => try new_insts.append(func.allocator, inst),
+            // SPIR-V has no 128-bit float, so a shader holding one cannot widen.
+            .fconst128 => return error.NotWidenable,
             .fconst => {
                 const cval = func.instResult(inst).?;
                 try new_insts.append(func.allocator, inst);

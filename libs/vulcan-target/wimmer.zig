@@ -276,7 +276,7 @@ fn normalizeRanges(ranges: *std.ArrayList(Range)) void {
 /// target-independent `Opcode` set (exhaustive, so a new opcode forces an update here).
 fn visitOperands(func: *const Function, inst: Inst, ctx: anytype, comptime f: fn (@TypeOf(ctx), Value, bool) void) void {
     switch (func.opcode(inst)) {
-        .iconst, .fconst, .alloca, .global_addr => {},
+        .iconst, .fconst, .fconst128, .alloca, .global_addr => {},
         .arith => |a| {
             f(ctx, a.lhs, false);
             f(ctx, a.rhs, false);
@@ -413,9 +413,14 @@ pub fn buildIntervals(allocator: std.mem.Allocator, func: *const Function, desc:
                 // x86_64) can satisfy once the value count passes the register file size.
                 .should_have_register
             else if (self.term_kind)
-                // A ret value goes to its ABI return register at the block boundary, so it needs a
-                // register.
-                .must_have_register
+                // A ret value normally goes to its ABI return register at the block boundary, so it
+                // needs a register. The exception is a value whose class has NO allocatable register
+                // (a memory-resident class, for example riscv64/i386 binary128, which lives in a
+                // stack slot and moves into its ABI location, a GPR pair or the stack, only at the
+                // ret): it can never occupy a register, so a `must_have_register` demand would be
+                // unsatisfiable. The terminator emitter reads it straight from its slot, so mark it
+                // `should_have_register` instead. Non-empty classes are unaffected (byte-identical).
+                (if (self.desc.classes[self.desc.classOf(self.desc.ctx, self.func, v)].allocatable.len == 0) UseKind.should_have_register else .must_have_register)
             else
                 self.desc.useKind(self.desc.ctx, self.func, self.inst, v);
             self.use_lists[vi].append(self.allocator, .{ .pos = self.pos, .kind = kind }) catch |e| {

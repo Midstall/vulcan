@@ -354,7 +354,10 @@ pub const Expr = union(enum) {
     /// `std.fmt.parseFloat` since every C float literal fits an `f64` (narrowing to `f32`
     /// happens on lowering's `.fconst`, not here), and its `CType` (`.float{.f32}` for an
     /// `f`/`F` suffix, `.float{.f64}` otherwise, so `1.5f` differs from `1.5`/`1.5l`).
-    float_lit: struct { value: f64, ty: ctype.CType },
+    /// The f128 carrier holds every float literal exactly: the digits are parsed at the
+    /// literal's own target width first (so decimal-to-binary rounding is direct, never
+    /// double), and a narrower target's value widens into the carrier losslessly.
+    float_lit: struct { value: f128, ty: ctype.CType },
     negate: *Expr,
     complement: *Expr,
     lognot: *Expr,
@@ -1267,15 +1270,30 @@ const Parser = struct {
                 // extended `long double` here), gives `double` (f64).
                 var end = t.text.len;
                 var is_f32 = false;
+                var is_f128 = false;
                 while (end > 0) : (end -= 1) {
                     switch (t.text[end - 1]) {
                         'f', 'F' => is_f32 = true,
                         'l', 'L' => {},
+                        'q', 'Q' => is_f128 = true, // GNU suffix for __float128
                         else => break,
                     }
                 }
-                const value = std.fmt.parseFloat(f64, t.text[0..end]) catch return error.Overflow;
-                const ty: ctype.CType = .{ .float = if (is_f32) .f32 else .f64 };
+                // The `f128`/`F128` suffix (the ISO form) is multi-character, so it is
+                // checked off the text the single-character loop left.
+                if (std.mem.endsWith(u8, t.text[0..end], "128")) {
+                    end -= 3;
+                    is_f128 = true;
+                }
+                const digits = t.text[0..end];
+                // Parse at the literal's own target width: direct decimal rounding, and the
+                // value then widens into the f128 carrier exactly.
+                const ty: ctype.CType = .{ .float = if (is_f128) .f128 else if (is_f32) .f32 else .f64 };
+                const value: f128 = switch (ty.float) {
+                    .f32 => @floatCast(std.fmt.parseFloat(f32, digits) catch return error.Overflow),
+                    .f64 => @floatCast(std.fmt.parseFloat(f64, digits) catch return error.Overflow),
+                    .f128 => std.fmt.parseFloat(f128, digits) catch return error.Overflow,
+                };
                 return self.node(.{ .float_lit = .{ .value = value, .ty = ty } });
             },
             .str_lit => {
@@ -1880,6 +1898,41 @@ const Parser = struct {
             self.pos += 1;
             return self.parseEnum();
         }
+        // C99 `_Complex <real float type>`: the element follows immediately
+        // (`_Complex float`, `_Complex double`, `_Complex _Float128`). Complex
+        // arithmetic is not yet supported; a declaration works, a use errors at the
+        // op. The glibc x86_64 <bits/floatn.h> chain typedefs one of these, which is
+        // how this spelling reaches a parse at all.
+        if (self.peek().kind == .kw_complex) {
+            self.pos += 1;
+            const elem: ctype.FloatKind = switch (self.peek().kind) {
+                .kw_float => blk: {
+                    self.pos += 1;
+                    break :blk .f32;
+                },
+                .kw_double => blk: {
+                    self.pos += 1;
+                    break :blk .f64;
+                },
+                .kw_long => blk: {
+                    // `_Complex long double`: long double collapses to f64 here, the
+                    // same as the plain `long double` rule below.
+                    self.pos += 1;
+                    if (self.peek().kind == .kw_double) self.pos += 1;
+                    break :blk .f64;
+                },
+                .ident => blk: {
+                    const text = self.peek().text;
+                    if (std.mem.eql(u8, text, "__float128") or std.mem.eql(u8, text, "_Float128")) {
+                        self.pos += 1;
+                        break :blk .f128;
+                    }
+                    return error.UnexpectedToken;
+                },
+                else => return error.UnexpectedToken,
+            };
+            return .{ .complex = elem };
+        }
         // `float` (`f32`) and `double`/`long double` (both collapse to `f64`, no extended
         // precision here) are never combined with the integer-specifier soup below, so,
         // like `struct`/`union`/`enum` above, they are handled first and return directly. A
@@ -2009,6 +2062,17 @@ const Parser = struct {
         if (!any and self.peek().kind == .ident and std.mem.eql(u8, self.peek().text, "__builtin_va_list")) {
             self.pos += 1;
             return ctype.builtinVaList(self.layout);
+        }
+        // `_Float128` (the ISO spelling) and `__float128` (the GNU spelling) are the same
+        // type. Both lex as idents, and neither ever combines with another specifier, so the
+        // `!any` rule that guards `__builtin_va_list` guards them too. glibc's x86_64
+        // <bits/floatn.h> writes `typedef __float128 _Float128;` for a pre-C23 compiler,
+        // which is how this spelling reaches a parse at all.
+        if (!any and self.peek().kind == .ident and
+            (std.mem.eql(u8, self.peek().text, "__float128") or std.mem.eql(u8, self.peek().text, "_Float128")))
+        {
+            self.pos += 1;
+            return .{ .float = .f128 };
         }
         // The typedef-name-vs-identifier ambiguity. An `.ident` in type-specifier position,
         // with NO integer specifier seen yet (`!any`, since a typedef-name is never combined

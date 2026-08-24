@@ -21,8 +21,70 @@ pub fn runAll(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !voi
     try calls(io, allocator, backend);
     try floats(io, allocator, backend);
     try doubles(io, allocator, backend);
+    try quads(io, allocator, backend);
     try vectors(io, allocator, backend);
     try memory(io, allocator, backend);
+}
+
+/// Binary128 (`_Float128`) DATA MOVEMENT: an f128 lives in a whole 128-bit xmm register, so
+/// its argument passing, register move, constant, and memory load and store must all move 16
+/// bytes. f128 arithmetic, compares, and conversions have no SSE form and are lowered to
+/// soft-fp libcalls before isel, so no such op appears here; these cases prove only that the
+/// 16-byte value survives every move path intact.
+fn quads(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {
+    const t_of = struct {
+        fn f(func: *Function) !ir.types.Type {
+            return func.types.intern(.{ .float = .f128 });
+        }
+    }.f;
+    { // identity: the argument arrives in xmm0 and returns in xmm0. A messy value (nonzero in
+        // every byte) proves no half is dropped or zeroed.
+        const v: f128 = 0.1;
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const t = try t_of(&f);
+        const b = try f.appendBlock();
+        const a = try f.appendBlockParam(b, t);
+        f.setTerminator(b, .{ .ret = ir.function.Ret.one(a) });
+        try h.expectRunQuadFull(io, allocator, &f, &.{@bitCast(v)}, v, backend);
+    }
+    { // return the SECOND argument: it arrives in xmm1 and must move, whole, to xmm0.
+        const v0: f128 = 2.5;
+        const v1: f128 = 0.3;
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const t = try t_of(&f);
+        const b = try f.appendBlock();
+        _ = try f.appendBlockParam(b, t);
+        const bb = try f.appendBlockParam(b, t);
+        f.setTerminator(b, .{ .ret = ir.function.Ret.one(bb) });
+        try h.expectRunQuadFull(io, allocator, &f, &.{ @bitCast(v0), @bitCast(v1) }, v1, backend);
+    }
+    { // an f128 constant: materialized from its two 64-bit halves with punpcklqdq.
+        const c: f128 = 3.141592653589793238462643383279502884;
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const t = try t_of(&f);
+        const b = try f.appendBlock();
+        const k = try f.appendInst(b, t, .{ .fconst128 = @bitCast(c) });
+        f.setTerminator(b, .{ .ret = ir.function.Ret.one(k) });
+        try h.expectRunQuadFull(io, allocator, &f, &.{}, c, backend);
+    }
+    { // an f128 stack slot: alloca, store the argument (movups, 16 bytes), load it back
+        // (movups, 16 bytes), return it. Proves the memory load and store move the full width.
+        const v: f128 = 1.0 / 3.0;
+        var f = Function.init(allocator);
+        defer f.deinit();
+        const t = try t_of(&f);
+        const ptr_t = try f.types.intern(.ptr);
+        const b = try f.appendBlock();
+        const a = try f.appendBlockParam(b, t);
+        const slot = try f.appendInst(b, ptr_t, .{ .alloca = .{ .elem = t } });
+        try f.appendStore(b, a, slot);
+        const r = try f.appendInst(b, t, .{ .load = .{ .ptr = slot } });
+        f.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
+        try h.expectRunQuadFull(io, allocator, &f, &.{@bitCast(v)}, v, backend);
+    }
 }
 
 fn doubles(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {

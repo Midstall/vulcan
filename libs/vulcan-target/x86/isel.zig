@@ -227,6 +227,7 @@ pub fn compile(allocator: std.mem.Allocator, func: *const Function) Error!Compil
     // This backend does not yet lower f16; reject it cleanly rather than
     // silently treat it as f64.
     if (ir.function.functionUsesF16(func)) return error.Unsupported;
+    if (ir.function.functionUsesF128(func)) return error.Unsupported;
     if (func.blockCount() == 0) return error.Unsupported;
 
     // The Wimmer pipeline mutates the function (splitCriticalEdges appends forwarding blocks,
@@ -894,6 +895,7 @@ fn vaSlotSize(func: *const Function, ty: ir.types.Type) Error!u32 {
             .f16 => 2,
             .f32 => 4,
             .f64 => 8,
+            .f128 => 16,
         }), 4),
         .ptr => 4,
         else => error.Unsupported,
@@ -1453,7 +1455,7 @@ fn emitFromAllocation(allocator: std.mem.Allocator, ctx: *Ctx, func: *const Func
 /// the exact way the fold rewrite repoints operands.
 fn forEachOperand(func: *const Function, inst: ir.function.Inst, fold: *const addrfold.Analysis, ctx: anytype, comptime f: fn (@TypeOf(ctx), Value, bool) void) void {
     switch (func.opcode(inst)) {
-        .iconst, .fconst, .alloca, .global_addr => {},
+        .iconst, .fconst, .fconst128, .alloca, .global_addr => {},
         .arith => |a| {
             f(ctx, a.lhs, false);
             f(ctx, a.rhs, false);
@@ -1587,6 +1589,7 @@ fn applyFoldRewriteX86(func: *Function, fold: *const addrfold.Analysis) void {
 /// behavior.
 pub fn compileFunctionWimmerX86(allocator: std.mem.Allocator, func: *Function) Error!Compiled {
     if (ir.function.functionUsesF16(func)) return error.Unsupported;
+    if (ir.function.functionUsesF128(func)) return error.Unsupported;
     if (func.blockCount() == 0) return error.Unsupported;
 
     // Split critical edges first (mutating `func`), so the shared resolver's no-critical-edge
@@ -1639,6 +1642,7 @@ pub fn compileFunctionWimmerX86(allocator: std.mem.Allocator, func: *Function) E
 /// and compiles one each way.
 pub fn compileFunctionWimmerX86Fold(allocator: std.mem.Allocator, func: *Function) Error!Compiled {
     if (ir.function.functionUsesF16(func)) return error.Unsupported;
+    if (ir.function.functionUsesF128(func)) return error.Unsupported;
     if (func.blockCount() == 0) return error.Unsupported;
 
     // Split critical edges first (mutating `func`), matching `compileFunctionWimmerX86`.

@@ -187,6 +187,35 @@ pub fn buildUserStub(allocator: std.mem.Allocator, args: []const i64) std.mem.Al
     return w.toOwnedSlice(allocator);
 }
 
+/// Like `buildUserStub`, but for a function whose arguments and result are 2xXLEN (an f128,
+/// carried in an integer register PAIR by lp64d). Each `argHalves` entry is one 64-bit half, so an
+/// f128 argument is two consecutive entries (low then high) that load into the aligned a-register
+/// pair. After the call the 16-byte result lives in a0:a1; the tail writes both (16 LE bytes) to
+/// stdout, then exits. `x5`/`x6` are the 64-bit-load scratch (caller-saved, never an a-register).
+pub fn buildUserStubQuad(allocator: std.mem.Allocator, argHalves: []const u64) std.mem.Allocator.Error![]u32 {
+    var w: std.ArrayList(u32) = .empty;
+    errdefer w.deinit(allocator);
+
+    for (argHalves, 0..) |bits, i| try loadImm64Into(allocator, &w, argReg(i), .x5, bits);
+    const call_idx = w.items.len;
+    try w.append(allocator, encode.jal(.x1, 0)); // call the function (offset patched below)
+    // a0:a1 hold the 16-byte result. Spill both, write 16 bytes to fd 1, exit.
+    try w.append(allocator, encode.addi(.x2, .x2, -16)); // sp -= 16
+    try w.append(allocator, encode.sd(.x10, .x2, 0)); // sd a0, 0(sp) (low 64 bits)
+    try w.append(allocator, encode.sd(.x11, .x2, 8)); // sd a1, 8(sp) (high 64 bits)
+    try w.append(allocator, encode.addi(.x10, .x0, 1)); // a0 = 1 (stdout)
+    try w.append(allocator, encode.addi(.x11, .x2, 0)); // a1 = sp (buffer)
+    try w.append(allocator, encode.addi(.x12, .x0, 16)); // a2 = 16 (length)
+    try w.append(allocator, encode.addi(.x17, .x0, 64)); // a7 = 64 (write)
+    try w.append(allocator, encode.ecall());
+    try w.append(allocator, encode.addi(.x10, .x0, 0)); // a0 = 0 (status)
+    try w.append(allocator, encode.addi(.x17, .x0, 93)); // a7 = 93 (exit)
+    try w.append(allocator, encode.ecall());
+    const fn_off: i21 = @intCast((w.items.len - call_idx) * 4);
+    w.items[call_idx] = encode.jal(.x1, fn_off);
+    return w.toOwnedSlice(allocator);
+}
+
 /// Load a 32-bit pattern into `reg` via `lui`+`addi` (RV64 sign-extends the `addi` result
 /// through bit 63; callers either want that directly, or immediately mask/shift it away).
 fn loadImm32Into(allocator: std.mem.Allocator, words: *std.ArrayList(u32), reg: encode.Reg, bits: u32) std.mem.Allocator.Error!void {
@@ -361,6 +390,51 @@ pub fn runFunc(io: std.Io, allocator: std.mem.Allocator, func: *Function, args: 
     var words = try compileFunc(allocator, func);
     defer words.deinit(allocator);
     return runProgram(io, allocator, words.items, args, backend, backend.compress_rvc);
+}
+
+/// Compile `func` and run it under a user-mode backend, returning the full 16-byte a0:a1 result as a
+/// u128. `argHalves` supplies the 64-bit halves of the f128 arguments (low then high per f128, in
+/// aligned-pair order, with a filler entry for a skipped odd alignment register). Mirrors
+/// `runProgram`'s ELF-and-qemu path but with the quad stub and a 16-byte result read. User-mode only
+/// (the quad tail uses the write syscall); a non-user-mode backend skips.
+pub fn runFuncQuad(io: std.Io, allocator: std.mem.Allocator, func: *Function, argHalves: []const u64, backend: Backend) !u128 {
+    if (!backend.user_mode or backend.incompatible) return error.SkipZigTest;
+    var words = try compileFunc(allocator, func);
+    defer words.deinit(allocator);
+    const code = words.items;
+
+    const stub = try buildUserStubQuad(allocator, argHalves);
+    defer allocator.free(stub);
+    const program = try allocator.alloc(u32, stub.len + code.len);
+    defer allocator.free(program);
+    @memcpy(program[0..stub.len], stub);
+    @memcpy(program[stub.len..], code);
+    // A self-contained program (stub + body, all PC-relative) is safe to RVC-compress when the
+    // backend asks; compress recomputes the stub's call jal for the shrunk layout.
+    const bytes = if (backend.compress_rvc) try compress.compress(allocator, program) else try emit.emitBytes(allocator, program);
+    defer allocator.free(bytes);
+    const user_base: u64 = 0x10000;
+    const elf = try (@import("vulcan-link")).writeElfExec(.riscv64, allocator, bytes, bytes.len, user_base, user_base);
+    defer allocator.free(elf);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "firmware.elf", .data = elf, .flags = .{ .permissions = .executable_file } });
+    const argv = try backend.buildArgv(allocator, "firmware.elf");
+    defer allocator.free(argv);
+    const result = std.process.run(allocator, io, .{ .argv = argv, .cwd = .{ .dir = tmp.dir } }) catch |e| switch (e) {
+        error.FileNotFound => return error.SkipZigTest,
+        else => return e,
+    };
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    if (result.stdout.len < 16) {
+        std.debug.print("{s}: stdout too short ({d} bytes):\nstdout: {s}\nstderr: {s}\n", .{ backend.name, result.stdout.len, result.stdout, result.stderr });
+        return error.BackendFailed;
+    }
+    const tail = result.stdout[result.stdout.len - 16 ..];
+    const lo = std.mem.readInt(u64, tail[0..8], .little);
+    const hi = std.mem.readInt(u64, tail[8..16], .little);
+    return (@as(u128, hi) << 64) | lo;
 }
 
 /// Like `runFunc`, but for a whole linked module (entry first). Compression is only safe when the

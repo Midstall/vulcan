@@ -1975,7 +1975,14 @@ fn lowerExpr(l: *L, expr: *const parser.Expr) Error!TypedValue {
         },
         .float_lit => |v| blk: {
             const ft = try l.irTy(v.ty);
-            break :blk .{ .value = try f.appendInst(l.block, ft, .{ .fconst = v.value }), .ty = v.ty };
+            // The f128 carrier narrows to f64 for an f32/f64 literal exactly (the parse
+            // rounded at the target width). An f128 literal is the fconst128 opcode with
+            // its binary128 bits, the IR's f64 carrier cannot hold one.
+            const inst: ir.function.Opcode = switch (v.ty.float) {
+                .f128 => .{ .fconst128 = @bitCast(v.value) },
+                else => .{ .fconst = @floatCast(v.value) },
+            };
+            break :blk .{ .value = try f.appendInst(l.block, ft, inst), .ty = v.ty };
         },
         .negate => |inner| blk: {
             const iv = try lowerExpr(l, inner);

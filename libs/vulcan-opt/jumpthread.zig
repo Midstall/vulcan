@@ -417,7 +417,7 @@ fn blockUsesValueFromBlock(func: *const Function, block: Block, def_bi: u32, def
     }.f;
     for (func.blockInsts(block)) |inst| {
         switch (func.opcode(inst)) {
-            .iconst, .fconst, .alloca, .global_addr => {},
+            .iconst, .fconst, .fconst128, .alloca, .global_addr => {},
             .arith => |a| if (usesB(def_block, a.lhs, def_bi) or usesB(def_block, a.rhs, def_bi)) return true,
             .arith_imm => |a| if (usesB(def_block, a.lhs, def_bi)) return true,
             .icmp => |c| if (usesB(def_block, c.lhs, def_bi) or usesB(def_block, c.rhs, def_bi)) return true,
@@ -473,6 +473,7 @@ fn hasSideEffect(func: *const Function, block: Block) bool {
             .va_start, .va_arg, .va_end => return true,
             .iconst,
             .fconst,
+            .fconst128,
             .arith,
             .arith_imm,
             .icmp,

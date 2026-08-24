@@ -120,6 +120,8 @@ fn wrapProgram(allocator: std.mem.Allocator, func: *const Function, args: []cons
             .f16 => try out.appendSlice(allocator, "    uint16_t bits; memcpy(&bits, &r, 2); printf(\"%u\\n\", (unsigned)bits);\n"),
             .f32 => try out.appendSlice(allocator, "    uint32_t bits; memcpy(&bits, &r, 4); printf(\"%u\\n\", bits);\n"),
             .f64 => try out.appendSlice(allocator, "    uint64_t bits; memcpy(&bits, &r, 8); printf(\"%llu\\n\", (unsigned long long)bits);\n"),
+            // An f128 result is 16 bytes; print the two 64-bit halves, high first.
+            .f128 => try out.appendSlice(allocator, "    unsigned long long hi; unsigned long long lo; memcpy(&hi, (char*)&r + 8, 8); memcpy(&lo, (char*)&r, 8); printf(\"%llx%016llx\\n\", hi, lo);\n"),
         }
     } else {
         try out.appendSlice(allocator, "    printf(\"%lld\\n\", (long long)r);\n");
@@ -150,6 +152,7 @@ fn emitCType(allocator: std.mem.Allocator, out: *std.ArrayList(u8), func: *const
             .f16 => "_Float16",
             .f32 => "float",
             .f64 => "double",
+            .f128 => "_Float128",
         }),
         .ptr => try out.appendSlice(allocator, "void*"),
         else => return error.Unsupported,
@@ -175,6 +178,23 @@ fn runCF16(io: std.Io, allocator: std.mem.Allocator, func: *const Function, args
     defer allocator.free(stdout);
     const bits = try std.fmt.parseInt(u16, stdout, 10);
     return @bitCast(bits);
+}
+
+/// Like `runCF16`, but the function returns f128: the program prints the result's two 64-bit
+/// halves as hex (high first, low zero-padded to 16 digits), which we reassemble into the raw
+/// 128-bit pattern so the comparison is bit-exact.
+fn runCQuad(io: std.Io, allocator: std.mem.Allocator, func: *const Function, args: []const Arg) !u128 {
+    const program = try wrapProgram(allocator, func, args);
+    defer allocator.free(program);
+    const stdout = try compileAndRun(io, allocator, program);
+    defer allocator.free(stdout);
+    // "<hi:x><lo:016x>": the low 64 bits are always the last 16 hex digits (zero-padded); the
+    // high 64 bits are whatever precedes them.
+    if (stdout.len < 16) return error.BadOutput;
+    const split = stdout.len - 16;
+    const hi = try std.fmt.parseInt(u64, stdout[0..split], 16);
+    const lo = try std.fmt.parseInt(u64, stdout[split..], 16);
+    return (@as(u128, hi) << 64) | lo;
 }
 
 /// Compile GLSL `src`, emit its function `name` to C, compile and run it with `args`, and
@@ -599,4 +619,52 @@ test "C backend: f16 multiply compiled+run with cc, bit-exact against Zig's own 
     // so this is really exercising round-to-nearest-even and not silently widening to f32.
     const exact_f32: f32 = @as(f32, cases[1].a) * @as(f32, cases[1].b);
     try std.testing.expect(@as(f32, cases[1].a * cases[1].b) != exact_f32);
+}
+
+test "C backend: i64->f128 multiply compiled+run with cc, bit-exact against Zig's own f128" {
+    // f(a, b) = (_Float128)a * (_Float128)b, a and b i64. Real `cc` compiles the emitted
+    // `_Float128` widen-and-multiply and its host libgcc/compiler-rt runs it; the 128-bit
+    // result is compared bit-for-bit against Zig's own f128. This is the numeric ground truth
+    // behind the machine backends, which lower the SAME widen and multiply to the SAME soft-fp
+    // symbols (`__floatditf`, `__multf3`). Integer arguments carry their value exactly (unlike
+    // the f32-carried float args), so the case below can force a product that only a real
+    // binary128 keeps: two integers just under 2^41 whose product needs ~81 mantissa bits,
+    // more than f64's 53 but well inside f128's 112.
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+
+    const i64_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
+    const f128_t = try func.types.intern(.{ .float = .f128 });
+    const entry = try func.appendBlock();
+    const a = try func.appendBlockParam(entry, i64_t);
+    const b = try func.appendBlockParam(entry, i64_t);
+    const fa = try func.appendInst(entry, f128_t, .{ .convert = .{ .value = a } });
+    const fb = try func.appendInst(entry, f128_t, .{ .convert = .{ .value = b } });
+    const r = try func.appendInst(entry, f128_t, .{ .arith = .{ .op = .mul, .lhs = fa, .rhs = fb } });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(r) });
+
+    const cases = [_]struct { a: i64, b: i64 }{
+        .{ .a = 6, .b = 7 }, // tiny sanity case
+        .{ .a = (1 << 40) + 1, .b = (1 << 40) + 1 }, // product = 2^80 + 2^41 + 1: needs > 53 mantissa bits
+        .{ .a = -123456789, .b = 987654321 },
+    };
+    for (cases) |case| {
+        const got = runCQuad(std.testing.io, allocator, &func, &.{
+            .{ .int = case.a },
+            .{ .int = case.b },
+        }) catch |err| switch (err) {
+            error.NoCompiler => return error.SkipZigTest,
+            else => return err,
+        };
+        const want: f128 = @as(f128, @floatFromInt(case.a)) * @as(f128, @floatFromInt(case.b));
+        try std.testing.expectEqual(@as(u128, @bitCast(want)), got);
+    }
+    // The middle case genuinely needs binary128: its f128 product differs from the f64 product
+    // (a and b are exact in f64, but their product is not), so a backend computing in f64 would
+    // fail the bit-exact check above.
+    const af: f64 = @floatFromInt(cases[1].a);
+    const bf: f64 = @floatFromInt(cases[1].b);
+    const p128: f128 = @as(f128, @floatFromInt(cases[1].a)) * @as(f128, @floatFromInt(cases[1].b));
+    try std.testing.expect(p128 != @as(f128, af * bf));
 }

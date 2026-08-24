@@ -14,6 +14,7 @@
 //! (`__GNUC__`, `__x86_64__`, ...). So `#include <stdio.h>` compiles with no `-I`.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const cc = @import("vulcan-cc");
 const target = @import("vulcan-target");
 const link = @import("vulcan-link");
@@ -754,7 +755,7 @@ fn linkErrorMessage(e: link.Error) []const u8 {
     return switch (e) {
         error.OutOfMemory => "out of memory",
         error.MalformedObject => "malformed object or archive input",
-        error.UndefinedSymbol => "undefined symbol reference could not be resolved (missing a crt0/_start object or a library?)",
+        error.UndefinedSymbol => "undefined symbol reference could not be resolved (missing a crt0/_start object, a library, or the compiler runtime? a program using _Float128/__float128 needs the soft-float runtime, e.g. libgcc or compiler-rt, on the link line)",
         error.DuplicateSymbol => "duplicate symbol definition across inputs",
         error.RelocationOutOfRange => "a relocation target is out of range",
         error.UnsupportedReloc => "an input uses an unsupported relocation type",
@@ -769,7 +770,7 @@ fn scriptErrorMessage(e: link.ScriptError) []const u8 {
     return switch (e) {
         error.OutOfMemory => "out of memory",
         error.MalformedObject => "malformed object or archive input",
-        error.UndefinedSymbol => "undefined symbol reference could not be resolved (missing a crt0/_start object or a library?)",
+        error.UndefinedSymbol => "undefined symbol reference could not be resolved (missing a crt0/_start object, a library, or the compiler runtime? a program using _Float128/__float128 needs the soft-float runtime, e.g. libgcc or compiler-rt, on the link line)",
         error.DuplicateSymbol => "duplicate symbol definition across inputs",
         error.RelocationOutOfRange => "a relocation target is out of range",
         error.UnsupportedReloc => "an input uses an unsupported relocation type",
@@ -2042,9 +2043,17 @@ test "driver wiring: default system dir (host glibc) resolves #include <stdio.h>
     const system_dirs = try buildSystemDirs(arena.allocator(), &opts, glibc_include);
 
     var fsr = cc.fs_resolver.FsResolver.init(arena.allocator(), io, system_dirs);
+    // The predefs must match the headers' own arch: the discovered glibc tree is the
+    // HOST's, so an aarch64 spelling on an x86_64 host mis-parses the floatn chain.
     const toks = try preproc.preprocess(allocator, "#include <stdio.h>\n", .{
         .resolver = fsr.asResolver(),
-        .system = systemPredefFor(.aarch64),
+        .system = systemPredefFor(switch (builtin.cpu.arch) {
+            .aarch64 => .aarch64,
+            .x86_64 => .x86_64,
+            .riscv64 => .riscv64,
+            .x86 => .x86,
+            else => return error.SkipZigTest,
+        }),
     });
     defer cc.lexer.freeTokens(allocator, toks);
 

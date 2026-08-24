@@ -14,10 +14,10 @@ pub const Int = struct {
     bits: u16,
 };
 
-/// The floating-point formats in the primitive core. f16 is appended (not
-/// inserted) so f32/f64 keep their existing tag values; nothing may rely on
-/// f16's own tag value ordering relative to future additions.
-pub const FloatKind = enum { f32, f64, f16 };
+/// The floating-point formats in the primitive core. f16 and f128 are appended
+/// (not inserted) so f32/f64 keep their existing tag values; nothing may rely on
+/// a later member's own tag value ordering relative to future additions.
+pub const FloatKind = enum { f32, f64, f16, f128 };
 
 /// A fixed-length SIMD vector over a primitive scalar element.
 pub const Vector = struct {
@@ -298,6 +298,7 @@ const TypeParser = struct {
         if (std.mem.eql(u8, word, "f32")) return self.table.intern(.{ .float = .f32 });
         if (std.mem.eql(u8, word, "f64")) return self.table.intern(.{ .float = .f64 });
         if (std.mem.eql(u8, word, "f16")) return self.table.intern(.{ .float = .f16 });
+        if (std.mem.eql(u8, word, "f128")) return self.table.intern(.{ .float = .f128 });
         if (word.len >= 2 and (word[0] == 'i' or word[0] == 'u')) {
             const signedness: std.builtin.Signedness = if (word[0] == 'i') .signed else .unsigned;
             const bits = std.fmt.parseInt(u16, word[1..], 10) catch return error.InvalidType;
@@ -443,6 +444,19 @@ test "float and pointer primitives intern distinctly" {
     try std.testing.expectEqual(ptr_a, ptr_b);
     try std.testing.expect(f32_a != f64_t);
     try std.testing.expect(f32_a != ptr_a);
+}
+
+test "f128 parses, prints, and interns distinctly from f16/f32/f64" {
+    var table = TypeTable.init(std.testing.allocator);
+    defer table.deinit();
+
+    const f128_t = try table.intern(.{ .float = .f128 });
+    const f64_t = try table.intern(.{ .float = .f64 });
+
+    try std.testing.expectEqual(f128_t, try table.parseType("f128"));
+    try std.testing.expectFmt("f128", "{f}", .{table.fmt(f128_t)});
+    try std.testing.expect(f128_t != f64_t);
+    try std.testing.expectEqual(f128_t, try table.intern(.{ .float = .f128 }));
 }
 
 test "f16 parses, prints, and interns distinctly from f32/f64" {

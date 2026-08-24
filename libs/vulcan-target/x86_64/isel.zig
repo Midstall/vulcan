@@ -166,6 +166,18 @@ fn isHalf(func: *const Function, v: Value) bool {
         else => false,
     };
 }
+/// Whether `v` is a binary128 (`f128`) scalar float. It occupies a whole 128-bit xmm
+/// register (16 bytes), so its constant, memory load and store, and call-argument reload
+/// use the full 128-bit `movups` form rather than the `movss`/`movsd` scalar forms an f32
+/// or f64 uses. Its arithmetic, compares, and conversions have no SSE instruction and lower
+/// to soft-fp libcalls before isel (see the `softfp` pass), so no f128 value reaches the
+/// in-register scalar-arithmetic path here.
+fn isQuad(func: *const Function, v: Value) bool {
+    return switch (func.types.type_kind(func.valueType(v))) {
+        .float => |f| f == .f128,
+        else => false,
+    };
+}
 /// Whether `v` lives in an xmm register, as a scalar float or a SIMD vector.
 fn isXmm(func: *const Function, v: Value) bool {
     return isFloat(func, v) or isVector(func, v);
@@ -544,6 +556,11 @@ pub fn compileWithCaps(allocator: std.mem.Allocator, func: *const Function, caps
     var work = try func.clone(allocator);
     defer work.deinit();
 
+    // Lower binary128 arithmetic, compares, conversions, and sqrt to soft-fp libcalls before
+    // anything numbers the IR, so the call clobbers and argument placement are visible to the
+    // register allocator. f128 data movement stays native and is untouched.
+    _ = try ir.softfp.lower(allocator, &work);
+
     // Split critical edges first, before the code builds any numbering. The shared
     // resolver needs a block on every critical edge to place its shuffle moves.
     try ir.critical_edge.splitCriticalEdges(allocator, &work);
@@ -625,17 +642,18 @@ pub fn compileWithCaps(allocator: std.mem.Allocator, func: *const Function, caps
     return compiled;
 }
 
-/// The `func`-owned symbol string equal to `name`. Every emitted relocation names a
-/// callee that the function interned, since a `call`'s `symbol` indexes `func`'s
-/// symbol table. So a match always exists. A miss would be a codegen bug, not a
-/// runtime condition.
+/// The longer-lived symbol string equal to `name`. Most relocations name a callee the
+/// function itself interned, so the match is `func`'s own copy. A soft-fp libcall symbol
+/// (`__addtf3`, ...) is added to the clone by `softfp.lower`, not the caller's function, so it
+/// has no match there; it is one of the pass's static string literals, which outlive every
+/// `Compiled`, so the code re-points it to that literal. Any other miss is a codegen bug.
 fn rebindSymbolName(func: *const Function, name: []const u8) []const u8 {
     var i: u32 = 0;
     while (i < func.symbolCount()) : (i += 1) {
         const s = func.symbolName(i);
         if (std.mem.eql(u8, s, name)) return s;
     }
-    unreachable;
+    return ir.softfp.staticName(name) orelse unreachable;
 }
 
 /// Compute the stack frame and fill the xmm and alloca bases on `ctx`. Frame
@@ -1189,7 +1207,7 @@ fn emitVaArg(allocator: std.mem.Allocator, ctx: *Ctx, list: Value, result: Value
     const load_target = ctx.code.items.len;
     if (is_fp) {
         const rd = try ctx.dstXmm(result, xmm_scratch);
-        try ctx.put(allocator, if (isDouble(func, result)) encode.movsdLoadMem(rd, scratch1, 0) else encode.movssLoadMem(rd, scratch1, 0));
+        try ctx.put(allocator, if (isQuad(func, result)) encode.movupsLoadMem(rd, scratch1, 0) else if (isDouble(func, result)) encode.movsdLoadMem(rd, scratch1, 0) else encode.movssLoadMem(rd, scratch1, 0));
         try ctx.storeXmm(allocator, result, rd);
     } else {
         const rd = ctx.dst(result, scratch1);
@@ -1344,7 +1362,7 @@ fn lowerDirectCall(allocator: std.mem.Allocator, ctx: *Ctx, c: ir.function.Call,
             xi += 1;
             if (ctx.loc(arg) == .xmm_spill) {
                 const disp = ctx.xmmDisp(ctx.loc(arg).xmm_spill) + stack_bytes;
-                try ctx.put(allocator, if (isWide(func, arg)) encode.vmovupsLoad(dst, disp) else if (isVector(func, arg)) encode.movupsLoad(dst, disp) else encode.movssLoad(dst, disp));
+                try ctx.put(allocator, if (isWide(func, arg)) encode.vmovupsLoad(dst, disp) else if (isVector(func, arg) or isQuad(func, arg)) encode.movupsLoad(dst, disp) else encode.movssLoad(dst, disp));
             }
         } else {
             if (gi >= arg_regs.len) {
@@ -1424,7 +1442,7 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
                 try ctx.put(allocator, encode.movdFromXmm(scratch1, xmm_scratch));
                 try ctx.put(allocator, encode.movToMem16(base, disp, scratch1));
             } else {
-                try ctx.put(allocator, if (isVector(func, st.value)) encode.movupsStoreMem(base, disp, val) else if (isDouble(func, st.value)) encode.movsdStoreMem(base, disp, val) else encode.movssStoreMem(base, disp, val));
+                try ctx.put(allocator, if (isVector(func, st.value) or isQuad(func, st.value)) encode.movupsStoreMem(base, disp, val) else if (isDouble(func, st.value)) encode.movsdStoreMem(base, disp, val) else encode.movssStoreMem(base, disp, val));
             }
         } else {
             const val = try ctx.use(allocator, st.value, scratch1);
@@ -1511,7 +1529,7 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
                 xi += 1;
                 if (ctx.loc(arg) == .xmm_spill) {
                     const disp = ctx.xmmDisp(ctx.loc(arg).xmm_spill);
-                    try ctx.put(allocator, if (isWide(func, arg)) encode.vmovupsLoad(dst, disp) else if (isVector(func, arg)) encode.movupsLoad(dst, disp) else encode.movssLoad(dst, disp));
+                    try ctx.put(allocator, if (isWide(func, arg)) encode.vmovupsLoad(dst, disp) else if (isVector(func, arg) or isQuad(func, arg)) encode.movupsLoad(dst, disp) else encode.movssLoad(dst, disp));
                 }
             } else {
                 const dst = arg_regs[gi];
@@ -1608,7 +1626,27 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
             }
             try ctx.storeXmm(allocator, result, rd);
         },
+        .fconst128 => |val| {
+            // A binary128 constant is 16 bytes, too wide for one gpr. Materialize each 64-bit
+            // half in a scratch gpr, move it into an xmm low lane with movq (which zeroes the
+            // high lane), then splice the two halves with punpcklqdq: the destination keeps
+            // the low half and takes the other register's low half as its high half. Baseline
+            // x86-64 has no SSE4.1 `pinsrq`, so this SSE2 sequence is the portable path.
+            const lo: u64 = @truncate(val);
+            const hi: u64 = @truncate(val >> 64);
+            const rd = try ctx.dstXmm(result, xmm_scratch);
+            try ctx.put(allocator, encode.movImm64(scratch1, lo));
+            try ctx.put(allocator, encode.movqToXmm(rd, scratch1)); // rd = [lo, 0]
+            try ctx.put(allocator, encode.movImm64(scratch2, hi));
+            try ctx.put(allocator, encode.movqToXmm(xmm_op1, scratch2)); // xmm_op1 = [hi, 0]
+            try ctx.put(allocator, encode.punpcklqdq(rd, xmm_op1)); // rd = [lo, hi]
+            try ctx.storeXmm(allocator, result, rd);
+        },
         .arith => |a| {
+            // f128 arithmetic has no SSE instruction; the softfp pass rewrites it to a
+            // libcall before isel, so a real f128 arith never reaches this scalar path. Reject
+            // one defensively rather than emit a wrong-width `addss` if the pass was skipped.
+            if (isQuad(func, result)) return error.Unsupported;
             if (isWide(func, result)) {
                 // AVX 256-bit is three-operand and non-destructive: `dst =
                 // v<op>ps src1, src2` directly. So the code needs no copy and
@@ -1815,6 +1853,10 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
                 return;
             }
             if (isFloat(func, cmp.lhs)) {
+                // f128 has no ucomiss/ucomisd; the softfp pass rewrites an f128 compare to a
+                // libcall (`__eqtf2` and friends) plus an integer compare of its status
+                // result before isel, so a real one never reaches here. Reject defensively.
+                if (isQuad(func, cmp.lhs)) return error.Unsupported;
                 // Float compare via ucomiss and setcc. The bool result lives
                 // in a gpr.
                 const rd = ctx.dst(result, scratch1);
@@ -1912,6 +1954,10 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
         .convert => |cv| {
             // Numeric conversions: int to float or back (32-bit int, f32, or
             // f64), int to int (low bits), and f32 to f64 or back.
+            // Any conversion touching f128 has no SSE form; the softfp pass rewrites it to an
+            // `__extend*`/`__trunc*`/`__float*`/`__fix*` libcall before isel, so a real f128
+            // convert never reaches here. Reject defensively rather than emit a wrong convert.
+            if (isQuad(func, cv.value) or isQuad(func, result)) return error.Unsupported;
             const src_float = isFloat(func, cv.value);
             const dst_float = isFloat(func, result);
             if (!src_float and dst_float) {
@@ -2163,7 +2209,7 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
                     try ctx.put(allocator, encode.movdToXmm(rd, scratch1));
                     try ctx.put(allocator, encode.vcvtph2ps(rd, rd));
                 } else {
-                    try ctx.put(allocator, if (isVector(func, result)) encode.movupsLoadMem(rd, base, disp) else if (isDouble(func, result)) encode.movsdLoadMem(rd, base, disp) else encode.movssLoadMem(rd, base, disp));
+                    try ctx.put(allocator, if (isVector(func, result) or isQuad(func, result)) encode.movupsLoadMem(rd, base, disp) else if (isDouble(func, result)) encode.movsdLoadMem(rd, base, disp) else encode.movssLoadMem(rd, base, disp));
                 }
                 try ctx.storeXmm(allocator, result, rd);
             } else {
@@ -2379,7 +2425,7 @@ fn emitMoves(allocator: std.mem.Allocator, ctx: *Ctx, jump: ir.function.Jump, pr
             .reg => |dst| if (ctx.loc(arg) == .spill) try ctx.put(allocator, encode.movFromStack(dst, slotDisp(ctx.loc(arg).spill))),
             .xmm => |dst| if (ctx.loc(arg) == .xmm_spill) {
                 const disp = ctx.xmmDisp(ctx.loc(arg).xmm_spill);
-                try ctx.put(allocator, if (isWide(func, param)) encode.vmovupsLoad(dst, disp) else if (isVector(func, param)) encode.movupsLoad(dst, disp) else encode.movssLoad(dst, disp));
+                try ctx.put(allocator, if (isWide(func, param)) encode.vmovupsLoad(dst, disp) else if (isVector(func, param) or isQuad(func, param)) encode.movupsLoad(dst, disp) else encode.movssLoad(dst, disp));
             },
             else => {},
         }
@@ -3183,6 +3229,12 @@ fn applyFoldRewriteX86(func: *Function, fold: *const addrfold.Analysis) void {
 pub fn compileFunctionWimmerX86(allocator: std.mem.Allocator, func: *Function) Error!Compiled {
     if (ir.function.functionUsesCompositeF16(func)) return error.Unsupported;
     if (func.blockCount() == 0) return error.Unsupported;
+    // f128 data movement (constant, move, spill, memory load and store) is emitted natively
+    // as 128-bit xmm traffic. Its arithmetic, compares, and conversions have no SSE form and
+    // are lowered to soft-fp libcalls here by the softfp pass, so no f128 arith, compare, or
+    // convert reaches emission; any that slips through is rejected per-op rather than
+    // miscompiled.
+    _ = try ir.softfp.lower(allocator, func);
 
     // Split critical edges first, mutating `func`, so the shared resolver's
     // no-critical-edge precondition holds, and the RegDescription, scan,
@@ -3300,7 +3352,7 @@ pub fn compileFunctionWimmerX86Fold(allocator: std.mem.Allocator, func: *Functio
 /// predicate scores, carrying the edge-arg flag that predicate needs.
 fn forEachOperand(func: *const Function, inst: ir.function.Inst, fold: *const addrfold.Analysis, ctx: anytype, comptime f: fn (@TypeOf(ctx), Value, bool) void) void {
     switch (func.opcode(inst)) {
-        .iconst, .fconst, .alloca, .global_addr => {},
+        .iconst, .fconst, .fconst128, .alloca, .global_addr => {},
         .arith => |a| {
             f(ctx, a.lhs, false);
             f(ctx, a.rhs, false);
@@ -3549,6 +3601,7 @@ fn typeSize(func: *const Function, ty: ir.types.Type) u32 {
             .f16 => 2, // a 2-byte IEEE half in memory (its in-register form is the f32 widening)
             .f32 => 4,
             .f64 => 8,
+            .f128 => 16, // a 16-byte IEEE quad in memory
         },
         .array => |a| @as(u32, @intCast(a.len)) * typeSize(func, a.elem),
         .vector => |v| @as(u32, v.len) * typeSize(func, v.elem),

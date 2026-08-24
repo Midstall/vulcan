@@ -513,7 +513,7 @@ fn customLatency(op: ir.function.Opcode) u32 {
         .dot => 3,
         // This fictional part carries no tensor unit; a placeholder in case one is added.
         .matmul => 64,
-        .iconst, .fconst, .icmp, .select, .struct_new, .extract, .alloca, .call, .call_indirect, .global_addr, .store, .prefetch, .@"if" => 1,
+        .iconst, .fconst, .fconst128, .icmp, .select, .struct_new, .extract, .alloca, .call, .call_indirect, .global_addr, .store, .prefetch, .@"if" => 1,
         // SM12 T3: no backend expands these yet, priced like any other cheap bookkeeping op.
         .va_start, .va_arg, .va_end => 1,
     };
@@ -540,7 +540,7 @@ fn customThroughput(op: ir.function.Opcode, elem_float: bool) u32 {
         .convert, .unary => 1,
         .dot => 3,
         .matmul => 64, // no tensor unit here; non-pipelined placeholder
-        .iconst, .fconst, .icmp, .select, .struct_new, .extract, .alloca, .call, .call_indirect, .global_addr, .store, .prefetch, .@"if" => 1,
+        .iconst, .fconst, .fconst128, .icmp, .select, .struct_new, .extract, .alloca, .call, .call_indirect, .global_addr, .store, .prefetch, .@"if" => 1,
         // SM12 T3: no backend expands these yet, priced like any other cheap bookkeeping op.
         .va_start, .va_arg, .va_end => 1,
     };
@@ -550,7 +550,7 @@ fn customUnit(op: ir.function.Opcode) opt.microarch.UnitClass {
     return switch (op) {
         .arith => |a| customArithUnit(a.op),
         .arith_imm => |a| customArithUnit(a.op),
-        .icmp, .select, .iconst, .fconst, .global_addr => .alu,
+        .icmp, .select, .iconst, .fconst, .fconst128, .global_addr => .alu,
         .convert => .fpsimd,
         .unary => |u| switch (u.op) {
             .reinterpret => .alu,

@@ -68,9 +68,11 @@ pub const IntType = struct {
     }
 };
 
-/// A C floating-point type's width: `float` (`f32`) or `double`/`long double` (`f64`).
-/// This frontend has no extended-precision `long double`, so it collapses to plain `double`.
-pub const FloatKind = enum { f32, f64 };
+/// A C floating-point type's width: `float` (`f32`), `double`/`long double` (`f64`), or
+/// `_Float128`/`__float128` (`f128`). This frontend has no extended-precision `long double`,
+/// so that one collapses to plain `double`. f128 is a real, distinct width: 16 bytes,
+/// 16-aligned, the widest float under the usual arithmetic conversions.
+pub const FloatKind = enum { f32, f64, f128 };
 
 /// A `const`/`volatile` qualifier pair. It is carried on `CType.ptr` (the pointee's
 /// qualifiers), `CType.array` (the element's), `Field` (the field's own), and threaded
@@ -205,6 +207,12 @@ pub const CType = union(enum) {
     /// A `float` or `double`. No pointee or element allocation is needed. Unlike `ptr`,
     /// `array`, and `@"struct"`, a `FloatKind` is a plain value, not arena-owned.
     float: FloatKind,
+    /// A C99 `_Complex` of a real float element: `_Complex float`, `_Complex double`,
+    /// `_Complex _Float128`. The element is a plain value for the same reason `.float`
+    /// is. Storage is two elements side by side (real then imaginary), so size is 2x
+    /// the element and alignment is the element's own. Complex ARITHMETIC is not yet
+    /// supported: a use errors clearly, a declaration works.
+    complex: FloatKind,
     /// A function type. See this union's doc comment for where `.func` shows up: always
     /// as `ptr.pointee`, or transiently as a bodyless-prototype declarator's resolved
     /// type before `parser.parse` unpacks it into a `FuncDecl`.
@@ -279,7 +287,14 @@ pub const CType = union(enum) {
             .float => |fk| switch (fk) {
                 .f32 => 4,
                 .f64 => 8,
+                .f128 => 16,
             },
+            // A complex is two elements side by side: real then imaginary.
+            .complex => |fk| 2 * @as(u64, switch (fk) {
+                .f32 => 4,
+                .f64 => 8,
+                .f128 => 16,
+            }),
             // A bare function type has no size of its own. C forbids `sizeof` on one; it
             // is never an object. This arm is only ever reached, if at all, through a
             // switch-exhaustiveness requirement, since every real use goes through
@@ -307,7 +322,7 @@ pub const CType = union(enum) {
     /// `sizeInBytes`'s doc comment for the same pointer versus by-value split.
     pub fn storageSize(self: CType, l: layout.TargetLayout) Error!u64 {
         return switch (self) {
-            .int, .ptr, .float, .void_ => try self.sizeInBytes(l),
+            .int, .ptr, .float, .complex, .void_ => try self.sizeInBytes(l),
             .array => |a| a.len * (try a.elem.storageSize(l)),
             .@"struct" => |s| blk: {
                 if (!s.complete) break :blk error.IncompleteType;
@@ -334,6 +349,13 @@ pub const CType = union(enum) {
                 break :blk s.alignment;
             },
             .float => try self.sizeInBytes(l), // C aligns a float or double to its own width.
+            // A complex aligns as its element: _Complex double is 8-aligned, and
+            // _Complex _Float128 is 16-aligned.
+            .complex => |fk| switch (fk) {
+                .f32 => 4,
+                .f64 => 8,
+                .f128 => 16,
+            },
             .func => 1, // No object, so no alignment requirement of its own.
             .void_ => 1, // GNU gives sizeof(void) == 1, so alignOf follows suit.
         };
@@ -365,6 +387,18 @@ pub const CType = union(enum) {
             .float => |fk| func.types.intern(.{ .float = switch (fk) {
                 .f32 => .f32,
                 .f64 => .f64,
+                .f128 => .f128,
+            } }),
+            // A complex lowers to its storage shape: the IR array of the element's own
+            // type, real part at index 0, imaginary at index 1. Complex arithmetic has
+            // no IR op; a use of one errors at the op, not at the storage.
+            .complex => |fk| func.types.intern(.{ .array = .{
+                .len = 2,
+                .elem = try func.types.intern(.{ .float = switch (fk) {
+                    .f32 => .f32,
+                    .f64 => .f64,
+                    .f128 => .f128,
+                } }),
             } }),
             // A pointer to a function, the only way `.func` is meaningfully lowered, for
             // a function-pointer variable, already goes through the `.ptr` arm above,
@@ -401,6 +435,7 @@ pub const CType = union(enum) {
             .array => |aa| b == .array and aa.len == b.array.len and aa.elem.eql(b.array.elem.*),
             .@"struct" => |as| b == .@"struct" and as == b.@"struct",
             .float => |af| b == .float and af == b.float,
+            .complex => |ac| b == .complex and ac == b.complex,
             .func => |af| b == .func and af.eql(b.func.*),
             .void_ => b == .void_,
         };
@@ -419,13 +454,22 @@ pub const CType = union(enum) {
 
     /// The usual arithmetic conversions, lifted to `CType`. Meaningful for two `.int`
     /// operands (see `promote`), or when either operand is `.float`. The result is then
-    /// the wider float, `f64` if either operand is `f64`, else `f32`. An int operand
+    /// the wider float: f128 if either operand is f128, then f64, else f32. An int operand
     /// converts straight to that float, never through an intermediate int-int conversion.
     pub fn commonType(a: CType, b: CType, l: layout.TargetLayout) CType {
         if (a.isFloat() or b.isFloat()) {
-            const a_f64 = (a.asFloat() orelse .f32) == .f64;
-            const b_f64 = (b.asFloat() orelse .f32) == .f64;
-            return .{ .float = if (a_f64 or b_f64) .f64 else .f32 };
+            const rank = struct {
+                fn of(fk: FloatKind) u2 {
+                    return switch (fk) {
+                        .f32 => 0,
+                        .f64 => 1,
+                        .f128 => 2,
+                    };
+                }
+            }.of;
+            const af = a.asFloat() orelse .f32;
+            const bf = b.asFloat() orelse .f32;
+            return .{ .float = if (rank(af) >= rank(bf)) af else bf };
         }
         std.debug.assert(a.isInt() and b.isInt());
         return .{ .int = IntType.commonType(a.int, b.int, l) };

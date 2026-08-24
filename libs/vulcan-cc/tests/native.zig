@@ -183,6 +183,7 @@ fn returnKind(func: *const ir.function.Function) !ReturnKind {
                         .f32 => .f32,
                         .f64 => .f64,
                         .f16 => error.Unsupported,
+                        .f128 => error.Unsupported,
                     },
                     else => error.Unsupported,
                 };

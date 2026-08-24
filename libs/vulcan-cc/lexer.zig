@@ -38,6 +38,7 @@ pub const Kind = enum {
     kw_float,
     kw_double,
     kw_bool,
+    kw_complex,
     ident,
     int_lit,
     float_lit,
@@ -171,6 +172,9 @@ pub fn keyword(text: []const u8) ?Kind {
     // already accepts a leading `_`, so `_Bool` scans as a plain identifier first. This
     // keyword check is what reclassifies it, the same as every other type keyword above.
     if (std.mem.eql(u8, text, "_Bool")) return .kw_bool;
+    // C99 `_Complex`: the complex type specifier, reclassified from an identifier the
+    // same way `_Bool` is.
+    if (std.mem.eql(u8, text, "_Complex")) return .kw_complex;
     return null;
 }
 

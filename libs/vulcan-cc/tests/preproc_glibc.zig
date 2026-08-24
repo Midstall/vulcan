@@ -13,6 +13,7 @@
 //! and `GCC system_header`.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const cc = @import("vulcan-cc");
 
 /// This sets a modest `__GNUC__` version: 4.2. It is old enough that glibc's
@@ -20,14 +21,26 @@ const cc = @import("vulcan-cc");
 /// and `__THROW`, that real glibc headers rely on. The target is LP64: both `long` and
 /// pointers are 64 bits.
 fn systemPredef(arch: cc.layout.Arch) cc.preproc.SystemPredef {
+    const lay = cc.layout.forArch(arch);
     return .{
         .arch = arch,
         .gnuc_major = 4,
         .gnuc_minor = 2,
         .gnuc_patch = 0,
-        .long_bits = 64,
-        .ptr_bits = 64,
-        .char_signed = false,
+        .long_bits = lay.long_bits,
+        .ptr_bits = lay.ptr_bits,
+        .char_signed = lay.char_signed,
+    };
+}
+
+/// The host arch as a layout arch, skipping on a host with no layout entry.
+fn hostLayoutArch() error{SkipZigTest}!cc.layout.Arch {
+    return switch (builtin.cpu.arch) {
+        .aarch64 => .aarch64,
+        .x86_64 => .x86_64,
+        .riscv64 => .riscv64,
+        .x86 => .x86,
+        else => error.SkipZigTest,
     };
 }
 
@@ -128,13 +141,15 @@ fn expectChainPreprocessesClean(allocator: std.mem.Allocator, glibc_include: []c
     try std.testing.expect(std.mem.indexOf(u8, joined.items, "__attribute__") != null);
 }
 
-// The host (aarch64) test must pass whenever a glibc dev tree is present. This is the
-// one case that is required to succeed, not merely allowed to succeed.
-test "VCC preprocesses the real glibc <stdio.h> chain to no-error (aarch64 host)" {
+// The host test must pass whenever a glibc dev tree is present. This is the
+// one case that is required to succeed, not merely allowed to succeed. The predef
+// and layout follow the host arch, so the same check runs on aarch64 and x86_64.
+test "VCC preprocesses the real glibc <stdio.h> chain to no-error (host glibc)" {
     const allocator = std.testing.allocator;
+    const arch = try hostLayoutArch();
     const glibc_include = (try findHostGlibcIncludeDir(allocator)) orelse return error.SkipZigTest;
     defer allocator.free(glibc_include);
-    try expectChainPreprocessesClean(allocator, glibc_include, systemPredef(.aarch64));
+    try expectChainPreprocessesClean(allocator, glibc_include, systemPredef(arch));
 }
 
 // The whole VCC stack must work together on a real header. The test above proved that
@@ -166,11 +181,12 @@ fn expectChainParsesClean(allocator: std.mem.Allocator, glibc_include: []const u
     try std.testing.expect(unit.func_decls.len > 0);
 }
 
-test "VCC PARSES the real glibc <stdio.h> chain to no-error (aarch64 host)" {
+test "VCC PARSES the real glibc <stdio.h> chain to no-error (host glibc)" {
     const allocator = std.testing.allocator;
+    const arch = try hostLayoutArch();
     const glibc_include = (try findHostGlibcIncludeDir(allocator)) orelse return error.SkipZigTest;
     defer allocator.free(glibc_include);
-    try expectChainParsesClean(allocator, glibc_include, .aarch64);
+    try expectChainParsesClean(allocator, glibc_include, arch);
 }
 
 // The same full parse, repeated for each cross target whose glibc dev tree this Nix

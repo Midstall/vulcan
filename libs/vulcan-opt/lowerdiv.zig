@@ -166,7 +166,7 @@ fn rewriteUses(func: *Function, subst: std.AutoHashMapUnmanaged(Value, Value)) v
     }.f;
     for (0..func.instCount()) |i| {
         switch (func.opcodeMut(@enumFromInt(i)).*) {
-            .iconst, .fconst, .alloca, .global_addr => {},
+            .iconst, .fconst, .fconst128, .alloca, .global_addr => {},
             .arith => |*a| {
                 a.lhs = sub(subst, a.lhs);
                 a.rhs = sub(subst, a.rhs);

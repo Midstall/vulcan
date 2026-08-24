@@ -29,7 +29,7 @@ fn nonTrapping(op: BinOp) bool {
 /// Whether an instruction may be hoisted out of a loop if it is invariant.
 fn hoistable(opcode: ir.function.Opcode) bool {
     return switch (opcode) {
-        .iconst, .fconst, .icmp, .select, .convert, .unary, .extract, .global_addr, .dot => true,
+        .iconst, .fconst, .fconst128, .icmp, .select, .convert, .unary, .extract, .global_addr, .dot => true,
         .arith => |a| nonTrapping(a.op),
         .arith_imm => |a| nonTrapping(a.op),
         .alloca, .struct_new, .load, .store, .prefetch, .matmul, .call, .call_indirect, .@"if" => false,
@@ -46,7 +46,7 @@ fn operandsInvariant(func: *const Function, inst: Inst, invariant: []const bool)
         }
     }.f;
     return switch (func.opcode(inst)) {
-        .iconst, .fconst, .global_addr => true,
+        .iconst, .fconst, .fconst128, .global_addr => true,
         .arith => |a| inv(invariant, a.lhs) and inv(invariant, a.rhs),
         .arith_imm => |a| inv(invariant, a.lhs),
         .icmp => |c| inv(invariant, c.lhs) and inv(invariant, c.rhs),

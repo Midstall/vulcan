@@ -286,6 +286,8 @@ fn returnBaseType(func: *const ir.function.Function) ?dwarf.BaseType {
             // A 2-byte IEEE half in memory. x86_64 lowers f16 via F16C, and holds it as its
             // widened f32 form in registers.
             .f16 => .{ .name = "half", .encoding = .float, .byte_size = 2 },
+            // A 16-byte IEEE quad. Debug naming only; no lowering claim.
+            .f128 => .{ .name = "__float128", .encoding = .float, .byte_size = 16 },
         },
         .int => |it| blk: {
             const bytes: u8 = @intCast((it.bits + 7) / 8);

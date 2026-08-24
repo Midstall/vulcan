@@ -383,6 +383,9 @@ pub fn irTypeToWasm(types: *const ir.types.TypeTable, ty: ir.types.Type) ?ValTyp
         .float => |kind| switch (kind) {
             .f32 => .f32,
             .f64 => .f64,
+            // Wasm has no f128 value type and no wider float to widen one into, so an
+            // f128 SSA value cannot be held at all. Null reports it as unsupported.
+            .f128 => null,
             // Wasm has no native f16 value type, so an f16 SSA value is held as its
             // f32 widening in an f32 local (the isel converts at every memory/round
             // boundary in software). The value slot is therefore f32, matching the
@@ -412,6 +415,8 @@ pub fn irLoadOp(types: *const ir.types.TypeTable, ty: ir.types.Type) error{Unsup
             .f64 => MemOp.load64f64,
             // The 16-bit half pattern; the isel widens it to the held f32 in software.
             .f16 => MemOp.load16_u,
+            // Wasm has no 128-bit float memory op.
+            .f128 => return error.Unsupported,
         },
         else => unreachable,
     };
@@ -435,6 +440,8 @@ pub fn irStoreOp(types: *const ir.types.TypeTable, ty: ir.types.Type) error{Unsu
             .f64 => MemOp.store64f64,
             // The isel truncates the held f32 to the 16-bit half, then stores it.
             .f16 => MemOp.store16,
+            // Wasm has no 128-bit float memory op.
+            .f128 => return error.Unsupported,
         },
         else => unreachable,
     };

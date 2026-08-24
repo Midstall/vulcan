@@ -19,7 +19,7 @@ const Block = ir.function.Block;
 
 pub const pass_def = pass.Pass{ .name = "gvn", .run = run };
 
-const ExprKind = enum(u8) { iconst, fconst, arith, arith_imm, icmp, select, convert, unary, extract, global_addr, dot };
+const ExprKind = enum(u8) { iconst, fconst, fconst128, arith, arith_imm, icmp, select, convert, unary, extract, global_addr, dot };
 
 /// A canonical key for a pure expression: its kind, a sub-opcode (BinOp/CmpOp,
 /// result type, or field index), and up to three operand value-numbers/literals.
@@ -108,6 +108,8 @@ fn keyOf(func: *const Function, canon: []const Value, inst: Inst, result: Value)
         // suffixes) is the first place a same-valued constant can carry a different type.
         .iconst => null, // SPIKE: do not common constants (rematerializable; commoning creates long-lived spills)
         .fconst => |v| .{ .kind = .fconst, .a = @bitCast(v), .sub = @intFromEnum(func.valueType(result)) },
+        // The 128-bit pattern needs two of the key's three slots; `c` stays zero.
+        .fconst128 => |v| .{ .kind = .fconst128, .a = @truncate(v), .b = @truncate(v >> 64), .sub = @intFromEnum(func.valueType(result)) },
         .arith => |x| blk: {
             var a = vn(canon, x.lhs);
             var b = vn(canon, x.rhs);
@@ -151,7 +153,7 @@ fn rewriteOperands(func: *Function, canon: []const Value) void {
     for (0..func.instCount()) |i| {
         const op = func.opcodeMut(@enumFromInt(i));
         switch (op.*) {
-            .iconst, .fconst, .alloca, .global_addr => {},
+            .iconst, .fconst, .fconst128, .alloca, .global_addr => {},
             .arith => |*a| {
                 a.lhs = sub(canon, a.lhs);
                 a.rhs = sub(canon, a.rhs);
