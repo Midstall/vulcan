@@ -774,7 +774,11 @@ pub fn linkDynamic(allocator: std.mem.Allocator, inputs: []const dynamic.DynInpu
                 const kind: ?dynamic.DataRefKind = switch (r.type) {
                     .adr_got_page => .got_pg,
                     .ld64_got_lo12_nc => .got_lo12,
-                    .gotpcrel => .got_pcrel,
+                    // x86-64's plain GOTPCREL and its two relaxable variants all target a
+                    // symbol's GOT slot; against a shared export they share one `.got` slot +
+                    // GLOB_DAT. (An in-image REX_GOTPCRELX never reaches here - the
+                    // `defined_names` guard below leaves it for `applyRelocs` to relax.)
+                    .gotpcrel, .gotpcrelx, .rex_gotpcrelx => .got_pcrel,
                     .got32 => .got_abs,
                     // riscv64's GOT-indirect `auipc` (the paired `ld` reuses `pcrel_lo12_i`, so it is
                     // NOT classified by reloc type - it is derived from the `auipc` below).
@@ -989,13 +993,15 @@ fn collectDataFixups(allocator: std.mem.Allocator, placement: *const elf.Placeme
             if (place.seg == elf.not_placed) return error.MalformedObject;
             for (sec.relocs) |r| {
                 if (r.symbol >= obj.symbols.len) return error.MalformedObject;
-                // A `.prel32` is a 32-bit PC-relative FDE pointer in `.eh_frame` (a real glibc
-                // `crt1.o` carries two). VCC never registers the crt's unwind tables (the
-                // autolink omits `crtbegin.o`, so nothing ever reads `.eh_frame`), so the site
-                // is LEFT unrelocated rather than mis-applied as a 64-bit absolute pointer
-                // init. Its symbol is a local `.text` section symbol (no name), so resolving it
-                // as a global would fail anyway.
-                if (r.type == .prel32) continue;
+                // A `.prel32` (aarch64) or `.pc32` (x86-64) is a 32-bit PC-relative FDE pointer
+                // in `.eh_frame` (a real glibc `crt1.o` carries two of them, one per FDE's
+                // `initial_location`). VCC never registers the crt's unwind tables (the autolink
+                // omits `crtbegin.o`, so nothing ever reads `.eh_frame`), so the site is LEFT
+                // unrelocated rather than mis-applied as a 64-bit absolute pointer init. Its
+                // symbol is a local `.text` section symbol (no name), so resolving it as a global
+                // would fail anyway. A `.pc32` never appears in a real DATA pointer-init slot (a
+                // pointer init is `.abs64`), so skipping it here only ever drops an unwind pointer.
+                if (r.type == .prel32 or r.type == .pc32) continue;
                 const sym = obj.symbols[r.symbol];
                 // Resolve the target. A GLOBAL symbol comes from the merged table by name. A
                 // LOCAL DEFINED symbol (a `.str.N` string literal, made local so per-object
@@ -1044,7 +1050,7 @@ fn dataImportIndexOf(list: []const dynamic.DataImport, name: []const u8) ?u32 {
 fn isDataRefSite(data_ref_sites: anytype, oi: usize, si: usize, offset: u64, typ: elf.RelocType) bool {
     // riscv64's GOT `auipc` is `got_hi20` and its paired `ld` reuses `pcrel_lo12_i` (recorded as a
     // derived ref at auipc+4); both must be filtered so `applyRelocs` never sees them.
-    if (typ != .adr_got_page and typ != .ld64_got_lo12_nc and typ != .gotpcrel and typ != .got32 and typ != .got_hi20 and typ != .pcrel_lo12_i) return false;
+    if (typ != .adr_got_page and typ != .ld64_got_lo12_nc and typ != .gotpcrel and typ != .gotpcrelx and typ != .rex_gotpcrelx and typ != .got32 and typ != .got_hi20 and typ != .pcrel_lo12_i) return false;
     for (data_ref_sites) |dsite| {
         if (dsite.oi == oi and dsite.si == si and dsite.offset == offset) return true;
     }
@@ -1211,4 +1217,114 @@ test "linkObjects: a cross-section call resolves the callee to its OWN same-clas
     const site_addr = base + 1;
     const call_target: u64 = @intCast(@as(i64, @intCast(site_addr + 4)) + disp);
     try std.testing.expectEqual(func_b, call_target);
+}
+
+test "linkObjects: an in-image REX_GOTPCRELX mov relaxes to a lea addressing the symbol" {
+    const allocator = std.testing.allocator;
+
+    // A hand-built ELF64/RELA x86-64 object modelling what a real glibc `crt1.o` does with
+    // `main`: `_start` loads main's address with `mov main@GOTPCREL(%rip), %rdi` (REX.W 8B 3D
+    // <disp32>), and `main` is defined in the SAME object. Because `main` binds locally, the
+    // linker must RELAX the GOT indirection: the `mov` (8B) becomes a `lea` (8D) and the disp32
+    // becomes a plain PC32 to `main`. Before this support the parse rejected the REX_GOTPCRELX
+    // reloc (numeric 42) as `error.UnsupportedReloc`, which is what broke the x86_64 autolink.
+    const shstrtab = "\x00.text\x00.symtab\x00.strtab\x00.rela.text\x00.shstrtab\x00";
+    const strtab = "\x00_start\x00main\x00";
+
+    const text_off: u64 = 64;
+    // 48 8B 3D 00 00 00 00 (mov rdi,[rip+disp32]) + C3 (ret), then main: C3 (ret) at offset 8.
+    const text_size: u64 = 9;
+    const symtab_off: u64 = text_off + text_size;
+    const symtab_size: u64 = 3 * 24; // null + _start + main
+    const strtab_off: u64 = symtab_off + symtab_size;
+    const rela_off: u64 = strtab_off + strtab.len;
+    const rela_size: u64 = 24; // one Elf64_Rela
+    const shstrtab_off: u64 = rela_off + rela_size;
+    const shoff: u64 = elf.alignUp(shstrtab_off + shstrtab.len, 8);
+    const shnum: u16 = 6;
+    const total: usize = @intCast(shoff + @as(u64, shnum) * 64);
+
+    var buf = try allocator.alloc(u8, total);
+    defer allocator.free(buf);
+    @memset(buf, 0);
+
+    @memcpy(buf[0..4], "\x7fELF");
+    buf[4] = 2; // ELFCLASS64
+    buf[5] = 1; // ELFDATA2LSB
+    buf[6] = 1; // EV_CURRENT
+    std.mem.writeInt(u16, buf[16..18], 1, .little); // e_type = ET_REL
+    std.mem.writeInt(u16, buf[18..20], elf.EM_X86_64, .little);
+    std.mem.writeInt(u32, buf[20..24], 1, .little); // e_version
+    std.mem.writeInt(u64, buf[40..48], shoff, .little); // e_shoff
+    std.mem.writeInt(u16, buf[52..54], 64, .little); // e_ehsize
+    std.mem.writeInt(u16, buf[58..60], 64, .little); // e_shentsize
+    std.mem.writeInt(u16, buf[60..62], shnum, .little); // e_shnum
+    std.mem.writeInt(u16, buf[62..64], 5, .little); // e_shstrndx (.shstrtab is index 5)
+
+    @memcpy(buf[@intCast(text_off)..][0..9], &[_]u8{ 0x48, 0x8b, 0x3d, 0, 0, 0, 0, 0xc3, 0xc3 });
+    @memcpy(buf[@intCast(strtab_off)..][0..strtab.len], strtab);
+    @memcpy(buf[@intCast(shstrtab_off)..][0..shstrtab.len], shstrtab);
+
+    const writeSym = struct {
+        fn f(b: []u8, off: u64, idx: usize, name: u32, info: u8, shndx: u16, value: u64, size: u64) void {
+            const e = b[@intCast(off + idx * 24)..][0..24];
+            std.mem.writeInt(u32, e[0..4], name, .little);
+            e[4] = info;
+            e[5] = 0;
+            std.mem.writeInt(u16, e[6..8], shndx, .little);
+            std.mem.writeInt(u64, e[8..16], value, .little);
+            std.mem.writeInt(u64, e[16..24], size, .little);
+        }
+    }.f;
+    // _start @ .text (shndx=1) value 0, main @ .text value 8. Both STB_GLOBAL|STT_FUNC.
+    writeSym(buf, symtab_off, 1, 1, 0x12, 1, 0, 8);
+    writeSym(buf, symtab_off, 2, 8, 0x12, 1, 8, 1);
+
+    // The one relocation: `.rela.text` patches the disp32 (offset 3 in .text) against `main`
+    // (symbol index 2), `R_X86_64_REX_GOTPCRELX` (42) with addend -4 (the disp32 field width).
+    const rela = buf[@intCast(rela_off)..][0..24];
+    std.mem.writeInt(u64, rela[0..8], 3, .little); // r_offset
+    std.mem.writeInt(u64, rela[8..16], (@as(u64, 2) << 32) | 42, .little); // r_info = sym 2, REX_GOTPCRELX
+    std.mem.writeInt(i64, rela[16..24], -4, .little); // r_addend
+
+    const writeShdr = struct {
+        fn f(b: []u8, sh: u64, idx: u16, name: u32, typ: u32, flags: u64, off: u64, size: u64, link: u32, info: u32) void {
+            const e = b[@intCast(sh + @as(u64, idx) * 64)..][0..64];
+            std.mem.writeInt(u32, e[0..4], name, .little);
+            std.mem.writeInt(u32, e[4..8], typ, .little);
+            std.mem.writeInt(u64, e[8..16], flags, .little);
+            std.mem.writeInt(u64, e[16..24], 0, .little); // sh_addr
+            std.mem.writeInt(u64, e[24..32], off, .little);
+            std.mem.writeInt(u64, e[32..40], size, .little);
+            std.mem.writeInt(u32, e[40..44], link, .little);
+            std.mem.writeInt(u32, e[44..48], info, .little);
+            std.mem.writeInt(u64, e[48..56], 1, .little); // sh_addralign
+            std.mem.writeInt(u64, e[56..64], 0, .little); // sh_entsize
+        }
+    }.f;
+    const XF = elf.SHF_ALLOC | elf.SHF_EXECINSTR;
+    writeShdr(buf, shoff, 0, 0, 0, 0, 0, 0, 0, 0); // NULL
+    writeShdr(buf, shoff, 1, 1, elf.SHT_PROGBITS, XF, text_off, text_size, 0, 0); // .text
+    writeShdr(buf, shoff, 2, 7, elf.SHT_SYMTAB, 0, symtab_off, symtab_size, 3, 1); // .symtab -> .strtab
+    writeShdr(buf, shoff, 3, 15, 3, 0, strtab_off, strtab.len, 0, 0); // .strtab (SHT_STRTAB)
+    writeShdr(buf, shoff, 4, 23, elf.SHT_RELA, 0, rela_off, rela_size, 2, 1); // .rela.text -> symtab, target .text
+    writeShdr(buf, shoff, 5, 34, 3, 0, shstrtab_off, shstrtab.len, 0, 0); // .shstrtab
+
+    const base: u64 = 0x400000;
+    var image = try linkObjects(allocator, &.{buf}, base);
+    defer image.deinit(allocator);
+
+    // The `mov` (8B) relaxed to a `lea` (8D); the REX prefix (48) and ModRM (3D) are untouched.
+    try std.testing.expectEqual(@as(u8, 0x48), image.code[0]);
+    try std.testing.expectEqual(@as(u8, 0x8d), image.code[1]);
+    try std.testing.expectEqual(@as(u8, 0x3d), image.code[2]);
+
+    // The disp32 is a plain PC32 to `main`: RIP at the read point is the byte after the 4-byte
+    // field (`base + 3 + 4`), so `rip + disp` must land exactly on `main` (`base + 8`).
+    const main_addr = image.addressOf("main") orelse return error.UndefinedSymbol;
+    try std.testing.expectEqual(base + 8, main_addr);
+    const disp = std.mem.readInt(i32, image.code[3..7], .little);
+    const site_addr = base + 3;
+    const lea_target: u64 = @intCast(@as(i64, @intCast(site_addr + 4)) + disp);
+    try std.testing.expectEqual(main_addr, lea_target);
 }

@@ -139,6 +139,18 @@ pub const RelocType = enum(u32) {
     /// linker synthesizes the GOT slot + a `R_X86_64_GLOB_DAT` and patches the disp32 to
     /// the slot; the static path never sees this reloc (it targets no in-image symbol).
     gotpcrel = 9,
+    /// `R_X86_64_GOTPCRELX` (41) and `R_X86_64_REX_GOTPCRELX` (42): the RELAXABLE forms of
+    /// `R_X86_64_GOTPCREL`. A modern assembler emits them for a GOT-indirect reference the
+    /// linker MAY relax to a direct one when the target binds locally: `mov
+    /// sym@GOTPCREL(%rip), %reg` (`REX.W 8B /r`, the REX form), or `call`/`jmp
+    /// *sym@GOTPCREL(%rip)`. A real glibc x86-64 `crt1.o` carries both - REX_GOTPCRELX for
+    /// `main` (defined in-image, so its `mov` relaxes to `lea`) and GOTPCRELX for the `call
+    /// *__libc_start_main@GOTPCREL(%rip)` (an external import, kept GOT-indirect). Against a
+    /// shared export both route to the same GOT slot as `gotpcrel`; against an in-image
+    /// symbol the x86-64 backend relaxes the site to a direct PC32 reference (see
+    /// `arch/x86_64.zig`'s `applyRelocs`). Distinct numeric codes, one shared semantic.
+    gotpcrelx = 41,
+    rex_gotpcrelx = 42,
 };
 
 /// A relocation applied to a `.text` offset against a symbol.
@@ -539,6 +551,8 @@ fn parseObject64(allocator: std.mem.Allocator, buf: []const u8) Error!ParsedObje
                 @intFromEnum(RelocType.pc32) => if (arch == .riscv64) .abs64 else .pc32,
                 @intFromEnum(RelocType.plt32) => .plt32,
                 @intFromEnum(RelocType.gotpcrel) => .gotpcrel,
+                @intFromEnum(RelocType.gotpcrelx) => .gotpcrelx,
+                @intFromEnum(RelocType.rex_gotpcrelx) => .rex_gotpcrelx,
                 // `R_X86_64_64` (numeric 1): a 64-bit absolute address in a DATA section
                 // (a pointer-init slot), x86-64's analog of aarch64's ABS64. Gated on
                 // `arch == .x86_64` since numeric 1 is ALSO i386's `R_386_32` - but that is
