@@ -1483,14 +1483,13 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
         // a pointer arg, so this has no result. Stage the target into r10,
         // which survives the arg moves and the call and is never an arg
         // register. Then move the arguments into the System V arg registers,
-        // then `call r10`.
+        // and put each integer argument past the sixth into the caller's own
+        // stack-argument block, then `call r10`.
         const c = func.opcode(inst).call_indirect;
         // A variadic call through a function pointer is not supported yet. The
         // code fails closed instead of emitting a call with no AL
         // vector-count, which would miscompile silently.
         if (c.is_variadic) return error.Unsupported;
-        const tgt = try ctx.use(allocator, c.target, scratch1);
-        if (tgt != scratch1) try ctx.put(allocator, encode.movReg(scratch1, tgt));
         const args = func.valueList(c.args);
         var moves: std.ArrayList(Move) = .empty;
         defer moves.deinit(allocator);
@@ -1498,9 +1497,76 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
         defer xmm_moves.deinit(allocator);
         var gi: usize = 0;
         var xi: usize = 0;
+        // Count the gp stack args, the same way `lowerDirectCall` does: each
+        // non-xmm arg past the 6 gp registers. An fp arg past the 8 xmm
+        // registers stays fail-closed, because no call path on this backend
+        // places an fp stack arg yet, and a wrong float ABI is worse than a
+        // clear refusal. Only a call with stack args opens a local rsp window,
+        // so a call that fits inside the 6 gp or 8 xmm registers emits exactly
+        // the same bytes as before stack args were handled.
+        var n_stack: usize = 0;
+        {
+            var g: usize = 0;
+            var x: usize = 0;
+            for (args) |arg| {
+                if (isXmm(func, arg)) {
+                    if (x >= xmm_arg_regs.len) return error.Unsupported; // fp stack args not handled
+                    x += 1;
+                } else {
+                    if (g >= arg_regs.len) n_stack += 1;
+                    g += 1;
+                }
+            }
+        }
+        // Round the stack-arg block up to a multiple of 16, so rsp stays
+        // 16-aligned at the `call`, per System V. This frame keeps rsp
+        // 16-aligned, so subtracting a 16-multiple preserves that. An odd
+        // number of stack args therefore gets 8 bytes of padding above them.
+        // `stack_bytes` is 0 when there are no stack args, so every
+        // rsp-relative reload below adds 0 and stays byte-identical for a call
+        // that fits inside the argument registers.
+        const stack_bytes: i32 = @intCast((n_stack * 8 + 15) & ~@as(usize, 15));
+        // Stage the target BEFORE the rsp window opens: `use` reloads a
+        // spilled target from an rsp-relative slot, and that displacement is
+        // correct only while rsp still sits at the frame base. r10 then holds
+        // the target for the whole sequence. Nothing below writes r10: the
+        // stack-arg stores read r11, and `parallelMove` writes only argument
+        // registers and r11.
+        const tgt = try ctx.use(allocator, c.target, scratch1);
+        if (tgt != scratch1) try ctx.put(allocator, encode.movReg(scratch1, tgt));
+        // Open the local rsp window before any argument placement. This lets
+        // the stack-arg stores run while every reg arg still holds its value,
+        // so no reg-arg parallel move can clobber a stack arg that the
+        // allocator happened to place in an argument register.
+        if (n_stack > 0) try ctx.put(allocator, encode.aluImm(5, .rsp, stack_bytes, true)); // sub rsp, stack_bytes
+        // Place the gp stack args at [rsp + k*8], with k in declaration order,
+        // so the leftmost stack arg lands at [rsp] when the callee starts. A
+        // reg source stores straight to the slot. A spilled source reloads
+        // through scratch2 (r11), NOT through scratch1 (r10) as the direct
+        // path does, because r10 holds the call target here. r11 is reserved
+        // from allocation, so it holds no live value, and `parallelMove`, its
+        // only other reader, runs later. A spill slot moved up by
+        // `stack_bytes` when rsp dropped, so its reload adds that bias.
+        if (n_stack > 0) {
+            var gk: usize = 0;
+            var k: usize = 0;
+            for (args) |arg| {
+                if (isXmm(func, arg)) continue;
+                defer gk += 1;
+                if (gk < arg_regs.len) continue;
+                switch (ctx.loc(arg)) {
+                    .reg => |src| try ctx.put(allocator, encode.movToStack(@as(i32, @intCast(k)) * 8, src)),
+                    .spill => |slot| {
+                        try ctx.put(allocator, encode.movFromStack(scratch2, slotDisp(slot) + stack_bytes));
+                        try ctx.put(allocator, encode.movToStack(@as(i32, @intCast(k)) * 8, scratch2));
+                    },
+                    else => unreachable,
+                }
+                k += 1;
+            }
+        }
         for (args) |arg| {
             if (isXmm(func, arg)) {
-                if (xi >= xmm_arg_regs.len) return error.Unsupported; // fp stack args not handled
                 const dst = xmm_arg_regs[xi];
                 xi += 1;
                 switch (ctx.loc(arg)) {
@@ -1509,7 +1575,10 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
                     else => unreachable,
                 }
             } else {
-                if (gi >= arg_regs.len) return error.Unsupported;
+                if (gi >= arg_regs.len) {
+                    gi += 1; // a gp stack arg, already placed above
+                    continue;
+                }
                 const dst = arg_regs[gi];
                 gi += 1;
                 switch (ctx.loc(arg)) {
@@ -1528,16 +1597,24 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
                 const dst = xmm_arg_regs[xi];
                 xi += 1;
                 if (ctx.loc(arg) == .xmm_spill) {
-                    const disp = ctx.xmmDisp(ctx.loc(arg).xmm_spill);
+                    const disp = ctx.xmmDisp(ctx.loc(arg).xmm_spill) + stack_bytes;
                     try ctx.put(allocator, if (isWide(func, arg)) encode.vmovupsLoad(dst, disp) else if (isVector(func, arg) or isQuad(func, arg)) encode.movupsLoad(dst, disp) else encode.movssLoad(dst, disp));
                 }
             } else {
+                if (gi >= arg_regs.len) {
+                    gi += 1; // a gp stack arg, already placed above
+                    continue;
+                }
                 const dst = arg_regs[gi];
                 gi += 1;
-                if (ctx.loc(arg) == .spill) try ctx.put(allocator, encode.movFromStack(dst, slotDisp(ctx.loc(arg).spill)));
+                if (ctx.loc(arg) == .spill) try ctx.put(allocator, encode.movFromStack(dst, slotDisp(ctx.loc(arg).spill) + stack_bytes));
             }
         }
         try ctx.put(allocator, encode.callReg(scratch1)); // call r10
+        // Close the local rsp window. System V is caller-cleaned. The result
+        // is still in rax, and rsp is back at the frame base, which every
+        // frame-relative store below depends on.
+        if (n_stack > 0) try ctx.put(allocator, encode.aluImm(0, .rsp, stack_bytes, true)); // add rsp, stack_bytes
         if (func.instResult(inst)) |res| {
             if (isXmm(func, res)) {
                 const rd = try ctx.dstXmm(res, xmm_scratch); // fp result comes back in xmm0
@@ -1551,9 +1628,9 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
         }
         if (c.ret_dest) |dest| {
             // Store the register-return eightbytes into the dest slot,
-            // rsp-relative. See `lowerDirectCall`. This indirect call opens no
-            // rsp window, so rsp is at the frame base, and the return
-            // registers still hold the values.
+            // rsp-relative. See `lowerDirectCall`. The stack-arg window, if
+            // this call opened one, is already closed above, so rsp is at the
+            // frame base, and the return registers still hold the values.
             const doff = ctx.alloca_base + @as(i32, @intCast(ctx.alloca_off.get(dest).?));
             try emitStructRetStoreX86(allocator, ctx, c.ret_pieces, c.ret_regs, doff);
         }
@@ -3813,6 +3890,85 @@ test "a call keeps RSP 16-aligned at the call site (movaps-safe host calls)" {
     const end = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
     const frame = try std.fmt.parseInt(u32, rest[0..end], 10);
     try std.testing.expectEqual(@as(u32, 8), frame % 16);
+}
+
+// ===========================================================================
+// System V gives only six registers to integer arguments. An argument past
+// the sixth goes in the caller's stack-argument block. `lowerDirectCall` has
+// always done this. The `call_indirect` path did not: it answered
+// `error.Unsupported`, so a whole module failed to compile. The tests below
+// pin the stack-argument block, its 16-byte rounding, and the fact that the
+// call target survives the argument placement.
+//
+// This was invisible on aarch64, which has eight argument registers, so the
+// seven-argument shape that a wasm `call_indirect` produces (the wasm
+// frontend prepends a hidden context pointer to the wasm parameters) fits in
+// registers there.
+// ===========================================================================
+
+/// Build a function that calls a pointer parameter with `n` integer arguments
+/// (the constants 1 through n) and returns the result. The caller owns the
+/// returned code and must free it.
+fn indirectCallWithArgs(allocator: std.mem.Allocator, comptime n: usize) Error![]u8 {
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
+    const ptr_t = try func.types.intern(.ptr);
+    const b = try func.appendBlock();
+    const target = try func.appendBlockParam(b, ptr_t);
+    var args: [n]Value = undefined;
+    for (&args, 0..) |*a, i| a.* = try func.appendInst(b, t, .{ .iconst = @intCast(i + 1) });
+    const r = try func.appendCallIndirect(b, t, target, &args);
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
+    return selectFunction(allocator, &func);
+}
+
+test "call_indirect with 7 integer args puts the 7th in a 16-byte stack window" {
+    const allocator = std.testing.allocator;
+    const code = try indirectCallWithArgs(allocator, 7);
+    defer allocator.free(code);
+    const text = try @import("disasm.zig").format(allocator, code);
+    defer allocator.free(text);
+    // One stack argument needs 8 bytes, rounded up to 16 so rsp is still
+    // 16-aligned at the call. The argument itself sits at the bottom of the
+    // window, which is where the callee reads its first stack argument.
+    try std.testing.expect(std.mem.indexOf(u8, text, "sub rsp, 16\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "mov qword ptr [rsp], ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "call r10") != null);
+    // System V is caller-cleaned, so the window closes after the call.
+    try std.testing.expect(std.mem.indexOf(u8, text, "add rsp, 16\n") != null);
+}
+
+test "call_indirect stack args are laid out left to right from [rsp]" {
+    // Nine integer arguments: six in registers, three on the stack. 24 bytes
+    // round up to a 32-byte window, which keeps rsp 16-aligned at the call.
+    // The seventh argument goes to [rsp], the eighth to [rsp + 8], and the
+    // ninth to [rsp + 16], so the leftmost stack argument has the lowest
+    // address.
+    const allocator = std.testing.allocator;
+    const code = try indirectCallWithArgs(allocator, 9);
+    defer allocator.free(code);
+    const text = try @import("disasm.zig").format(allocator, code);
+    defer allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "sub rsp, 32\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "add rsp, 32\n") != null);
+    const at0 = std.mem.indexOf(u8, text, "mov qword ptr [rsp], ") orelse return error.NoFirstStackArg;
+    const at8 = std.mem.indexOf(u8, text, "mov qword ptr [rsp + 8], ") orelse return error.NoSecondStackArg;
+    const at16 = std.mem.indexOf(u8, text, "mov qword ptr [rsp + 16], ") orelse return error.NoThirdStackArg;
+    try std.testing.expect(at0 < at8 and at8 < at16);
+}
+
+test "a call_indirect that fits in the argument registers opens no stack window" {
+    // Six integer arguments need no stack block, so the sequence must be
+    // exactly what it was before stack arguments existed: no rsp window at
+    // all. This is what keeps the common call byte-identical.
+    const allocator = std.testing.allocator;
+    const code = try indirectCallWithArgs(allocator, 6);
+    defer allocator.free(code);
+    const text = try @import("disasm.zig").format(allocator, code);
+    defer allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "mov qword ptr [rsp], ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "call r10") != null);
 }
 
 // ===========================================================================

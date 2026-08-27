@@ -632,6 +632,84 @@ test "native: compiles and runs a function in-process on the host" {
     try std.testing.expectEqual(@as(i64, 41), f(20)); // 20*2 + 1
 }
 
+// ===========================================================================
+// An indirect call with more than six integer arguments. The x86_64 System V
+// ABI has six integer argument registers, so the seventh argument and every
+// one after it goes in the caller's stack-argument block. The x86_64 isel
+// refused to compile that shape until the block was added, which is why a
+// wasm `call_indirect` with six wasm parameters (the wasm frontend prepends a
+// hidden context pointer, so seven machine arguments) ran on aarch64, which
+// has eight argument registers, and failed on x86_64.
+//
+// These tests RUN the call. A byte-level check cannot show that each value
+// reaches the right place, and it cannot show the stack alignment the ABI
+// needs, so both are measured here instead.
+// ===========================================================================
+
+fn sumSeven(a0: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64, a6: i64) callconv(.c) i64 {
+    return a0 + a1 + a2 + a3 + a4 + a5 + a6;
+}
+
+fn sumNine(a0: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64, a6: i64, a7: i64, a8: i64) callconv(.c) i64 {
+    return a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8;
+}
+
+/// JIT a function that calls its pointer parameter with `n` integer arguments
+/// and returns what the callee returned, then run it against `target`. The
+/// arguments are the powers of two 1, 2, 4 and so on, so a dropped, doubled,
+/// or reordered argument gives a different sum.
+fn runIndirectCall(allocator: std.mem.Allocator, comptime n: usize, target: usize) !i64 {
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
+    const ptr_t = try func.types.intern(.ptr);
+    const b = try func.appendBlock();
+    const p = try func.appendBlockParam(b, ptr_t);
+    var args: [n]ir.function.Value = undefined;
+    for (&args, 0..) |*a, i| a.* = try func.appendInst(b, t, .{ .iconst = @as(i64, 1) << @intCast(i) });
+    const r = try func.appendCallIndirect(b, t, p, &args);
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
+    var buf = try jitFunction(allocator, &func);
+    defer buf.deinit();
+    return buf.entry(*const fn (usize) callconv(.c) i64, 0)(target);
+}
+
+test "native: an indirect call delivers a 7th integer argument" {
+    const allocator = std.testing.allocator;
+    // 1 + 2 + 4 + 8 + 16 + 32 + 64. On x86_64 the last one travels on the
+    // stack, in a window padded to 16 bytes.
+    try std.testing.expectEqual(@as(i64, 127), try runIndirectCall(allocator, 7, @intFromPtr(&sumSeven)));
+}
+
+test "native: an indirect call delivers 7th, 8th and 9th integer arguments" {
+    const allocator = std.testing.allocator;
+    // 1 + 2 + ... + 256. On x86_64 three arguments travel on the stack, which
+    // is 24 bytes rounded up to a 32-byte window.
+    try std.testing.expectEqual(@as(i64, 511), try runIndirectCall(allocator, 9, @intFromPtr(&sumNine)));
+}
+
+test "native: an indirect call with stack args keeps rsp 16-aligned (x86_64)" {
+    if (arch != .x86_64) return error.SkipZigTest;
+    // The callee is three instructions of machine code: `mov rax, rsp`,
+    // `and rax, 15`, `ret`. It reports the low bits of rsp as the callee sees
+    // them. The call instruction already pushed the return address, so a call
+    // site that obeys System V leaves rsp at 8 modulo 16.
+    //
+    // A misaligned call site does not fail here or under an emulator. It
+    // faults later, inside some callee that reads its stack with an aligned
+    // SSE instruction, and the fault lands nowhere near the cause. So the
+    // alignment is measured directly.
+    const probe = [_]u8{ 0x48, 0x89, 0xE0, 0x48, 0x83, 0xE0, 0x0F, 0xC3 };
+    var buf = try CodeBuffer.map(&probe);
+    defer buf.deinit();
+    const addr = @intFromPtr(buf.entry(*const fn () callconv(.c) i64, 0));
+    const allocator = std.testing.allocator;
+    try std.testing.expectEqual(@as(i64, 8), try runIndirectCall(allocator, 6, addr)); // no window
+    try std.testing.expectEqual(@as(i64, 8), try runIndirectCall(allocator, 7, addr)); // one stack arg, padded
+    try std.testing.expectEqual(@as(i64, 8), try runIndirectCall(allocator, 8, addr)); // two stack args, exact
+    try std.testing.expectEqual(@as(i64, 8), try runIndirectCall(allocator, 9, addr)); // three stack args, padded
+}
+
 test "native: jitModule links functions with no data globals" {
     // The no-data path: `jitModule` delegates to `jitModuleData` with an empty
     // data set. This is a direct regression test that delegation still runs.
