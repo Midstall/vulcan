@@ -94,6 +94,60 @@ test "an unreachable block that uses a reachable value compiles and the reachabl
     try harness.expectRunFull(std.testing.io, a, &func, &.{ 5, 3 }, 8, harness.qemu);
 }
 
+test "an indirect call with 7 integer args passes the 7th on the stack (qemu-x86_64)" {
+    // The bug: the x86-64 indirect-call path (`call_indirect`) failed closed on any
+    // seventh integer argument, since System V has only 6 integer arg registers and the
+    // path had no stack-argument code. A wasm `call_indirect` prepends a hidden context
+    // pointer, so six wasm params become seven machine args, and this was reached in the
+    // wild on x86-64 while aarch64 (eight arg registers) never hit it. The direct-call
+    // path already homed stack args; this proves the indirect path now does too.
+    //
+    // main() computes the address of callee and calls it indirectly with 7 args
+    // {1,2,3,4,5,6,100}. callee returns a1 - a2 + a3 - a4 + a5 - a6 + a7, an
+    // order-sensitive sum: dropping or misplacing the stack arg (100) or any register
+    // arg changes the result. Expected: 1 - 2 + 3 - 4 + 5 - 6 + 100 = 97.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const i64k = ir.types.TypeKind{ .int = .{ .signedness = .signed, .bits = 64 } };
+
+    var callee = Function.init(allocator);
+    defer callee.deinit();
+    {
+        const t = try callee.types.intern(i64k);
+        const b = try callee.appendBlock();
+        var a: [7]ir.function.Value = undefined;
+        for (&a) |*p| p.* = try callee.appendBlockParam(b, t);
+        const s1 = try callee.appendInst(b, t, .{ .arith = .{ .op = .sub, .lhs = a[0], .rhs = a[1] } });
+        const s2 = try callee.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = s1, .rhs = a[2] } });
+        const s3 = try callee.appendInst(b, t, .{ .arith = .{ .op = .sub, .lhs = s2, .rhs = a[3] } });
+        const s4 = try callee.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = s3, .rhs = a[4] } });
+        const s5 = try callee.appendInst(b, t, .{ .arith = .{ .op = .sub, .lhs = s4, .rhs = a[5] } });
+        const s6 = try callee.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = s5, .rhs = a[6] } });
+        callee.setTerminator(b, .{ .ret = ir.function.Ret.one(s6) });
+    }
+
+    var main_f = Function.init(allocator);
+    defer main_f.deinit();
+    {
+        const t = try main_f.types.intern(i64k);
+        const ptr_t = try main_f.types.intern(.ptr);
+        const b = try main_f.appendBlock();
+        const vals = [_]i64{ 1, 2, 3, 4, 5, 6, 100 };
+        var args: [7]ir.function.Value = undefined;
+        for (&args, vals) |*arg, v| arg.* = try main_f.appendInst(b, t, .{ .iconst = v });
+        const tgt = try main_f.appendGlobalAddr(b, ptr_t, "callee");
+        const r = try main_f.appendCallIndirect(b, t, tgt, &args);
+        main_f.setTerminator(b, .{ .ret = ir.function.Ret.one(r) });
+    }
+
+    var module: link.Module = .{};
+    defer module.deinit(allocator);
+    try module.addFunction(allocator, "main", &main_f);
+    try module.addFunction(allocator, "callee", &callee);
+
+    try std.testing.expectEqual(@as(u8, 97), try harness.runModuleData(io, allocator, &module, &.{}, harness.qemu));
+}
+
 test "a rodata global read via global_addr returns its value under qemu-x86_64" {
     // main() -> *(&K), K a rodata i32 constant. Proves isel's `global_addr` arm
     // (`lea rd, [rip+disp32]`) end to end: a real `.pcrel_lea` reloc, resolved (here,
