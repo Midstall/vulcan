@@ -20,7 +20,7 @@ const Function = ir.function.Function;
 /// available, before the load reads through it.
 fn buildLoadAdd(func: *Function, with_prefetch: bool) anyerror!void {
     const i64_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const entry = try func.appendBlock();
     const p = try func.appendBlockParam(entry, ptr_t);
     if (with_prefetch) try func.appendPrefetch(entry, p);
@@ -37,7 +37,7 @@ fn buildLoadAdd(func: *Function, with_prefetch: bool) anyerror!void {
 /// cell. A prefetch never reads memory architecturally. It is a hint only.
 fn buildStoreDouble(func: *Function, with_prefetch: bool) anyerror!void {
     const i64_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const entry = try func.appendBlock();
     const p = try func.appendBlockParam(entry, ptr_t);
     const val = try func.appendInst(entry, i64_t, .{ .load = .{ .ptr = p } });
@@ -142,7 +142,7 @@ fn buildStridedSum(func: *Function) anyerror!void {
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const i64_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
     const bool_t = try func.types.intern(.bool);
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const entry = try func.appendBlock();
     const loop = try func.appendBlock();
     const body = try func.appendBlock();

@@ -613,7 +613,7 @@ test "inlined via_got global_addr keeps via_got=true (not reconstructed as false
     var callee = Function.init(allocator);
     defer callee.deinit();
     {
-        const ptr_t = try callee.types.intern(.ptr);
+        const ptr_t = try callee.types.ptrGlobal();
         const b = try callee.appendBlock();
         const g = try callee.appendGlobalAddrGot(b, ptr_t, "G");
         callee.setTerminator(b, .{ .ret = ir.function.Ret.one(g) });
@@ -622,7 +622,7 @@ test "inlined via_got global_addr keeps via_got=true (not reconstructed as false
     // caller f(): return getg()
     var caller = Function.init(allocator);
     defer caller.deinit();
-    const ptr_t = try caller.types.intern(.ptr);
+    const ptr_t = try caller.types.ptrGlobal();
     const b = try caller.appendBlock();
     const call = try caller.appendCall(b, ptr_t, "getg", &.{});
     caller.setTerminator(b, .{ .ret = ir.function.Ret.one(call) });

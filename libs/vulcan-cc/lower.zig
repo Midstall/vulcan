@@ -692,7 +692,7 @@ fn lowerFunction(allocator: std.mem.Allocator, fn_ast: parser.Func, lay: layout.
     func.num_fixed_params = if (fn_ast.is_variadic) @intCast(fn_ast.params.len) else 0;
 
     const i32t = try ctype.int_t.irType(&func, lay);
-    const ptrt = try func.types.intern(.ptr);
+    const ptrt = try func.types.ptrGlobal();
     const boolt = try func.types.intern(.bool);
     const i64t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
     const entry = try func.appendBlock();

@@ -1023,7 +1023,7 @@ fn buildFoldUnderPressure(allocator: std.mem.Allocator) anyerror!Function {
     errdefer func.deinit();
     const i64_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
     const bool_t = try func.types.intern(.bool);
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const entry = try func.appendBlock();
     const then_b = try func.appendBlock();
     const else_b = try func.appendBlock();

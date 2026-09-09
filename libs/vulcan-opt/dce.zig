@@ -171,7 +171,7 @@ test "keeps a matmul even though it has no result to be used" {
     var func = Function.init(allocator);
     defer func.deinit();
 
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const b = try func.appendBlock();
     const a = try func.appendBlockParam(b, ptr_t);
     const bp = try func.appendBlockParam(b, ptr_t);

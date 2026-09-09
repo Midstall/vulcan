@@ -895,7 +895,7 @@ test "jumpthread: tail-duplicates a side-effecting B so the effect runs on the t
     defer func.deinit();
     const t = try i32Ty(&func);
     const bool_t = try func.types.intern(.bool);
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const entry = try func.appendBlock();
     const b = try func.appendBlock();
     const d = try func.appendBlock();

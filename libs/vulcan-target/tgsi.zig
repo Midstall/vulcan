@@ -1458,7 +1458,7 @@ test "lower a UBO-reading fragment shader (uniform vec4 color) to TGSI CONST[]" 
     try func.addAttr(.func, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "stage", .value = .{ .string = "fragment" } } });
     const f32_t = try func.types.intern(.{ .float = .f32 });
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const b = try func.appendBlock();
 
     // A UBO base pointer at binding 0 (the SPIR-V lowering's buffer entry param).
@@ -1498,7 +1498,7 @@ test "lower a UBO-transform vertex shader (uniform scale of position) to TGSI" {
     try func.addAttr(.func, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "stage", .value = .{ .string = "vertex" } } });
     const f32_t = try func.types.intern(.{ .float = .f32 });
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const b = try func.appendBlock();
 
     // Position input (loc 0) + a UBO at binding 0 holding a scale vec4.
@@ -1541,7 +1541,7 @@ test "lower a texturing fragment shader (sampler2D) to TGSI SAMP/TEX" {
     try func.addAttr(.func, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "stage", .value = .{ .string = "fragment" } } });
     const f32_t = try func.types.intern(.{ .float = .f32 });
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const b = try func.appendBlock();
 
     // Input uv (loc 0, two components), a sampler descriptor (binding 0), and the
@@ -1743,7 +1743,7 @@ test "lower a per-instance UBO fetch (dynamic CONST index by gl_InstanceIndex) t
     try func.addAttr(.func, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "stage", .value = .{ .string = "vertex" } } });
     const f32_t = try func.types.intern(.{ .float = .f32 });
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const b = try func.appendBlock();
 
     var pos: [4]Value = undefined;
@@ -1947,7 +1947,7 @@ test "lower a derivative (dFdx of a varying) to TGSI DDX" {
     try func.addAttr(.func, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "grad_slot", .value = .{ .int = @as(i64, ATTR_GENERIC0) << 1 } } });
     const f32_t = try func.types.intern(.{ .float = .f32 });
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const b = try func.appendBlock();
 
     var in: [4]Value = undefined;
@@ -2058,7 +2058,7 @@ test "lower a fragment shader with a conditional discard to TGSI UIF/KILL/ENDIF"
     const f32_t = try func.types.intern(.{ .float = .f32 });
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const bool_t = try func.types.intern(.bool);
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const void_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 0 } });
 
     const entry = try func.appendBlock();

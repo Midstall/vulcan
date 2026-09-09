@@ -1128,7 +1128,7 @@ fn buildMemElementwise(op: BinOp, n: usize, store_between: bool) !Function {
     var func = Function.init(std.testing.allocator);
     errdefer func.deinit();
     const f32_t = try func.types.intern(.{ .float = .f32 });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const block = try func.appendBlock();
     const ptr_a = try func.appendBlockParam(block, ptr_t);
     const ptr_b = try func.appendBlockParam(block, ptr_t);
@@ -1242,7 +1242,7 @@ fn buildMemElementwiseInt(op: BinOp, n: usize) !Function {
     var func = Function.init(std.testing.allocator);
     errdefer func.deinit();
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const block = try func.appendBlock();
     const ptr_a = try func.appendBlockParam(block, ptr_t);
     const ptr_b = try func.appendBlockParam(block, ptr_t);

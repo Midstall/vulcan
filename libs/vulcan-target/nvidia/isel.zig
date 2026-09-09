@@ -2810,7 +2810,7 @@ test "graphics: a UBO pointer param loads its address from constant bank (LDC), 
     defer func.deinit();
     const f32_t = try func.types.intern(.{ .float = .f32 });
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const b = try func.appendBlock();
 
     // Entry params, in graphics order: a vertex input attribute scalar,
@@ -2867,7 +2867,7 @@ test "graphics: gl_VertexIndex sources from S2R and pulls a vec from a UBO array
     defer func.deinit();
     const f32_t = try func.types.intern(.{ .float = .f32 });
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const b = try func.appendBlock();
 
     // Entry params, in vertex-pulling order with no attribute inputs: the
@@ -2970,7 +2970,7 @@ test "the emitted LDC offsets match the offsets LaunchInfo reports" {
     var func = Function.init(allocator);
     defer func.deinit();
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const b = try func.appendBlock();
     const buf = try func.appendBlockParam(b, ptr_t);
     const n = try func.appendBlockParam(b, i32_t);
@@ -3133,7 +3133,7 @@ test "a FLOAT compare (max/min of floats) lowers to FSETP, not ISETP" {
     defer func.deinit();
     const f32_t = try func.types.intern(.{ .float = .f32 });
     const bool_t = try func.types.intern(.bool);
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const b = try func.appendBlock();
     // out[0] = max(a, 0.0) modelled as (a > 0) ? a : 0 over FLOAT operands.
     const a = try func.appendBlockParam(b, f32_t);
@@ -3167,7 +3167,7 @@ test "REPRO: derivative + multi-component color outputs stay distinct until thei
     defer func.deinit();
     const f32_t = try func.types.intern(.{ .float = .f32 });
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const b = try func.appendBlock();
 
     // A frag_pos.x varying, interpolated. The derivative descriptor table
@@ -3226,7 +3226,7 @@ test "REPRO: derivative FS with interleaved color stores does not clobber a colo
     defer func.deinit();
     const f32_t = try func.types.intern(.{ .float = .f32 });
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const b = try func.appendBlock();
 
     const x = try func.appendBlockParam(b, f32_t);
@@ -3289,7 +3289,7 @@ test "REPRO: a derivative SHFL's source varying register is not clobbered before
     defer func.deinit();
     const f32_t = try func.types.intern(.{ .float = .f32 });
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const b = try func.appendBlock();
 
     const x = try func.appendBlockParam(b, f32_t);
@@ -3448,7 +3448,7 @@ test "graphics: a texturing fragment shader lowers the host-sampler call to a TE
     const f32_t = try func.types.intern(.{ .float = .f32 });
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const u128_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 128 } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const b = try func.appendBlock();
 
     // Entry params, in exactly the order the SPIR-V image-sample lowering
@@ -3534,7 +3534,7 @@ test "a boolean-valued && (bit_and of two bool compares) lowers to PLOP3, not a 
     defer func.deinit();
     const f32_t = try func.types.intern(.{ .float = .f32 });
     const bool_t = try func.types.intern(.bool);
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const b = try func.appendBlock();
     const a = try func.appendBlockParam(b, f32_t);
     const outp = try func.appendBlockParam(b, ptr_t);
@@ -3566,7 +3566,7 @@ test "a boolean-valued NOT (bit_xor bool, -1) lowers to PLOP3 (predicate negatio
     defer func.deinit();
     const f32_t = try func.types.intern(.{ .float = .f32 });
     const bool_t = try func.types.intern(.bool);
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const b = try func.appendBlock();
     const a = try func.appendBlockParam(b, f32_t);
     const outp = try func.appendBlockParam(b, ptr_t);

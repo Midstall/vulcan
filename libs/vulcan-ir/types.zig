@@ -38,6 +38,14 @@ pub const Slice = struct {
     elem: Type,
 };
 
+/// Where a pointer points. The address space rides in the interned type rather than in an
+/// attribute, because an attribute does not survive pointer arithmetic: `shared_ptr + i` would
+/// lose it and the backend would then emit a global access where a shared one is correct. That
+/// is a silent miscompile, and the type system turns it into a verifier error instead.
+///
+/// `global` is the default every frontend that does not model address spaces produces.
+pub const AddressSpace = enum { global, shared, private, constant };
+
 /// The structural description of a type. Identical descriptions intern to the
 /// same `Type` handle.
 pub const TypeKind = union(enum) {
@@ -47,8 +55,8 @@ pub const TypeKind = union(enum) {
     int: Int,
     /// A floating-point value.
     float: FloatKind,
-    /// An opaque, typeless pointer. Address math is explicit.
-    ptr,
+    /// An opaque, typeless pointer into a given address space. Address math is explicit.
+    ptr: AddressSpace,
     /// A fixed-length SIMD vector over a primitive scalar.
     vector: Vector,
     /// An aggregate of ordered field types. High profile only. The slice is
@@ -72,7 +80,8 @@ const TypeContext = struct {
     pub fn eql(_: TypeContext, a: TypeKind, b: TypeKind) bool {
         if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
         return switch (a) {
-            .bool, .ptr => true,
+            .bool => true,
+            .ptr => a.ptr == b.ptr,
             .int => a.int.signedness == b.int.signedness and a.int.bits == b.int.bits,
             .float => a.float == b.float,
             .vector => a.vector.len == b.vector.len and a.vector.elem == b.vector.elem,
@@ -116,6 +125,13 @@ pub const TypeTable = struct {
 
         try self.dedup.putContext(self.allocator, owned, handle, .{});
         return handle;
+    }
+
+    /// Intern a pointer into the global address space. Every frontend that does not model
+    /// address spaces means this one, so it is worth a name: it keeps the 300-odd call sites
+    /// short, and it marks each place that ASSUMED global for a later audit.
+    pub fn ptrGlobal(self: *TypeTable) std.mem.Allocator.Error!Type {
+        return self.intern(.{ .ptr = .global });
     }
 
     /// Borrow the structural kind backing a handle.
@@ -294,7 +310,20 @@ const TypeParser = struct {
     fn parseScalar(self: *TypeParser) Error!Type {
         const word = self.readWord();
         if (std.mem.eql(u8, word, "bool")) return self.table.intern(.bool);
-        if (std.mem.eql(u8, word, "ptr")) return self.table.intern(.ptr);
+        if (std.mem.eql(u8, word, "ptr")) {
+            if (self.pos >= self.src.len or self.src[self.pos] != '(') {
+                return self.table.intern(.{ .ptr = .global });
+            }
+            self.pos += 1;
+            const space_word = self.readWord();
+            // The text is UNTRUSTED, so an unknown space is a parse error and never an
+            // invalid enum.
+            const space = std.meta.stringToEnum(AddressSpace, space_word) orelse
+                return error.InvalidType;
+            if (self.pos >= self.src.len or self.src[self.pos] != ')') return error.InvalidType;
+            self.pos += 1;
+            return self.table.intern(.{ .ptr = space });
+        }
         if (std.mem.eql(u8, word, "f32")) return self.table.intern(.{ .float = .f32 });
         if (std.mem.eql(u8, word, "f64")) return self.table.intern(.{ .float = .f64 });
         if (std.mem.eql(u8, word, "f16")) return self.table.intern(.{ .float = .f16 });
@@ -324,7 +353,10 @@ pub const TypeFormatter = struct {
                 try w.print("{s}{d}", .{ prefix, i.bits });
             },
             .float => |f| try w.writeAll(@tagName(f)),
-            .ptr => try w.writeAll("ptr"),
+            .ptr => |space| switch (space) {
+                .global => try w.writeAll("ptr"),
+                .shared, .private, .constant => try w.print("ptr({s})", .{@tagName(space)}),
+            },
             .vector => |v| try w.print("<{d} x {f}>", .{ v.len, self.table.fmt(v.elem) }),
             .array => |a| try w.print("[{d} x {f}]", .{ a.len, self.table.fmt(a.elem) }),
             .slice => |s| try w.print("[]{f}", .{self.table.fmt(s.elem)}),
@@ -354,7 +386,7 @@ test "parsing scalar types" {
     );
     try std.testing.expectEqual(try table.intern(.bool), try table.parseType("bool"));
     try std.testing.expectEqual(try table.intern(.{ .float = .f64 }), try table.parseType("f64"));
-    try std.testing.expectEqual(try table.intern(.ptr), try table.parseType("ptr"));
+    try std.testing.expectEqual(try table.ptrGlobal(), try table.parseType("ptr"));
 }
 
 test "parsing composite types round-trips with printing" {
@@ -385,7 +417,7 @@ test "printing scalar types" {
     try std.testing.expectFmt("u8", "{f}", .{table.fmt(u8_t)});
     try std.testing.expectFmt("bool", "{f}", .{table.fmt(try table.intern(.bool))});
     try std.testing.expectFmt("f64", "{f}", .{table.fmt(try table.intern(.{ .float = .f64 }))});
-    try std.testing.expectFmt("ptr", "{f}", .{table.fmt(try table.intern(.ptr))});
+    try std.testing.expectFmt("ptr", "{f}", .{table.fmt(try table.ptrGlobal())});
 }
 
 test "printing composite types" {
@@ -437,8 +469,8 @@ test "float and pointer primitives intern distinctly" {
     const f32_a = try table.intern(.{ .float = .f32 });
     const f32_b = try table.intern(.{ .float = .f32 });
     const f64_t = try table.intern(.{ .float = .f64 });
-    const ptr_a = try table.intern(.ptr);
-    const ptr_b = try table.intern(.ptr);
+    const ptr_a = try table.ptrGlobal();
+    const ptr_b = try table.ptrGlobal();
 
     try std.testing.expectEqual(f32_a, f32_b);
     try std.testing.expectEqual(ptr_a, ptr_b);
@@ -548,9 +580,68 @@ test "slice is distinct from array and pointer" {
     const sl_a = try table.intern(.{ .slice = .{ .elem = i32_t } });
     const sl_b = try table.intern(.{ .slice = .{ .elem = i32_t } });
     const arr = try table.intern(.{ .array = .{ .len = 4, .elem = i32_t } });
-    const ptr = try table.intern(.ptr);
+    const ptr = try table.ptrGlobal();
 
     try std.testing.expectEqual(sl_a, sl_b);
     try std.testing.expect(sl_a != arr);
     try std.testing.expect(sl_a != ptr);
+}
+
+test "two pointers in different address spaces intern to different handles" {
+    // The regression this pins is severe. While `eql` said every pointer was equal, a function
+    // holding two address spaces interned the second onto the first one's handle, and
+    // `Function.clone` then shifted every later handle and silently retyped values.
+    var table = TypeTable.init(std.testing.allocator);
+    defer table.deinit();
+
+    const g = try table.intern(.{ .ptr = .global });
+    const s = try table.intern(.{ .ptr = .shared });
+    try std.testing.expect(g != s);
+    try std.testing.expectEqual(AddressSpace.global, table.type_kind(g).ptr);
+    try std.testing.expectEqual(AddressSpace.shared, table.type_kind(s).ptr);
+}
+
+test "the same address space interns to one handle" {
+    var table = TypeTable.init(std.testing.allocator);
+    defer table.deinit();
+    try std.testing.expectEqual(try table.ptrGlobal(), try table.ptrGlobal());
+    try std.testing.expectEqual(
+        try table.intern(.{ .ptr = .shared }),
+        try table.intern(.{ .ptr = .shared }),
+    );
+}
+
+test "a global pointer still prints as the bare word ptr" {
+    // Every golden text test in the repository depends on this spelling.
+    var table = TypeTable.init(std.testing.allocator);
+    defer table.deinit();
+    const g = try table.ptrGlobal();
+    try std.testing.expectFmt("ptr", "{f}", .{table.fmt(g)});
+}
+
+test "a non-global pointer prints and parses in the parenthesised form" {
+    var table = TypeTable.init(std.testing.allocator);
+    defer table.deinit();
+    const s = try table.intern(.{ .ptr = .shared });
+    try std.testing.expectFmt("ptr(shared)", "{f}", .{table.fmt(s)});
+    try std.testing.expectEqual(s, try table.parseType("ptr(shared)"));
+    try std.testing.expectEqual(
+        try table.intern(.{ .ptr = .constant }),
+        try table.parseType("ptr(constant)"),
+    );
+}
+
+test "a bare ptr parses as the global space" {
+    var table = TypeTable.init(std.testing.allocator);
+    defer table.deinit();
+    try std.testing.expectEqual(try table.ptrGlobal(), try table.parseType("ptr"));
+}
+
+test "an unknown address space is a parse error, not an invalid enum" {
+    // Suspicious case: the text is untrusted, so stringToEnum must reject rather than convert.
+    var table = TypeTable.init(std.testing.allocator);
+    defer table.deinit();
+    try std.testing.expectError(error.InvalidType, table.parseType("ptr(nonsense)"));
+    try std.testing.expectError(error.InvalidType, table.parseType("ptr(shared"));
+    try std.testing.expectError(error.InvalidType, table.parseType("ptr()"));
 }

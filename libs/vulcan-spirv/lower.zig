@@ -487,7 +487,7 @@ pub fn lowerModule(allocator: std.mem.Allocator, words: []const u32) Error!Funct
         .sampler_ptr_of = undefined,
         .input_comp_of = undefined,
         .pos_chain_var = undefined,
-        .ptr_t = try func.types.intern(.ptr),
+        .ptr_t = try func.types.ptrGlobal(),
         .i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } }),
         .array_stride = array_stride,
         .const_val = const_val,

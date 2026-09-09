@@ -434,7 +434,7 @@ test "readelf shows per-function .text sections and .rodata/.data/.bss for a glo
     defer entry.deinit();
     {
         const t = try entry.types.intern(i32k);
-        const ptr_t = try entry.types.intern(.ptr);
+        const ptr_t = try entry.types.ptrGlobal();
         const b = try entry.appendBlock();
         const g = try entry.appendGlobalAddr(b, ptr_t, "K");
         const v = try entry.appendInst(b, t, .{ .load = .{ .ptr = g } });

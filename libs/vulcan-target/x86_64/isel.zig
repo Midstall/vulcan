@@ -3766,7 +3766,7 @@ test "global_addr emits lea [rip+disp32] and a .pcrel_lea reloc at the disp32 fi
     const allocator = std.testing.allocator;
     var func = Function.init(allocator);
     defer func.deinit();
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const i8_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 8 } });
     const b = try func.appendBlock();
     const g = try func.appendGlobalAddr(b, ptr_t, "g");
@@ -3799,7 +3799,7 @@ test "a via_got global_addr emits mov [rip+disp32] and a .got_pcrel reloc (GOT-i
     const allocator = std.testing.allocator;
     var func = Function.init(allocator);
     defer func.deinit();
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const i8_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 8 } });
     const b = try func.appendBlock();
     const g = try func.appendGlobalAddrGot(b, ptr_t, "g");
@@ -3913,7 +3913,7 @@ fn indirectCallWithArgs(allocator: std.mem.Allocator, comptime n: usize) Error![
     var func = Function.init(allocator);
     defer func.deinit();
     const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const b = try func.appendBlock();
     const target = try func.appendBlockParam(b, ptr_t);
     var args: [n]Value = undefined;

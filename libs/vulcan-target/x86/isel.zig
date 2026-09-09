@@ -1706,7 +1706,7 @@ test "global_addr emits mov rd, imm32 and an .abs32 reloc at the imm32 field" {
     const allocator = std.testing.allocator;
     var func = Function.init(allocator);
     defer func.deinit();
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const i8_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 8 } });
     const b = try func.appendBlock();
     const g = try func.appendGlobalAddr(b, ptr_t, "g");
@@ -1735,7 +1735,7 @@ test "a via_got global_addr emits mov rd, [abs32] and a .got_abs reloc (GOT-indi
     const allocator = std.testing.allocator;
     var func = Function.init(allocator);
     defer func.deinit();
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const i8_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 8 } });
     const b = try func.appendBlock();
     const g = try func.appendGlobalAddrGot(b, ptr_t, "g");

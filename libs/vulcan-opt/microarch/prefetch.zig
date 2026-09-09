@@ -337,7 +337,7 @@ fn buildStridedSum(func: *Function) !void {
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const i64_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
     const bool_t = try func.types.intern(.bool);
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const entry = try func.appendBlock();
     const loop = try func.appendBlock();
     const body = try func.appendBlock();
@@ -374,7 +374,7 @@ fn buildStridedSum(func: *Function) !void {
 fn buildNoLoad(func: *Function) !void {
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const bool_t = try func.types.intern(.bool);
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const entry = try func.appendBlock();
     const loop = try func.appendBlock();
     const body = try func.appendBlock();

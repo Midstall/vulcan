@@ -671,7 +671,7 @@ const registry = @import("registry.zig");
 fn buildSaxpy(func: *Function) !void {
     const f32_t = try func.types.intern(.{ .float = .f32 });
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const bool_t = try func.types.intern(.bool);
     const entry = try func.appendBlock();
     const loop = try func.appendBlock();
@@ -727,7 +727,7 @@ test "declines a non-unit-stride access (a[2*i])" {
     var func = Function.init(allocator);
     defer func.deinit();
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const bool_t = try func.types.intern(.bool);
     const entry = try func.appendBlock();
     const loop = try func.appendBlock();

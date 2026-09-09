@@ -347,7 +347,7 @@ fn isIconstZero(func: *const Function, v: Value) bool {
 /// original scalar loop (header/body/exit) is left untouched and reused as the remainder; only the
 /// preheader's jump is redirected into the new vector prologue.
 fn apply(func: *Function, plan: *const Plan) Error!void {
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const bool_t = try func.types.intern(.bool);
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const v4 = try func.types.intern(.{ .vector = .{ .len = 4, .elem = i32_t } });
@@ -455,7 +455,7 @@ const LoopSpec = struct {
 };
 
 fn buildDotLoop(func: *Function, spec: LoopSpec) Error!void {
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const bool_t = try func.types.intern(.bool);
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const ea = try func.types.intern(.{ .int = .{ .signedness = spec.sign, .bits = spec.elem_bits } });
@@ -595,7 +595,7 @@ fn expectRejectedUnchanged(allocator: std.mem.Allocator, func: *Function, model:
 /// bi`, unused by anything), so the body is ten instructions rather than the exact
 /// nine-instruction shape `recognize` requires.
 fn buildDotLoopExtraOp(func: *Function) Error!void {
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const bool_t = try func.types.intern(.bool);
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const i8_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 8 } });
@@ -654,7 +654,7 @@ test "skips a loop whose body has an extra unrelated instruction" {
 /// canonical `arith_imm add(bpb, 1)` unit stride: two of the four back-edge args (`acc` and `pb`)
 /// now match the "accumulator-shaped update" pattern the recognizer looks for.
 fn buildMultiAccDotLoop(func: *Function) Error!void {
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const bool_t = try func.types.intern(.bool);
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const i8_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 8 } });
@@ -711,7 +711,7 @@ test "skips a loop with two accumulator-shaped updates in the latch args" {
 /// A dot-shaped reduction whose body spans TWO blocks (`body1` then `body2`, forwarding straight
 /// through to the header), so the loop is not the single-body-block shape `recognize` requires.
 fn buildNestedBodyDotLoop(func: *Function) Error!void {
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const bool_t = try func.types.intern(.bool);
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const i8_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 8 } });
@@ -785,7 +785,7 @@ test "skips a loop whose induction variable starts at a non-zero value" {
 /// A reduction loop shaped like a plain array sum, with only THREE header/body params (`i`, `acc`,
 /// `pa`), not the four the dot-reduction shape requires.
 fn buildWrongParamCountLoop(func: *Function) Error!void {
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const bool_t = try func.types.intern(.bool);
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const i8_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 8 } });
@@ -834,7 +834,7 @@ test "skips a loop whose header has the wrong param count" {
 /// A dot-shaped loop where BOTH multiply operands load from the same `pa` pointer param (`pb` is
 /// carried and stepped but never read): the aliased-base-pointer case, `sum(a[i] * a[i])`.
 fn buildAliasedDotLoop(func: *Function) Error!void {
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const bool_t = try func.types.intern(.bool);
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const i8_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 8 } });

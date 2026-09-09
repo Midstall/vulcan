@@ -6191,7 +6191,7 @@ test "an unreachable register-pressure block is skipped so the function still co
     defer func.deinit();
 
     const i64_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const entry = try func.appendBlock();
     _ = try func.appendBlockParam(entry, ptr_t);
     func.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
@@ -6215,7 +6215,7 @@ test "a big-endian load byte-swaps after the load" {
     defer func.deinit();
 
     const i64_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const entry = try func.appendBlock();
     const p = try func.appendBlockParam(entry, ptr_t);
     const v = try func.appendInst(entry, i64_t, .{ .load = .{ .ptr = p } });
@@ -6238,7 +6238,7 @@ test "a big-endian store byte-swaps before the store" {
     defer func.deinit();
 
     const i64_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const entry = try func.appendBlock();
     const p = try func.appendBlockParam(entry, ptr_t);
     const v = try func.appendBlockParam(entry, i64_t);
@@ -6464,7 +6464,7 @@ test "an alloca opens a stack frame and addresses its slot" {
     defer func.deinit();
 
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const entry = try func.appendBlock();
     const x = try func.appendBlockParam(entry, i32_t);
     const p = try func.appendInst(entry, ptr_t, .{ .alloca = .{ .elem = i32_t } });
@@ -6491,7 +6491,7 @@ test "sub-word integer loads and stores pick the right width" {
     defer func.deinit();
 
     const i8_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 8 } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const entry = try func.appendBlock();
     const p = try func.appendBlockParam(entry, ptr_t);
     const b = try func.appendBlockParam(entry, i8_t);
@@ -6515,7 +6515,7 @@ test "an unsigned halfword load zero-extends" {
     defer func.deinit();
 
     const u16_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 16 } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const entry = try func.appendBlock();
     const p = try func.appendBlockParam(entry, ptr_t);
     const v = try func.appendInst(entry, u16_t, .{ .load = .{ .ptr = p } });
@@ -6536,7 +6536,7 @@ test "selects loads and stores" {
     defer func.deinit();
 
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const entry = try func.appendBlock();
     const p = try func.appendBlockParam(entry, ptr_t);
     const v = try func.appendInst(entry, i32_t, .{ .load = .{ .ptr = p } });
@@ -6872,7 +6872,7 @@ test "selects float loads and stores" {
     defer func.deinit();
 
     const f32_t = try func.types.intern(.{ .float = .f32 });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const entry = try func.appendBlock();
     const p = try func.appendBlockParam(entry, ptr_t);
     const v = try func.appendInst(entry, f32_t, .{ .load = .{ .ptr = p } });
@@ -7153,7 +7153,7 @@ test "qemu-riscv-V: a <4 x f32> round-trips through an alloca slot (vse32 then v
     defer func.deinit();
     const t = try func.types.intern(.{ .float = .f32 });
     const v4 = try func.types.intern(.{ .vector = .{ .len = 4, .elem = t } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const b = try func.appendBlock();
     var ap: [4]V = undefined;
     var bp: [4]V = undefined;
@@ -7300,7 +7300,7 @@ test "et-soc VPU: an 8-lane elementwise f32 add compiles to VPU words with an M0
     defer func.deinit();
     const f32_t = try func.types.intern(.{ .float = .f32 });
     const v8 = try func.types.intern(.{ .vector = .{ .len = 8, .elem = f32_t } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const b = try func.appendBlock();
     const ptr_a = try func.appendBlockParam(b, ptr_t);
     const ptr_b = try func.appendBlockParam(b, ptr_t);
@@ -7455,7 +7455,7 @@ fn buildIntVecKernel(func: *Function, op: ir.function.BinOp, signedness: std.bui
     const V = ir.function.Value;
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = signedness, .bits = 32 } });
     const v8 = try func.types.intern(.{ .vector = .{ .len = 8, .elem = i32_t } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const b = try func.appendBlock();
     const ptr_a = try func.appendBlockParam(b, ptr_t);
     const ptr_b = try func.appendBlockParam(b, ptr_t);

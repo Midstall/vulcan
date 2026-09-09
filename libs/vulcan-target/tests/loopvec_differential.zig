@@ -27,7 +27,7 @@ fn hasJit() bool {
 fn buildSaxpy(func: *Function) !void {
     const f32_t = try func.types.intern(.{ .float = .f32 });
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const bool_t = try func.types.intern(.bool);
     const entry = try func.appendBlock();
     const loop = try func.appendBlock();
@@ -60,7 +60,7 @@ fn buildSaxpy(func: *Function) !void {
 fn buildSquare(func: *Function) !void {
     const f32_t = try func.types.intern(.{ .float = .f32 });
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const bool_t = try func.types.intern(.bool);
     const entry = try func.appendBlock();
     const loop = try func.appendBlock();
@@ -93,7 +93,7 @@ fn buildSquare(func: *Function) !void {
 fn buildSumReduction(func: *Function) !void {
     const f32_t = try func.types.intern(.{ .float = .f32 });
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const bool_t = try func.types.intern(.bool);
     try func.addAttr(.func, .{ .custom = .{ .namespace = "vulcan", .key = "fast_math", .value = .flag } });
     const entry = try func.appendBlock();

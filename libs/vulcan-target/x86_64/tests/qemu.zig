@@ -130,7 +130,7 @@ test "an indirect call with 7 integer args passes the 7th on the stack (qemu-x86
     defer main_f.deinit();
     {
         const t = try main_f.types.intern(i64k);
-        const ptr_t = try main_f.types.intern(.ptr);
+        const ptr_t = try main_f.types.ptrGlobal();
         const b = try main_f.appendBlock();
         const vals = [_]i64{ 1, 2, 3, 4, 5, 6, 100 };
         var args: [7]ir.function.Value = undefined;
@@ -161,7 +161,7 @@ test "a rodata global read via global_addr returns its value under qemu-x86_64" 
     defer main_f.deinit();
     {
         const t = try main_f.types.intern(i32k);
-        const ptr_t = try main_f.types.intern(.ptr);
+        const ptr_t = try main_f.types.ptrGlobal();
         const b = try main_f.appendBlock();
         const g = try main_f.appendGlobalAddr(b, ptr_t, "K");
         const v = try main_f.appendInst(b, t, .{ .load = .{ .ptr = g } });

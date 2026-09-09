@@ -480,7 +480,7 @@ const FunctionParser = struct {
         if (std.mem.eql(u8, op, "alloca")) {
             self.skipWs();
             const elem = try self.parseType();
-            const ptr_t = try self.func.types.intern(.ptr);
+            const ptr_t = try self.func.types.ptrGlobal();
             const result = try self.func.appendInst(block, ptr_t, .{ .alloca = .{ .elem = elem } });
             try self.recordValue(result);
             return result;

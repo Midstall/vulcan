@@ -99,7 +99,7 @@ fn buildSumLoop(func: *Function) anyerror!void {
 fn buildStridedSum(func: *Function) anyerror!void {
     const i64_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
     const bool_t = try func.types.intern(.bool);
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const entry = try func.appendBlock();
     const loop = try func.appendBlock();
     const body = try func.appendBlock();

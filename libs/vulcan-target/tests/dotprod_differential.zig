@@ -28,7 +28,7 @@ fn ampere() *const opt.microarch.Model {
 /// unit-stride reduction with an i32 accumulator and two loop-carried element pointers advancing by
 /// one byte per iteration.
 fn buildDotLoop(func: *Function, sign: std.builtin.Signedness) !void {
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const bool_t = try func.types.intern(.bool);
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const e8 = try func.types.intern(.{ .int = .{ .signedness = sign, .bits = 8 } });

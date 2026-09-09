@@ -311,7 +311,7 @@ test "links an intra-module call to a real bl offset" {
 
 test "compileModule lays out a global_addr's data object and carries its relocs forward" {
     const allocator = std.testing.allocator;
-    const ptr_t_kind = ir.types.TypeKind.ptr;
+    const ptr_t_kind = ir.types.TypeKind{ .ptr = .global };
     const i8_t_kind = ir.types.TypeKind{ .int = .{ .signedness = .signed, .bits = 8 } };
 
     var entry = Function.init(allocator);

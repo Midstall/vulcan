@@ -46,7 +46,7 @@ fn buildExtendFn(func: *Function) !void {
     const f32_t = try func.types.intern(.{ .float = .f32 });
     const b = try func.appendBlock();
     const in = try func.appendBlockParam(b, i64_t);
-    const slot = try func.appendInst(b, try func.types.intern(.ptr), .{ .alloca = .{ .elem = i32_t } });
+    const slot = try func.appendInst(b, try func.types.ptrGlobal(), .{ .alloca = .{ .elem = i32_t } });
     try func.appendStore(b, in, slot); // sd: low 16 bits are the half pattern
     const h = try func.appendInst(b, f16_t, .{ .load = .{ .ptr = slot } });
     const f = try func.appendInst(b, f32_t, .{ .convert = .{ .value = h } });
@@ -65,7 +65,7 @@ fn buildTruncFn(func: *Function) !void {
     const f32_t = try func.types.intern(.{ .float = .f32 });
     const b = try func.appendBlock();
     const in = try func.appendBlockParam(b, i64_t);
-    const slot = try func.appendInst(b, try func.types.intern(.ptr), .{ .alloca = .{ .elem = i32_t } });
+    const slot = try func.appendInst(b, try func.types.ptrGlobal(), .{ .alloca = .{ .elem = i32_t } });
     try func.appendStore(b, in, slot);
     const x = try func.appendInst(b, f32_t, .{ .load = .{ .ptr = slot } });
     const h = try func.appendInst(b, f16_t, .{ .convert = .{ .value = x } });
@@ -99,7 +99,7 @@ fn buildExtendSweepFn(func: *Function) !void {
     const bool_t = try func.types.intern(.bool);
     const f16_t = try func.types.intern(.{ .float = .f16 });
     const f32_t = try func.types.intern(.{ .float = .f32 });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
 
     const entry = try func.appendBlock();
     const loop = try func.appendBlock();
@@ -153,7 +153,7 @@ fn buildTruncSweepFn(func: *Function) !void {
     const bool_t = try func.types.intern(.bool);
     const f16_t = try func.types.intern(.{ .float = .f16 });
     const f32_t = try func.types.intern(.{ .float = .f32 });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
 
     const entry = try func.appendBlock();
     const loop = try func.appendBlock();
@@ -409,7 +409,7 @@ fn buildIntToHalfFn(func: *Function) !void {
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const b = try func.appendBlock();
     const x = try func.appendBlockParam(b, i32_t);
-    const slot = try func.appendInst(b, try func.types.intern(.ptr), .{ .alloca = .{ .elem = i32_t } });
+    const slot = try func.appendInst(b, try func.types.ptrGlobal(), .{ .alloca = .{ .elem = i32_t } });
     const h = try func.appendInst(b, f16_t, .{ .convert = .{ .value = x } });
     const f = try func.appendInst(b, f32_t, .{ .convert = .{ .value = h } });
     try func.appendStore(b, f, slot);
@@ -425,7 +425,7 @@ fn buildHalfToIntFn(func: *Function) !void {
     const i64_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
     const b = try func.appendBlock();
     const in = try func.appendBlockParam(b, i64_t);
-    const slot = try func.appendInst(b, try func.types.intern(.ptr), .{ .alloca = .{ .elem = i32_t } });
+    const slot = try func.appendInst(b, try func.types.ptrGlobal(), .{ .alloca = .{ .elem = i32_t } });
     try func.appendStore(b, in, slot);
     const h = try func.appendInst(b, f16_t, .{ .load = .{ .ptr = slot } });
     const r = try func.appendInst(b, i32_t, .{ .convert = .{ .value = h } });

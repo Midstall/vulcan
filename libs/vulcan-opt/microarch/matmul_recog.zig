@@ -1503,7 +1503,7 @@ pub const NestSpec = struct {
 /// 2-5, and `pub` for the same reason as `NestSpec` above: it is the one nest builder the sysemu
 /// differential can trust to match `recognizeNest`.
 pub fn buildMatmulNest(func: *Function, spec: NestSpec) Error!void {
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const bool_t = try func.types.intern(.bool);
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const f32_t = try func.types.intern(.{ .float = .f32 });
@@ -1732,7 +1732,7 @@ pub fn buildMatmulNest(func: *Function, spec: NestSpec) Error!void {
 
 /// Build a 2-deep (i, j) loop nest, verify-clean, for the "not exactly three loops" negative.
 fn buildTwoDeepNest(func: *Function) Error!void {
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const bool_t = try func.types.intern(.bool);
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const f32_t = try func.types.intern(.{ .float = .f32 });

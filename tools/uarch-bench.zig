@@ -223,7 +223,7 @@ fn buildSaxpyLoop(allocator: std.mem.Allocator) anyerror!Function {
     errdefer func.deinit();
     const f32_t = try func.types.intern(.{ .float = .f32 });
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const bool_t = try func.types.intern(.bool);
     const entry = try func.appendBlock();
     const loop = try func.appendBlock();
@@ -264,7 +264,7 @@ fn buildFsumLoop(allocator: std.mem.Allocator) anyerror!Function {
     errdefer func.deinit();
     const f32_t = try func.types.intern(.{ .float = .f32 });
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const bool_t = try func.types.intern(.bool);
     try func.addAttr(.func, .{ .custom = .{ .namespace = "vulcan", .key = "fast_math", .value = .flag } });
     const entry = try func.appendBlock();
@@ -301,7 +301,7 @@ fn buildStridedSum(allocator: std.mem.Allocator) anyerror!Function {
     errdefer func.deinit();
     const i64_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
     const bool_t = try func.types.intern(.bool);
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const entry = try func.appendBlock();
     const loop = try func.appendBlock();
     const body = try func.appendBlock();
@@ -388,7 +388,7 @@ fn buildMemAdd(allocator: std.mem.Allocator) anyerror!Function {
     var func = Function.init(allocator);
     errdefer func.deinit();
     const f32_t = try func.types.intern(.{ .float = .f32 });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const entry = try func.appendBlock();
     const pa = try func.appendBlockParam(entry, ptr_t);
     const pb = try func.appendBlockParam(entry, ptr_t);
@@ -428,7 +428,7 @@ fn buildMemMulAdd(allocator: std.mem.Allocator) anyerror!Function {
     var func = Function.init(allocator);
     errdefer func.deinit();
     const f32_t = try func.types.intern(.{ .float = .f32 });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const entry = try func.appendBlock();
     const pa = try func.appendBlockParam(entry, ptr_t);
     const pb = try func.appendBlockParam(entry, ptr_t);
@@ -473,7 +473,7 @@ fn buildMemPair(allocator: std.mem.Allocator) anyerror!Function {
     var func = Function.init(allocator);
     errdefer func.deinit();
     const i64_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const words = 16;
     const entry = try func.appendBlock();
     const in = try func.appendBlockParam(entry, ptr_t);

@@ -417,7 +417,7 @@ test "neon: a vector crosses a block edge whole (block-param move, no truncation
     // <4 x f32> block parameter, so a parallel move carries it across the edge.
     var func = Function.init(allocator);
     defer func.deinit();
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const f32_t = try func.types.intern(.{ .float = .f32 });
     const v4 = try func.types.intern(.{ .vector = .{ .len = 4, .elem = f32_t } });
@@ -462,7 +462,7 @@ test "neon: high vector pressure spills and reloads all 128 bits (no truncation)
     const N = 18;
     var func = Function.init(allocator);
     defer func.deinit();
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const f32_t = try func.types.intern(.{ .float = .f32 });
     const v4 = try func.types.intern(.{ .vector = .{ .len = 4, .elem = f32_t } });
     const blk = try func.appendBlock();
@@ -552,7 +552,7 @@ test "vectorize: chained (a+b)*c keeps the intermediate in a vector (pack reuse)
     // the vector add's result straight into the vector mul (no re-pack between them).
     var func = Function.init(allocator);
     defer func.deinit();
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const f32_t = try func.types.intern(.{ .float = .f32 });
     const blk = try func.appendBlock();
     const pa = try func.appendBlockParam(blk, ptr_t);
@@ -631,7 +631,7 @@ test "neon: <4 x f32> lane-wise add/mul through pointers" {
     // out = a * b + a, computed a full 4-wide vector at a time (one fmul + one fadd).
     var func = Function.init(allocator);
     defer func.deinit();
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const f32_t = try func.types.intern(.{ .float = .f32 });
     const v4 = try func.types.intern(.{ .vector = .{ .len = 4, .elem = f32_t } });
     const blk = try func.appendBlock();
@@ -1379,7 +1379,7 @@ const VecFmaShape = enum { add, csub };
 fn buildVecFmaFunc(allocator: std.mem.Allocator, shape: VecFmaShape) !Function {
     var func = Function.init(allocator);
     errdefer func.deinit();
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const f32_t = try func.types.intern(.{ .float = .f32 });
     const v4 = try func.types.intern(.{ .vector = .{ .len = 4, .elem = f32_t } });
     const blk = try func.appendBlock();
@@ -1501,7 +1501,7 @@ test "neon fma: a multi-use vector mul does NOT fuse (separate fmul+fadd, correc
     const allocator = std.testing.allocator;
     var func = Function.init(allocator);
     defer func.deinit();
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const f32_t = try func.types.intern(.{ .float = .f32 });
     const v4 = try func.types.intern(.{ .vector = .{ .len = 4, .elem = f32_t } });
     const blk = try func.appendBlock();
@@ -1569,7 +1569,7 @@ test "neon fma: vector a*b-c does NOT fuse (no single NEON instruction expresses
 fn buildVecFmaFuncSub(allocator: std.mem.Allocator) !Function {
     var func = Function.init(allocator);
     errdefer func.deinit();
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const f32_t = try func.types.intern(.{ .float = .f32 });
     const v4 = try func.types.intern(.{ .vector = .{ .len = 4, .elem = f32_t } });
     const blk = try func.appendBlock();
@@ -1882,7 +1882,7 @@ test "native: alloca stores and reloads through a stack frame" {
     var func = Function.init(allocator);
     defer func.deinit();
     const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const e = try func.appendBlock();
     const x = try func.appendBlockParam(e, t);
     const slot = try func.appendInst(e, ptr_t, .{ .alloca = .{ .elem = t } });
@@ -1897,7 +1897,7 @@ test "native: sub-word store and sign-extending load (i8)" {
     var func = Function.init(allocator);
     defer func.deinit();
     const i8_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 8 } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const e = try func.appendBlock();
     const a = try func.appendBlockParam(e, i8_t);
     const slot = try func.appendInst(e, ptr_t, .{ .alloca = .{ .elem = i8_t } });
@@ -1927,7 +1927,7 @@ test "native: a stack slot survives a call (alloca in a non-leaf frame)" {
     defer f.deinit();
     {
         const t = try f.types.intern(t_kind);
-        const ptr_t = try f.types.intern(.ptr);
+        const ptr_t = try f.types.ptrGlobal();
         const b = try f.appendBlock();
         const x = try f.appendBlockParam(b, t);
         const slot = try f.appendInst(b, ptr_t, .{ .alloca = .{ .elem = t } });
@@ -2050,7 +2050,7 @@ fn selectF16(allocator: std.mem.Allocator, func: *const Function, native: bool) 
 fn runF16Bin(allocator: std.mem.Allocator, op: ir.function.BinOp, a: f16, b: f16, native: bool) !f16 {
     var func = Function.init(allocator);
     defer func.deinit();
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const f16_t = try func.types.intern(.{ .float = .f16 });
     const blk = try func.appendBlock();
     const out = try func.appendBlockParam(blk, ptr_t);
@@ -2101,7 +2101,7 @@ test "native: FEAT_FP16 half add/sub/mul/div bit-exact vs @as(f16), native and e
     // drops the per-op fcvt widen/narrow around the load, arithmetic, and store.
     var func = Function.init(allocator);
     defer func.deinit();
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const f16_t = try func.types.intern(.{ .float = .f16 });
     const blk = try func.appendBlock();
     const out = try func.appendBlockParam(blk, ptr_t);
@@ -2129,7 +2129,7 @@ test "native: FEAT_FP16 conversions, int<->f16, and fconst bit-exact vs @as(f16)
         {
             var func = Function.init(allocator);
             defer func.deinit();
-            const ptr_t = try func.types.intern(.ptr);
+            const ptr_t = try func.types.ptrGlobal();
             const f16_t = try func.types.intern(ptr_k);
             const blk = try func.appendBlock();
             const out = try func.appendBlockParam(blk, ptr_t);
@@ -2172,7 +2172,7 @@ test "native: FEAT_FP16 conversions, int<->f16, and fconst bit-exact vs @as(f16)
         {
             var widen = Function.init(allocator);
             defer widen.deinit();
-            const ptr_t = try widen.types.intern(.ptr);
+            const ptr_t = try widen.types.ptrGlobal();
             const f16_t = try widen.types.intern(ptr_k);
             const f32_t = try widen.types.intern(.{ .float = .f32 });
             const blk = try widen.appendBlock();
@@ -2188,7 +2188,7 @@ test "native: FEAT_FP16 conversions, int<->f16, and fconst bit-exact vs @as(f16)
 
             var narrow = Function.init(allocator);
             defer narrow.deinit();
-            const nptr_t = try narrow.types.intern(.ptr);
+            const nptr_t = try narrow.types.ptrGlobal();
             const nf16_t = try narrow.types.intern(ptr_k);
             const nf32_t = try narrow.types.intern(.{ .float = .f32 });
             const nblk = try narrow.appendBlock();
@@ -2218,7 +2218,7 @@ test "native: FEAT_FP16 conversions, int<->f16, and fconst bit-exact vs @as(f16)
         {
             var widen = Function.init(allocator);
             defer widen.deinit();
-            const ptr_t = try widen.types.intern(.ptr);
+            const ptr_t = try widen.types.ptrGlobal();
             const f16_t = try widen.types.intern(ptr_k);
             const f64_t = try widen.types.intern(.{ .float = .f64 });
             const blk = try widen.appendBlock();
@@ -2234,7 +2234,7 @@ test "native: FEAT_FP16 conversions, int<->f16, and fconst bit-exact vs @as(f16)
 
             var narrow = Function.init(allocator);
             defer narrow.deinit();
-            const nptr_t = try narrow.types.intern(.ptr);
+            const nptr_t = try narrow.types.ptrGlobal();
             const nf16_t = try narrow.types.intern(ptr_k);
             const nf64_t = try narrow.types.intern(.{ .float = .f64 });
             const nblk = try narrow.appendBlock();
@@ -2578,7 +2578,7 @@ test "native: 64-bit pointer arithmetic into a stack array (base + i*4)" {
     var func = Function.init(allocator);
     defer func.deinit();
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const arr_t = try func.types.intern(.{ .array = .{ .len = 8, .elem = i32_t } });
 
     // f(i) { int buf[8], int* p = buf + i, *p = i*10 + 1, return *p }
@@ -3031,7 +3031,7 @@ test "object+ld+exec: link a program with a global (data section) and execute it
     defer main.deinit();
     {
         const t = try main.types.intern(i32k);
-        const ptr_t = try main.types.intern(.ptr);
+        const ptr_t = try main.types.ptrGlobal();
         const b = try main.appendBlock();
         const p = try main.appendGlobalAddr(b, ptr_t, "g");
         const v = try main.appendInst(b, t, .{ .load = .{ .ptr = p } });
@@ -3561,7 +3561,7 @@ test "multi-block inlining preserves semantics on aarch64 (callee has a loop)" {
 /// operands through allocas plus a store loop.
 fn dotFunc(allocator: std.mem.Allocator, signed: bool) !Function {
     var func = Function.init(allocator);
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const acc_t = try func.types.intern(.{ .vector = .{ .len = 4, .elem = i32_t } });
     const i8_t = try func.types.intern(.{ .int = .{ .signedness = if (signed) .signed else .unsigned, .bits = 8 } });
@@ -3689,7 +3689,7 @@ fn f16Bits(x: f16) u16 {
 fn runF16Binary(allocator: std.mem.Allocator, op: ir.function.BinOp, a: f16, b: f16) !f16 {
     var func = Function.init(allocator);
     defer func.deinit();
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const f16_t = try func.types.intern(.{ .float = .f16 });
     const blk = try func.appendBlock();
     const pa = try func.appendBlockParam(blk, ptr_t);
@@ -3718,7 +3718,7 @@ test "f16 load/store round-trips a half value bit-exact" {
     // already an exact half, so its 16 bits must survive the round-trip unchanged.
     var func = Function.init(allocator);
     defer func.deinit();
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const f16_t = try func.types.intern(.{ .float = .f16 });
     const blk = try func.appendBlock();
     const pin = try func.appendBlockParam(blk, ptr_t);
@@ -3781,7 +3781,7 @@ test "f16 chained multiply rounds every intermediate to half" {
     // result against Zig's step-by-step f16 chain.
     var func = Function.init(allocator);
     defer func.deinit();
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const f16_t = try func.types.intern(.{ .float = .f16 });
     const blk = try func.appendBlock();
     const pa = try func.appendBlockParam(blk, ptr_t);
@@ -3815,7 +3815,7 @@ test "convert f16 -> f32 widens exactly" {
     const allocator = std.testing.allocator;
     var func = Function.init(allocator);
     defer func.deinit();
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const f16_t = try func.types.intern(.{ .float = .f16 });
     const f32_t = try func.types.intern(.{ .float = .f32 });
     const blk = try func.appendBlock();
@@ -3844,7 +3844,7 @@ test "convert f32 -> f16 rounds to nearest-even half (proves it is not a bare co
     const allocator = std.testing.allocator;
     var func = Function.init(allocator);
     defer func.deinit();
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const f16_t = try func.types.intern(.{ .float = .f16 });
     const f32_t = try func.types.intern(.{ .float = .f32 });
     const blk = try func.appendBlock();
@@ -3878,7 +3878,7 @@ test "convert int <-> f16 rounds int->f16 and truncates f16->int" {
     {
         var func = Function.init(allocator);
         defer func.deinit();
-        const p_t = try func.types.intern(.ptr);
+        const p_t = try func.types.ptrGlobal();
         const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
         const f16_t = try func.types.intern(.{ .float = .f16 });
         const blk = try func.appendBlock();
@@ -3905,7 +3905,7 @@ test "convert int <-> f16 rounds int->f16 and truncates f16->int" {
     {
         var func = Function.init(allocator);
         defer func.deinit();
-        const p_t = try func.types.intern(.ptr);
+        const p_t = try func.types.ptrGlobal();
         const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
         const f16_t = try func.types.intern(.{ .float = .f16 });
         const blk = try func.appendBlock();
@@ -3931,7 +3931,7 @@ test "f16 constant materializes as its half-rounded f32 widening" {
     const allocator = std.testing.allocator;
     var func = Function.init(allocator);
     defer func.deinit();
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const f16_t = try func.types.intern(.{ .float = .f16 });
     const blk = try func.appendBlock();
     const pout = try func.appendBlockParam(blk, ptr_t);
@@ -3961,7 +3961,7 @@ test "f16 survives register spilling bit-exact (held as its f32 widening in a 16
     const N = 40;
     var func = Function.init(allocator);
     defer func.deinit();
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const f16_t = try func.types.intern(.{ .float = .f16 });
     const blk = try func.appendBlock();
     const in = try func.appendBlockParam(blk, ptr_t);
@@ -4000,7 +4000,7 @@ test "f32/f64 through the same memory paths are unchanged by the f16 work (regre
     inline for (.{ f32, f64 }) |T| {
         var func = Function.init(allocator);
         defer func.deinit();
-        const ptr_t = try func.types.intern(.ptr);
+        const ptr_t = try func.types.ptrGlobal();
         const ft = try func.types.intern(.{ .float = if (T == f32) .f32 else .f64 });
         const blk = try func.appendBlock();
         const pa = try func.appendBlockParam(blk, ptr_t);
@@ -4169,7 +4169,7 @@ test "ldp/stp: a struct-copy of consecutive words matches and emits ldp/stp" {
     var main = Function.init(allocator);
     defer main.deinit();
     const t = try main.types.intern(i64_kind);
-    const ptr_t = try main.types.intern(.ptr);
+    const ptr_t = try main.types.ptrGlobal();
     const b = try main.appendBlock();
     const out = try main.appendBlockParam(b, ptr_t);
     const in = try main.appendBlockParam(b, ptr_t);
@@ -4218,7 +4218,7 @@ test "ldp/stp: adjacent scalar loads summed match" {
     var func = Function.init(allocator);
     defer func.deinit();
     const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const b = try func.appendBlock();
     const base = try func.appendBlockParam(b, ptr_t);
     var lanes: [4]ir.function.Value = undefined;
@@ -4291,7 +4291,7 @@ test "addrfold: constant-index i64 copy folds every address-add away and compute
     var func = Function.init(allocator);
     defer func.deinit();
     const t = try func.types.intern(i64_kind);
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const b = try func.appendBlock();
     const out = try func.appendBlockParam(b, ptr_t);
     const in = try func.appendBlockParam(b, ptr_t);
@@ -4351,7 +4351,7 @@ test "addrfold: byte and halfword constant-index loads fold and compute correctl
     {
         const i8_t = try byte_fn.types.intern(i8_kind);
         const i32_t = try byte_fn.types.intern(i32_kind);
-        const ptr_t = try byte_fn.types.intern(.ptr);
+        const ptr_t = try byte_fn.types.ptrGlobal();
         const b = try byte_fn.appendBlock();
         const base = try byte_fn.appendBlockParam(b, ptr_t);
         var acc: ?ir.function.Value = null;
@@ -4369,7 +4369,7 @@ test "addrfold: byte and halfword constant-index loads fold and compute correctl
     {
         const i16_t = try half_fn.types.intern(i16_kind);
         const i32_t = try half_fn.types.intern(i32_kind);
-        const ptr_t = try half_fn.types.intern(.ptr);
+        const ptr_t = try half_fn.types.ptrGlobal();
         const b = try half_fn.appendBlock();
         const base = try half_fn.appendBlockParam(b, ptr_t);
         var acc: ?ir.function.Value = null;
@@ -4417,7 +4417,7 @@ test "addrfold: fp32 and fp64 constant-index loads fold" {
     defer f32_fn.deinit();
     {
         const f32_t = try f32_fn.types.intern(.{ .float = .f32 });
-        const ptr_t = try f32_fn.types.intern(.ptr);
+        const ptr_t = try f32_fn.types.ptrGlobal();
         const b = try f32_fn.appendBlock();
         const base = try f32_fn.appendBlockParam(b, ptr_t);
         const p = try f32_fn.appendInst(b, ptr_t, .{ .arith_imm = .{ .op = .add, .lhs = base, .imm = 4 } });
@@ -4429,7 +4429,7 @@ test "addrfold: fp32 and fp64 constant-index loads fold" {
     defer f64_fn.deinit();
     {
         const f64_t = try f64_fn.types.intern(.{ .float = .f64 });
-        const ptr_t = try f64_fn.types.intern(.ptr);
+        const ptr_t = try f64_fn.types.ptrGlobal();
         const b = try f64_fn.appendBlock();
         const base = try f64_fn.appendBlockParam(b, ptr_t);
         const p = try f64_fn.appendInst(b, ptr_t, .{ .arith_imm = .{ .op = .add, .lhs = base, .imm = 8 } });
@@ -4471,7 +4471,7 @@ test "addrfold: a CROSS-BLOCK folded load computes correctly" {
     defer func.deinit();
     const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const bool_t = try func.types.intern(.bool);
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const entry = try func.appendBlock();
     const then_b = try func.appendBlock();
     const else_b = try func.appendBlock();
@@ -4528,7 +4528,7 @@ test "addrfold: a loop-invariant base folded-loaded in the header survives the b
     defer func.deinit();
     const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const bool_t = try func.types.intern(.bool);
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const entry = try func.appendBlock();
     const loop = try func.appendBlock();
     const body = try func.appendBlock();
@@ -4596,7 +4596,7 @@ test "addrfold: a base used by a folded load AND another consumer keeps the add 
     var func = Function.init(allocator);
     defer func.deinit();
     const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const b = try func.appendBlock();
     const base = try func.appendBlockParam(b, ptr_t);
     const p = try func.appendInst(b, ptr_t, .{ .arith_imm = .{ .op = .add, .lhs = base, .imm = 8 } });
@@ -5203,7 +5203,7 @@ test "native: pointer icmp ==0 with a high bit set is correctly not-equal (aarch
     if (builtin.cpu.arch != .aarch64) return error.SkipZigTest;
     var func = Function.init(allocator);
     defer func.deinit();
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const bool_t = try func.types.intern(.bool);
     const blk = try func.appendBlock();
     const p = try func.appendBlockParam(blk, ptr_t);
@@ -5534,7 +5534,7 @@ test "addrfold+wimmer: a folded load whose base is live across register pressure
     var func = Function.init(allocator);
     defer func.deinit();
 
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const i64_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
     const blk = try func.appendBlock();
     const base = try func.appendBlockParam(blk, ptr_t);
@@ -5574,7 +5574,7 @@ test "addrfold+wimmer: a folded store whose base is live across register pressur
     var func = Function.init(allocator);
     defer func.deinit();
 
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const i64_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
     const blk = try func.appendBlock();
     const base = try func.appendBlockParam(blk, ptr_t);
@@ -5723,7 +5723,7 @@ test "native f128: alloca store then load round-trips all 16 bytes" {
     var f = Function.init(allocator);
     defer f.deinit();
     const t = try f.types.intern(.{ .float = .f128 });
-    const ptr_t = try f.types.intern(.ptr);
+    const ptr_t = try f.types.ptrGlobal();
     const b = try f.appendBlock();
     const a = try f.appendBlockParam(b, t);
     const slot = try f.appendInst(b, ptr_t, .{ .alloca = .{ .elem = t } });

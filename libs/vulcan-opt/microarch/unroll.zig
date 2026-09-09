@@ -799,7 +799,7 @@ fn replaceInBlock(func: *Function, block: Block, from: Value, to: Value) void {
 fn buildCountedLoop(func: *Function, impure_header: bool) Error!void {
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const bool_t = try func.types.intern(.bool);
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const entry = try func.appendBlock();
     const loop = try func.appendBlock();
     const body = try func.appendBlock();
@@ -887,7 +887,7 @@ test "cloneBlocks keeps via_got=true on a cloned global_addr (loop-unroll body c
     const allocator = std.testing.allocator;
     var func = Function.init(allocator);
     defer func.deinit();
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const b0 = try func.appendBlock();
     const g = try func.appendGlobalAddrGot(b0, ptr_t, "G");
     func.setTerminator(b0, .{ .ret = ir.function.Ret.one(g) });

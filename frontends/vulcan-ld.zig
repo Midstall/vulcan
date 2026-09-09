@@ -1234,7 +1234,7 @@ fn buildScriptMainObj(allocator: std.mem.Allocator) ![]u8 {
     var main_fn = Function.init(allocator);
     defer main_fn.deinit();
     const t = try main_fn.types.intern(i32k);
-    const ptr_t = try main_fn.types.intern(.ptr);
+    const ptr_t = try main_fn.types.ptrGlobal();
     const b = try main_fn.appendBlock();
     const g = try main_fn.appendGlobalAddr(b, ptr_t, "g");
     const gv = try main_fn.appendInst(b, t, .{ .load = .{ .ptr = g } });

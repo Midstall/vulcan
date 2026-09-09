@@ -76,7 +76,7 @@ fn quads(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {
         var f = Function.init(allocator);
         defer f.deinit();
         const t = try t_of(&f);
-        const ptr_t = try f.types.intern(.ptr);
+        const ptr_t = try f.types.ptrGlobal();
         const b = try f.appendBlock();
         const a = try f.appendBlockParam(b, t);
         const slot = try f.appendInst(b, ptr_t, .{ .alloca = .{ .elem = t } });
@@ -170,7 +170,7 @@ fn memory(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {
         var f = Function.init(allocator);
         defer f.deinit();
         const t = try h.i32type(&f);
-        const ptr_t = try f.types.intern(.ptr);
+        const ptr_t = try f.types.ptrGlobal();
         const b = try f.appendBlock();
         const x = try f.appendBlockParam(b, t);
         const slot = try f.appendInst(b, ptr_t, .{ .alloca = .{ .elem = t } });
@@ -196,7 +196,7 @@ fn memory(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {
         var f = Function.init(allocator);
         defer f.deinit();
         const t = try f.types.intern(.{ .float = .f32 });
-        const ptr_t = try f.types.intern(.ptr);
+        const ptr_t = try f.types.ptrGlobal();
         const b = try f.appendBlock();
         const x = try f.appendBlockParam(b, t);
         const y = try f.appendBlockParam(b, t);
@@ -213,7 +213,7 @@ fn memory(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {
         var f = Function.init(allocator);
         defer f.deinit();
         const t = try f.types.intern(.{ .float = .f64 });
-        const ptr_t = try f.types.intern(.ptr);
+        const ptr_t = try f.types.ptrGlobal();
         const b = try f.appendBlock();
         const x = try f.appendBlockParam(b, t);
         const y = try f.appendBlockParam(b, t);

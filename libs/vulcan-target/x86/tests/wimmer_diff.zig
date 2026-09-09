@@ -736,7 +736,7 @@ fn buildFoldAcrossCall(allocator: std.mem.Allocator) anyerror!Function {
     var func = Function.init(allocator);
     errdefer func.deinit();
     const t = try i32type(&func);
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const entry = try func.appendBlock();
     const a = try func.appendBlockParam(entry, t);
     const buf0 = try func.appendInst(entry, ptr_t, .{ .alloca = .{ .elem = t } });

@@ -347,7 +347,7 @@ test "JS backend: alloca, store, load round-trip" {
     defer func.deinit();
 
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const entry = try func.appendBlock();
     const a = try func.appendBlockParam(entry, i32_t);
     const b = try func.appendBlockParam(entry, i32_t);
@@ -370,7 +370,7 @@ test "JS backend: array alloca with computed pointer store/load" {
     defer func.deinit();
 
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const arr_t = try func.types.intern(.{ .array = .{ .len = 8, .elem = i32_t } });
 
     const e = try func.appendBlock();
@@ -422,7 +422,7 @@ test "JS backend: slice construction and length extract" {
 
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const i64_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const slice_t = try func.types.intern(.{ .slice = .{ .elem = i32_t } });
 
     const e = try func.appendBlock();
@@ -535,7 +535,7 @@ test "JS backend: call_indirect through a global function reference" {
     defer func.deinit();
 
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
 
     // f(x) { fp = &triple; return fp(x); }  triple is defined by the driver.
     const e = try func.appendBlock();
@@ -568,7 +568,7 @@ test "JS backend: global_addr reads an external data global" {
     defer func.deinit();
 
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
 
     // f() { return *(int*)&g_value; }  g_value is a byte offset the driver sets up.
     const e = try func.appendBlock();

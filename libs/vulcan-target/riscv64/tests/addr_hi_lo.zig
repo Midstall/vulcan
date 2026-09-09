@@ -17,7 +17,7 @@ const Function = ir.function.Function;
 fn buildGlobalAddr(allocator: std.mem.Allocator, sym: []const u8) !Function {
     var func = Function.init(allocator);
     errdefer func.deinit();
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const blk = try func.appendBlock();
     const p = try func.appendGlobalAddr(blk, ptr_t, sym);
     func.setTerminator(blk, .{ .ret = ir.function.Ret.one(p) });

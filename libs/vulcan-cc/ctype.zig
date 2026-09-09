@@ -372,7 +372,7 @@ pub const CType = union(enum) {
     pub fn irType(self: CType, func: *ir.function.Function, l: layout.TargetLayout) (Error || std.mem.Allocator.Error)!ir.types.Type {
         return switch (self) {
             .int => |i| func.types.intern(.{ .int = i.irInt(l) }),
-            .ptr => func.types.intern(.ptr),
+            .ptr => func.types.ptrGlobal(),
             .array => |a| func.types.intern(.{ .array = .{ .len = a.len, .elem = try a.elem.irType(func, l) } }),
             // A by-value object of an incomplete struct or union has no storage width to
             // reserve. This reports `error.IncompleteType`, checked before reading
@@ -408,7 +408,7 @@ pub const CType = union(enum) {
             // type directly, which no lowering path does yet, it lowers the same way a
             // function decays to a pointer everywhere else in C. An array parameter's
             // own decay is the closest existing precedent; see `parser.parseParams`.
-            .func => func.types.intern(.ptr),
+            .func => func.types.ptrGlobal(),
             // A bare `void` has no IR representation as a value. Only `void*`, a `.ptr`
             // handled above with no pointee lookup at all, ever actually lowers.
             // Reaching this arm means something tried to give a `void`-typed local,

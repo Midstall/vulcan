@@ -1162,7 +1162,7 @@ fn buildF16IntMixRv(func: *Function) !void {
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const f16_t = try func.types.intern(.{ .float = .f16 });
     const f32_t = try func.types.intern(.{ .float = .f32 });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const b = try func.appendBlock();
     const n = try func.appendBlockParam(b, i64_t);
     const hbits = try func.appendBlockParam(b, i64_t); // half bit pattern in the low 16 bits
@@ -1383,7 +1383,7 @@ fn buildFoldLoadPressure(allocator: std.mem.Allocator) anyerror!Function {
     errdefer func.deinit();
     const i64_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
     const bool_t = try func.types.intern(.bool);
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const entry = try func.appendBlock();
     const then_b = try func.appendBlock();
     const else_b = try func.appendBlock();
@@ -1438,7 +1438,7 @@ fn buildFoldStorePressure(allocator: std.mem.Allocator) anyerror!Function {
     var func = Function.init(allocator);
     errdefer func.deinit();
     const i64_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const e = try func.appendBlock();
     const arg = try func.appendBlockParam(e, i64_t);
 

@@ -1345,7 +1345,7 @@ test "wasm target: narrow i8 store/load sign-extends round-trips" {
     var f = ir.function.Function.init(allocator);
     defer f.deinit();
     const i8t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 8 } });
-    const ptr = try f.types.intern(.ptr);
+    const ptr = try f.types.ptrGlobal();
     const b = try f.appendBlock();
     const x = try f.appendBlockParam(b, i8t);
     const slot = try f.appendInst(b, ptr, .{ .alloca = .{ .elem = i8t } });
@@ -2128,7 +2128,7 @@ test "wasm target: stack frame + control flow + cross-block alloca" {
     defer f.deinit();
     const t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const bool_t = try f.types.intern(.bool);
-    const ptr = try f.types.intern(.ptr);
+    const ptr = try f.types.ptrGlobal();
     const entry = try f.appendBlock();
     const x = try f.appendBlockParam(entry, t);
     const neg = try f.appendBlock();
@@ -2175,7 +2175,7 @@ test "wasm target: cross-call allocas do not alias (stack pointer)" {
     defer callee.deinit();
     {
         const t = try i32t_of(&callee);
-        const ptr = try callee.types.intern(.ptr);
+        const ptr = try callee.types.ptrGlobal();
         const b = try callee.appendBlock();
         const slot = try callee.appendInst(b, ptr, .{ .alloca = .{ .elem = t } });
         const seven = try callee.appendInst(b, t, .{ .iconst = 7 });
@@ -2190,7 +2190,7 @@ test "wasm target: cross-call allocas do not alias (stack pointer)" {
     defer caller.deinit();
     {
         const t = try i32t_of(&caller);
-        const ptr = try caller.types.intern(.ptr);
+        const ptr = try caller.types.ptrGlobal();
         const b = try caller.appendBlock();
         const slot = try caller.appendInst(b, ptr, .{ .alloca = .{ .elem = t } });
         const k = try caller.appendInst(b, t, .{ .iconst = 1000 });
@@ -2219,7 +2219,7 @@ test "wasm target: alloca + store/load through linear memory round-trips" {
     var f = ir.function.Function.init(allocator);
     defer f.deinit();
     const t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
-    const ptr = try f.types.intern(.ptr);
+    const ptr = try f.types.ptrGlobal();
     const entry = try f.appendBlock();
     const a = try f.appendBlockParam(entry, t);
     const b = try f.appendBlockParam(entry, t);
@@ -2322,7 +2322,7 @@ test "wasm vs aarch64: multiple allocas do not alias" {
     var f = ir.function.Function.init(allocator);
     defer f.deinit();
     const t = try i32ty(&f);
-    const ptr = try f.types.intern(.ptr);
+    const ptr = try f.types.ptrGlobal();
     const b = try f.appendBlock();
     const x = try f.appendBlockParam(b, t);
     const sa = try f.appendInst(b, ptr, .{ .alloca = .{ .elem = t } });
@@ -2398,7 +2398,7 @@ test "wasm vs aarch64: value live across a call and a memory slot" {
     defer f.deinit();
     {
         const t = try i32ty(&f);
-        const ptr = try f.types.intern(.ptr);
+        const ptr = try f.types.ptrGlobal();
         const b = try f.appendBlock();
         const x = try f.appendBlockParam(b, t);
         const tv = try f.appendArithImm(b, t, .add, x, 5);
@@ -2431,7 +2431,7 @@ test "wasm target: f16 extend widens raw half bits to f32, bit-exact vs @as(f32,
     defer f.deinit();
     const i16t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 16 } });
     const f16t = try f.types.intern(.{ .float = .f16 });
-    const ptr = try f.types.intern(.ptr);
+    const ptr = try f.types.ptrGlobal();
     const b = try f.appendBlock();
     const x = try f.appendBlockParam(b, i16t);
     const slot = try f.appendInst(b, ptr, .{ .alloca = .{ .elem = f16t } });
@@ -2470,7 +2470,7 @@ test "wasm target: f16 truncate rounds f32 to half bits (RNE), bit-exact vs @as(
     const f32t = try f.types.intern(.{ .float = .f32 });
     const f16t = try f.types.intern(.{ .float = .f16 });
     const u16t = try f.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 16 } });
-    const ptr = try f.types.intern(.ptr);
+    const ptr = try f.types.ptrGlobal();
     const b = try f.appendBlock();
     const x = try f.appendBlockParam(b, f32t);
     const c = try f.appendInst(b, f16t, .{ .convert = .{ .value = x } });
@@ -2580,7 +2580,7 @@ test "wasm target: f16 store/load round-trips a representable half through memor
     var f = ir.function.Function.init(allocator);
     defer f.deinit();
     const f16t = try f.types.intern(.{ .float = .f16 });
-    const ptr = try f.types.intern(.ptr);
+    const ptr = try f.types.ptrGlobal();
     const b = try f.appendBlock();
     const x = try f.appendBlockParam(b, f16t);
     const slot = try f.appendInst(b, ptr, .{ .alloca = .{ .elem = f16t } });

@@ -297,7 +297,7 @@ fn buildAddKernel(func: *Function) !void {
     const V = ir.function.Value;
     const f32_t = try func.types.intern(.{ .float = .f32 });
     const v8 = try func.types.intern(.{ .vector = .{ .len = 8, .elem = f32_t } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const b = try func.appendBlock();
     const ptr_a = try func.appendBlockParam(b, ptr_t);
     const ptr_b = try func.appendBlockParam(b, ptr_t);
@@ -347,7 +347,7 @@ fn buildAddKernel(func: *Function) !void {
 fn buildSquareAddKernel(func: *Function) !void {
     const V = ir.function.Value;
     const f32_t = try func.types.intern(.{ .float = .f32 });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const b = try func.appendBlock();
     const ptr_a = try func.appendBlockParam(b, ptr_t);
     const ptr_b = try func.appendBlockParam(b, ptr_t);
@@ -462,7 +462,7 @@ fn buildVectorMulAddKernel(func: *Function, second_op: ir.function.BinOp) !void 
     const V = ir.function.Value;
     const f32_t = try func.types.intern(.{ .float = .f32 });
     const v8 = try func.types.intern(.{ .vector = .{ .len = 8, .elem = f32_t } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const b = try func.appendBlock();
     const ptr_a = try func.appendBlockParam(b, ptr_t);
     const ptr_b = try func.appendBlockParam(b, ptr_t);
@@ -587,7 +587,7 @@ fn buildIntKernel(func: *Function, op: ir.function.BinOp) !void {
     const V = ir.function.Value;
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const v8 = try func.types.intern(.{ .vector = .{ .len = 8, .elem = i32_t } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const b = try func.appendBlock();
     const ptr_a = try func.appendBlockParam(b, ptr_t);
     const ptr_b = try func.appendBlockParam(b, ptr_t);
@@ -672,7 +672,7 @@ test "et-soc VPU differential: sw-sysemu executes 8-lane <8 x i32> pi ops and ma
 fn buildIntMulAddKernel(func: *Function) !void {
     const V = ir.function.Value;
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const b = try func.appendBlock();
     const ptr_a = try func.appendBlockParam(b, ptr_t);
     const ptr_b = try func.appendBlockParam(b, ptr_t);
@@ -712,7 +712,7 @@ fn buildIntMulAddKernel(func: *Function) !void {
 fn buildIntXorShiftKernel(func: *Function) !void {
     const V = ir.function.Value;
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const b = try func.appendBlock();
     const ptr_a = try func.appendBlockParam(b, ptr_t);
     const ptr_b = try func.appendBlockParam(b, ptr_t);
@@ -972,7 +972,7 @@ fn runMatmulImage(io: std.Io, allocator: std.mem.Allocator, image: MatmulImage) 
 /// (a0=&A, a1=&B, a2=&C), the shape the isel `.matmul` lowering handles. `accumulate` picks the
 /// tensor_fma first_pass flag.
 fn buildMatmulKernel(func: *Function, m: u16, n: u16, k: u16, dtype: MMType, accumulate: bool) !void {
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const blk = try func.appendBlock();
     const pa = try func.appendBlockParam(blk, ptr_t);
     const pb = try func.appendBlockParam(blk, ptr_t);
@@ -988,7 +988,7 @@ fn buildMatmulKernel(func: *Function, m: u16, n: u16, k: u16, dtype: MMType, acc
 /// save/restore keeps V intact, so a mis-lowered (or non-self-contained) matmul makes the stored V
 /// observably wrong while C stays correct. a0=&A, a1=&B, a2=&C, exactly like `buildMatmulKernel`.
 fn buildEmbeddedMatmulKernel(func: *Function, m: u16, n: u16, k: u16, dtype: MMType) !void {
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const f32_t = try func.types.intern(.{ .float = .f32 });
     const blk = try func.appendBlock();
     const pa = try func.appendBlockParam(blk, ptr_t);
@@ -1509,7 +1509,7 @@ fn refElemSigned(unsigned: bool, v: i32) i32 {
 /// quant) via `appendMatmulSigned`. Sibling of `buildMatmulKernel`, always `dtype == .int8` (the
 /// only dtype `input_signs` may pair with).
 fn buildMatmulMixedKernel(func: *Function, m: u16, n: u16, k: u16, accumulate: bool, input_signs: InputSigns) !void {
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const blk = try func.appendBlock();
     const pa = try func.appendBlockParam(blk, ptr_t);
     const pb = try func.appendBlockParam(blk, ptr_t);
@@ -1655,7 +1655,7 @@ const MMQuantSpec = Function.MatMulQuantSpec;
 /// input dtype. Verify rejects any dtype other than `.int8`/`.uint8` paired with a quant. The
 /// symmetric differentials all pass `.int8`, the asymmetric ones `.uint8`.
 fn buildMatmulQuantKernel(func: *Function, m: u16, n: u16, k: u16, dtype: MMType, accumulate: bool, quant: MMQuant) !void {
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const blk = try func.appendBlock();
     const pa = try func.appendBlockParam(blk, ptr_t);
     const pb = try func.appendBlockParam(blk, ptr_t);
@@ -1670,7 +1670,7 @@ fn buildMatmulQuantKernel(func: *Function, m: u16, n: u16, k: u16, dtype: MMType
 /// subset those two builders' call sites need. The asymmetric-uint8 differentials need bias and a
 /// nonzero zero_point, so they go through `appendMatmulQuantSpec` directly.
 fn buildMatmulQuantSpecKernel(func: *Function, m: u16, n: u16, k: u16, dtype: MMType, accumulate: bool, spec: MMQuantSpec) !void {
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const blk = try func.appendBlock();
     const pa = try func.appendBlockParam(blk, ptr_t);
     const pb = try func.appendBlockParam(blk, ptr_t);
@@ -1932,7 +1932,7 @@ test "et-soc matmul quant: structural CSR sequence has tensor_quant, non-quant p
 /// `per_column` scale. Sibling of `buildMatmulQuantKernel`. `out` picks the requantized output
 /// element type (signed int8 or unsigned uint8), threaded straight to `appendMatmulQuantPerColumn`.
 fn buildMatmulQuantPerColumnKernel(func: *Function, m: u16, n: u16, k: u16, accumulate: bool, relu: bool, out: ir.function.MatMulQuantOut, scales: []const u32) !void {
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const blk = try func.appendBlock();
     const pa = try func.appendBlockParam(blk, ptr_t);
     const pb = try func.appendBlockParam(blk, ptr_t);
@@ -2820,7 +2820,7 @@ test "matmul_recog differential: a MEMORY-accumulator nest raises to accumulate=
 /// unit-stepped element pointers, is exactly the layout `buildMatmulImage` writes, so the plain fp32
 /// image runs it.
 fn buildSurroundedMatmulNest(func: *Function, m: u16, n: u16, k: u16, mem_accumulate: bool) !void {
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const bool_t = try func.types.intern(.bool);
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const f32_t = try func.types.intern(.{ .float = .f32 });
@@ -3478,7 +3478,7 @@ fn buildVpuPressureKernel(func: *Function) !void {
     const V = ir.function.Value;
     const f32_t = try func.types.intern(.{ .float = .f32 });
     const v8 = try func.types.intern(.{ .vector = .{ .len = 8, .elem = f32_t } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const b = try func.appendBlock();
     const ptr_a = try func.appendBlockParam(b, ptr_t);
     _ = try func.appendBlockParam(b, ptr_t); // ptr_b (unused, keeps the 3-pointer runVpuKernel shape)
@@ -3560,7 +3560,7 @@ fn buildVpuAcrossCallCaller(func: *Function) !void {
     const V = ir.function.Value;
     const f32_t = try func.types.intern(.{ .float = .f32 });
     const v8 = try func.types.intern(.{ .vector = .{ .len = 8, .elem = f32_t } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const b = try func.appendBlock();
     const ptr_a = try func.appendBlockParam(b, ptr_t);
     _ = try func.appendBlockParam(b, ptr_t); // ptr_b (unused)
@@ -3664,7 +3664,7 @@ fn buildVpuEdgeKernel(func: *Function) !void {
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const bool_t = try func.types.intern(.bool);
     const v8 = try func.types.intern(.{ .vector = .{ .len = 8, .elem = f32_t } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
 
     const entry = try func.appendBlock();
     const arm_a = try func.appendBlock();

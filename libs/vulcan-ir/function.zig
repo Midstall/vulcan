@@ -1873,7 +1873,7 @@ test "store writes a value to a pointer" {
     defer func.deinit();
 
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const entry = try func.appendBlock();
     const p = try func.appendBlockParam(entry, ptr_t);
     const x = try func.appendInst(entry, i32_t, .{ .iconst = 5 });
@@ -1889,7 +1889,7 @@ test "prefetch hints an address and has no result" {
     var func = Function.init(std.testing.allocator);
     defer func.deinit();
 
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const entry = try func.appendBlock();
     const p = try func.appendBlockParam(entry, ptr_t);
     try func.appendPrefetch(entry, p);
@@ -1905,7 +1905,7 @@ test "va_start/va_arg/va_end round-trip through print and clone" {
     defer func.deinit();
 
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const entry = try func.appendBlock();
     const list = try func.appendBlockParam(entry, ptr_t);
     try func.appendVaStart(entry, list);
@@ -1970,7 +1970,7 @@ test "matmul writes c from a and b tile and has no result" {
     var func = Function.init(std.testing.allocator);
     defer func.deinit();
 
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const entry = try func.appendBlock();
     const a = try func.appendBlockParam(entry, ptr_t);
     const b = try func.appendBlockParam(entry, ptr_t);
@@ -2016,7 +2016,7 @@ test "load reads a typed value from a pointer" {
     defer func.deinit();
 
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const entry = try func.appendBlock();
     const p = try func.appendBlockParam(entry, ptr_t);
     const v = try func.appendInst(entry, i32_t, .{ .load = .{ .ptr = p } });
@@ -2179,7 +2179,7 @@ test "printing an alloca names the slot type" {
     defer func.deinit();
 
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const entry = try func.appendBlock();
     const p = try func.appendInst(entry, ptr_t, .{ .alloca = .{ .elem = i32_t } });
     func.setTerminator(entry, .{ .ret = Ret.one(p) });
@@ -2678,4 +2678,35 @@ test "clone deep-copies a function and leaves the original untouched" {
     _ = try copy.appendBlock();
     try std.testing.expectEqual(before, func.blockCount());
     try std.testing.expectEqual(before + 1, copy.blockCount());
+}
+
+test "clone preserves handles for a function holding two pointer address spaces" {
+    // The exact corruption the eql fix prevents: clone re-interns every kind in order and
+    // depends on the n-th kind receiving handle n. If two address spaces collapsed to one
+    // handle, every later handle would shift and values would be silently retyped.
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+
+    const g = try func.types.ptrGlobal();
+    const s = try func.types.intern(.{ .ptr = .shared });
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const b = try func.appendBlock();
+    const pg = try func.appendBlockParam(b, g);
+    const ps = try func.appendBlockParam(b, s);
+    const n = try func.appendBlockParam(b, i32_t);
+    func.setTerminator(b, .{ .ret = Ret.one(n) });
+
+    var copy = try func.clone(allocator);
+    defer copy.deinit();
+
+    try std.testing.expectEqual(
+        types.AddressSpace.global,
+        copy.types.type_kind(copy.valueType(pg)).ptr,
+    );
+    try std.testing.expectEqual(
+        types.AddressSpace.shared,
+        copy.types.type_kind(copy.valueType(ps)).ptr,
+    );
+    try std.testing.expectEqual(@as(u16, 32), copy.types.type_kind(copy.valueType(n)).int.bits);
 }

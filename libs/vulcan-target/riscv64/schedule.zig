@@ -54,7 +54,7 @@ test "a later load never reorders ahead of an earlier store" {
     defer func.deinit();
 
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const block = try func.appendBlock();
     const p = try func.appendBlockParam(block, ptr_t);
     const x = try func.appendBlockParam(block, i32_t);
@@ -80,7 +80,7 @@ test "fills the load-use gap with independent work, keeping the load pinned" {
     defer func.deinit();
 
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const block = try func.appendBlock();
     const p = try func.appendBlockParam(block, ptr_t);
     const x = try func.appendBlockParam(block, i32_t);

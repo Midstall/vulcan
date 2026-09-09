@@ -150,7 +150,7 @@ test "qemu-riscv: linkObjectsCompressed resolves a global auipc pair against the
             var entry = Function.init(a);
             defer entry.deinit();
             const t = try entry.types.intern(.{ .int = .{ .bits = 32, .signedness = .signed } });
-            const ptr_t = try entry.types.intern(.ptr);
+            const ptr_t = try entry.types.ptrGlobal();
             const b = try entry.appendBlock();
             const p = try entry.appendGlobalAddr(b, ptr_t, "K");
             const v = try entry.appendInst(b, t, .{ .load = .{ .ptr = p } });
@@ -196,7 +196,7 @@ test "qemu-riscv: linkObjectsCompressed remaps a reloc site shifted by preceding
             var entry = Function.init(a);
             defer entry.deinit();
             const t = try entry.types.intern(.{ .int = .{ .bits = 32, .signedness = .signed } });
-            const ptr_t = try entry.types.intern(.ptr);
+            const ptr_t = try entry.types.ptrGlobal();
             const b = try entry.appendBlock();
             const slot = try entry.appendInst(b, ptr_t, .{ .alloca = .{ .elem = t } });
             const zero = try entry.appendInst(b, t, .{ .iconst = 0 });
@@ -471,7 +471,7 @@ fn fnDivRem(allocator: std.mem.Allocator) !*Function {
 fn fnAllocaRoundtrip(allocator: std.mem.Allocator) !*Function {
     const f = try newFunc(allocator);
     const t = try i32t(f);
-    const ptr_t = try f.types.intern(.ptr);
+    const ptr_t = try f.types.ptrGlobal();
     const b = try f.appendBlock();
     const x = try f.appendBlockParam(b, t);
     const y = try f.appendBlockParam(b, t);
@@ -522,7 +522,7 @@ fn fnDoubleRoundtrip(allocator: std.mem.Allocator) !*Function {
     const f = try newFunc(allocator);
     const it = try i32t(f);
     const dt = try f.types.intern(.{ .float = .f64 });
-    const ptr_t = try f.types.intern(.ptr);
+    const ptr_t = try f.types.ptrGlobal();
     const b = try f.appendBlock();
     const x = try f.appendBlockParam(b, it);
     const xd = try f.appendInst(b, dt, .{ .convert = .{ .value = x } }); // i32 -> f64

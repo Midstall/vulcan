@@ -799,7 +799,7 @@ test "composite f16 (a vector of half) is still rejected cleanly" {
 test "a via_got global_addr is rejected (no C-source rendering for GOT-indirect addressing)" {
     var func = Function.init(std.testing.allocator);
     defer func.deinit();
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const entry = try func.appendBlock();
     const g = try func.appendGlobalAddrGot(entry, ptr_t, "G");
     func.setTerminator(entry, .{ .ret = ir.function.Ret.one(g) });

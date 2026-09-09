@@ -608,7 +608,7 @@ test "single-block store then load forwards the stored value" {
     var func = Function.init(allocator);
     defer func.deinit();
     const t = try intTy(&func, 32, .signed);
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const b = try func.appendBlock();
     const x = try func.appendBlockParam(b, t);
     const slot = try func.appendInst(b, ptr_t, .{ .alloca = .{ .elem = t } });
@@ -626,7 +626,7 @@ test "store in entry forwards across a jump to its single successor" {
     var func = Function.init(allocator);
     defer func.deinit();
     const t = try intTy(&func, 32, .signed);
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const b0 = try func.appendBlock();
     const b1 = try func.appendBlock();
     const x = try func.appendBlockParam(b0, t);
@@ -648,7 +648,7 @@ test "diamond store on each arm merges into a block parameter at the join" {
     defer func.deinit();
     const t = try intTy(&func, 32, .signed);
     const bool_t = try func.types.intern(.bool);
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const b0 = try func.appendBlock();
     const b1 = try func.appendBlock();
     const b2 = try func.appendBlock();
@@ -683,7 +683,7 @@ test "loop-carried slot becomes a header parameter threaded around the back edge
     defer func.deinit();
     const t = try intTy(&func, 32, .signed);
     const bool_t = try func.types.intern(.bool);
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const entry = try func.appendBlock();
     const header = try func.appendBlock();
     const body = try func.appendBlock();
@@ -728,7 +728,7 @@ test "a slot whose address escapes to a call is left in memory" {
     var func = Function.init(allocator);
     defer func.deinit();
     const t = try intTy(&func, 32, .signed);
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const b = try func.appendBlock();
     const x = try func.appendBlockParam(b, t);
     const slot = try func.appendInst(b, ptr_t, .{ .alloca = .{ .elem = t } });
@@ -751,7 +751,7 @@ test "a slot with an aggregate element is not promoted" {
     defer func.deinit();
     const t = try intTy(&func, 32, .signed);
     const arr_t = try func.types.intern(.{ .array = .{ .len = 4, .elem = t } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const b = try func.appendBlock();
     const slot = try func.appendInst(b, ptr_t, .{ .alloca = .{ .elem = arr_t } });
     _ = try func.appendInst(b, arr_t, .{ .load = .{ .ptr = slot } });
@@ -777,7 +777,7 @@ test "loop-invariant slot through a single-pred chain re-entering the header is 
     defer func.deinit();
     const t = try intTy(&func, 32, .signed);
     const bool_t = try func.types.intern(.bool);
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const entry = try func.appendBlock();
     const header = try func.appendBlock();
     const body = try func.appendBlock();
@@ -874,7 +874,7 @@ test "diamond storing a promoted load into a slot then reading it after the merg
     defer func.deinit();
     const t = try intTy(&func, 32, .signed);
     const bool_t = try func.types.intern(.bool);
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
 
     // Creation order is load-bearing: then (block 1) MUST precede merge (block 3) so Phase 2
     // visits and promotes the then-arm load before the merge join parameter is constructed.
@@ -934,7 +934,7 @@ test "two independent scalar slots both promote" {
     var func = Function.init(allocator);
     defer func.deinit();
     const t = try intTy(&func, 32, .signed);
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const b = try func.appendBlock();
     const x = try func.appendBlockParam(b, t);
     const y = try func.appendBlockParam(b, t);

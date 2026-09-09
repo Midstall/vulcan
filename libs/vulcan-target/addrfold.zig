@@ -241,7 +241,7 @@ test "recognizes a load whose ptr is arith_imm.add and records base+off" {
     var func = Function.init(allocator);
     defer func.deinit();
 
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const b = try func.appendBlock();
     const base = try func.appendBlockParam(b, ptr_t);
@@ -265,7 +265,7 @@ test "a load whose ptr is a block param does not fold" {
     var func = Function.init(allocator);
     defer func.deinit();
 
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const b = try func.appendBlock();
     const base = try func.appendBlockParam(b, ptr_t);
@@ -286,7 +286,7 @@ test "a load whose ptr is a reg+reg arith (not arith_imm) does not fold" {
     var func = Function.init(allocator);
     defer func.deinit();
 
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const b = try func.appendBlock();
     const base = try func.appendBlockParam(b, ptr_t);
@@ -306,7 +306,7 @@ test "a load whose ptr is arith_imm.sub does not fold" {
     var func = Function.init(allocator);
     defer func.deinit();
 
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const b = try func.appendBlock();
     const base = try func.appendBlockParam(b, ptr_t);
@@ -325,7 +325,7 @@ test "foldOffset returning null (out of range imm) leaves the op unfolded" {
     var func = Function.init(allocator);
     defer func.deinit();
 
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const b = try func.appendBlock();
     const base = try func.appendBlockParam(b, ptr_t);
@@ -350,7 +350,7 @@ test "baseOf and offOf return the raw ptr and 0 for an unfolded op" {
     var func = Function.init(allocator);
     defer func.deinit();
 
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const b = try func.appendBlock();
     const base = try func.appendBlockParam(b, ptr_t);
@@ -373,7 +373,7 @@ test "an add used only by a folded load is dead" {
     var func = Function.init(allocator);
     defer func.deinit();
 
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const b = try func.appendBlock();
     const base = try func.appendBlockParam(b, ptr_t);
@@ -393,7 +393,7 @@ test "an add used by a folded load AND a ret is not dead" {
     var func = Function.init(allocator);
     defer func.deinit();
 
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const b = try func.appendBlock();
     const base = try func.appendBlockParam(b, ptr_t);
@@ -415,7 +415,7 @@ test "cross-block: an add in the entry block feeding a load in a successor folds
     var func = Function.init(allocator);
     defer func.deinit();
 
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const entry = try func.appendBlock();
     const b_block = try func.appendBlock();

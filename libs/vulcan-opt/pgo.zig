@@ -123,7 +123,7 @@ fn takeBytes(data: []const u8, pos: *usize, len: u32) Error![]const u8 {
 /// The increments never feed the function's result, so it stays transparent.
 pub fn instrument(allocator: std.mem.Allocator, func: *Function, counters_symbol: []const u8) Error!usize {
     _ = allocator; // reordering is now in place (std.mem.rotate); kept for API stability
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const i64_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
     const n = func.blockCount();
 

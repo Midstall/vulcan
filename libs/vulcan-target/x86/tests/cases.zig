@@ -213,7 +213,7 @@ fn memory(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {
             var f = Function.init(allocator);
             defer f.deinit();
             const t = try h.i32type(&f);
-            const ptr_t = try f.types.intern(.ptr);
+            const ptr_t = try f.types.ptrGlobal();
             const b = try f.appendBlock();
             const slot = try f.appendInst(b, ptr_t, .{ .alloca = .{ .elem = t } });
             const v = try f.appendInst(b, t, .{ .iconst = c });
@@ -236,7 +236,7 @@ fn memory(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {
         var f = Function.init(allocator);
         defer f.deinit();
         const t = try h.i32type(&f);
-        const ptr_t = try f.types.intern(.ptr);
+        const ptr_t = try f.types.ptrGlobal();
         const b = try f.appendBlock();
         const x = try f.appendBlockParam(b, t);
         const slot0 = try f.appendInst(b, ptr_t, .{ .alloca = .{ .elem = t } });
@@ -251,7 +251,7 @@ fn memory(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {
 }
 
 fn memorySubWord(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {
-    const ptr_kind: ir.types.TypeKind = .ptr;
+    const ptr_kind: ir.types.TypeKind = .{ .ptr = .global };
     { // signed i8 load: 0x81 sign-extends, so shr(v, 24) leaves the extension fill (-1).
         var f = Function.init(allocator);
         defer f.deinit();

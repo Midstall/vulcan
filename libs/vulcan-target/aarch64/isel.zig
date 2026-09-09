@@ -4442,7 +4442,7 @@ test "via_got global_addr lowers to adrp+ldr with got_pg/got_lo12 relocs (GOT-in
     var func = Function.init(allocator);
     defer func.deinit();
     const i32t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const b = try func.appendBlock();
     const g = try func.appendGlobalAddrGot(b, ptr_t, "G");
     const v = try func.appendInst(b, i32t, .{ .load = .{ .ptr = g } });
@@ -4477,7 +4477,7 @@ test "direct global_addr stays adrp+add with adrp_pg/add_pgoff relocs (control, 
     var func = Function.init(allocator);
     defer func.deinit();
     const i32t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const b = try func.appendBlock();
     const g = try func.appendGlobalAddr(b, ptr_t, "G");
     const v = try func.appendInst(b, i32t, .{ .load = .{ .ptr = g } });

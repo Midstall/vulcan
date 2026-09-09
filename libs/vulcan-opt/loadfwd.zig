@@ -177,7 +177,7 @@ test "a store forwards its value to a later load of the same address" {
     var func = Function.init(allocator);
     defer func.deinit();
     const t = try i32Ty(&func);
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const b = try func.appendBlock();
     const p = try func.appendBlockParam(b, ptr_t); // an incoming pointer (mem2reg won't touch it)
     const v = try func.appendBlockParam(b, t);
@@ -194,7 +194,7 @@ test "a second load of an address reuses the first" {
     var func = Function.init(allocator);
     defer func.deinit();
     const t = try i32Ty(&func);
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const b = try func.appendBlock();
     const p = try func.appendBlockParam(b, ptr_t);
     const y1 = try func.appendInst(b, t, .{ .load = .{ .ptr = p } });
@@ -213,7 +213,7 @@ test "a store to a distinct alloca does not kill an available load" {
     var func = Function.init(allocator);
     defer func.deinit();
     const t = try i32Ty(&func);
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const b = try func.appendBlock();
     const v = try func.appendBlockParam(b, t);
     const a = try func.appendInst(b, ptr_t, .{ .alloca = .{ .elem = t } });
@@ -234,7 +234,7 @@ test "a store to a possibly-aliasing pointer forces a reload" {
     var func = Function.init(allocator);
     defer func.deinit();
     const t = try i32Ty(&func);
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const b = try func.appendBlock();
     const p = try func.appendBlockParam(b, ptr_t);
     const q = try func.appendBlockParam(b, ptr_t); // unknown base: may alias p
@@ -260,7 +260,7 @@ test "a store and a load of different widths at the same address do not forward"
     defer func.deinit();
     const t32 = try i32Ty(&func);
     const t64 = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const b = try func.appendBlock();
     const p = try func.appendBlockParam(b, ptr_t);
     const wide = try func.appendBlockParam(b, t64);

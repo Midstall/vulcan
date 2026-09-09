@@ -28,7 +28,7 @@ fn buildMainObj(allocator: std.mem.Allocator) ![]u8 {
     var main = Function.init(allocator);
     defer main.deinit();
     const t = try main.types.intern(i32k);
-    const ptr_t = try main.types.intern(.ptr);
+    const ptr_t = try main.types.ptrGlobal();
     const b = try main.appendBlock();
     const g = try main.appendGlobalAddr(b, ptr_t, "g");
     const gv = try main.appendInst(b, t, .{ .load = .{ .ptr = g } });

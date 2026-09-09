@@ -148,7 +148,7 @@ test "global data loaded via PC-relative addressing runs on River" {
     defer entry.deinit();
     {
         const t = try entry.types.intern(i32k);
-        const ptr_t = try entry.types.intern(.ptr);
+        const ptr_t = try entry.types.ptrGlobal();
         const b = try entry.appendBlock();
         const p = try entry.appendGlobalAddr(b, ptr_t, "K");
         const v = try entry.appendInst(b, t, .{ .load = .{ .ptr = p } });
@@ -184,7 +184,7 @@ test "initialized writable .data global is read back on River" {
     defer entry.deinit();
     {
         const t = try entry.types.intern(i32k);
-        const ptr_t = try entry.types.intern(.ptr);
+        const ptr_t = try entry.types.ptrGlobal();
         const b = try entry.appendBlock();
         const p = try entry.appendGlobalAddr(b, ptr_t, "D");
         const v = try entry.appendInst(b, t, .{ .load = .{ .ptr = p } });
@@ -217,7 +217,7 @@ test "zero-initialized .bss global is writable and reads back on River" {
     defer entry.deinit();
     {
         const t = try entry.types.intern(i32k);
-        const ptr_t = try entry.types.intern(.ptr);
+        const ptr_t = try entry.types.ptrGlobal();
         const b = try entry.appendBlock();
         const p = try entry.appendGlobalAddr(b, ptr_t, "B");
         const c = try entry.appendInst(b, t, .{ .iconst = 99 });

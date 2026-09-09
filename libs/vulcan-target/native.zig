@@ -511,7 +511,7 @@ test "writeObjectDataFor(hostLinkArch, ...) is byte-identical to writeObjectData
     var func = Function.init(allocator);
     defer func.deinit();
     const t = try func.types.intern(i32k);
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const b = try func.appendBlock();
     const g = try func.appendGlobalAddr(b, ptr_t, "g");
     const v = try func.appendInst(b, t, .{ .load = .{ .ptr = g } });
@@ -549,7 +549,7 @@ test "writeObjectDataForModel(model=null) is byte-identical to writeObjectDataFo
     var func = Function.init(allocator);
     defer func.deinit();
     const t = try func.types.intern(i32k);
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const b = try func.appendBlock();
     const g = try func.appendGlobalAddr(b, ptr_t, "g");
     const v = try func.appendInst(b, t, .{ .load = .{ .ptr = g } });
@@ -662,7 +662,7 @@ fn runIndirectCall(allocator: std.mem.Allocator, comptime n: usize, target: usiz
     var func = Function.init(allocator);
     defer func.deinit();
     const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const b = try func.appendBlock();
     const p = try func.appendBlockParam(b, ptr_t);
     var args: [n]ir.function.Value = undefined;
@@ -739,7 +739,7 @@ test "jitModuleData: reads a rodata global at its resolved runtime address" {
 
     var f = Function.init(allocator);
     defer f.deinit();
-    const ptr_t = try f.types.intern(.ptr);
+    const ptr_t = try f.types.ptrGlobal();
     const i8_t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 8 } });
     const b = try f.appendBlock();
     const g = try f.appendGlobalAddr(b, ptr_t, "g");
@@ -767,7 +767,7 @@ test "jitModuleData: a .data global is written by one function and read by anoth
     var setw = Function.init(allocator);
     defer setw.deinit();
     {
-        const ptr_t = try setw.types.intern(.ptr);
+        const ptr_t = try setw.types.ptrGlobal();
         const i32_t = try setw.types.intern(i32k);
         const b = try setw.appendBlock();
         const w = try setw.appendGlobalAddr(b, ptr_t, "w");
@@ -780,7 +780,7 @@ test "jitModuleData: a .data global is written by one function and read by anoth
     var f = Function.init(allocator);
     defer f.deinit();
     {
-        const ptr_t = try f.types.intern(.ptr);
+        const ptr_t = try f.types.ptrGlobal();
         const i32_t = try f.types.intern(i32k);
         const b = try f.appendBlock();
         try f.appendVoidCall(b, "setw", &.{});
@@ -812,7 +812,7 @@ test "jitModuleData: a .data global's internal reloc is patched to another objec
 
     var f = Function.init(allocator);
     defer f.deinit();
-    const ptr_t = try f.types.intern(.ptr);
+    const ptr_t = try f.types.ptrGlobal();
     const i8_t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 8 } });
     const b = try f.appendBlock();
     const p_addr = try f.appendGlobalAddr(b, ptr_t, "p"); // &p
@@ -885,7 +885,7 @@ test "jitModuleData: sections are mapped W^X (rodata r--, code r-x, data rw-)" {
     // `w` so all three section kinds (code/rodata/data) exist to inspect.
     var f = Function.init(allocator);
     defer f.deinit();
-    const ptr_t = try f.types.intern(.ptr);
+    const ptr_t = try f.types.ptrGlobal();
     const i8_t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 8 } });
     const b = try f.appendBlock();
     const g = try f.appendGlobalAddr(b, ptr_t, "g");
@@ -933,7 +933,7 @@ test "jitModuleData: riscv64 host reads a rodata global at its resolved runtime 
 
     var f = Function.init(allocator);
     defer f.deinit();
-    const ptr_t = try f.types.intern(.ptr);
+    const ptr_t = try f.types.ptrGlobal();
     const i8_t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 8 } });
     const b = try f.appendBlock();
     const g = try f.appendGlobalAddr(b, ptr_t, "g");

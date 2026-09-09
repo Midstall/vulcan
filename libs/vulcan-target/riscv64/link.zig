@@ -368,7 +368,7 @@ test "compileModule carries a global_addr's pcrel_hi20/pcrel_lo12 pair and lays 
 
     var f = Function.init(allocator);
     defer f.deinit();
-    const ptr_t = try f.types.intern(.ptr);
+    const ptr_t = try f.types.ptrGlobal();
     const i8_t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 8 } });
     const b = try f.appendBlock();
     const g = try f.appendGlobalAddr(b, ptr_t, "g");

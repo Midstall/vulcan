@@ -496,7 +496,7 @@ fn readType(r: *Reader, func: *Function, type_map: []const Type, valid: usize) E
             };
             break :blk try func.types.intern(.{ .float = kind });
         },
-        3 => try func.types.intern(.ptr),
+        3 => try func.types.ptrGlobal(),
         4 => blk: {
             const len = try r.take(u32);
             const elem = try mapType(type_map, valid, try r.take(u32));
@@ -900,7 +900,7 @@ test "round-trips a prefetch through bitcode" {
 
     var func = Function.init(allocator);
     defer func.deinit();
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const entry = try func.appendBlock();
     const p = try func.appendBlockParam(entry, ptr_t);
     try func.appendPrefetch(entry, p);
@@ -930,7 +930,7 @@ test "round-trips va_start/va_arg/va_end through bitcode" {
     var func = Function.init(allocator);
     defer func.deinit();
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const entry = try func.appendBlock();
     const list = try func.appendBlockParam(entry, ptr_t);
     try func.appendVaStart(entry, list);
@@ -962,7 +962,7 @@ test "round-trips a global_addr's via_got flag through bitcode (both directions)
 
     var func = Function.init(allocator);
     defer func.deinit();
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const entry = try func.appendBlock();
     const direct = try func.appendGlobalAddr(entry, ptr_t, "D");
     const got = try func.appendGlobalAddrGot(entry, ptr_t, "G");
@@ -1032,7 +1032,7 @@ test "round-trips a matmul through bitcode" {
 
     var func = Function.init(allocator);
     defer func.deinit();
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const entry = try func.appendBlock();
     const a_val = try func.appendBlockParam(entry, ptr_t);
     const b_val = try func.appendBlockParam(entry, ptr_t);
@@ -1072,7 +1072,7 @@ test "round-trips a matmul with a mixed-signedness input_signs override through 
 
     var func = Function.init(allocator);
     defer func.deinit();
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const entry = try func.appendBlock();
     const a_val = try func.appendBlockParam(entry, ptr_t);
     const b_val = try func.appendBlockParam(entry, ptr_t);
@@ -1106,7 +1106,7 @@ test "round-trips a matmul quant epilogue through bitcode" {
 
     var func = Function.init(allocator);
     defer func.deinit();
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const entry = try func.appendBlock();
     const a_val = try func.appendBlockParam(entry, ptr_t);
     const b_val = try func.appendBlockParam(entry, ptr_t);
@@ -1143,7 +1143,7 @@ test "round-trips a matmul per-column quant epilogue through bitcode" {
 
     var func = Function.init(allocator);
     defer func.deinit();
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const entry = try func.appendBlock();
     const a_val = try func.appendBlockParam(entry, ptr_t);
     const b_val = try func.appendBlockParam(entry, ptr_t);
@@ -1181,7 +1181,7 @@ test "round-trips an asymmetric-uint8 matmul quant epilogue (bias + zero_point) 
 
     var func = Function.init(allocator);
     defer func.deinit();
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const entry = try func.appendBlock();
     const a_val = try func.appendBlockParam(entry, ptr_t);
     const b_val = try func.appendBlockParam(entry, ptr_t);

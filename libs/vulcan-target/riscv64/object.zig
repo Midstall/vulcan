@@ -864,7 +864,7 @@ test "our PCREL global-data resolution matches lld byte for byte" {
     defer entry.deinit();
     {
         const t = try entry.types.intern(i32k);
-        const ptr_t = try entry.types.intern(.ptr);
+        const ptr_t = try entry.types.ptrGlobal();
         const b = try entry.appendBlock();
         const p = try entry.appendGlobalAddr(b, ptr_t, "K");
         const v = try entry.appendInst(b, t, .{ .load = .{ .ptr = p } });

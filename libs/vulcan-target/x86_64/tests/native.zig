@@ -135,7 +135,7 @@ test "a rodata global read via global_addr runs in-process through native.jitMod
     defer main_f.deinit();
     {
         const t = try main_f.types.intern(i32k);
-        const ptr_t = try main_f.types.intern(.ptr);
+        const ptr_t = try main_f.types.ptrGlobal();
         const b = try main_f.appendBlock();
         const g = try main_f.appendGlobalAddr(b, ptr_t, "K");
         const v = try main_f.appendInst(b, t, .{ .load = .{ .ptr = g } });

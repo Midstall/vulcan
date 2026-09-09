@@ -1129,7 +1129,7 @@ test "wimmer: an f32 arg + f32 return leaf function matches" {
 fn buildVecArg(allocator: std.mem.Allocator) anyerror!Function {
     var func = Function.init(allocator);
     errdefer func.deinit();
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const f32_t = try func.types.intern(.{ .float = .f32 });
     const v4 = try func.types.intern(.{ .vector = .{ .len = 4, .elem = f32_t } });
     const b = try func.appendBlock();
@@ -1184,7 +1184,7 @@ test "wimmer: a <4xf32> vector-arg leaf function matches" {
 fn buildVecParamPressure(allocator: std.mem.Allocator) anyerror!Function {
     var func = Function.init(allocator);
     errdefer func.deinit();
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const f32_t = try func.types.intern(.{ .float = .f32 });
     const v4 = try func.types.intern(.{ .vector = .{ .len = 4, .elem = f32_t } });
     const b = try func.appendBlock();

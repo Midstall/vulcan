@@ -69,7 +69,7 @@ test "a rodata global read via global_addr runs in-process through native.jitMod
     defer main_f.deinit();
     {
         const t = try main_f.types.intern(i32k);
-        const ptr_t = try main_f.types.intern(.ptr);
+        const ptr_t = try main_f.types.ptrGlobal();
         const b = try main_f.appendBlock();
         const g = try main_f.appendGlobalAddr(b, ptr_t, "K");
         const v = try main_f.appendInst(b, t, .{ .load = .{ .ptr = g } });
@@ -162,7 +162,7 @@ test "codegen+disasm round-trip: alloca/store/load at displacement 0 (no qemu ne
     var func = ir.function.Function.init(a);
     defer func.deinit();
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const e = try func.appendBlock();
     const x = try func.appendBlockParam(e, i32_t);
     const slot = try func.appendInst(e, ptr_t, .{ .alloca = .{ .elem = i32_t } });
@@ -345,7 +345,7 @@ test "codegen+disasm round-trip: an i8 store stages through ebx (byte-addressabi
     var func = ir.function.Function.init(a);
     defer func.deinit();
     const i8_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 8 } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const e = try func.appendBlock();
     const x = try func.appendBlockParam(e, i8_t);
     const slot = try func.appendInst(e, ptr_t, .{ .alloca = .{ .elem = i8_t } });
@@ -399,7 +399,7 @@ fn buildFoldUnderPressure(allocator: std.mem.Allocator) !ir.function.Function {
     errdefer func.deinit();
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const bool_t = try func.types.intern(.bool);
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const entry = try func.appendBlock();
     const then_b = try func.appendBlock();
     const else_b = try func.appendBlock();

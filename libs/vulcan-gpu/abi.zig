@@ -138,7 +138,7 @@ test "a pointer parameter aligns to eight even after a four-byte scalar" {
     var func = try testFunc(std.testing.allocator);
     defer func.deinit();
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const b = try func.appendBlock();
     _ = try func.appendBlockParam(b, i32_t);
     _ = try func.appendBlockParam(b, ptr_t);

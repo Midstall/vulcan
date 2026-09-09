@@ -412,7 +412,7 @@ fn lowerFunction(allocator: std.mem.Allocator, ctx: Ctx, ft: FuncType, body: []c
     // at fixed offsets (mem 0, globals 8, table 16, imports 24, import-context 32). The
     // bases are loaded from it at entry. Calls thread the context through; a host-import
     // call also forwards the import-context pointer as the callee's hidden first argument.
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const needs_ctx = ctx.has_memory or ctx.global_types.len > 0 or ctx.has_table or ctx.has_imports;
     const context: ?Value = if (needs_ctx) try func.appendBlockParam(entry, ptr_t) else null;
     const loadBase = struct {

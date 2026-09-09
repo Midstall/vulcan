@@ -546,7 +546,7 @@ test "endian is rejected when not on a memory op" {
     defer func.deinit();
 
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const entry = try func.appendBlock();
     const p = try func.appendBlockParam(entry, ptr_t);
     const loaded = try func.appendInst(entry, i32_t, .{ .load = .{ .ptr = p } });
@@ -712,7 +712,7 @@ test "a prefetch hint verifies clean in the low profile and prints as a hint" {
     var func = Function.init(std.testing.allocator);
     defer func.deinit();
 
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const entry = try func.appendBlock();
     const p = try func.appendBlockParam(entry, ptr_t);
     try func.appendPrefetch(entry, p);
@@ -731,7 +731,7 @@ test "a matmul over pointer operands verifies clean and prints the tile" {
     var func = Function.init(std.testing.allocator);
     defer func.deinit();
 
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const entry = try func.appendBlock();
     const a = try func.appendBlockParam(entry, ptr_t);
     const b = try func.appendBlockParam(entry, ptr_t);
@@ -752,7 +752,7 @@ test "matmul with a non-pointer operand is reported" {
     var func = Function.init(std.testing.allocator);
     defer func.deinit();
 
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const entry = try func.appendBlock();
     const a = try func.appendBlockParam(entry, ptr_t);
@@ -771,7 +771,7 @@ test "va_start with a ptr list verifies clean" {
     var func = Function.init(std.testing.allocator);
     defer func.deinit();
 
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const entry = try func.appendBlock();
     const list = try func.appendBlockParam(entry, ptr_t);
     try func.appendVaStart(entry, list);
@@ -802,7 +802,7 @@ test "an int8 matmul with a mixed input_signs override verifies clean" {
     var func = Function.init(std.testing.allocator);
     defer func.deinit();
 
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const entry = try func.appendBlock();
     const a = try func.appendBlockParam(entry, ptr_t);
     const b = try func.appendBlockParam(entry, ptr_t);
@@ -819,7 +819,7 @@ test "a non-int8 matmul with an input_signs override is rejected" {
     var func = Function.init(std.testing.allocator);
     defer func.deinit();
 
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const entry = try func.appendBlock();
     const a = try func.appendBlockParam(entry, ptr_t);
     const b = try func.appendBlockParam(entry, ptr_t);
@@ -838,7 +838,7 @@ test "a matmul quant epilogue on int8 verifies clean" {
     var func = Function.init(std.testing.allocator);
     defer func.deinit();
 
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const entry = try func.appendBlock();
     const a = try func.appendBlockParam(entry, ptr_t);
     const b = try func.appendBlockParam(entry, ptr_t);
@@ -855,7 +855,7 @@ test "a matmul quant epilogue with a per_column scale of len==n verifies clean" 
     var func = Function.init(std.testing.allocator);
     defer func.deinit();
 
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const entry = try func.appendBlock();
     const a = try func.appendBlockParam(entry, ptr_t);
     const b = try func.appendBlockParam(entry, ptr_t);
@@ -872,7 +872,7 @@ test "a matmul quant epilogue with a per_column scale of len!=n is reported" {
     var func = Function.init(std.testing.allocator);
     defer func.deinit();
 
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const entry = try func.appendBlock();
     const a = try func.appendBlockParam(entry, ptr_t);
     const b = try func.appendBlockParam(entry, ptr_t);
@@ -890,7 +890,7 @@ test "a matmul quant epilogue on a non-int8 dtype is reported" {
     var func = Function.init(std.testing.allocator);
     defer func.deinit();
 
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const entry = try func.appendBlock();
     const a = try func.appendBlockParam(entry, ptr_t);
     const b = try func.appendBlockParam(entry, ptr_t);
@@ -908,7 +908,7 @@ test "a matmul quant epilogue with a per-column bias of len==n and a nonzero zer
     var func = Function.init(std.testing.allocator);
     defer func.deinit();
 
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const entry = try func.appendBlock();
     const a = try func.appendBlockParam(entry, ptr_t);
     const b = try func.appendBlockParam(entry, ptr_t);
@@ -931,7 +931,7 @@ test "a matmul quant epilogue with a per-column bias of len!=n is reported" {
     var func = Function.init(std.testing.allocator);
     defer func.deinit();
 
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const entry = try func.appendBlock();
     const a = try func.appendBlockParam(entry, ptr_t);
     const b = try func.appendBlockParam(entry, ptr_t);

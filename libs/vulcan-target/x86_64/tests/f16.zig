@@ -48,7 +48,7 @@ const Types = struct {
             .i32 = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } }),
             .u32 = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } }),
             .u64 = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 64 } }),
-            .ptr = try func.types.intern(.ptr),
+            .ptr = try func.types.ptrGlobal(),
         };
     }
 };

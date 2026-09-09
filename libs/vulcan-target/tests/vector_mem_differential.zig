@@ -36,7 +36,7 @@ const Kind = enum { add, mul_add };
 
 fn buildMemKernel(func: *Function, kind: Kind, store_between: bool) anyerror!void {
     const f32_t = try func.types.intern(.{ .float = .f32 });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const block = try func.appendBlock();
     const pa = try func.appendBlockParam(block, ptr_t);
     const pb = try func.appendBlockParam(block, ptr_t);

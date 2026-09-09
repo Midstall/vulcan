@@ -366,7 +366,7 @@ test "qemu-user-riscv: a loop's backward conditional branch past -4KiB relaxes a
     defer func.deinit();
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const bool_t = try func.types.intern(.bool);
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
 
     // Layout order follows block-append order: entry(0), loop(1, the header AND the padded
     // body, since this is a do-while shape), done(2).
@@ -608,7 +608,7 @@ test "riscv64 fallthrough: a diamond and a loop compute correctly under elision"
         defer func.deinit();
         const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
         const bool_t = try func.types.intern(.bool);
-        const ptr_t = try func.types.intern(.ptr);
+        const ptr_t = try func.types.ptrGlobal();
         const entry = try func.appendBlock();
         const loop = try func.appendBlock();
         const body = try func.appendBlock();

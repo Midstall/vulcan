@@ -156,7 +156,7 @@ test "float-spill: fused multiply-add under register pressure falls back correct
 /// operands so the pressure is real.
 fn buildMulAddSelfKernel(func: *Function) !void {
     const f32_t = try func.types.intern(.{ .float = .f32 });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const b = try func.appendBlock();
     const ptr_a = try func.appendBlockParam(b, ptr_t);
     const ptr_b = try func.appendBlockParam(b, ptr_t);

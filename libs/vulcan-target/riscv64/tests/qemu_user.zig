@@ -93,7 +93,7 @@ test "qemu-user-riscv f128: alloca store then load round-trips all 16 bytes" {
     var f = Function.init(allocator);
     defer f.deinit();
     const t = try f.types.intern(.{ .float = .f128 });
-    const ptr_t = try f.types.intern(.ptr);
+    const ptr_t = try f.types.ptrGlobal();
     const b = try f.appendBlock();
     const a = try f.appendBlockParam(b, t);
     const slot = try f.appendInst(b, ptr_t, .{ .alloca = .{ .elem = t } });

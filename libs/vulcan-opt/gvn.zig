@@ -278,7 +278,7 @@ test "gvn does not merge a direct and a via_got global_addr of the same symbol" 
     var func = Function.init(allocator);
     defer func.deinit();
 
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const i64_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
     const b = try func.appendBlock();
     // direct = &G, got = &G (via GOT). Same symbol, different addressing mode:

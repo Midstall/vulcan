@@ -374,7 +374,7 @@ fn widenFlattened(func: *Function) Error!void {
     const entry: Block = @enumFromInt(0);
     const vec_ty = try f32VecType(func);
     const f32_t = try func.types.intern(.{ .float = .f32 });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const u128_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 128 } });
 
     // Retype f32 PARAMS to <4 x f32>. Ptr params stay scalar (broadcast-invariant pointers).
@@ -783,7 +783,7 @@ test "widen heavy: a grad_buf load BROADCASTS (one scalar load + a 4-splat), res
     var func = Function.init(gpa);
     defer func.deinit();
     const f32_t = try func.types.intern(.{ .float = .f32 });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const entry = try func.appendBlock();
     const vin = try func.appendBlockParam(entry, f32_t); // one f32 varying input
     const gbuf = try func.appendBlockParam(entry, ptr_t); // a grad_buf-like pointer param
@@ -812,7 +812,7 @@ test "widen heavy: a math_fn call_indirect GATHERS to 4 scalar calls + a pack" {
     defer func.deinit();
     const f32_t = try func.types.intern(.{ .float = .f32 });
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const entry = try func.appendBlock();
     const x = try func.appendBlockParam(entry, f32_t);
     const mathfn = try func.appendBlockParam(entry, ptr_t);
@@ -842,7 +842,7 @@ test "widen heavy: an if/else merge-phi diamond FLATTENS to one block with a sel
     defer func.deinit();
     const f32_t = try func.types.intern(.{ .float = .f32 });
     const bool_t = try func.types.intern(.bool);
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
 
     const entry = try func.appendBlock();
     const then_b = try func.appendBlock();
@@ -887,7 +887,7 @@ test "widen single-block straight-line still works (the original fast path)" {
     var func = Function.init(gpa);
     defer func.deinit();
     const f32_t = try func.types.intern(.{ .float = .f32 });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const entry = try func.appendBlock();
     const a = try func.appendBlockParam(entry, f32_t);
     const b = try func.appendBlockParam(entry, f32_t);

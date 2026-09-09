@@ -58,7 +58,7 @@ fn buildBinaryFn(func: *Function, op: ir.function.BinOp) !void {
     const i64_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
     const u16_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 16 } });
     const f16_t = try func.types.intern(.{ .float = .f16 });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const b = try func.appendBlock();
     const a_bits = try func.appendBlockParam(b, i64_t);
     const b_bits = try func.appendBlockParam(b, i64_t);
@@ -117,7 +117,7 @@ fn buildDivSweepFn(func: *Function) !void {
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const bool_t = try func.types.intern(.bool);
     const f16_t = try func.types.intern(.{ .float = .f16 });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
 
     const entry = try func.appendBlock();
     const loop = try func.appendBlock();
@@ -209,7 +209,7 @@ fn buildF16ToF32Fn(func: *Function) !void {
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const f16_t = try func.types.intern(.{ .float = .f16 });
     const f32_t = try func.types.intern(.{ .float = .f32 });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const b = try func.appendBlock();
     const in = try func.appendBlockParam(b, i64_t);
     const slot = try func.appendInst(b, ptr_t, .{ .alloca = .{ .elem = i64_t } });
@@ -228,7 +228,7 @@ fn buildF32ToF16Fn(func: *Function) !void {
     const u16_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 16 } });
     const f16_t = try func.types.intern(.{ .float = .f16 });
     const f32_t = try func.types.intern(.{ .float = .f32 });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const b = try func.appendBlock();
     const in = try func.appendBlockParam(b, i64_t);
     const slot = try func.appendInst(b, ptr_t, .{ .alloca = .{ .elem = i64_t } });
@@ -271,7 +271,7 @@ fn buildF16ToF64Fn(func: *Function) !void {
     const i64_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
     const f16_t = try func.types.intern(.{ .float = .f16 });
     const f64_t = try func.types.intern(.{ .float = .f64 });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const b = try func.appendBlock();
     const in = try func.appendBlockParam(b, i64_t);
     const slot = try func.appendInst(b, ptr_t, .{ .alloca = .{ .elem = i64_t } });
@@ -300,7 +300,7 @@ fn buildIntToF16Fn(func: *Function) !void {
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const u16_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 16 } });
     const f16_t = try func.types.intern(.{ .float = .f16 });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const b = try func.appendBlock();
     const x = try func.appendBlockParam(b, i32_t);
     const slot = try func.appendInst(b, ptr_t, .{ .alloca = .{ .elem = i32_t } });
@@ -315,7 +315,7 @@ fn buildF16ToIntFn(func: *Function) !void {
     const i64_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const f16_t = try func.types.intern(.{ .float = .f16 });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const b = try func.appendBlock();
     const in = try func.appendBlockParam(b, i64_t);
     const slot = try func.appendInst(b, ptr_t, .{ .alloca = .{ .elem = i64_t } });
@@ -352,7 +352,7 @@ fn buildFconstFn(func: *Function, val: f16) !void {
     const u16_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 16 } });
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const f16_t = try func.types.intern(.{ .float = .f16 });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const b = try func.appendBlock();
     const slot = try func.appendInst(b, ptr_t, .{ .alloca = .{ .elem = i32_t } });
     const c = try func.appendInst(b, f16_t, .{ .fconst = val });
@@ -379,7 +379,7 @@ fn buildCmpFn(func: *Function, op: ir.function.CmpOp) !void {
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const bool_t = try func.types.intern(.bool);
     const f16_t = try func.types.intern(.{ .float = .f16 });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const b = try func.appendBlock();
     const a_bits = try func.appendBlockParam(b, i64_t);
     const b_bits = try func.appendBlockParam(b, i64_t);

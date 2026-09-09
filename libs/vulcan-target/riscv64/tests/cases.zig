@@ -187,7 +187,7 @@ fn memory(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {
         var f = Function.init(allocator);
         defer f.deinit();
         const t = try f.types.intern(i32k);
-        const ptr_t = try f.types.intern(.ptr);
+        const ptr_t = try f.types.ptrGlobal();
         const e = try f.appendBlock();
         const x = try f.appendBlockParam(e, t);
         const slot = try f.appendInst(e, ptr_t, .{ .alloca = .{ .elem = t } });
@@ -200,7 +200,7 @@ fn memory(io: std.Io, allocator: std.mem.Allocator, backend: h.Backend) !void {
         var f = Function.init(allocator);
         defer f.deinit();
         const i8_t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 8 } });
-        const ptr_t = try f.types.intern(.ptr);
+        const ptr_t = try f.types.ptrGlobal();
         const e = try f.appendBlock();
         const a = try f.appendBlockParam(e, i8_t);
         const slot = try f.appendInst(e, ptr_t, .{ .alloca = .{ .elem = i8_t } });

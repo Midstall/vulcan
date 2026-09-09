@@ -38,7 +38,7 @@ test "our x86-64 linker resolves a PC32 global load and a PLT32 call, runs under
     defer main.deinit();
     {
         const t = try main.types.intern(i32k);
-        const ptr_t = try main.types.intern(.ptr);
+        const ptr_t = try main.types.ptrGlobal();
         const b = try main.appendBlock();
         const p = try main.appendGlobalAddr(b, ptr_t, "g");
         const v = try main.appendInst(b, t, .{ .load = .{ .ptr = p } });
@@ -133,7 +133,7 @@ test "object+ld+exec: x86-64 links through the Placement model, byte-identical, 
     defer main.deinit();
     {
         const t = try main.types.intern(i32k);
-        const ptr_t = try main.types.intern(.ptr);
+        const ptr_t = try main.types.ptrGlobal();
         const b = try main.appendBlock();
         const p = try main.appendGlobalAddr(b, ptr_t, "g");
         const v = try main.appendInst(b, t, .{ .load = .{ .ptr = p } });

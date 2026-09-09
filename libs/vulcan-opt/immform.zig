@@ -107,7 +107,7 @@ test "an address add of a single-use constant becomes arith_imm; a plain add is 
     defer func.deinit();
 
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const b = try func.appendBlock();
     const base = try func.appendBlockParam(b, ptr_t);
     const x = try func.appendBlockParam(b, i32_t);

@@ -86,7 +86,7 @@ fn buildCopy(allocator: std.mem.Allocator) !Function {
     var func = Function.init(allocator);
     errdefer func.deinit();
     const i32_t = try func.types.intern(i32k);
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const e = try func.appendBlock();
     const arg = try func.appendBlockParam(e, i32_t);
 
@@ -152,7 +152,7 @@ fn buildNarrowSum(allocator: std.mem.Allocator, comptime kind: ir.types.TypeKind
     errdefer func.deinit();
     const i32_t = try func.types.intern(i32k);
     const elem_t = try func.types.intern(kind);
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const e = try func.appendBlock();
     const arg = try func.appendBlockParam(e, i32_t);
 
@@ -211,7 +211,7 @@ fn buildCrossBlock(allocator: std.mem.Allocator) !Function {
     errdefer func.deinit();
     const i32_t = try func.types.intern(i32k);
     const bool_t = try func.types.intern(.bool);
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const entry = try func.appendBlock();
     const then_b = try func.appendBlock();
     const else_b = try func.appendBlock();
@@ -273,7 +273,7 @@ fn buildLiveAdd(allocator: std.mem.Allocator) !Function {
     var func = Function.init(allocator);
     errdefer func.deinit();
     const i32_t = try func.types.intern(i32k);
-    const ptr_t = try func.types.intern(.ptr);
+    const ptr_t = try func.types.ptrGlobal();
     const e = try func.appendBlock();
     const arg = try func.appendBlockParam(e, i32_t);
 
