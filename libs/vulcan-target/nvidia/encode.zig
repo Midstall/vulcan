@@ -959,10 +959,34 @@ pub const graphics_ubo_cb_base: u16 = 0x40;
 /// inside the face's atlas column. Below graphics_ubo_cb_base's per-slot area.
 pub const cube_halftexel_cb: u16 = 0x00;
 
-/// Special-register indices for `s2r`.
-pub const SR_LANEID: u8 = 0x00; // the warp lane index (0..31); the first special register on Volta and later
-pub const SR_TID_X: u8 = 0x21; // threadIdx.x
-pub const SR_CTAID_X: u8 = 0x25; // blockIdx.x
+/// Special-register indices for `s2r`. Every index here comes from Mesa NAK's
+/// `enum nak_sv` in `src/nouveau/compiler/nak_private.h`, which is the
+/// authoritative list of the Volta-and-later special registers. Do not derive a
+/// new index by counting from a known one, because the list has holes: 0x24 lies
+/// between the thread-id group and the block-id group and is not a grid axis.
+pub const SR_LANEID: u8 = 0x00; // NAK_SV_LANE_ID: the warp lane index (0..31); the first special register on Volta and later
+pub const SR_TID_X: u8 = 0x21; // NAK_SV_TID_X: threadIdx.x
+pub const SR_TID_Y: u8 = 0x22; // NAK_SV_TID_Y: threadIdx.y
+pub const SR_TID_Z: u8 = 0x23; // NAK_SV_TID_Z: threadIdx.z
+pub const SR_CTAID_X: u8 = 0x25; // NAK_SV_CTAID_X: blockIdx.x
+pub const SR_CTAID_Y: u8 = 0x26; // NAK_SV_CTAID_Y: blockIdx.y
+pub const SR_CTAID_Z: u8 = 0x27; // NAK_SV_CTAID_Z: blockIdx.z
+
+/// The thread-id and the block-id special registers by axis, x first. A caller
+/// that holds an axis index reads the register out of these tables instead of
+/// doing arithmetic on `SR_TID_X` or `SR_CTAID_X`.
+pub const sr_tid = [3]u8{ SR_TID_X, SR_TID_Y, SR_TID_Z };
+pub const sr_ctaid = [3]u8{ SR_CTAID_X, SR_CTAID_Y, SR_CTAID_Z };
+
+test "the grid special-register indices match NAK's nak_sv list" {
+    // A wrong index here still assembles and still runs. The kernel then reads a different
+    // axis, or a register that holds something else, and computes wrong answers with no
+    // fault. So the numbers are pinned against the reference list.
+    try std.testing.expectEqual([3]u8{ 0x21, 0x22, 0x23 }, sr_tid);
+    try std.testing.expectEqual([3]u8{ 0x25, 0x26, 0x27 }, sr_ctaid);
+    // The hole at 0x24. This records that the two groups are separate lists.
+    try std.testing.expectEqual(@as(u8, 2), SR_CTAID_X - SR_TID_Z);
+}
 
 test "MOV imm matches the hardware-verified encoding" {
     const w = movImm(2, 0xcafe, .{});

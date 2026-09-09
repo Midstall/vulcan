@@ -241,3 +241,379 @@ test "SASS: a lowered division compiles to a kernel (register reuse)" {
     // Reuse kept the register count modest despite ~256 instructions.
     try std.testing.expect(kernel.reg_count <= 32);
 }
+
+// ---------------------------------------------------------------------------
+// Grid-builtin differential tests (M3).
+//
+// Each test below builds ONE kernel IR function and sends it down two paths.
+//
+//   1. `vulcan-gpu.lowerToLoopNest` rewrites it into a host loop nest, the native JIT
+//      compiles that, and the host runs the whole grid. The buffer it writes is the
+//      reference answer: it says what the builtin MEANS, one value per thread, in nest
+//      order. That is the CPU offload oracle.
+//   2. `isel.compileKernel` selects the same function to SASS. This repository has no GPU,
+//      so the GPU side stays structural. The assertion is not "an S2R appears" but the exact
+//      special-register index in the exact operand field of the exact instruction, plus the
+//      register wiring around it.
+//
+// Together they close the loop: the oracle fixes the quantity, and the structural check
+// fixes the register the hardware holds that quantity in. A swapped axis fails path 1, a
+// wrong SR number fails path 2, and a lowering that reads the right register into the wrong
+// place fails the wiring check.
+
+const gpu = @import("vulcan-gpu");
+const encode = @import("../encode.zig");
+const native = @import("../../native.zig");
+const host_builtin = @import("builtin");
+
+/// SASS opcodes the decoders below match on, in the low 12 bits of word 0.
+const s2r_opcode: u32 = 0x919;
+const mov_imm_opcode: u32 = 0x802;
+const imad_opcode: u32 = 0x224;
+
+/// The workgroup size every probe kernel declares. The three axes differ, so a lowering that
+/// reads the wrong axis writes different numbers instead of the same ones.
+const probe_block = [3]u32{ 5, 3, 2 };
+
+/// The grid the oracle runs. Again all three axes differ.
+const probe_grid = [3]i32{ 2, 3, 4 };
+
+/// The number of threads `probe_grid` x `probe_block` starts, which is the length of the
+/// trace the oracle writes.
+const probe_threads: usize =
+    @as(usize, probe_block[0]) * probe_block[1] * probe_block[2] *
+    @as(usize, @intCast(probe_grid[0] * probe_grid[1] * probe_grid[2]));
+
+/// Whether the native JIT has a backend for the host architecture. The structural half of
+/// each test runs everywhere; only the execution half needs this.
+fn hasJit() bool {
+    return switch (host_builtin.cpu.arch) {
+        .aarch64, .x86_64, .x86, .riscv64 => true,
+        else => false,
+    };
+}
+
+/// The signature of the lowered probe kernel: the grid size in workgroups on all three axes,
+/// then the kernel's real parameters. The builtin parameter is gone, because the nest
+/// computes it.
+const ProbeFn = *const fn (
+    grid_x: i32,
+    grid_y: i32,
+    grid_z: i32,
+    out: [*]i32,
+    counter: *i32,
+) callconv(.c) void;
+
+/// The kernel `out[counter[0]] = v; counter[0] += 1`, where `v` is the one builtin parameter
+/// under test.
+///
+/// The counter makes the buffer hold the value of `v` for every thread of the launch, in the
+/// order the nest visits them, rather than one value per grid point. So the same kernel reads
+/// back a full trace whichever builtin it is tagged with, including the uniform ones. The
+/// nest runs one thread at a time, so the counter needs no atomic.
+///
+/// `v` is the FIRST entry parameter, so the prologue emits its hardware read before anything
+/// else and the structural checks can index from instruction 0.
+fn probeKernel(
+    allocator: std.mem.Allocator,
+    tag: gpu.Builtin,
+    block: [3]u32,
+) !ir.function.Function {
+    var func = ir.function.Function.init(allocator);
+    errdefer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr_t = try func.types.ptrGlobal();
+
+    const entry = try func.appendBlock();
+    const v = try func.appendBlockParam(entry, i32_t);
+    const out = try func.appendBlockParam(entry, ptr_t);
+    const counter = try func.appendBlockParam(entry, ptr_t);
+    try gpu.attrs.setBuiltin(&func, v, tag);
+    try gpu.attrs.setLocalSize(&func, block);
+
+    const seq = try func.appendInst(entry, i32_t, .{ .load = .{ .ptr = counter } });
+    const off = try func.appendArithImm(entry, i32_t, .mul, seq, 4);
+    const slot = try func.appendInst(entry, ptr_t, .{
+        .arith = .{ .op = .add, .lhs = out, .rhs = off },
+    });
+    try func.appendStore(entry, v, slot);
+    const next = try func.appendArithImm(entry, i32_t, .add, seq, 1);
+    try func.appendStore(entry, next, counter);
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.none() });
+    return func;
+}
+
+/// Run the probe kernel for `tag` through the CPU offload oracle and fill `out` with the
+/// value every thread of the launch read, in nest order.
+fn oracleTrace(allocator: std.mem.Allocator, tag: gpu.Builtin, out: []i32) !void {
+    var kernel = try probeKernel(allocator, tag, probe_block);
+    defer kernel.deinit();
+    var lowered = try gpu.lowerToLoopNest(allocator, &kernel, gpu.attrs.localSize(&kernel));
+    defer lowered.deinit();
+
+    var code = try native.jitFunction(allocator, &lowered);
+    defer code.deinit();
+
+    @memset(out, -1);
+    var counter: i32 = 0;
+    code.entry(ProbeFn, 0)(probe_grid[0], probe_grid[1], probe_grid[2], out.ptr, &counter);
+    // Every thread wrote exactly once, so the trace has no hole and no overrun.
+    try std.testing.expectEqual(@as(i32, @intCast(out.len)), counter);
+}
+
+/// Select the probe kernel for `tag` to SASS. The caller owns the result.
+fn probeSass(allocator: std.mem.Allocator, tag: gpu.Builtin) !isel.Kernel {
+    var kernel = try probeKernel(allocator, tag, probe_block);
+    defer kernel.deinit();
+    return isel.compileKernel(allocator, &kernel, isel.nvidia_abi);
+}
+
+/// One decoded `S2R`: the GPR it writes (bits 16..23, word 0) and the special-register index
+/// it reads (bits 72..79, which is word 2 bits 8..15).
+const S2RRead = struct { dst: u8, sysval: u8 };
+
+fn decodeS2R(w: []const u32) S2RRead {
+    return .{ .dst = @truncate(w[0] >> 16), .sysval = @truncate(w[2] >> 8) };
+}
+
+/// One decoded `MOV dst, imm32`: the GPR it writes and the 32-bit immediate (word 1).
+const MovImm = struct { dst: u8, imm: u32 };
+
+fn decodeMovImm(w: []const u32) MovImm {
+    return .{ .dst = @truncate(w[0] >> 16), .imm = w[1] };
+}
+
+/// One decoded ALU `IMAD dst, a, b, c`: `dst = a * b + c`. The operand fields are the shared
+/// ALU ones: dst at 16..23, srcA at 24..31, srcB at 32..39 (word 1 bits 0..7), and srcC at
+/// 64..71 (word 2 bits 0..7).
+const Imad = struct { dst: u8, a: u8, b: u8, c: u8 };
+
+fn decodeImad(w: []const u32) Imad {
+    return .{
+        .dst = @truncate(w[0] >> 16),
+        .a = @truncate(w[0] >> 24),
+        .b = @truncate(w[1]),
+        .c = @truncate(w[2]),
+    };
+}
+
+test "grid builtins: thread_id on each axis reads its own SR_TID and traces that axis" {
+    const allocator = std.testing.allocator;
+
+    const cases = [3]struct { tag: gpu.Builtin, axis: u2, sysval: u8 }{
+        .{ .tag = .thread_id_x, .axis = 0, .sysval = 0x21 },
+        .{ .tag = .thread_id_y, .axis = 1, .sysval = 0x22 },
+        .{ .tag = .thread_id_z, .axis = 2, .sysval = 0x23 },
+    };
+
+    const trace = try allocator.alloc(i32, probe_threads);
+    defer allocator.free(trace);
+
+    for (cases) |case| {
+        // The SASS path. The builtin is the first entry parameter, so its hardware read is
+        // instruction 0, and one S2R is the whole lowering.
+        var kernel = try probeSass(allocator, case.tag);
+        defer kernel.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 1), countOpcode(kernel.code, s2r_opcode));
+        try std.testing.expectEqual(s2r_opcode, kernel.code[0] & 0xfff);
+        const read = decodeS2R(kernel.code[0..4]);
+        try std.testing.expectEqual(case.sysval, read.sysval);
+        try std.testing.expectEqual(encode.sr_tid[case.axis], read.sysval);
+
+        // The oracle. The thread index counts 0..block[axis]-1 inside every workgroup, so the
+        // trace is that axis's induction variable and nothing else.
+        if (!hasJit()) continue;
+        try oracleTrace(allocator, case.tag, trace);
+
+        var want = try allocator.alloc(i32, probe_threads);
+        defer allocator.free(want);
+        var n: usize = 0;
+        for (0..@intCast(probe_grid[2] * probe_grid[1] * probe_grid[0])) |_| {
+            for (0..probe_block[2]) |tz| {
+                for (0..probe_block[1]) |ty| {
+                    for (0..probe_block[0]) |tx| {
+                        const t = [3]usize{ tx, ty, tz };
+                        want[n] = @intCast(t[case.axis]);
+                        n += 1;
+                    }
+                }
+            }
+        }
+        try std.testing.expectEqualSlices(i32, want, trace);
+    }
+}
+
+test "grid builtins: block_id on each axis reads its own SR_CTAID and traces that axis" {
+    const allocator = std.testing.allocator;
+
+    const cases = [3]struct { tag: gpu.Builtin, axis: u2, sysval: u8 }{
+        .{ .tag = .block_id_x, .axis = 0, .sysval = 0x25 },
+        .{ .tag = .block_id_y, .axis = 1, .sysval = 0x26 },
+        .{ .tag = .block_id_z, .axis = 2, .sysval = 0x27 },
+    };
+
+    const trace = try allocator.alloc(i32, probe_threads);
+    defer allocator.free(trace);
+
+    for (cases) |case| {
+        var kernel = try probeSass(allocator, case.tag);
+        defer kernel.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 1), countOpcode(kernel.code, s2r_opcode));
+        try std.testing.expectEqual(s2r_opcode, kernel.code[0] & 0xfff);
+        const read = decodeS2R(kernel.code[0..4]);
+        try std.testing.expectEqual(case.sysval, read.sysval);
+        try std.testing.expectEqual(encode.sr_ctaid[case.axis], read.sysval);
+
+        // The oracle. The workgroup index holds still for a whole workgroup and then steps,
+        // so the trace repeats each value block[0]*block[1]*block[2] times.
+        if (!hasJit()) continue;
+        try oracleTrace(allocator, case.tag, trace);
+
+        var want = try allocator.alloc(i32, probe_threads);
+        defer allocator.free(want);
+        var n: usize = 0;
+        var bz: i32 = 0;
+        while (bz < probe_grid[2]) : (bz += 1) {
+            var by: i32 = 0;
+            while (by < probe_grid[1]) : (by += 1) {
+                var bx: i32 = 0;
+                while (bx < probe_grid[0]) : (bx += 1) {
+                    const b = [3]i32{ bx, by, bz };
+                    for (0..probe_block[2] * probe_block[1] * probe_block[0]) |_| {
+                        want[n] = b[case.axis];
+                        n += 1;
+                    }
+                }
+            }
+        }
+        try std.testing.expectEqualSlices(i32, want, trace);
+    }
+}
+
+test "grid builtins: global_id on each axis fuses ctaid * ntid + tid on that same axis" {
+    const allocator = std.testing.allocator;
+
+    const cases = [3]struct { tag: gpu.Builtin, axis: u2, tid: u8, ctaid: u8 }{
+        .{ .tag = .global_id_x, .axis = 0, .tid = 0x21, .ctaid = 0x25 },
+        .{ .tag = .global_id_y, .axis = 1, .tid = 0x22, .ctaid = 0x26 },
+        .{ .tag = .global_id_z, .axis = 2, .tid = 0x23, .ctaid = 0x27 },
+    };
+
+    const trace = try allocator.alloc(i32, probe_threads);
+    defer allocator.free(trace);
+
+    for (cases) |case| {
+        // The SASS path. The lowering is four instructions: the declared workgroup size as an
+        // immediate, the two hardware reads, and the multiply-add that fuses them. Both
+        // special-register indices and the whole register wiring are checked, so a read of
+        // the right register into the wrong operand fails here.
+        var kernel = try probeSass(allocator, case.tag);
+        defer kernel.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 2), countOpcode(kernel.code, s2r_opcode));
+        try std.testing.expectEqual(mov_imm_opcode, kernel.code[0] & 0xfff);
+        try std.testing.expectEqual(s2r_opcode, kernel.code[4] & 0xfff);
+        try std.testing.expectEqual(s2r_opcode, kernel.code[8] & 0xfff);
+        try std.testing.expectEqual(imad_opcode, kernel.code[12] & 0xfff);
+
+        const size = decodeMovImm(kernel.code[0..4]);
+        const tid = decodeS2R(kernel.code[4..8]);
+        const ctaid = decodeS2R(kernel.code[8..12]);
+        const fuse = decodeImad(kernel.code[12..16]);
+
+        try std.testing.expectEqual(case.tid, tid.sysval);
+        try std.testing.expectEqual(encode.sr_tid[case.axis], tid.sysval);
+        try std.testing.expectEqual(case.ctaid, ctaid.sysval);
+        try std.testing.expectEqual(encode.sr_ctaid[case.axis], ctaid.sysval);
+        try std.testing.expectEqual(probe_block[case.axis], size.imm);
+        // dst = ctaid * ntid + tid, with each operand coming from the instruction that
+        // produced it.
+        try std.testing.expectEqual(ctaid.dst, fuse.a);
+        try std.testing.expectEqual(size.dst, fuse.b);
+        try std.testing.expectEqual(tid.dst, fuse.c);
+        try std.testing.expectEqual(size.dst, fuse.dst);
+        // The two hardware reads land in different registers, or the multiply-add would fold
+        // one axis onto the other.
+        try std.testing.expect(tid.dst != ctaid.dst);
+
+        // The oracle. Every thread reads block_id * block_dim + thread_id on its own axis.
+        if (!hasJit()) continue;
+        try oracleTrace(allocator, case.tag, trace);
+
+        var want = try allocator.alloc(i32, probe_threads);
+        defer allocator.free(want);
+        var n: usize = 0;
+        var bz: i32 = 0;
+        while (bz < probe_grid[2]) : (bz += 1) {
+            var by: i32 = 0;
+            while (by < probe_grid[1]) : (by += 1) {
+                var bx: i32 = 0;
+                while (bx < probe_grid[0]) : (bx += 1) {
+                    for (0..probe_block[2]) |tz| {
+                        for (0..probe_block[1]) |ty| {
+                            for (0..probe_block[0]) |tx| {
+                                const b = [3]i32{ bx, by, bz };
+                                const t = [3]usize{ tx, ty, tz };
+                                const size_a: i32 = @intCast(probe_block[case.axis]);
+                                want[n] = b[case.axis] * size_a + @as(i32, @intCast(t[case.axis]));
+                                n += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        try std.testing.expectEqualSlices(i32, want, trace);
+    }
+}
+
+test "grid builtins: block_dim on each axis is the declared size, with no hardware read" {
+    const allocator = std.testing.allocator;
+
+    const cases = [3]struct { tag: gpu.Builtin, axis: u2 }{
+        .{ .tag = .block_dim_x, .axis = 0 },
+        .{ .tag = .block_dim_y, .axis = 1 },
+        .{ .tag = .block_dim_z, .axis = 2 },
+    };
+
+    const trace = try allocator.alloc(i32, probe_threads);
+    defer allocator.free(trace);
+
+    for (cases) |case| {
+        // The SASS path. The workgroup size is not a special register on this hardware. It is
+        // the size the kernel declares, so the lowering is one immediate and the kernel reads
+        // no special register at all.
+        var kernel = try probeSass(allocator, case.tag);
+        defer kernel.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 0), countOpcode(kernel.code, s2r_opcode));
+        try std.testing.expectEqual(mov_imm_opcode, kernel.code[0] & 0xfff);
+        try std.testing.expectEqual(probe_block[case.axis], decodeMovImm(kernel.code[0..4]).imm);
+        // The launch descriptor carries the same number, so the runtime cannot launch a
+        // workgroup shape the folded immediate disagrees with.
+        try std.testing.expectEqual(probe_block[case.axis], kernel.launch.block[case.axis]);
+
+        // The oracle. A size is uniform over the launch, so every thread reads the same value.
+        if (!hasJit()) continue;
+        try oracleTrace(allocator, case.tag, trace);
+        for (trace) |got| try std.testing.expectEqual(@as(i32, @intCast(probe_block[case.axis])), got);
+    }
+}
+
+test "grid builtins: the grid size and the subgroup builtins still refuse to lower" {
+    // These have no correct lowering on this backend yet. The grid size is a launch-time
+    // value with no special register and no slot in the parameter-block contract, and the
+    // subgroup builtins have no oracle to check them against. A refusal is the honest answer:
+    // a kernel that read the wrong register would look right and compute garbage.
+    const allocator = std.testing.allocator;
+
+    const refused = [5]gpu.Builtin{
+        .grid_dim_x, .grid_dim_y, .grid_dim_z, .warp_id, .subgroup_size,
+    };
+    for (refused) |tag| {
+        var kernel = try probeKernel(allocator, tag, probe_block);
+        defer kernel.deinit();
+        try std.testing.expectError(
+            error.Unsupported,
+            isel.compileKernel(allocator, &kernel, isel.nvidia_abi),
+        );
+    }
+}

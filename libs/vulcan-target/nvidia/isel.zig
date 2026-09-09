@@ -1109,10 +1109,14 @@ fn isPtr(func: *const Function, v: Value) bool {
 
 /// Emit the hardware read for a compute builtin parameter.
 ///
-/// Only the builtins the encoder can currently reach are accepted. `encode.zig` has special
-/// registers for tid.x, ctaid.x and laneid only, so the remaining axes return
-/// `error.Unsupported` rather than silently producing the wrong index. M3 adds the missing
-/// SR_* constants and the arms that use them.
+/// The thread index, the block index and the fused global index lower on all three axes. Each
+/// index reads its own special register, whose number comes from NAK (see the `SR_*` block in
+/// `encode.zig`). The workgroup size lowers to an immediate, because the kernel declares it.
+///
+/// The grid size and the subgroup builtins have no correct lowering here yet and return
+/// `error.Unsupported`. Each refusal says why below. A refusal is deliberate: a builtin that
+/// reads the wrong register produces a kernel that looks right and computes garbage, and no
+/// test in this repository can execute SASS to catch that.
 fn emitComputeBuiltin(
     allocator: std.mem.Allocator,
     code: *std.ArrayList(Inst),
@@ -1125,29 +1129,39 @@ fn emitComputeBuiltin(
     const dst = gprOf(loc, p);
     switch (bi) {
         .thread_id_x => try code.append(allocator, encode.s2r(dst, encode.SR_TID_X, .{})),
+        .thread_id_y => try code.append(allocator, encode.s2r(dst, encode.SR_TID_Y, .{})),
+        .thread_id_z => try code.append(allocator, encode.s2r(dst, encode.SR_TID_Z, .{})),
         .block_id_x => try code.append(allocator, encode.s2r(dst, encode.SR_CTAID_X, .{})),
+        .block_id_y => try code.append(allocator, encode.s2r(dst, encode.SR_CTAID_Y, .{})),
+        .block_id_z => try code.append(allocator, encode.s2r(dst, encode.SR_CTAID_Z, .{})),
         .lane_id => try code.append(allocator, encode.s2r(dst, encode.SR_LANEID, .{})),
-        .global_id_x => {
-            // gid.x = ctaid.x * ntid.x + tid.x. The workgroup size is a compile-time constant,
-            // so it becomes an immediate rather than a second hardware read.
-            const size = gpu.attrs.localSize(func)[0];
-            try code.append(allocator, encode.movImm(dst, size, .{}));
-            try code.append(allocator, encode.s2r(r_scratch, encode.SR_TID_X, .{}));
-            try code.append(allocator, encode.s2r(r_scratch2, encode.SR_CTAID_X, .{}));
-            try code.append(allocator, encode.imad(dst, r_scratch2, dst, r_scratch, .{}));
-        },
-        .thread_id_y,
-        .thread_id_z,
-        .block_id_y,
-        .block_id_z,
-        .block_dim_x,
-        .block_dim_y,
-        .block_dim_z,
+        .global_id_x => try emitGlobalId(allocator, code, func, dst, 0),
+        .global_id_y => try emitGlobalId(allocator, code, func, dst, 1),
+        .global_id_z => try emitGlobalId(allocator, code, func, dst, 2),
+        // The workgroup size is not a special register on this hardware. It is the size the
+        // kernel DECLARES, which `Kernel.launch.block` carries to the runtime and which the
+        // launch descriptor must match, so it is a compile-time constant here. The fused
+        // global index above folds the same number into the same immediate, so a kernel that
+        // reads both stays self-consistent.
+        .block_dim_x => try code.append(allocator, encode.movImm(dst, gpu.attrs.localSize(func)[0], .{})),
+        .block_dim_y => try code.append(allocator, encode.movImm(dst, gpu.attrs.localSize(func)[1], .{})),
+        .block_dim_z => try code.append(allocator, encode.movImm(dst, gpu.attrs.localSize(func)[2], .{})),
+        // The grid size is a launch-time value, not a compile-time one, and NVIDIA has no
+        // special register for it. The CUDA driver puts it in its own reserved area of
+        // constant bank 0, but that offset belongs to a driver convention this ABI does not
+        // define: `gpu.Abi` describes where the PARAMETER block starts and nothing else, and
+        // `layoutParams` reserves no slot for the grid size. Picking an offset here would
+        // invent a delivery mechanism the runtime does not implement. This lowers once
+        // `vulcan-gpu` gives the grid size a place in the contract.
         .grid_dim_x,
         .grid_dim_y,
         .grid_dim_z,
-        .global_id_y,
-        .global_id_z,
+        => return error.Unsupported,
+        // The warp index inside a workgroup has no special register of its own. It is
+        // derivable from the combined thread index and the warp width, but that derivation
+        // needs the full workgroup shape and has no oracle to check it against, because the
+        // host loop nest runs one thread at a time and has no subgroup. `subgroup_size` waits
+        // with it, so the whole subgroup group lands together and gets tested together.
         .warp_id,
         .subgroup_size,
         => return error.Unsupported,
@@ -1158,6 +1172,25 @@ fn emitComputeBuiltin(
         .front_facing,
         => return error.Unsupported,
     }
+}
+
+/// Emit `gid.a = ctaid.a * ntid.a + tid.a` into `dst` for axis `a`.
+///
+/// The workgroup size is a compile-time constant, so it becomes an immediate rather than a
+/// second hardware read. The two scratch registers hold the hardware reads: the prologue owns
+/// them, and the allocator keeps values out of them.
+fn emitGlobalId(
+    allocator: std.mem.Allocator,
+    code: *std.ArrayList(Inst),
+    func: *const Function,
+    dst: u8,
+    a: u2,
+) Error!void {
+    const size = gpu.attrs.localSize(func)[a];
+    try code.append(allocator, encode.movImm(dst, size, .{}));
+    try code.append(allocator, encode.s2r(r_scratch, encode.sr_tid[a], .{}));
+    try code.append(allocator, encode.s2r(r_scratch2, encode.sr_ctaid[a], .{}));
+    try code.append(allocator, encode.imad(dst, r_scratch2, dst, r_scratch, .{}));
 }
 
 /// Whether `v` carries the named `vulcan.gpu` flag or attribute, in any value form.
