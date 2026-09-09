@@ -153,7 +153,19 @@ fn writeType(w: *Writer, kind: types.TypeKind) Error!void {
             }
             try w.u8v(@intFromEnum(f));
         },
-        .ptr => try w.u8v(3),
+        .ptr => |space| {
+            try w.u8v(3);
+            // The decoder is a hardcoded switch on these values, so pin them here. A
+            // future reorder would otherwise desync the two sides and silently corrupt
+            // streams instead of failing to build.
+            comptime {
+                std.debug.assert(@intFromEnum(types.AddressSpace.global) == 0);
+                std.debug.assert(@intFromEnum(types.AddressSpace.shared) == 1);
+                std.debug.assert(@intFromEnum(types.AddressSpace.private) == 2);
+                std.debug.assert(@intFromEnum(types.AddressSpace.constant) == 3);
+            }
+            try w.u8v(@intFromEnum(space));
+        },
         .vector => |v| {
             try w.u8v(4);
             try w.u32v(v.len);
@@ -496,7 +508,14 @@ fn readType(r: *Reader, func: *Function, type_map: []const Type, valid: usize) E
             };
             break :blk try func.types.intern(.{ .float = kind });
         },
-        3 => try func.types.ptrGlobal(),
+        3 => blk: {
+            // The byte comes off an UNTRUSTED stream, so an unknown value is a
+            // recoverable fault and never an invalid enum.
+            const raw = try r.take(u8);
+            const space = std.enums.fromInt(types.AddressSpace, raw) orelse
+                return error.MalformedBitcode;
+            break :blk try func.types.intern(.{ .ptr = space });
+        },
         4 => blk: {
             const len = try r.take(u32);
             const elem = try mapType(type_map, valid, try r.take(u32));
@@ -1371,4 +1390,71 @@ test "a 2-value ret round-trips through bitcode and text-IR" {
     const reprinted = try std.fmt.allocPrint(allocator, "{f}", .{reparsed});
     defer allocator.free(reprinted);
     try std.testing.expectEqualStrings(text, reprinted);
+}
+
+test "a pointer address space survives a bitcode round trip" {
+    // Tag 3 carried no payload before, so every pointer decoded as global and a
+    // shared one silently changed address space across a round trip.
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+
+    const s = try func.types.intern(.{ .ptr = .shared });
+    const g = try func.types.ptrGlobal();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const b = try func.appendBlock();
+    const ps = try func.appendBlockParam(b, s);
+    const pg = try func.appendBlockParam(b, g);
+    const n = try func.appendBlockParam(b, i32_t);
+    func.setTerminator(b, .{ .ret = function.Ret.one(n) });
+
+    const bytes = try encode(allocator, &func);
+    defer allocator.free(bytes);
+    var back = try decode(allocator, bytes);
+    defer back.deinit();
+
+    try std.testing.expectEqual(
+        types.AddressSpace.shared,
+        back.types.type_kind(back.valueType(ps)).ptr,
+    );
+    try std.testing.expectEqual(
+        types.AddressSpace.global,
+        back.types.type_kind(back.valueType(pg)).ptr,
+    );
+    try std.testing.expect(back.valueType(ps) != back.valueType(pg));
+}
+
+test "regression: rejects an unknown address-space byte instead of @enumFromInt UB" {
+    // Suspicious case: the stream is untrusted. An out-of-range byte must not
+    // become an invalid enum.
+    //
+    // The stream is a real encode of the function below, patched at one exact
+    // offset. A scan for the first tag 3 is not safe here, because tag 3 is also
+    // the `arith_imm` opcode and the low byte of many counts, so it can match
+    // earlier by coincidence and patch a byte this test does not mean to touch.
+    // The layout is fixed instead: the magic, then a u32 type count, then the
+    // type records. The function holds exactly one type, so type 0 starts right
+    // after the count.
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    _ = try func.types.ptrGlobal();
+    const b = try func.appendBlock();
+    func.setTerminator(b, .{ .ret = function.Ret.none() });
+
+    const bytes = try encode(allocator, &func);
+    defer allocator.free(bytes);
+
+    const tag_offset = magic.len + @sizeOf(u32);
+    const space_offset = tag_offset + 1;
+    try std.testing.expect(space_offset < bytes.len);
+    // Prove the offset really names the pointer record before it is patched.
+    try std.testing.expectEqual(@as(u8, 3), bytes[tag_offset]);
+    try std.testing.expectEqual(@intFromEnum(types.AddressSpace.global), bytes[space_offset]);
+
+    const patched = try allocator.dupe(u8, bytes);
+    defer allocator.free(patched);
+    patched[space_offset] = 0xff;
+
+    try std.testing.expectError(error.MalformedBitcode, decode(allocator, patched));
 }
