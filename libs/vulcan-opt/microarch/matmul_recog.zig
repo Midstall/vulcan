@@ -12,6 +12,15 @@
 //! cap the isel backend enforces, so recognition never raises a matmul the backend would reject. Not
 //! yet wired into the `optimize` pipeline (a later task does that plus the sysemu differential).
 //!
+//! THE CAPABILITY GATE (this revision). `run` no longer reads the model's VPU feature bit directly.
+//! It asks `Model.tensor` for the target's `vulcan-gpu.tensor.Tensor` descriptor and refuses when
+//! the target has none, and `recognizeNest` then asks that descriptor whether it can lower the
+//! exact matmul this pass is about to build. The dtype set, the column group, the packed-slot rule
+//! for K and the compile-time-unrolled pass cap live in the descriptor and are no longer restated
+//! here, so this pass and the backend cannot drift apart. The descriptor also records the 64-byte
+//! alignment of a, b and c, which no query over the IR can decide (a `ptr` carries no alignment)
+//! and which therefore stays a contract on the builder.
+//!
 //! Plan 19 generalized the body match from fp32-only to also recognize int8/uint8 (and MIXED operand
 //! signedness) matmul nests, raising each to the `matmul` op with the correct `dtype` and, for mixed
 //! signedness, the plan-16 `input_signs` override. The int8 body is the 2D analogue of dotprod.zig's
@@ -41,6 +50,7 @@
 
 const std = @import("std");
 const ir = @import("vulcan-ir");
+const gpu = @import("vulcan-gpu");
 const mm = @import("model.zig");
 const loops = @import("../loops.zig");
 
@@ -158,13 +168,15 @@ const Plan = struct {
     embedded: bool,
 };
 
-/// Recognize the matmul nest `func` contains, when `model` is an et-soc VPU target (the only place the
-/// `matmul` op lowers), and transform it. Returns whether a nest was matched and applied. Recognition
-/// runs to completion (collect) before `apply` mutates anything (kept as a collect-then-apply structure
-/// so the mutation lands after recognition, mirroring `dotprod.zig`).
+/// Recognize the matmul nest `func` contains, when `model`'s target can lower a `matmul`, and
+/// transform it. Returns whether a nest was matched and applied. Recognition runs to completion
+/// (collect) before `apply` mutates anything (kept as a collect-then-apply structure so the mutation
+/// lands after recognition, mirroring `dotprod.zig`).
 pub fn run(allocator: std.mem.Allocator, func: *Function, model: *const mm.Model) Error!bool {
-    // The matmul op only lowers on the et-soc VPU; never raise a nest to it on any other target.
-    if (!model.vpu()) return false;
+    // Ask the target what it can take before raising anything. A model with no tensor capability
+    // lowers no matmul at all, so a nest raised there would destroy the loops and then fail to
+    // compile. `Model.tensor` is non-null only for the et-soc VPU today.
+    const caps = model.tensor() orelse return false;
 
     var info = try loops.analyze(allocator, func);
     defer info.deinit(allocator);
@@ -178,7 +190,7 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, model: *const mm.Model
 
     // A single well-formed function holds at most one whole-function matmul nest; recognizeNest
     // scans the flat loop list for the exact 3-loop chain and gates on the whole function.
-    if (try recognizeNest(allocator, func, &info, def_block)) |plan| {
+    if (try recognizeNest(allocator, func, &info, def_block, caps)) |plan| {
         try plans.append(allocator, plan);
     }
 
@@ -293,7 +305,7 @@ const LoopMatch = struct {
 ///
 /// `allocator` is unused in Task 1 (recognition is allocation-free) but is kept in the signature so
 /// Tasks 2-4 can grow the analysis without a churny signature change.
-fn recognizeNest(allocator: std.mem.Allocator, func: *const Function, info: *const loops.LoopInfo, def_block: []const u32) Error!?Plan {
+fn recognizeNest(allocator: std.mem.Allocator, func: *const Function, info: *const loops.LoopInfo, def_block: []const u32, caps: *const gpu.tensor.Tensor) Error!?Plan {
     const l = info.loops;
     // A matmul is a perfect nest of EXACTLY three loops; any other count is not this shape.
     if (l.len != 3) return null;
@@ -395,29 +407,30 @@ fn recognizeNest(allocator: std.mem.Allocator, func: *const Function, info: *con
     // strict: any deviation returns null.
     const strides = matchStrides(func, def_block, outer_l.body, &outer, &middle, &inner, &body) orelse return null;
 
-    // Task 4 CAP (final gate before accepting the nest): recognition must never raise a matmul the
-    // isel backend will refuse, because doing so destroys the loop nest and then fails to lower the
-    // op, turning a program that compiled as scalar loops into a hard compile error. Mirror EVERY
-    // riscv64/isel.zig `.matmul` rejection for the recognized dtype (isel.zig around lines 2639-2657):
-    //   1. N must be a multiple of 4 (the fma b_cols field encodes cols/4 - 1; all dtypes).
-    //   2. K must be a multiple of `factor` (the fma acols field encodes K/factor; a partial packed
-    //      column group has no representation). factor = 4 for int8/uint8 (64 int8 per SCP line / 16),
-    //      2 for fp16 (32 f16 per SCP line / 16), 1 for fp32.
-    //   3. the tile-count cap: TILE=16 rows/cols, K_TILE = 16*factor (fp32 16, fp16 32, int8/uint8 64),
-    //      m_tiles*n_tiles*k_tiles <= 64.
-    // An ineligible nest is left as loops.
-    const factor: u32 = switch (body.dtype) {
-        .fp32 => 1, // one fp32 element per 4-byte column slot
-        .fp16 => 2, // two fp16 elements packed per 4-byte column slot
-        .int8, .uint8 => 4, // four int8 elements packed per 4-byte column slot
+    // CAPABILITY GATE (final gate before accepting the nest): recognition must never raise a matmul
+    // the target cannot lower, because doing so destroys the loop nest and then fails to lower the
+    // op, turning a program that compiled as scalar loops into a hard compile error. Ask the
+    // target's tensor descriptor about the exact matmul this pass is about to build, rather than
+    // restating the backend's rules here. The descriptor holds the et-soc dtype set, the column
+    // group, the packed-slot rule for K, and the compile-time-unrolled pass cap in one place, so
+    // the backend and this pass cannot drift apart. See `vulcan-gpu.tensor`.
+    //
+    // The descriptor cannot decide the 64-byte alignment of a, b and c, because an IR `ptr` carries
+    // no alignment. That precondition stays a contract on whoever builds the op.
+    //
+    // `quant` is null here: this pass never recognizes a requantize epilogue.
+    const candidate: ir.function.MatMul = .{
+        .a = strides.a,
+        .b = strides.b,
+        .c = strides.c,
+        .m = outer.bound,
+        .n = middle.bound,
+        .k = inner.bound,
+        .dtype = body.dtype,
+        .accumulate = body.accumulate,
+        .input_signs = body.input_signs,
     };
-    if (middle.bound % 4 != 0) return null; // N not a multiple of 4: isel rejects, keep the loops
-    if (inner.bound % factor != 0) return null; // K not a whole packed column group: isel rejects
-    const k_tile: u32 = 16 * factor;
-    const m_tiles: u32 = (@as(u32, outer.bound) + 15) / 16;
-    const n_tiles: u32 = (@as(u32, middle.bound) + 15) / 16;
-    const k_tiles: u32 = (@as(u32, inner.bound) + k_tile - 1) / k_tile;
-    if (@as(u64, m_tiles) * n_tiles * k_tiles > 64) return null; // too big for the compile-time-unrolled op
+    if (caps.rejects(candidate) != null) return null; // the target refuses this matmul: keep the loops
 
     // Task 2 EXIT-ARG RECONSTRUCTION (done here, in recognition, so `apply` can never fail): when the
     // preheader is redirected straight to outer.exit, it must pass exactly the block args the outer
@@ -469,7 +482,7 @@ fn recognizeNest(allocator: std.mem.Allocator, func: *const Function, info: *con
     // embedded matmul into such a function would destroy the loops and THEN fail to lower, a hard compile
     // error where the scalar loops compiled fine. Gate on `embedded` exactly as isel does, so a
     // whole-function nest (never embedded) is unaffected. Same "never raise a matmul the backend refuses"
-    // contract as the cap gate above.
+    // contract as the capability gate above.
     if (embedded and functionHasWideFloatValue(func)) return null;
 
     // Mirror riscv64/isel.zig's OTHER embedded-matmul reject (isel.zig ~line 3246: `if (mmv.embedded
@@ -1041,7 +1054,7 @@ fn matchBody(func: *const Function, def_block: []const u32, inner: *const LoopMa
         // Task 1's isel REJECTS accumulate=true with an int8/uint8 dtype (its C-preload path is fp32/fp16
         // only). Raising a memory-accumulator int8/uint8 nest would destroy the loops and THEN fail to
         // lower, a hard compile error where the scalar loops compiled fine. So keep such nests as loops,
-        // the same "never raise a matmul the backend refuses" contract as recognizeNest's cap and
+        // the same "never raise a matmul the backend refuses" contract as recognizeNest's capability and
         // embedded-wide-float gates. fp32/fp16 memory accumulation is the supported set, matching Task 1.
         switch (dtype) {
             .int8, .uint8 => return null, // accumulate=true + int8/uint8: isel refuses, keep the loops
@@ -1786,13 +1799,15 @@ fn buildTwoDeepNest(func: *Function) Error!void {
     func.setTerminator(ret_block, .{ .ret = ir.function.Ret.none() });
 }
 
-/// Run recognizeNest end to end (analyze + def-blocks + match), returning the Plan or null.
+/// Run recognizeNest end to end (analyze + def-blocks + match) against the et-soc tensor unit,
+/// returning the Plan or null. The et-soc descriptor is the one every test here recognizes for,
+/// and it is what `Model.tensor` gives a VPU model.
 fn recognizeIn(allocator: std.mem.Allocator, func: *const Function) Error!?Plan {
     var info = try loops.analyze(allocator, func);
     defer info.deinit(allocator);
     const def_block = try computeDefBlocks(allocator, func);
     defer allocator.free(def_block);
-    return recognizeNest(allocator, func, &info, def_block);
+    return recognizeNest(allocator, func, &info, def_block, &gpu.tensor.et_soc);
 }
 
 test "the canonical matmul nest is well-formed and recognized with the right bounds" {
@@ -1922,7 +1937,7 @@ test "run does not transform a nest whose tile count exceeds the isel cap" {
     var func = Function.init(allocator);
     defer func.deinit();
     // 80x80x80: ceil(80/16)=5 per axis, 5*5*5 = 125 > 64, over the cap `matmul_recog` mirrors from
-    // riscv64/isel.zig. The nest is otherwise perfectly canonical, so this fails ONLY the cap gate.
+    // riscv64/isel.zig. The nest is otherwise perfectly canonical, so this fails ONLY the capability gate.
     try buildMatmulNest(&func, .{ .m = 80, .n = 80, .k = 80 });
     const blocks_before = func.blockCount();
     const insts_before = func.instCount();
@@ -1931,6 +1946,63 @@ test "run does not transform a nest whose tile count exceeds the isel cap" {
     try std.testing.expectEqual(@as(usize, 0), countMatmuls(&func));
     try std.testing.expectEqual(blocks_before, func.blockCount());
     try std.testing.expectEqual(insts_before, func.instCount());
+}
+
+test "the shape gate comes from the target descriptor, not from this pass" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    // 80x80x80 is 5*5*5 = 125 tile passes, over the et-soc cap of 64. The scalar-expansion
+    // descriptor takes any shape, so the SAME nest is recognized when that target is asked. Nothing
+    // about the nest changed between the two calls, only the descriptor, which is what proves the
+    // gate reads the descriptor rather than a rule written into this pass.
+    try buildMatmulNest(&func, .{ .m = 80, .n = 80, .k = 80 });
+
+    var info = try loops.analyze(allocator, &func);
+    defer info.deinit(allocator);
+    const def_block = try computeDefBlocks(allocator, &func);
+    defer allocator.free(def_block);
+
+    try std.testing.expect(try recognizeNest(allocator, &func, &info, def_block, &gpu.tensor.et_soc) == null);
+    const plan = (try recognizeNest(allocator, &func, &info, def_block, &gpu.tensor.scalar)).?;
+    try std.testing.expectEqual(@as(u16, 80), plan.m);
+    try std.testing.expectEqual(@as(u16, 80), plan.n);
+    try std.testing.expectEqual(@as(u16, 80), plan.k);
+}
+
+test "the column-group gate also comes from the target descriptor" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    // N=6 breaks the et-soc column group of 4. The scalar nest has no column group, so it takes it.
+    try buildMatmulNest(&func, .{ .m = 2, .n = 6, .k = 3 });
+
+    var info = try loops.analyze(allocator, &func);
+    defer info.deinit(allocator);
+    const def_block = try computeDefBlocks(allocator, &func);
+    defer allocator.free(def_block);
+
+    try std.testing.expect(try recognizeNest(allocator, &func, &info, def_block, &gpu.tensor.et_soc) == null);
+    const plan = (try recognizeNest(allocator, &func, &info, def_block, &gpu.tensor.scalar)).?;
+    try std.testing.expectEqual(@as(u16, 6), plan.n);
+}
+
+test "run refuses a nest on a target whose descriptor lowers no matmul" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    try buildMatmulNest(&func, .{});
+    // The nvidia descriptor is the empty capability: no dtype, no tile. Every matmul is rejected as
+    // `unsupported`, which is exactly what a pass needs to leave the loops alone.
+    try std.testing.expect(!gpu.tensor.nvidia.lowersAny());
+
+    var info = try loops.analyze(allocator, &func);
+    defer info.deinit(allocator);
+    const def_block = try computeDefBlocks(allocator, &func);
+    defer allocator.free(def_block);
+    try std.testing.expect(try recognizeNest(allocator, &func, &info, def_block, &gpu.tensor.nvidia) == null);
+    // The et-soc descriptor takes the very same nest, so the refusal is the target and not the nest.
+    try std.testing.expect(try recognizeNest(allocator, &func, &info, def_block, &gpu.tensor.et_soc) != null);
 }
 
 test "run does not transform a nest whose N is not a multiple of 4" {

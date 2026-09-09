@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const ir = @import("vulcan-ir");
+const gpu = @import("vulcan-gpu");
 
 /// Which Vulcan backend a model targets.
 pub const Arch = enum { aarch64, riscv64, x86_64 };
@@ -163,6 +164,22 @@ pub const Model = struct {
             .riscv64 => |f| f.vpu,
             .aarch64, .x86_64 => false,
         };
+    }
+
+    /// What this model's target can do with a `matmul`, or null when it lowers none.
+    ///
+    /// The et-soc tensor unit comes with the CORE-ET packed-single VPU, and the riscv64 backend
+    /// gates its `.matmul` lowering on exactly that feature bit (see `isel.zig`: `if (!vpu) return
+    /// error.Unsupported`). So the descriptor follows `vpu()` and the two cannot drift apart. No
+    /// other part in the registry has a tensor unit.
+    ///
+    /// A pass must ask this BEFORE it builds a `matmul`, because the op does not lower everywhere.
+    /// The descriptor answers which dtypes, tiles and epilogues the target takes, and it records
+    /// the alignment and the register ownership that no query over the IR can decide. See
+    /// `vulcan-gpu.tensor`.
+    pub fn tensor(self: *const Model) ?*const gpu.tensor.Tensor {
+        if (self.vpu()) return &gpu.tensor.et_soc;
+        return null;
     }
 
     /// Whether this model's macro-op fusion table declares `kind`.
@@ -393,6 +410,53 @@ test "Model.vpu is true only for a riscv64 model with the vpu feature bit set" {
         .fusion = &.{},
     };
     try std.testing.expect(!altra_like.vpu());
+}
+
+test "Model.tensor gives the et-soc descriptor to a vpu model and nothing to any other" {
+    const etsoc_like = Model{
+        .tag = .@"et-soc",
+        .arch = .riscv64,
+        .exec = .in_order,
+        .issue_width = 1,
+        .rob_size = 0,
+        .units = .{ .alu = 1, .muldiv = 1, .mem = 1, .branch = 1, .fpsimd = 1 },
+        .vector_bits = 256,
+        .cache_line = 64,
+        .fetch_align = 8,
+        .features = .{ .riscv64 = .{ .m = true, .f = true, .c = true, .vpu = true } },
+        .latency = testLatency,
+        .throughput = testThroughput,
+        .unitOf = testUnit,
+        .fusion = &.{},
+    };
+    const caps = etsoc_like.tensor().?;
+    // The et-soc descriptor, not some other one: 64-byte operands and a real register clobber set.
+    try std.testing.expectEqual(@as(u32, 64), caps.operand_align);
+    try std.testing.expect(caps.clobbers.len != 0);
+    try std.testing.expect(caps.lowersAny());
+
+    // Drop the vpu bit and the same part has no tensor unit to lower a matmul on.
+    var no_vpu = etsoc_like;
+    no_vpu.features = .{ .riscv64 = .{ .m = true, .f = true, .c = true } };
+    try std.testing.expect(no_vpu.tensor() == null);
+
+    const altra_like = Model{
+        .tag = .@"ampere-altra",
+        .arch = .aarch64,
+        .exec = .out_of_order,
+        .issue_width = 4,
+        .rob_size = 128,
+        .units = .{ .alu = 3, .muldiv = 1, .mem = 2, .branch = 1, .fpsimd = 2 },
+        .vector_bits = 128,
+        .cache_line = 64,
+        .fetch_align = 32,
+        .features = .{ .aarch64 = .{ .neon = true } },
+        .latency = testLatency,
+        .throughput = testThroughput,
+        .unitOf = testUnit,
+        .fusion = &.{},
+    };
+    try std.testing.expect(altra_like.tensor() == null);
 }
 
 test "cascadelake-sp tag parses and x86_64 Features carries the avx512 gating flags" {

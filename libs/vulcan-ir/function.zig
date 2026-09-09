@@ -211,23 +211,30 @@ pub const VaEnd = struct { list: Value };
 /// `b` are the same `<16 x i8>` (signed) or `<16 x u8>` (unsigned) type.
 pub const Dot = struct { acc: Value, a: Value, b: Value };
 
-/// An et-soc fixed-tile matrix multiply: `c := a * b` (or `c += a * b` when
-/// `accumulate`), an `m x k` by `k x n` tile written to `c`. `a`, `b`, and `c`
-/// are `ptr` values; `a` and `b` are read from memory, `c` is where the result
-/// is written. Produces no result. EFFECTFUL (writes memory at `c`).
+/// A fixed-tile matrix multiply: `c := a * b` (or `c += a * b` when `accumulate`),
+/// an `m x k` by `k x n` tile written to `c`. `a`, `b`, and `c` are `ptr` values;
+/// `a` and `b` are read from memory, `c` is where the result is written. Produces
+/// no result. EFFECTFUL (writes memory at `c`).
 ///
-/// PRECONDITIONS (the et-soc tensor unit is cache-line addressed, so these are hard
-/// requirements, enforced only by contract in this first slice, not verified):
-///   - `a`, `b`, `c` must be 64-byte aligned. Each `a`/`b` row occupies one 64-byte
-///     cache line (a row of `k`/`n` f32 then padding); the backend builds the load
-///     descriptor by OR-ing static field bits into the low 6 (zero) bits of the pointer,
-///     so an unaligned pointer would corrupt the descriptor. `c` receives `m` rows of
-///     32 bytes each (the fsw.ps readback stride).
-///   - The et-soc backend lowering owns x31/x6 and the TenC registers f0,f2,..,f(2m-2)
-///     across the op, so a matmul must not share a function with live values in those
-///     registers (the current builders only emit it in standalone tensor kernels).
-/// A future auto-recognition pass that emits matmul from a loop nest must guarantee
-/// (or repack for) 64-byte-aligned tiles and honor the register ownership.
+/// PRECONDITIONS ARE PER TARGET and live in `vulcan-gpu.tensor`, one `Tensor` descriptor per
+/// target, because they are hardware facts and not properties of this operation. The three real
+/// cases do not agree, so no single set can be stated here:
+///   - The et-soc tensor unit is cache-line addressed. It needs `a`, `b` and `c` 64-byte aligned,
+///     it accepts only the tiles its pass descriptor can encode, and it owns x5, x6, x7, x28, x31
+///     and the TenC registers f0 to f(2 * @min(16, m) - 1) for the whole op, so a matmul must not
+///     share a function with a live value in one of those registers. `tensor.et_soc` holds each of
+///     those facts with the reason for it.
+///   - The scalar loop nest `vulcan-ir.expand.expandMatmul` writes has NONE of them. It reads
+///     tightly packed row-major memory at any alignment, it takes any tile, and it owns no
+///     register. See `tensor.scalar`.
+///   - An NVIDIA tensor core is different again: one instruction is warp-collective, and each of
+///     the 32 lanes holds a fragment of the tile in its own registers. See `tensor.nvidia`.
+///
+/// Nothing verifies a precondition. `vulcan-ir` cannot import `vulcan-gpu`, and an IR `ptr` carries
+/// no alignment, so alignment stays a contract on whoever builds the op. `Tensor.rejects` answers
+/// what a `MatMul` alone can decide: the dtype, the tile and the epilogue. A pass that raises a
+/// loop nest to a matmul must ask that query first, and must prove or repack for the alignment the
+/// descriptor names. `vulcan-opt.microarch.matmul_recog` does both.
 /// Element dtype of a `matmul`'s A/B inputs (its output C is ALWAYS 32-bit: fp32
 /// accumulators for `fp32`/`fp16`, int32 accumulators for `int8`/`uint8`). This is the
 /// op's own metadata (A/B/C are opaque `ptr` values, so `verify` gains no new type check);
@@ -436,8 +443,8 @@ pub const Opcode = union(enum) {
     va_end: VaEnd,
     /// An INT8 4-way dot-product accumulate. Pure, like `arith`.
     dot: Dot,
-    /// An et-soc fixed-tile matrix multiply. Produces no result. EFFECTFUL
-    /// (writes memory at `c`).
+    /// A fixed-tile matrix multiply. Produces no result. EFFECTFUL (writes memory
+    /// at `c`). Its preconditions are per target, see `MatMul`.
     matmul: MatMul,
     /// A non-terminating conditional. Produces no result in its statement form.
     @"if": If,

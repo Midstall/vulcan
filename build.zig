@@ -11,24 +11,29 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // The optimization framework: target-independent IR analyses and transforms.
-    // Freestanding-clean. Depends only on the IR.
-    const vulcan_opt = b.addModule("vulcan-opt", .{
-        .root_source_file = b.path("libs/vulcan-opt.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{.{ .name = "vulcan-ir", .module = vulcan_ir }},
-    });
-
-    // The target-neutral accelerator kernel ABI: builtins, parameter layout, and the launch
-    // metadata a runtime reads. Freestanding-clean. Depends only on the IR, so the frontends
-    // can tag kernels with it without depending on the target seam. It is declared before the
-    // frontends because they import it.
+    // The target-neutral accelerator kernel ABI: builtins, parameter layout, the launch
+    // metadata a runtime reads, and the per-target tensor capability data. Freestanding-clean.
+    // Depends only on the IR, so the frontends can tag kernels with it without depending on the
+    // target seam. It is declared before the optimizer and the frontends because they import it.
     const vulcan_gpu = b.addModule("vulcan-gpu", .{
         .root_source_file = b.path("libs/vulcan-gpu.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{.{ .name = "vulcan-ir", .module = vulcan_ir }},
+    });
+
+    // The optimization framework: target-independent IR analyses and transforms.
+    // Freestanding-clean. Depends on the IR, and on the kernel ABI for the per-target tensor
+    // capability data that `microarch.matmul_recog` asks before it raises a loop nest to a
+    // `matmul`. `vulcan-gpu` imports only the IR, so that edge adds no cycle.
+    const vulcan_opt = b.addModule("vulcan-opt", .{
+        .root_source_file = b.path("libs/vulcan-opt.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "vulcan-ir", .module = vulcan_ir },
+            .{ .name = "vulcan-gpu", .module = vulcan_gpu },
+        },
     });
 
     // The SPIR-V frontend: read a SPIR-V binary and lower it to Vulcan IR. Freestanding-clean.

@@ -5,8 +5,8 @@
 //!
 //! Freestanding-clean. Depends only on the IR.
 //!
-//! The module has two tiers. `kernel` and `abi` are universal: a dataflow accelerator such as
-//! Tenstorrent uses them. `builtin` is the SIMT vocabulary that NVIDIA, AMD, Intel and ET-SoC
+//! The module has two tiers. `kernel`, `abi` and `tensor` are universal: a dataflow accelerator
+//! such as Tenstorrent uses them. `builtin` is the SIMT vocabulary that NVIDIA, AMD, Intel and ET-SoC
 //! share, and a non-SIMT target ignores it. Divergence handling belongs to each backend and
 //! is deliberately absent here: NVIDIA reconverges warps, ET-SoC minions branch independently.
 
@@ -17,6 +17,7 @@ pub const attrs = @import("vulcan-gpu/attrs.zig");
 pub const kernel = @import("vulcan-gpu/kernel.zig");
 pub const abi = @import("vulcan-gpu/abi.zig");
 pub const offload = @import("vulcan-gpu/offload.zig");
+pub const tensor = @import("vulcan-gpu/tensor.zig");
 
 /// A value the hardware provides rather than the parameter block. See `builtin.Builtin`.
 pub const Builtin = builtin.Builtin;
@@ -32,6 +33,8 @@ pub const AddressSpace = kernel.AddressSpace;
 pub const layoutParams = abi.layoutParams;
 /// Rewrite a kernel into a host-runnable loop nest. See `offload.lowerToLoopNest`.
 pub const lowerToLoopNest = offload.lowerToLoopNest;
+/// What one target's `matmul` lowering can take. See `tensor.Tensor`.
+pub const Tensor = tensor.Tensor;
 
 test {
     std.testing.refAllDecls(@This());
