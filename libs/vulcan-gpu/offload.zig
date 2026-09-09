@@ -103,6 +103,19 @@ fn entryIsBranchTarget(func: *const Function) bool {
     return false;
 }
 
+/// Whether any attribute is keyed by a block. `reorderBlocks` does not remap a block id that
+/// an attribute payload holds, and this pass lays the result out with `reorderBlocks`, so a
+/// kernel that carries such an attribute has no safe lowering here.
+fn hasBlockAttribute(func: *const Function) bool {
+    for (func.attributeEntries()) |entry| {
+        switch (entry.target) {
+            .block => return true,
+            .func, .inst, .value => {},
+        }
+    }
+    return false;
+}
+
 /// Rewrite `func`, a kernel, into an ordinary function that executes the whole grid.
 ///
 /// The result's entry block takes the grid size in workgroups as ONE leading i32 parameter,
@@ -114,9 +127,13 @@ fn entryIsBranchTarget(func: *const Function) bool {
 /// body as the inner body. `block` is the declared workgroup size, which the caller reads from
 /// `attrs.localSize`.
 ///
+/// The blocks come out in an order where every block follows its immediate dominator, which is
+/// what the machine backends' linear-scan liveness needs. See `layOutNest`.
+///
 /// Only the x axis is in scope. A kernel that reads a y or z axis builtin, the grid size, or a
 /// subgroup builtin returns `error.Unsupported`, as does a kernel whose builtin parameter is
-/// not a signed 32-bit integer, and a kernel whose entry block is a branch target.
+/// not a signed 32-bit integer, a kernel whose entry block is a branch target, and a kernel
+/// that carries a block-keyed attribute, which the layout step cannot keep valid.
 ///
 /// A kernel that RETURNS a value returns `error.Unsupported` too. Such a kernel writes its
 /// result through an implicit output pointer, and that convention belongs with the parameter
@@ -131,6 +148,7 @@ pub fn lowerToLoopNest(
     if (func.blockCount() == 0) return error.Unsupported;
     if (returnsValue(func)) return error.Unsupported;
     if (entryIsBranchTarget(func)) return error.Unsupported;
+    if (hasBlockAttribute(func)) return error.Unsupported;
 
     // Clone first: `clone` re-interns every type kind in order, so the n-th kind keeps handle
     // n and every Type in the copied arrays stays valid. The kernel's own blocks keep their
@@ -234,7 +252,56 @@ pub fn lowerToLoopNest(
 
     out.setTerminator(exit, .{ .ret = ir.function.Ret.none() });
 
+    try layOutNest(allocator, &out, kernel_blocks, .{
+        .body_entry = body_entry,
+        .outer_head = outer_head,
+        .inner_head = inner_head,
+        .inner_latch = inner_latch,
+        .outer_latch = outer_latch,
+        .exit = exit,
+    });
     return out;
+}
+
+/// The blocks the nest adds, in the order `lowerToLoopNest` creates them.
+const NestBlocks = struct {
+    body_entry: Block,
+    outer_head: Block,
+    inner_head: Block,
+    inner_latch: Block,
+    outer_latch: Block,
+    exit: Block,
+};
+
+/// Put the blocks in an order where every block follows its immediate dominator.
+///
+/// The nest is built by appending, so the kernel's body keeps the low block indices and the two
+/// loop headers land after it. That order is legal IR, and `ir.verify` accepts it, but the
+/// machine backends number linear-scan liveness by block index. A body block that comes before
+/// the header which defines the induction variables makes the register allocator read a use
+/// before its definition, and the allocation it produces is unsound. `vulcan-opt.blocklayout`
+/// states the same rule for the same reason.
+///
+/// The order is preheader, the two headers, the body, the two latches, then the exit. The
+/// kernel's own blocks keep the relative order they came in with, so a kernel that was itself
+/// laid out this way stays laid out this way.
+fn layOutNest(
+    allocator: std.mem.Allocator,
+    out: *Function,
+    kernel_blocks: usize,
+    nest: NestBlocks,
+) std.mem.Allocator.Error!void {
+    const order = try allocator.alloc(Block, out.blockCount());
+    defer allocator.free(order);
+    order[0] = entry_block;
+    order[1] = nest.outer_head;
+    order[2] = nest.inner_head;
+    order[3] = nest.body_entry;
+    for (1..kernel_blocks) |bi| order[3 + bi] = @enumFromInt(bi);
+    order[3 + kernel_blocks] = nest.inner_latch;
+    order[4 + kernel_blocks] = nest.outer_latch;
+    order[5 + kernel_blocks] = nest.exit;
+    try out.reorderBlocks(allocator, order);
 }
 
 /// The induction values one iteration of the nest exposes.
