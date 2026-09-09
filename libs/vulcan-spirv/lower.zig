@@ -19,6 +19,7 @@
 
 const std = @import("std");
 const ir = @import("vulcan-ir");
+const gpu = @import("vulcan-gpu");
 const binary = @import("binary.zig");
 const op = @import("opcodes.zig");
 
@@ -510,7 +511,9 @@ pub fn lowerModule(allocator: std.mem.Allocator, words: []const u32) Error!Funct
 
     var func_ret_type: ?u32 = null;
     var in_function = false;
-    var local_size_x: u32 = 1; // workgroup x dimension (OpExecutionMode LocalSize)
+    // The workgroup dimensions an OpExecutionMode LocalSize declares. It stays null when the
+    // module declares none, which keeps a bare scalar function free of kernel metadata.
+    var local_size: ?[3]u32 = null;
     var pending_vars: std.ArrayList([2]u32) = .empty; // (var id, storage class)
     defer pending_vars.deinit(allocator);
 
@@ -670,8 +673,11 @@ pub fn lowerModule(allocator: std.mem.Allocator, words: []const u32) Error!Funct
                     try module.members.put(allocator, key, .{ .type_id = 0, .offset = 0, .builtin = inst.operands[3] });
                 }
             },
-            op.ExecutionMode => if (inst.operands.len >= 3 and inst.operands[1] == op.ExecutionModeKind.local_size) {
-                local_size_x = inst.operands[2]; // [entryPoint, LocalSize, x, y, z]
+            // [entryPoint, LocalSize, x, y, z]. All three dimensions are literals here. A
+            // LocalSize with fewer than five operands is malformed, so it is ignored and the
+            // default of one on each axis stays.
+            op.ExecutionMode => if (inst.operands.len >= 5 and inst.operands[1] == op.ExecutionModeKind.local_size) {
+                local_size = .{ inst.operands[2], inst.operands[3], inst.operands[4] };
             },
             op.Constant => {
                 const type_id = try operandAt(inst.operands, 0);
@@ -760,10 +766,14 @@ pub fn lowerModule(allocator: std.mem.Allocator, words: []const u32) Error!Funct
         try func.addAttr(.func, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "stage", .value = .{ .string = @tagName(module.stage) } } });
     }
 
-    // Record the workgroup x dimension so a GPU backend can fold the block offset into
-    // the global invocation id (gid.x = blockIdx.x * local_size_x + threadIdx.x).
-    if (module.has_global_id) {
-        try func.addAttr(.func, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "local_size_x", .value = .{ .int = local_size_x } } });
+    // The declared workgroup size is part of the launch shape, so it is recorded for every
+    // compute kernel that declares one, not only for one that reads the global invocation
+    // id. A backend also folds the x dimension into the global invocation id
+    // (gid.x = blockIdx.x * local_size_x + threadIdx.x). A module that declares no LocalSize
+    // gets no attribute, and `gpu.attrs.localSize` then reports the one-per-axis default,
+    // which is the same launch shape.
+    if (module.stage == .compute) {
+        if (local_size) |size| try gpu.attrs.setLocalSize(&func, size);
     }
 
     // Emit the fragment-shader gradient-buffer layout: one func attr per grad_buf index
@@ -896,7 +906,7 @@ fn lowerFunction(allocator: std.mem.Allocator, func: *Function, module: *Module,
         // Tag the invocation-id parameter so a GPU backend sources it from the hardware
         // thread id (S2R) rather than a uniform kernel argument. CPU backends ignore the
         // tag and treat it as an ordinary register parameter.
-        try func.addAttr(.{ .value = gid }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "builtin", .value = .{ .int = op.BuiltIn.global_invocation_id } } });
+        try gpu.attrs.setBuiltin(func, gid, .global_id_x);
     }
     // Vertex-shader BuiltIn inputs (gl_VertexIndex / gl_InstanceIndex) become synthesized
     // i32 entry params BEFORE the f32 attribute inputs and the buffer pointers, tagged so
@@ -905,12 +915,12 @@ fn lowerFunction(allocator: std.mem.Allocator, func: *Function, module: *Module,
     if (module.has_vertex_index) {
         const vi = try func.appendBlockParam(entry, module.i32_t);
         module.vertex_index_value = vi;
-        try func.addAttr(.{ .value = vi }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "builtin", .value = .{ .int = op.BuiltIn.vertex_index } } });
+        try gpu.attrs.setBuiltin(func, vi, .vertex_index);
     }
     if (module.has_instance_index) {
         const ii = try func.appendBlockParam(entry, module.i32_t);
         module.instance_index_value = ii;
-        try func.addAttr(.{ .value = ii }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "builtin", .value = .{ .int = op.BuiltIn.instance_index } } });
+        try gpu.attrs.setBuiltin(func, ii, .instance_index);
     }
     // Graphics: each Input variable becomes a scalarized block parameter, one per vector
     // component, tagged with its attribute slot (ATTR_GENERIC0 + the Location's 16-byte
@@ -1074,14 +1084,19 @@ fn synthInputAttribs(allocator: std.mem.Allocator, func: *Function, module: *Mod
         // `bicomp` so a backend sources it from the fragment position / face rather than
         // an interpolated varying (a location-0 attr slot would alias a real varying).
         if (module.is_frag_coord[id] or module.is_point_coord[id] or module.is_front_facing[id]) {
-            const bi: i64 = if (module.is_frag_coord[id]) op.BuiltIn.frag_coord else if (module.is_point_coord[id]) op.BuiltIn.point_coord else op.BuiltIn.front_facing;
+            const bi: gpu.Builtin = if (module.is_frag_coord[id])
+                .frag_coord
+            else if (module.is_point_coord[id])
+                .point_coord
+            else
+                .front_facing;
             if (vectorInfo(module.types, pointee)) |vi| {
                 const elem = scalarType(module.types, vi.elem) orelse return error.Unsupported;
                 var out: Vec = .{ .len = vi.len };
                 var c: u8 = 0;
                 while (c < vi.len) : (c += 1) {
                     const p = try func.appendBlockParam(entry, elem);
-                    try func.addAttr(.{ .value = p }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "builtin", .value = .{ .int = bi } } });
+                    try gpu.attrs.setBuiltin(func, p, bi);
                     try func.addAttr(.{ .value = p }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "bicomp", .value = .{ .int = c } } });
                     out.comps[c] = p;
                 }
@@ -1098,14 +1113,14 @@ fn synthInputAttribs(allocator: std.mem.Allocator, func: *Function, module: *Mod
                 const f32_t = try func.types.intern(.{ .float = .f32 });
                 const bool_t = try func.types.intern(.bool);
                 const p = try func.appendBlockParam(entry, f32_t);
-                try func.addAttr(.{ .value = p }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "builtin", .value = .{ .int = bi } } });
+                try gpu.attrs.setBuiltin(func, p, bi);
                 try func.addAttr(.{ .value = p }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "bicomp", .value = .{ .int = 0 } } });
                 const zero = try func.appendInst(entry, f32_t, .{ .fconst = 0 });
                 module.value_of[id] = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .ne, .lhs = p, .rhs = zero } });
             } else {
                 const elem = scalarType(module.types, pointee) orelse return error.Unsupported;
                 const p = try func.appendBlockParam(entry, elem);
-                try func.addAttr(.{ .value = p }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "builtin", .value = .{ .int = bi } } });
+                try gpu.attrs.setBuiltin(func, p, bi);
                 try func.addAttr(.{ .value = p }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "bicomp", .value = .{ .int = 0 } } });
                 module.value_of[id] = p;
             }
@@ -3341,12 +3356,12 @@ fn hasFuncStage(func: *const Function, stage: []const u8) bool {
     return false;
 }
 
-/// Whether any value in the function carries a `vulcan.gpu.builtin = which` tag (the
-/// synthesized BuiltIn entry param, e.g. gl_VertexIndex).
-fn hasValueBuiltin(func: *const Function, which: u32) bool {
+/// Whether any value in the function carries the `which` builtin tag (the synthesized
+/// BuiltIn entry param, e.g. gl_VertexIndex).
+fn hasValueBuiltin(func: *const Function, which: gpu.Builtin) bool {
     var i: u32 = 0;
     while (i < func.valueCount()) : (i += 1) {
-        if (hasAttr(func, @enumFromInt(i), "builtin", which)) return true;
+        if (gpu.attrs.builtinOf(func, @enumFromInt(i)) == which) return true;
     }
     return false;
 }
@@ -3402,7 +3417,7 @@ test "lowers gl_VertexIndex pulling a vec4 from a UBO array (vkcube vertex-pulli
 
     try testing.expect(hasFuncStage(&func, "vertex"));
     // gl_VertexIndex synthesized a tagged i32 entry param.
-    try testing.expect(hasValueBuiltin(&func, op.BuiltIn.vertex_index));
+    try testing.expect(hasValueBuiltin(&func, .vertex_index));
 
     var buf: [8192]u8 = undefined;
     const text = try std.fmt.bufPrint(&buf, "{f}", .{func});
@@ -3520,7 +3535,7 @@ test "lowers gl_InstanceIndex as a synthesized vertex entry param" {
     var func = try lowerModule(allocator, b.words.items);
     defer func.deinit();
     try testing.expect(hasFuncStage(&func, "vertex"));
-    try testing.expect(hasValueBuiltin(&func, op.BuiltIn.instance_index));
+    try testing.expect(hasValueBuiltin(&func, .instance_index));
 }
 
 /// Whether the function carries a `vulcan.gpu.grad_slot` func attr encoding (slot, axis):

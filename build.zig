@@ -20,23 +20,27 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "vulcan-ir", .module = vulcan_ir }},
     });
 
-    // The SPIR-V frontend: read a SPIR-V binary and lower it to Vulcan IR.
-    // Freestanding-clean. Depends only on the IR.
-    const vulcan_spirv = b.addModule("vulcan-spirv", .{
-        .root_source_file = b.path("libs/vulcan-spirv.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{.{ .name = "vulcan-ir", .module = vulcan_ir }},
-    });
-
     // The target-neutral accelerator kernel ABI: builtins, parameter layout, and the launch
     // metadata a runtime reads. Freestanding-clean. Depends only on the IR, so the frontends
-    // can tag kernels with it without depending on the target seam.
+    // can tag kernels with it without depending on the target seam. It is declared before the
+    // frontends because they import it.
     const vulcan_gpu = b.addModule("vulcan-gpu", .{
         .root_source_file = b.path("libs/vulcan-gpu.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{.{ .name = "vulcan-ir", .module = vulcan_ir }},
+    });
+
+    // The SPIR-V frontend: read a SPIR-V binary and lower it to Vulcan IR. Freestanding-clean.
+    // Depends on the IR and on the kernel ABI, whose vocabulary it tags kernel parameters with.
+    const vulcan_spirv = b.addModule("vulcan-spirv", .{
+        .root_source_file = b.path("libs/vulcan-spirv.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "vulcan-ir", .module = vulcan_ir },
+            .{ .name = "vulcan-gpu", .module = vulcan_gpu },
+        },
     });
 
     // The shared static ELF linker: parse relocatable objects, resolve relocations,
