@@ -14,9 +14,21 @@ const std = @import("std");
 
 pub const builtin = @import("vulcan-gpu/builtin.zig");
 pub const attrs = @import("vulcan-gpu/attrs.zig");
+pub const kernel = @import("vulcan-gpu/kernel.zig");
+pub const abi = @import("vulcan-gpu/abi.zig");
 
 /// A value the hardware provides rather than the parameter block. See `builtin.Builtin`.
 pub const Builtin = builtin.Builtin;
+/// The per-target parameter delivery rules. See `abi.Abi`.
+pub const Abi = abi.Abi;
+/// The launch metadata a runtime reads. See `kernel.LaunchInfo`.
+pub const LaunchInfo = kernel.LaunchInfo;
+/// A placed parameter. See `kernel.Param`.
+pub const Param = kernel.Param;
+/// Where a pointer points. See `kernel.AddressSpace`.
+pub const AddressSpace = kernel.AddressSpace;
+/// Place a kernel's parameter block. See `abi.layoutParams`.
+pub const layoutParams = abi.layoutParams;
 
 test {
     std.testing.refAllDecls(@This());
