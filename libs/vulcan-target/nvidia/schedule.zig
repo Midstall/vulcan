@@ -12,9 +12,10 @@
 //! without it, a consumer could read a register before the load filling it completes.
 //!
 //! Register reads come from `readsSrc`. For an ALU op that is a conservative superset
-//! (the three ALU source fields), which only ever adds an unnecessary wait. For a memory
-//! op, an atomic or a barrier the superset is WRONG in both directions, because those
-//! opcodes put other things in the ALU source fields, so each names its own sources.
+//! (the three ALU source fields), which only ever adds an unnecessary wait. For every
+//! other opcode the superset is WRONG in both directions, because those opcodes put other
+//! things in the ALU source fields: an attribute address, a branch offset, a lookup table,
+//! a second destination, or nothing at all. So each of them names its own sources.
 //!
 //! Limits: read barriers (protecting a variable-latency op's source registers from being
 //! overwritten before it consumes them) are not assigned. Stall delays are left as the isel
@@ -112,6 +113,17 @@ fn writesDst(opcode: u32) bool {
         // compare-and-swap forms) write a real destination at 16..24 and stay out of this
         // list.
         encode.RED_OPCODE => false,
+        // AST (0x322), the graphics attribute store, and KIL (0x95b), the fragment
+        // discard. Neither writes a GPR, and neither encoder writes bits 16..23 at all, so
+        // the field reads as R0. That is the STS and BAR bug of 6e09607: if R0 has a live
+        // in-flight producer, the scheduler makes the AST or the KIL wait on that
+        // scoreboard and CLEARS its tag, so the instruction that really consumes R0 emits
+        // no wait of its own and reads stale.
+        0x322, 0x95b => false,
+        // PLOP3 (0x81c), the predicate-logic op. Its result is a PREDICATE at bits 81..83.
+        // Bits 16..23 hold the SECOND lookup table, which the encoder sets to 0, so the
+        // field reads as R0 with the same phantom-write result as AST and KIL.
+        0x81c => false,
         else => true,
     };
 }
@@ -131,12 +143,83 @@ fn writesDst(opcode: u32) bool {
 ///     instruction that really consumes R0 never waits and reads stale. That is the
 ///     phantom-read half of the STS and BAR bug fixed in 6e09607, on the source side.
 ///
-/// So each memory and atomic opcode names its own source fields instead.
+/// The same rule holds for every OTHER opcode that is not an ALU op. An instruction whose
+/// bits 24..31 or 64..71 hold something that is not a register has that field misread as a
+/// GPR number by the ALU rule. Those bits can hold an attribute address, a branch offset, a
+/// lookup table, a second destination, or simply nothing at all. So each such opcode names
+/// its own source fields instead, and only the true ALU family falls to the `else` arm.
+///
+/// `disasm.zig` decodes the same instruction set independently and lists the same source
+/// fields per opcode. The two models agree, opcode for opcode.
 fn readsSrc(opcode: u32, form: u32, pos: usize) bool {
     return switch (opcode) {
         // Convergence barriers (BCLEAR/BSSY/BSYNC) and BAR read no GPR at all: their
         // bit-24/16 fields hold a Bar register, and BAR has no operand.
         0x355, 0x945, 0x941, 0xb1d => false,
+        // IPA (0x326), the fragment-input interpolation, in both the perspective and the
+        // CONSTANT form. Bits 64..71 hold the ATTRIBUTE ADDRESS divided by 4, not a
+        // register: ATTR_GENERIC0 (0x80) reads back as "R32" and ATTR_POSITION (0x70) as
+        // "R28". Bits 24..31 are left at zero, which reads as "R0". The only register
+        // field, the interpolation offset at bit 32, is always RZ. So an IPA reads no GPR.
+        //
+        // Left as the ALU rule had it, an IPA into a shader that keeps a live value in R32
+        // makes the IPA wait on that value's scoreboard and CLEAR its tag, so the
+        // instruction that really consumes R32 emits no wait and reads it stale. Every
+        // fragment shader with a generic varying issues this instruction.
+        0x326 => false,
+        // S2R (0x919), the special-register read. The system value is an 8-bit selector at
+        // bits 72..79, and the destination is the only register field. Bits 24..31 and
+        // 64..71 stay zero, so the ALU rule read them as two reads of R0.
+        0x919 => false,
+        // BRA (0x947), EXIT (0x94d) and KIL (0x95b) read no GPR. The BRA taken
+        // condition is a PREDICATE at bits 87..89, and its relative offset occupies bits
+        // 16..23 plus 34..81, so bits 64..71 hold OFFSET BITS that the ALU rule read as a
+        // GPR number. A forward branch puts zeros there and so reads "R0". EXIT and KIL
+        // leave bits 24..31 and 64..71 at zero for the same two phantom reads of R0.
+        0x947, 0x94d, 0x95b => false,
+        // PLOP3 (0x81c), the predicate-logic op. Its operands are three PREDICATES, at bits
+        // 68..70, 77..79 and 87..89. Bits 24..31 are zero, so the ALU rule read them as a
+        // read of R0. Bits 64..71 are worse: they hold the LOW THREE BITS OF THE LOOKUP
+        // TABLE at 64..66 and the third predicate source (PT, which is 7) at 68..70, so the
+        // field reads as 0x70 plus the low lookup-table bits. LUT_AND names R112, and
+        // LUT_OR and LUT_XOR both name R116. Which register the phantom read hit therefore
+        // depended on the boolean operation being compiled.
+        0x81c => false,
+        // MOV (ALU base 0x002), in the register form 0x202 and the 32-bit immediate form
+        // 0x802. Its only operand is at bit 32, and only in the register form. The
+        // immediate form holds the value there. Bits 24..31 and 64..71 stay at zero in
+        // BOTH forms, so the ALU rule read two phantom R0 sources on the most frequently
+        // emitted instruction in the backend.
+        0x202, 0x802 => pos == 32 and form == 1,
+        // LDC (0xb82), the constant-bank load. Bits 24..31 hold the DYNAMIC offset
+        // register, which the encoder always sets to RZ, and it is a real register field.
+        // The 16-bit static offset lives at bits 38..53 and the bank at 54..58, so bits
+        // 64..71 are zero and the ALU rule read them as R0.
+        0xb82 => pos == 24,
+        // ALD (0x321), the vertex attribute load: the dynamic offset at 24 and the
+        // per-vertex index at 32, both RZ as the encoder emits them. The attribute address
+        // is an immediate at bits 40..49, and bits 64..71 are zero, so the ALU rule read
+        // them as R0.
+        0x321 => pos == 24 or pos == 32,
+        // AST (0x322), the output attribute store: the dynamic offset at 24, the data at
+        // 32 and the per-vertex index at 64. All three are real register fields.
+        0x322 => true,
+        // SHFL (0xf89), the all-immediate quad butterfly shuffle: the shuffled value at
+        // 24. The lane mask and the segment/clamp are immediates at bits 40..59, and bits
+        // 64..71 are zero, so the ALU rule read them as R0.
+        0xf89 => pos == 24,
+        // FSWZADD (0x822), the quad swizzle-add that finishes a derivative: the shuffled
+        // neighbour at 24 and self at 64. Bits 32..39 hold the PACKED LANE OPERATIONS, not
+        // a register. Source form 4 already kept the ALU rule off that field, so this arm
+        // states the layout rather than changing it.
+        0x822 => pos == 24 or pos == 64,
+        // TEX, TLD4 and TLD: the coordinate at 24 and the bindless handle at 32. Bits
+        // 64..71 hold the SECOND DESTINATION (dst + 2, the B and A channels), not a
+        // source. Reading it as a source made the texture op wait on, and clear the tag
+        // of, whatever still had an in-flight producer in dst + 2. That accidental
+        // write-after-write wait is now kept, and extended to the whole result block, by
+        // the destination-span scan in `scheduleBlocks`.
+        encode.TEX_OPCODE, encode.TLD4_OPCODE, encode.TLD_OPCODE => pos == 24 or pos == 32,
         // LDG and LDS: the address at 24, nothing else. LDG holds URZ in bits 64..71 and LDS
         // leaves them zero, so neither field is a GPR source.
         0x981, 0x984 => pos == 24,
@@ -147,7 +230,7 @@ fn readsSrc(opcode: u32, form: u32, pos: usize) bool {
         // Compare-and-swap: the address at 24, the compare operand at 32 and the swap data
         // at 64. All three are real registers, so all three must be waited on.
         encode.ATOMG_CAS_OPCODE, encode.ATOMS_CAS_OPCODE => true,
-        else => pos != 32 or form == 1 or isTexResult(opcode),
+        else => pos != 32 or form == 1,
     };
 }
 
@@ -267,9 +350,8 @@ pub fn scheduleBlocks(insts: []Inst, block_starts: []const usize) void {
         // handle comes from an LDC with variable latency, so TEX must wait on its
         // scoreboard, meaning its bit-32 source is a real register read.
         //
-        // The memory ops, the atomics and the barriers each name their own source fields.
-        // See `readsSrc` for why the ALU rule is wrong for them in both directions.
-        const is_barrier = opcode == 0x355 or opcode == 0x945 or opcode == 0x941 or opcode == 0xb1d;
+        // Every opcode that is not an ALU op names its own source fields. See `readsSrc`
+        // for why the ALU rule is wrong for them in both directions.
         var wait: u32 = 0;
         inline for (.{ 24, 32, 64 }) |pos| {
             if (readsSrc(opcode, form, pos)) {
@@ -330,15 +412,26 @@ pub fn scheduleBlocks(insts: []Inst, block_starts: []const usize) void {
         // value (MaterialColor came back (1,1,0)). The RAW path above only protects READS.
         // This protects WRITES. Wait on the scoreboard, then clear its tag so the register
         // is reusable. (DrainAll's boundary drain is per-block, not per-register.)
-        if (writesDst(opcode) and !is_barrier) {
+        //
+        // The scan covers the WHOLE destination block, not only the first register. A TEX
+        // writes up to four result registers, and a B64 or B128 load two or four, all
+        // under one write barrier. Each of them can clobber a different in-flight
+        // producer, so each needs its own wait. Before this scan spanned the block, the
+        // texture ops got the dst + 2 half of that protection by accident, through the
+        // second-destination field at bit 64 that `readsSrc` used to misread as a source.
+        if (writesDst(opcode)) {
             const wdst = getField(inst.*, 16, 8);
-            if (wdst != RZ and scoreboard_of[wdst] != 0) {
-                const sb_idx = scoreboard_of[wdst] - 1;
+            const wspan = dstSpan(opcode, inst.*);
+            var w: u32 = 0;
+            while (w < wspan and wdst + w < RZ) : (w += 1) {
+                const wreg = wdst + w;
+                if (scoreboard_of[wreg] == 0) continue;
+                const sb_idx = scoreboard_of[wreg] - 1;
                 const wbit: u32 = @as(u32, 1) << @intCast(sb_idx);
                 setField(inst, 116, 6, getField(inst.*, 116, 6) | wbit);
                 // Clear this register's tag. Free the scoreboard if no other register
                 // (a multi-register TEX block) still holds it.
-                scoreboard_of[wdst] = 0;
+                scoreboard_of[wreg] = 0;
                 var still_used = false;
                 for (scoreboard_of) |s| if (s == sb_idx + 1) {
                     still_used = true;
@@ -380,9 +473,9 @@ pub fn scheduleBlocks(insts: []Inst, block_starts: []const usize) void {
 
 /// Clear the in-flight-scoreboard tag from each register THIS instruction read whose
 /// producer is among `wait`. Mirrors the source-register set the wait computation
-/// scans (srcA@24, srcB@32 in register form or for TEX, srcC@64, plus the LDG/STG
-/// 64-bit address pair's high half). A register that was NOT read keeps its tag, so a
-/// later instruction reading it re-waits (the multi-register TEX-result case).
+/// scans: `readsSrc` for the three operand fields, plus the global 64-bit address pair's
+/// high half. A register that was NOT read keeps its tag, so a later instruction reading
+/// it re-waits (the multi-register TEX-result case).
 fn clearReadRegs(inst: Inst, opcode: u32, form: u32, scoreboard_of: *[256]u8, wait: u32) void {
     inline for (.{ 24, 32, 64 }) |pos| {
         if (readsSrc(opcode, form, pos)) {
@@ -691,4 +784,231 @@ test "a shared atomic reads ONE address register, not a pair" {
     try std.testing.expect((consumer_wait & (@as(u32, 1) << @intCast(ldg_bar))) != 0);
     // The shared atomic gives back a value, so it is variable-latency like ATOMG.
     try std.testing.expect(getField(insts[1], 110, 3) < 6);
+}
+
+test "an IPA does not read its ATTRIBUTE ADDRESS as a source register" {
+    // Regression: `encode.ipa` writes the attribute address divided by 4 into bits 64..71,
+    // and the ALU source rule read those bits as a GPR number. ATTR_GENERIC0 (0x80) came
+    // back as "R32". With a live in-flight producer for R32 the IPA waited on that
+    // scoreboard and CLEARED its tag, so the instruction that really consumes R32 emitted
+    // no wait and read it stale. An IPA reads no GPR at all: its one register field, the
+    // interpolation offset at bit 32, is always RZ.
+    var insts: [4]Inst = undefined;
+    insts[0] = encode.ldgU32(32, 2, .{}); // R32 <- global, variable latency
+    insts[1] = encode.ipa(4, encode.ATTR_GENERIC0, .{}); // bits 64..71 = 0x80 >> 2 = 32
+    insts[2] = encode.iadd3(5, 32, 32, .{}); // the REAL consumer of R32
+    insts[3] = encode.exit(.{});
+    scheduleBlocks(&insts, &.{0});
+
+    const ldg_bar = getField(insts[0], 110, 3);
+    try std.testing.expect(ldg_bar < 6);
+    try std.testing.expectEqual(@as(u32, 0), getField(insts[1], 116, 6)); // the IPA waits on nothing
+    const consumer_wait = getField(insts[2], 116, 6);
+    try std.testing.expect((consumer_wait & (@as(u32, 1) << @intCast(ldg_bar))) != 0);
+}
+
+test "an S2R reads no phantom R0 sources" {
+    // Regression: S2R takes its system value from a selector at bits 72..79 and leaves bits
+    // 24..31 and 64..71 at zero, which the ALU rule read as two reads of R0.
+    var insts: [4]Inst = undefined;
+    insts[0] = encode.ldgU32(0, 2, .{}); // R0 <- global, variable latency
+    insts[1] = encode.s2r(4, encode.SR_TID_X, .{});
+    insts[2] = encode.iadd3(1, 0, 0, .{}); // the REAL consumer of R0
+    insts[3] = encode.exit(.{});
+    scheduleBlocks(&insts, &.{0});
+
+    const ldg_bar = getField(insts[0], 110, 3);
+    try std.testing.expect(ldg_bar < 6);
+    try std.testing.expectEqual(@as(u32, 0), getField(insts[1], 116, 6)); // the S2R waits on nothing
+    const consumer_wait = getField(insts[2], 116, 6);
+    try std.testing.expect((consumer_wait & (@as(u32, 1) << @intCast(ldg_bar))) != 0);
+}
+
+test "a BRA does not read its BRANCH OFFSET as a source register" {
+    // Regression: a BRA holds its relative offset in bits 16..23 plus 34..81, so bits
+    // 64..71 are OFFSET BITS, and bits 24..31 are zero. The ALU rule read both as GPR
+    // numbers. A forward branch has zeros in both, so it phantom-read R0 twice.
+    var insts: [4]Inst = undefined;
+    insts[0] = encode.ldgU32(0, 2, .{}); // R0 <- global, variable latency
+    insts[1] = encode.bra(4, .{}); // a forward branch: bits 24..31 and 64..71 are zero
+    insts[2] = encode.iadd3(1, 0, 0, .{}); // the REAL consumer of R0
+    insts[3] = encode.exit(.{});
+    scheduleBlocks(&insts, &.{0});
+
+    const ldg_bar = getField(insts[0], 110, 3);
+    try std.testing.expect(ldg_bar < 6);
+    try std.testing.expectEqual(@as(u32, 0), getField(insts[1], 116, 6)); // the BRA waits on nothing
+    const consumer_wait = getField(insts[2], 116, 6);
+    try std.testing.expect((consumer_wait & (@as(u32, 1) << @intCast(ldg_bar))) != 0);
+}
+
+test "an EXIT reads no phantom R0 sources" {
+    // Regression: EXIT leaves bits 24..31 and 64..71 at zero, which the ALU rule read as
+    // two reads of R0. A dead load into R0 just before the EXIT then made the EXIT wait on
+    // a scoreboard it has no use for.
+    var insts: [2]Inst = undefined;
+    insts[0] = encode.ldgU32(0, 2, .{}); // R0 <- global, variable latency, never read
+    insts[1] = encode.exit(.{});
+    scheduleBlocks(&insts, &.{0});
+
+    try std.testing.expect(getField(insts[0], 110, 3) < 6);
+    try std.testing.expectEqual(@as(u32, 0), getField(insts[1], 116, 6)); // the EXIT waits on nothing
+}
+
+test "a KIL neither claims a destination register nor reads phantom sources" {
+    // Regression: KIL discards the fragment and touches no GPR, but it leaves bits 16..23,
+    // 24..31 and 64..71 at zero. The scheduler read that as a write to R0 plus two reads of
+    // R0, so a live producer for R0 was waited on and its tag CLEARED, and the instruction
+    // that really consumes R0 read stale. Same shape as the STS and BAR bug of 6e09607.
+    var insts: [4]Inst = undefined;
+    insts[0] = encode.ldgU32(0, 2, .{}); // R0 <- global, variable latency
+    insts[1] = encode.kil(.{});
+    insts[2] = encode.iadd3(1, 0, 0, .{}); // the REAL consumer of R0
+    insts[3] = encode.exit(.{});
+    scheduleBlocks(&insts, &.{0});
+
+    const ldg_bar = getField(insts[0], 110, 3);
+    try std.testing.expect(ldg_bar < 6);
+    try std.testing.expectEqual(@as(u32, 0), getField(insts[1], 116, 6)); // the KIL waits on nothing
+    const consumer_wait = getField(insts[2], 116, 6);
+    try std.testing.expect((consumer_wait & (@as(u32, 1) << @intCast(ldg_bar))) != 0);
+}
+
+test "a PLOP3 does not read its LOOKUP TABLE as a source register" {
+    // Regression: PLOP3 combines two PREDICATES into a predicate and touches no GPR. It
+    // leaves bits 16..23 at zero (the second lookup table) and bits 24..31 at zero, and
+    // bits 64..71 hold the low three lookup-table bits at 64..66 over the third predicate
+    // source (PT = 7) at 68..70. The scheduler therefore read a phantom write to R0, a
+    // phantom read of R0, and a phantom read of R112 or R116 depending on which boolean
+    // operation was being compiled. LUT_XOR (0x3C) names R116.
+    var insts: [5]Inst = undefined;
+    insts[0] = encode.ldgU32(0, 2, .{}); // R0: the phantom write and the bit-24 phantom read
+    insts[1] = encode.ldgU32(116, 2, .{}); // R116 = 0x70 | (LUT_XOR & 7), the bit-64 phantom read
+    insts[2] = encode.plop3(1, 2, 3, encode.LUT_XOR, .{});
+    insts[3] = encode.iadd3(5, 0, 116, .{}); // the REAL consumers of R0 and R116
+    insts[4] = encode.exit(.{});
+    scheduleBlocks(&insts, &.{0});
+
+    const r0_bar = getField(insts[0], 110, 3);
+    const r116_bar = getField(insts[1], 110, 3);
+    try std.testing.expect(r0_bar < 6 and r116_bar < 6);
+    try std.testing.expectEqual(@as(u32, 0), getField(insts[2], 116, 6)); // the PLOP3 waits on nothing
+    const consumer_wait = getField(insts[3], 116, 6);
+    try std.testing.expect((consumer_wait & (@as(u32, 1) << @intCast(r0_bar))) != 0);
+    try std.testing.expect((consumer_wait & (@as(u32, 1) << @intCast(r116_bar))) != 0);
+}
+
+test "an AST does not claim a phantom write to R0" {
+    // Regression: AST stores to an output attribute and writes no GPR, but the encoder
+    // leaves bits 16..23 at zero, so the scheduler recorded a write to R0. With a live
+    // producer for R0 the store waited on that scoreboard and CLEARED its tag, so the
+    // instruction that really consumes R0 read stale. This is the STS bug of 6e09607 in
+    // the graphics path.
+    var insts: [4]Inst = undefined;
+    insts[0] = encode.ldgU32(0, 2, .{}); // R0 <- global, variable latency
+    insts[1] = encode.ast(encode.ATTR_POSITION, 8, 1, .{}); // o[POSITION] = R8
+    insts[2] = encode.iadd3(1, 0, 0, .{}); // the REAL consumer of R0
+    insts[3] = encode.exit(.{});
+    scheduleBlocks(&insts, &.{0});
+
+    const ldg_bar = getField(insts[0], 110, 3);
+    try std.testing.expect(ldg_bar < 6);
+    try std.testing.expectEqual(@as(u32, 0), getField(insts[1], 116, 6)); // the AST waits on nothing
+    const consumer_wait = getField(insts[2], 116, 6);
+    try std.testing.expect((consumer_wait & (@as(u32, 1) << @intCast(ldg_bar))) != 0);
+}
+
+test "an ALD does not read a phantom R0 at bit 64" {
+    // Regression: ALD takes its attribute address from an immediate at bits 40..49 and
+    // leaves bits 64..71 at zero, which the ALU rule read as a read of R0.
+    var insts: [4]Inst = undefined;
+    insts[0] = encode.ldgU32(0, 2, .{}); // R0 <- global, variable latency
+    insts[1] = encode.ald(4, encode.ATTR_GENERIC0, 1, .{});
+    insts[2] = encode.iadd3(1, 0, 0, .{}); // the REAL consumer of R0
+    insts[3] = encode.exit(.{});
+    scheduleBlocks(&insts, &.{0});
+
+    const ldg_bar = getField(insts[0], 110, 3);
+    try std.testing.expect(ldg_bar < 6);
+    try std.testing.expectEqual(@as(u32, 0), getField(insts[1], 116, 6)); // the ALD waits on nothing
+    const consumer_wait = getField(insts[2], 116, 6);
+    try std.testing.expect((consumer_wait & (@as(u32, 1) << @intCast(ldg_bar))) != 0);
+}
+
+test "an LDC does not read a phantom R0 at bit 64" {
+    // Regression: LDC holds its static offset at bits 38..53 and its bank at 54..58, so
+    // bits 64..71 are zero and the ALU rule read them as a read of R0. Every uniform load
+    // in the backend is an LDC, so this stole a scoreboard on nearly every shader.
+    var insts: [4]Inst = undefined;
+    insts[0] = encode.ldgU32(0, 2, .{}); // R0 <- global, variable latency
+    insts[1] = encode.ldc(4, 0, 0x10, .{});
+    insts[2] = encode.iadd3(1, 0, 0, .{}); // the REAL consumer of R0
+    insts[3] = encode.exit(.{});
+    scheduleBlocks(&insts, &.{0});
+
+    const ldg_bar = getField(insts[0], 110, 3);
+    try std.testing.expect(ldg_bar < 6);
+    try std.testing.expectEqual(@as(u32, 0), getField(insts[1], 116, 6)); // the LDC waits on nothing
+    const consumer_wait = getField(insts[2], 116, 6);
+    try std.testing.expect((consumer_wait & (@as(u32, 1) << @intCast(ldg_bar))) != 0);
+}
+
+test "a MOV reads no phantom R0 sources in either form" {
+    // Regression: MOV takes its one operand from bit 32 in the register form and holds its
+    // immediate there in the immediate form. Bits 24..31 and 64..71 are zero in BOTH forms,
+    // so the ALU rule read two phantom R0 sources on the most frequently emitted
+    // instruction in the backend.
+    var insts: [5]Inst = undefined;
+    insts[0] = encode.ldgU32(0, 2, .{}); // R0 <- global, variable latency
+    insts[1] = encode.movImm(4, 0x1234, .{});
+    insts[2] = encode.movReg(5, 6, .{});
+    insts[3] = encode.iadd3(1, 0, 0, .{}); // the REAL consumer of R0
+    insts[4] = encode.exit(.{});
+    scheduleBlocks(&insts, &.{0});
+
+    const ldg_bar = getField(insts[0], 110, 3);
+    try std.testing.expect(ldg_bar < 6);
+    try std.testing.expectEqual(@as(u32, 0), getField(insts[1], 116, 6)); // MOV.imm waits on nothing
+    try std.testing.expectEqual(@as(u32, 0), getField(insts[2], 116, 6)); // MOV.reg waits on nothing
+    const consumer_wait = getField(insts[3], 116, 6);
+    try std.testing.expect((consumer_wait & (@as(u32, 1) << @intCast(ldg_bar))) != 0);
+}
+
+test "a SHFL does not read a phantom R0 at bit 64" {
+    // Regression: the all-immediate quad SHFL holds its lane mask and its segment/clamp in
+    // bits 40..59 and leaves bits 64..71 at zero, which the ALU rule read as a read of R0.
+    var insts: [4]Inst = undefined;
+    insts[0] = encode.ldgU32(0, 2, .{}); // R0 <- global, variable latency
+    insts[1] = encode.shflBflyQuad(4, 6, 1, .{}); // R4 <- R6 from the horizontal neighbour
+    insts[2] = encode.iadd3(1, 0, 0, .{}); // the REAL consumer of R0
+    insts[3] = encode.exit(.{});
+    scheduleBlocks(&insts, &.{0});
+
+    const ldg_bar = getField(insts[0], 110, 3);
+    try std.testing.expect(ldg_bar < 6);
+    try std.testing.expectEqual(@as(u32, 0), getField(insts[1], 116, 6)); // the SHFL waits on nothing
+    const consumer_wait = getField(insts[2], 116, 6);
+    try std.testing.expect((consumer_wait & (@as(u32, 1) << @intCast(ldg_bar))) != 0);
+}
+
+test "a TEX waits before it overwrites ANY register of its result block" {
+    // A TEX writes R4..R7 under one write barrier, and each of the four can clobber a
+    // different in-flight producer. The write-after-write scan used to look only at bits
+    // 16..23, so only R4 was protected. R6 was covered by accident, because bits 64..71
+    // hold the SECOND DESTINATION and the ALU rule misread them as a source. R5 and R7 were
+    // covered by nothing, so a decoupled load into either landed after the TEX and
+    // clobbered a result channel.
+    var insts: [4]Inst = undefined;
+    insts[0] = encode.ldgU32(5, 2, .{}); // R5 = result dst + 1, in flight
+    insts[1] = encode.ldgU32(6, 2, .{}); // R6 = result dst + 2, in flight
+    insts[2] = encode.tex2d(4, 8, 10, .{}); // writes R4..R7
+    insts[3] = encode.exit(.{});
+    scheduleBlocks(&insts, &.{0});
+
+    const r5_bar = getField(insts[0], 110, 3);
+    const r6_bar = getField(insts[1], 110, 3);
+    try std.testing.expect(r5_bar < 6 and r6_bar < 6);
+    const tex_wait = getField(insts[2], 116, 6);
+    try std.testing.expect((tex_wait & (@as(u32, 1) << @intCast(r5_bar))) != 0);
+    try std.testing.expect((tex_wait & (@as(u32, 1) << @intCast(r6_bar))) != 0);
 }
