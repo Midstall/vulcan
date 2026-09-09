@@ -1313,6 +1313,242 @@ pub fn tld(dst: u8, coord: u8, handle: u8, dim: u8, c: Control) Inst {
     return w;
 }
 
+// Tensor-core instructions. HMMA and IMMA multiply two small matrices and add a
+// third. LDSM loads the matrix fragments out of shared memory, and MOVM
+// transposes one 8x8 fragment inside the registers of a warp.
+//
+// These four are WARP-COLLECTIVE. All 32 lanes of the warp run one instruction
+// together, and each lane holds a slice of each matrix in its OWN registers. A
+// lane holds a RUN of registers per matrix, not one register, so the operand of
+// each encoder below names the FIRST register of that run. The run length comes
+// from the tile shape and the element type. See the `nvidia-hmma-design-study`
+// note for the per-lane element map and for the run lengths.
+//
+// The encodings come from Mesa NAK `sm70_encode.rs`, which is the authoritative
+// bit-level reference (see the `nak-sass-encoding-reference` note). None of them
+// is hardware-verified here, because this repository cannot execute SASS.
+//
+// Nothing emits them yet. The IR `matmul` reads POINTERS to row-major memory and
+// a tensor core reads REGISTERS in the per-lane fragment layout, so a lowering
+// needs a load-and-shuffle stage that does not exist. These are encoder-only
+// until it does, in the same way `barSync` and the atomics were.
+
+/// HMMA, the half-precision matrix multiply-accumulate.
+pub const HMMA_OPCODE: u32 = 0x23c;
+/// IMMA, the integer matrix multiply-accumulate.
+pub const IMMA_OPCODE: u32 = 0x237;
+/// LDSM, the load of matrix fragments out of shared memory.
+pub const LDSM_OPCODE: u32 = 0x83b;
+/// MOVM, the in-register transpose of one 8x8 fragment of 16-bit elements.
+pub const MOVM_OPCODE: u32 = 0x23a;
+
+/// The tile an HMMA computes, named as `m` by `n` by `k`. Values from NAK
+/// `sm70_encode.rs`, `impl SM70Op for OpHmma`: the selector is split across bit
+/// 75 (the low bit) and bit 78 (the high bit) by `set_field2(75..76, 78..79)`.
+///
+/// `m16n8k4` needs sm >= 80, which this Blackwell backend always satisfies. It is
+/// the tf32 shape, and the source-type field below has no confirmed tf32 value, so
+/// no caller can reach it usefully yet. It stays listed because the selector value
+/// is confirmed and a missing name would invite a guess later.
+pub const HmmaSize = enum(u2) { m16n8k8 = 0, m16n8k16 = 1, m16n8k4 = 2 };
+
+/// The element type of the HMMA accumulator and result. NAK writes bit 76 for
+/// this and asserts the type is one of these two.
+pub const HmmaDstType = enum(u1) { f16 = 0, f32 = 1 };
+
+/// `HMMA dst, a, b, c`: the fp16 matrix multiply-accumulate `dst = a * b + c`,
+/// run by all 32 lanes of the warp together.
+///
+/// Source: NAK `sm70_encode.rs`, `impl SM70Op for OpHmma`. Opcode 0x23c (bits
+/// 0..12); `set_dst` at 16..24; `set_reg_src(24..32)` for the A fragment,
+/// `set_reg_src(32..40)` for B and `set_reg_src(64..72)` for C, each the FIRST
+/// register of that lane's run; `set_field2(75..76, 78..79)` for the tile;
+/// `set_bit(76, dst_type == F32)`; and `set_field(82..84)` for the source type,
+/// where F16 is 0.
+///
+/// The source type has only ONE confirmed value. NAK leaves BF16 (1) and TF32 (2)
+/// commented out in that same match and hits `unreachable!` for them, so this
+/// encoder writes 0 and takes no source-type parameter. A guess there would send
+/// the tensor core a different element type and give silently wrong numbers.
+///
+/// HMMA sets NO bit 74, unlike IMMA below. That difference is in the NAK source,
+/// not a transcription slip.
+///
+/// On sm >= 90 NAK also writes `set_rev_upred_src(87..90, 90, &true.into())`.
+/// That path encodes the always-true uniform predicate, whose register index is 7,
+/// REVERSED as `7 - 7 = 0`, and clears the negate bit at 90. Every bit it writes
+/// is a zero, so it leaves the instruction unchanged and this encoder omits it.
+/// The test pins bits 87..91 at zero so a later edit cannot break that silently.
+pub fn hmma(dst: u8, a: u8, b: u8, c_in: u8, size: HmmaSize, dst_type: HmmaDstType, c: Control) Inst {
+    var w = base(c);
+    setBits(&w, 0, 12, HMMA_OPCODE);
+    setBits(&w, 16, 8, dst);
+    setBits(&w, 24, 8, a);
+    setBits(&w, 32, 8, b);
+    setBits(&w, 64, 8, c_in);
+    const tile = @intFromEnum(size);
+    setBits(&w, 75, 1, tile & 1); // tile selector, low bit
+    setBits(&w, 78, 1, tile >> 1); // tile selector, high bit
+    setBits(&w, 76, 1, @intFromEnum(dst_type));
+    setBits(&w, 82, 2, 0); // source type F16, the only confirmed value
+    return w;
+}
+
+/// The tile an IMMA computes. Values from NAK `sm70_encode.rs`, `impl SM70Op for
+/// OpImma`: the 3-bit selector is split across bit 75 (the low bit) and bits
+/// 85..87 (the two high bits) by `set_field2(75..76, 85..87)`. The gaps at 1, 3
+/// and 7 are gaps in the NAK table, not values to fill in.
+///
+/// Every shape except `m8n8k16` needs sm >= 80, which this Blackwell backend
+/// always satisfies.
+pub const ImmaSize = enum(u3) { m8n8k16 = 0, m8n8k32 = 2, m16n8k16 = 4, m16n8k32 = 5, m16n8k64 = 6 };
+
+/// One IMMA input operand: its signedness and its element width. NAK writes the
+/// signedness at bit 76 for A and bit 78 for B, and the "this operand is 4-bit" flag
+/// at bit 83 for A and bit 84 for B.
+pub const ImmaOperand = struct {
+    /// Whether the elements are signed. False means unsigned.
+    signed: bool,
+    /// Whether the elements are 4 bits wide. False means 8 bits wide.
+    four_bit: bool = false,
+};
+
+/// Whether `size` accepts an operand of `four_bit` width. NAK asserts this table
+/// in `impl SM70Op for OpImma` before it writes bits 83 and 84: the k16 shapes take
+/// 8-bit operands only, `m8n8k32` and `m16n8k64` take 4-bit operands only, and
+/// `m16n8k32` takes either.
+fn immaWidthFits(size: ImmaSize, four_bit: bool) bool {
+    return switch (size) {
+        .m8n8k16, .m16n8k16 => !four_bit,
+        .m8n8k32, .m16n8k64 => four_bit,
+        .m16n8k32 => true,
+    };
+}
+
+/// `IMMA dst, a, b, c`: the integer matrix multiply-accumulate `dst = a * b + c`,
+/// run by all 32 lanes of the warp together. The accumulator and the result are
+/// int32 whatever the input width is.
+///
+/// Source: NAK `sm70_encode.rs`, `impl SM70Op for OpImma`. Opcode 0x237 (bits
+/// 0..12); `set_dst` at 16..24; `set_reg_src(24..32)` for the A fragment,
+/// `set_reg_src(32..40)` for B and `set_reg_src(64..72)` for C, each the FIRST
+/// register of that lane's run; `set_bit(74, true)`, which NAK names SRC1.COL;
+/// `set_field2(75..76, 85..87)` for the tile; `set_bit(76)` and `set_bit(78)` for
+/// the signedness of A and of B; `set_bit(82)` for saturation; and `set_bit(83)`
+/// and `set_bit(84)` for a 4-bit A and a 4-bit B.
+///
+/// `saturate` clamps the int32 result to the input range instead of letting it
+/// wrap.
+///
+/// On sm >= 90 NAK also writes `set_rev_upred_src(87..90, 90, &true.into())`,
+/// which writes only zeros. See `hmma` for why this encoder omits it.
+pub fn imma(
+    dst: u8,
+    a: u8,
+    b: u8,
+    c_in: u8,
+    size: ImmaSize,
+    a_op: ImmaOperand,
+    b_op: ImmaOperand,
+    saturate: bool,
+    c: Control,
+) Inst {
+    // The hardware has no encoding for a width the tile does not take. NAK asserts
+    // the same table before it writes bits 83 and 84.
+    std.debug.assert(immaWidthFits(size, a_op.four_bit));
+    std.debug.assert(immaWidthFits(size, b_op.four_bit));
+    var w = base(c);
+    setBits(&w, 0, 12, IMMA_OPCODE);
+    setBits(&w, 16, 8, dst);
+    setBits(&w, 24, 8, a);
+    setBits(&w, 32, 8, b);
+    setBits(&w, 64, 8, c_in);
+    setBits(&w, 74, 1, 1); // SRC1.COL
+    const tile = @intFromEnum(size);
+    setBits(&w, 75, 1, tile & 1); // tile selector, low bit
+    setBits(&w, 85, 2, tile >> 1); // tile selector, two high bits
+    setBits(&w, 76, 1, @intFromBool(a_op.signed));
+    setBits(&w, 78, 1, @intFromBool(b_op.signed));
+    setBits(&w, 82, 1, @intFromBool(saturate));
+    setBits(&w, 83, 1, @intFromBool(a_op.four_bit));
+    setBits(&w, 84, 1, @intFromBool(b_op.four_bit));
+    return w;
+}
+
+/// How many 8x8 fragments one LDSM loads. Values from NAK `sm70_encode.rs`,
+/// `impl SM70Op for OpLdsm`, the `set_field(72..74)` match: a count of 1 encodes
+/// as 0, 2 as 1 and 4 as 2. NAK panics on any other count.
+pub const LdsmCount = enum(u2) {
+    x1 = 0,
+    x2 = 1,
+    x4 = 2,
+
+    /// The number of fragments this count names. Each fragment gives one lane 32
+    /// bits, so this is also the number of destination registers the load fills.
+    pub fn matrices(self: LdsmCount) u32 {
+        return switch (self) {
+            .x1 => 1,
+            .x2 => 2,
+            .x4 => 4,
+        };
+    }
+};
+
+/// `LDSM dst, [addr]`: load `count` fragments of 8 by 8 16-bit elements out of
+/// workgroup shared memory into the registers of the warp, in the per-lane layout
+/// a following HMMA or IMMA reads.
+///
+/// Every lane gives its OWN address, so the 32 addresses of the warp select the
+/// rows, and the hardware then spreads each row across the lanes. That is the
+/// point of the instruction: a plain LDS gives each lane the elements at its own
+/// address, and the fragment layout needs elements that live in another lane.
+///
+/// `transpose` selects NAK's `LdsmSize::MT8N8` instead of `M8N8`, which reads each
+/// 8 by 8 fragment transposed. NAK leaves `M8N8Nx2` (2) and `M8N8Nx4` (3) commented
+/// out, so those two values stay out of this encoder.
+///
+/// Source: NAK `sm70_encode.rs`, `impl SM70Op for OpLdsm`. Opcode 0x83b (bits
+/// 0..12); `set_dst` at 16..24, the FIRST of `count` destination registers;
+/// `set_reg_src(24..32)` for the address, ONE register holding a 32-bit offset into
+/// the shared window, the same form LDS and STS take; `set_ureg_src(32)` for the
+/// uniform base, URZ here because there is none (8 bits wide on sm >= 100);
+/// `set_field(40..64)` for the 24-bit immediate offset, 0 here because a lowering
+/// would materialize every offset into the address register; `set_field(72..74)`
+/// for the fragment count; and `set_field(78..80)` for the transpose.
+///
+/// LDSM writes bit 91 as `!uniform_addr.is_zero()`, which is FALSE here. LDS and
+/// STS write that same bit as TRUE, because NAK always enables UGPR mode for them.
+/// The two are different rules in the NAK source, not a transcription slip.
+pub fn ldsm(dst: u8, addr: u8, count: LdsmCount, transpose: bool, c: Control) Inst {
+    var w = base(c);
+    setBits(&w, 0, 12, LDSM_OPCODE);
+    setBits(&w, 16, 8, dst);
+    setBits(&w, 24, 8, addr); // 32-bit shared-window offset, ONE register
+    setBits(&w, 32, 8, URZ); // no uniform base
+    setBits(&w, 40, 24, 0); // immediate offset
+    setBits(&w, 72, 2, @intFromEnum(count));
+    setBits(&w, 78, 2, @intFromBool(transpose)); // M8N8 = 0, MT8N8 = 1
+    setBits(&w, 91, 1, 0); // no uniform address
+    return w;
+}
+
+/// `MOVM dst, src`: transpose one 8 by 8 fragment of 16-bit elements across the
+/// registers of the warp. A fragment loaded in row order needs this before it can
+/// feed the column operand of an HMMA.
+///
+/// Source: NAK `sm70_encode.rs`, `impl SM70Op for OpMovm`. Opcode 0x23a (bits
+/// 0..12); `set_dst` at 16..24; `set_reg_src(24..32)` for the source; and
+/// `set_field(78..80, 0)`, the MT88 mode. NAK marks the other two modes of that
+/// field as a TODO and gives them no names, so this encoder writes only MT88.
+pub fn movm(dst: u8, src: u8, c: Control) Inst {
+    var w = base(c);
+    setBits(&w, 0, 12, MOVM_OPCODE);
+    setBits(&w, 16, 8, dst);
+    setBits(&w, 24, 8, src);
+    setBits(&w, 78, 2, 0); // MT88
+    return w;
+}
+
 /// Shader attribute addresses: the clip-space position output, and the
 /// first generic varying or vertex input. System-value index for the
 /// vertex ID.
@@ -1840,4 +2076,177 @@ test "an atomic under a guard predicate keeps the predicate field" {
     try std.testing.expectEqual(@as(u32, ATOMG_OPCODE), w[0] & 0xfff);
     try std.testing.expectEqual(@as(u32, 3), (w[0] >> 12) & 0x7);
     try std.testing.expectEqual(@as(u32, 1), (w[0] >> 15) & 0x1);
+}
+
+test "HMMA places the three fragment operands and the fp32 result flag (NAK OpHmma)" {
+    // A = R0.., B = R4.., C = R8.., D = R8.. (the accumulator in place), 16x8x16, fp32 result.
+    const w = hmma(8, 0, 4, 8, .m16n8k16, .f32, .{});
+    // Every dword, so a stray bit anywhere in the 128-bit word fails this.
+    try std.testing.expectEqual([4]u32{ 0x0008723c, 0x00000004, 0x00001808, 0x000fde00 }, w);
+    try std.testing.expectEqual(@as(u32, HMMA_OPCODE), w[0] & 0xfff); // 0x23c, not IMMA 0x237
+    try std.testing.expectEqual(@as(u32, 8), (w[0] >> 16) & 0xff); // D fragment starts at R8
+    try std.testing.expectEqual(@as(u32, 0), (w[0] >> 24) & 0xff); // A fragment starts at R0
+    try std.testing.expectEqual(@as(u32, 4), w[1] & 0xff); // B fragment at bit 32
+    try std.testing.expectEqual(@as(u32, 8), w[2] & 0xff); // C fragment at bit 64
+    try std.testing.expectEqual(@as(u32, 1), (w[2] >> (75 - 64)) & 0x1); // tile low bit
+    try std.testing.expectEqual(@as(u32, 0), (w[2] >> (78 - 64)) & 0x1); // tile high bit
+    try std.testing.expectEqual(@as(u32, 1), (w[2] >> (76 - 64)) & 0x1); // fp32 result
+    try std.testing.expectEqual(@as(u32, 0), (w[2] >> (82 - 64)) & 0x3); // source type F16
+    // HMMA does NOT set bit 74. IMMA does. The difference is in the NAK source.
+    try std.testing.expectEqual(@as(u32, 0), (w[2] >> (74 - 64)) & 0x1);
+    // The sm>=90 uniform-predicate path writes only zeros, so bits 87..91 stay clear.
+    try std.testing.expectEqual(@as(u32, 0), (w[2] >> (87 - 64)) & 0xf);
+}
+
+test "the HMMA tile selector splits across bit 75 and bit 78 (NAK set_field2)" {
+    // NAK writes the selector low bit first into 75..76, then the rest into 78..79. A
+    // selector written whole into either field would send the tensor core a different
+    // tile shape, read the wrong registers of every lane, and give wrong numbers with no
+    // fault. So pin both halves of all three values.
+    const cases = [_]struct { size: HmmaSize, lo: u32, hi: u32 }{
+        .{ .size = .m16n8k8, .lo = 0, .hi = 0 },
+        .{ .size = .m16n8k16, .lo = 1, .hi = 0 },
+        .{ .size = .m16n8k4, .lo = 0, .hi = 1 },
+    };
+    for (cases) |c| {
+        const w = hmma(8, 0, 4, 8, c.size, .f32, .{});
+        try std.testing.expectEqual(c.lo, (w[2] >> (75 - 64)) & 0x1);
+        try std.testing.expectEqual(c.hi, (w[2] >> (78 - 64)) & 0x1);
+    }
+}
+
+test "an fp16 HMMA result changes ONLY bit 76" {
+    const f32_form = hmma(8, 0, 4, 8, .m16n8k8, .f32, .{});
+    const f16_form = hmma(8, 0, 4, 8, .m16n8k8, .f16, .{});
+    try std.testing.expectEqual(@as(u32, 1), (f32_form[2] >> (76 - 64)) & 0x1);
+    try std.testing.expectEqual(@as(u32, 0), (f16_form[2] >> (76 - 64)) & 0x1);
+    // Nothing else moves: the two words differ by exactly the one bit.
+    try std.testing.expectEqual(f32_form[0], f16_form[0]);
+    try std.testing.expectEqual(f32_form[1], f16_form[1]);
+    try std.testing.expectEqual(f32_form[3], f16_form[3]);
+    try std.testing.expectEqual(@as(u32, 1) << (76 - 64), f32_form[2] ^ f16_form[2]);
+}
+
+test "IMMA places the fragment operands, the SRC1.COL bit and the signedness (NAK OpImma)" {
+    const w = imma(8, 0, 4, 8, .m16n8k32, .{ .signed = true }, .{ .signed = true }, false, .{});
+    try std.testing.expectEqual([4]u32{ 0x00087237, 0x00000004, 0x00405c08, 0x000fde00 }, w);
+    try std.testing.expectEqual(@as(u32, IMMA_OPCODE), w[0] & 0xfff); // 0x237, not HMMA 0x23c
+    try std.testing.expectEqual(@as(u32, 8), (w[0] >> 16) & 0xff); // D fragment starts at R8
+    try std.testing.expectEqual(@as(u32, 0), (w[0] >> 24) & 0xff); // A fragment starts at R0
+    try std.testing.expectEqual(@as(u32, 4), w[1] & 0xff); // B fragment at bit 32
+    try std.testing.expectEqual(@as(u32, 8), w[2] & 0xff); // C fragment at bit 64
+    try std.testing.expectEqual(@as(u32, 1), (w[2] >> (74 - 64)) & 0x1); // SRC1.COL, always set
+    try std.testing.expectEqual(@as(u32, 1), (w[2] >> (75 - 64)) & 0x1); // tile low bit
+    try std.testing.expectEqual(@as(u32, 2), (w[2] >> (85 - 64)) & 0x3); // tile high bits
+    try std.testing.expectEqual(@as(u32, 1), (w[2] >> (76 - 64)) & 0x1); // A signed
+    try std.testing.expectEqual(@as(u32, 1), (w[2] >> (78 - 64)) & 0x1); // B signed
+    try std.testing.expectEqual(@as(u32, 0), (w[2] >> (82 - 64)) & 0x1); // no saturation
+    try std.testing.expectEqual(@as(u32, 0), (w[2] >> (83 - 64)) & 0x1); // A is 8-bit
+    try std.testing.expectEqual(@as(u32, 0), (w[2] >> (84 - 64)) & 0x1); // B is 8-bit
+    // The sm>=90 uniform-predicate path writes only zeros, so bits 87..91 stay clear.
+    try std.testing.expectEqual(@as(u32, 0), (w[2] >> (87 - 64)) & 0xf);
+}
+
+test "the IMMA tile selector splits across bit 75 and bits 85..87 (NAK set_field2)" {
+    // The same split rule as HMMA, but the high half is TWO bits and sits at 85, not 78.
+    // The table has gaps at 1, 3 and 7, so each named value is pinned on both halves.
+    const cases = [_]struct { size: ImmaSize, four: bool, lo: u32, hi: u32 }{
+        .{ .size = .m8n8k16, .four = false, .lo = 0, .hi = 0 },
+        .{ .size = .m8n8k32, .four = true, .lo = 0, .hi = 1 },
+        .{ .size = .m16n8k16, .four = false, .lo = 0, .hi = 2 },
+        .{ .size = .m16n8k32, .four = false, .lo = 1, .hi = 2 },
+        .{ .size = .m16n8k64, .four = true, .lo = 0, .hi = 3 },
+    };
+    for (cases) |c| {
+        const op: ImmaOperand = .{ .signed = false, .four_bit = c.four };
+        const w = imma(8, 0, 4, 8, c.size, op, op, false, .{});
+        try std.testing.expectEqual(c.lo, (w[2] >> (75 - 64)) & 0x1);
+        try std.testing.expectEqual(c.hi, (w[2] >> (85 - 64)) & 0x3);
+    }
+}
+
+test "each IMMA operand flag lands in its own bit (NAK OpImma bits 76, 78, 82, 83, 84)" {
+    // A and B carry SEPARATE signedness and width bits, which is what mixed-signedness
+    // int8 needs. A swap between the A bit and the B bit computes a different product and
+    // never faults, so each is set alone and read back alone.
+    const plain: ImmaOperand = .{ .signed = false };
+    const signed: ImmaOperand = .{ .signed = true };
+    const a_only = imma(8, 0, 4, 8, .m16n8k16, signed, plain, false, .{});
+    try std.testing.expectEqual(@as(u32, 1), (a_only[2] >> (76 - 64)) & 0x1);
+    try std.testing.expectEqual(@as(u32, 0), (a_only[2] >> (78 - 64)) & 0x1);
+    const b_only = imma(8, 0, 4, 8, .m16n8k16, plain, signed, false, .{});
+    try std.testing.expectEqual(@as(u32, 0), (b_only[2] >> (76 - 64)) & 0x1);
+    try std.testing.expectEqual(@as(u32, 1), (b_only[2] >> (78 - 64)) & 0x1);
+    // Saturation is bit 82 and nothing else moves with it.
+    const sat = imma(8, 0, 4, 8, .m16n8k16, plain, plain, true, .{});
+    const unsat = imma(8, 0, 4, 8, .m16n8k16, plain, plain, false, .{});
+    try std.testing.expectEqual(@as(u32, 1) << (82 - 64), sat[2] ^ unsat[2]);
+    // The 4-bit flags are bits 83 and 84. m16n8k32 is the one tile that takes either width.
+    const a4 = imma(8, 0, 4, 8, .m16n8k32, .{ .signed = false, .four_bit = true }, plain, false, .{});
+    try std.testing.expectEqual(@as(u32, 1), (a4[2] >> (83 - 64)) & 0x1);
+    try std.testing.expectEqual(@as(u32, 0), (a4[2] >> (84 - 64)) & 0x1);
+    const b4 = imma(8, 0, 4, 8, .m16n8k32, plain, .{ .signed = false, .four_bit = true }, false, .{});
+    try std.testing.expectEqual(@as(u32, 0), (b4[2] >> (83 - 64)) & 0x1);
+    try std.testing.expectEqual(@as(u32, 1), (b4[2] >> (84 - 64)) & 0x1);
+}
+
+test "LDSM reads ONE shared address register and names the fragment count (NAK OpLdsm)" {
+    const w = ldsm(8, 4, .x4, false, .{});
+    try std.testing.expectEqual([4]u32{ 0x0408783b, 0x000000ff, 0x00000200, 0x000fde00 }, w);
+    try std.testing.expectEqual(@as(u32, LDSM_OPCODE), w[0] & 0xfff); // 0x83b, not LDS 0x984
+    try std.testing.expectEqual(@as(u32, 8), (w[0] >> 16) & 0xff); // first destination R8
+    try std.testing.expectEqual(@as(u32, 4), (w[0] >> 24) & 0xff); // address R4, ONE register
+    try std.testing.expectEqual(@as(u32, URZ), w[1] & 0xff); // uniform base URZ at bit 32
+    try std.testing.expectEqual(@as(u32, 0), (w[1] >> 8) & 0xffffff); // immediate offset 0 at 40..64
+    try std.testing.expectEqual(@as(u32, 2), (w[2] >> (72 - 64)) & 0x3); // 4 fragments
+    try std.testing.expectEqual(@as(u32, 0), (w[2] >> (78 - 64)) & 0x3); // M8N8, not transposed
+    // LDSM writes bit 91 as "there is a uniform address", which is FALSE. LDS and STS
+    // write that same bit as TRUE. The two rules differ in the NAK source.
+    try std.testing.expectEqual(@as(u32, 0), (w[2] >> (91 - 64)) & 0x1);
+}
+
+test "the LDSM fragment count and the transpose each carry their own field" {
+    // A count of 1, 2 and 4 encodes as 0, 1 and 2. A wrong code loads a different number
+    // of registers per lane and leaves the rest of the fragment holding old values.
+    const cases = [_]struct { count: LdsmCount, code: u32, matrices: u32 }{
+        .{ .count = .x1, .code = 0, .matrices = 1 },
+        .{ .count = .x2, .code = 1, .matrices = 2 },
+        .{ .count = .x4, .code = 2, .matrices = 4 },
+    };
+    for (cases) |c| {
+        const w = ldsm(8, 4, c.count, false, .{});
+        try std.testing.expectEqual(c.code, (w[2] >> (72 - 64)) & 0x3);
+        try std.testing.expectEqual(c.matrices, c.count.matrices());
+    }
+    // The transpose is bits 78..80 = 1 and changes nothing else.
+    const plain = ldsm(8, 4, .x2, false, .{});
+    const trans = ldsm(8, 4, .x2, true, .{});
+    try std.testing.expectEqual(@as(u32, 1), (trans[2] >> (78 - 64)) & 0x3);
+    try std.testing.expectEqual(@as(u32, 1) << (78 - 64), plain[2] ^ trans[2]);
+}
+
+test "MOVM is the opcode, one source and the MT88 mode (NAK OpMovm)" {
+    const w = movm(8, 4, .{});
+    try std.testing.expectEqual([4]u32{ 0x0408723a, 0x00000000, 0x00000000, 0x000fde00 }, w);
+    try std.testing.expectEqual(@as(u32, MOVM_OPCODE), w[0] & 0xfff); // 0x23a, one below HMMA
+    try std.testing.expectEqual(@as(u32, 8), (w[0] >> 16) & 0xff); // dst R8
+    try std.testing.expectEqual(@as(u32, 4), (w[0] >> 24) & 0xff); // src R4
+    try std.testing.expectEqual(@as(u32, 0), (w[2] >> (78 - 64)) & 0x3); // MT88, the only named mode
+    // NAK's OpMovm writes nothing else. Bits 32..71 stay clear.
+    try std.testing.expectEqual(@as(u32, 0), w[1]);
+    try std.testing.expectEqual(@as(u32, 0), w[2] & 0xff);
+}
+
+test "a tensor op under a guard predicate keeps the predicate field" {
+    // A tensor op is warp-collective, so a lowering cannot branch around it for part of
+    // the warp. A guarded region has to be PREDICATED instead, the same rule the hardware
+    // quirk note gives for BAR.SYNC. The predicate has to survive into the encoding.
+    const h = hmma(8, 0, 4, 8, .m16n8k16, .f32, .{ .pred = 2, .pred_neg = true });
+    try std.testing.expectEqual(@as(u32, HMMA_OPCODE), h[0] & 0xfff);
+    try std.testing.expectEqual(@as(u32, 2), (h[0] >> 12) & 0x7);
+    try std.testing.expectEqual(@as(u32, 1), (h[0] >> 15) & 0x1);
+    const l = ldsm(8, 4, .x1, false, .{ .pred = 5, .pred_neg = false });
+    try std.testing.expectEqual(@as(u32, LDSM_OPCODE), l[0] & 0xfff);
+    try std.testing.expectEqual(@as(u32, 5), (l[0] >> 12) & 0x7);
+    try std.testing.expectEqual(@as(u32, 0), (l[0] >> 15) & 0x1);
 }

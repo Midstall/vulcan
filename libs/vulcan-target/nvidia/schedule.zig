@@ -83,7 +83,22 @@ fn isVariableLatency(opcode: u32) bool {
         // that never happened. RED (0x98e) is deliberately absent: it writes no register,
         // so there is nothing for a consumer to wait on.
         opcode == encode.ATOMG_OPCODE or opcode == encode.ATOMS_OPCODE or
-        opcode == encode.ATOMG_CAS_OPCODE or opcode == encode.ATOMS_CAS_OPCODE;
+        opcode == encode.ATOMG_CAS_OPCODE or opcode == encode.ATOMS_CAS_OPCODE or
+        // The tensor-core ops that need a scoreboard. NAK sm120_instr_latencies.rs is exact
+        // about which ones do: `SM120Latency::needs_scoreboards` returns true for the
+        // latency classes Dmma, Hmma, RedirectedFp64, Branch, Decoupled and DecoupledAgu.
+        //   - HMMA (0x23c) has class `Hmma`, which IS in that list.
+        //   - LDSM (0x83b) and MOVM (0x23a) both have class `DecoupledAgu`, the same class
+        //     as an LDS, so their results land an unknown number of cycles after issue.
+        // Without a scoreboard the HMMA that consumes an LDSM fragment reads the whole
+        // register run STALE, which means each lane multiplies whatever its registers held
+        // before the tile load. IMMA (0x237) is DELIBERATELY absent: its class is `Imma`,
+        // which is NOT in that list, so it is a COUPLED (fixed-latency) op that the stall
+        // delay covers. A write barrier on an op the hardware never signals would hang the
+        // consumer forever, which is worse than the missing wait. See `dstSpan` for the
+        // IMMA arm that this exclusion does not remove.
+        opcode == encode.HMMA_OPCODE or opcode == encode.LDSM_OPCODE or
+        opcode == encode.MOVM_OPCODE;
 }
 
 /// Whether `opcode` writes a destination GPR at bits 16..23 (so the scheduler can
@@ -124,6 +139,10 @@ fn writesDst(opcode: u32) bool {
         // Bits 16..23 hold the SECOND lookup table, which the encoder sets to 0, so the
         // field reads as R0 with the same phantom-write result as AST and KIL.
         0x81c => false,
+        // The tensor-core ops HMMA (0x23c), IMMA (0x237), LDSM (0x83b) and MOVM (0x23a) each
+        // write a REAL GPR at bits 16..23, so they belong to the `else` arm and need no arm
+        // here. Each writes a RUN of registers rather than one, and `dstSpan` gives the
+        // length of that run so the write-after-write scan covers all of it.
         else => true,
     };
 }
@@ -230,6 +249,28 @@ fn readsSrc(opcode: u32, form: u32, pos: usize) bool {
         // Compare-and-swap: the address at 24, the compare operand at 32 and the swap data
         // at 64. All three are real registers, so all three must be waited on.
         encode.ATOMG_CAS_OPCODE, encode.ATOMS_CAS_OPCODE => true,
+        // HMMA and IMMA: the A fragment at 24, the B fragment at 32 and the C fragment at
+        // 64. All three are real registers, so all three must be waited on.
+        //
+        // The ALU rule already gives that answer, because bits 9..11 of both opcodes read
+        // as form 1. That is an ACCIDENT of the opcode numbers, not a rule, and the same
+        // accident is what made LDC, BRA and S2R look safe before they were audited. The
+        // arm states the layout so a later opcode change cannot silently drop a source.
+        //
+        // LIMIT: each of the three is the FIRST register of a RUN that one lane holds, and
+        // the scheduler waits only on that first register. A producer that fills the rest
+        // of the run is not waited on. Today nothing emits a tensor op, so this is not
+        // live. It is the same open item as the TEX coordinate block.
+        encode.HMMA_OPCODE, encode.IMMA_OPCODE => true,
+        // LDSM (0x83b) and MOVM (0x23a): the address, or the fragment to transpose, at 24.
+        // Nothing else. LDSM holds URZ at bits 32..39 and its 24-bit immediate offset stops
+        // at bit 63, so bits 64..71 are ZERO and the ALU rule read them as a read of R0.
+        // MOVM writes nothing above bit 31 except its mode field at 78..80, so the ALU rule
+        // read TWO phantom R0 sources on it. Both are the phantom-read half of the STS and
+        // BAR bug of 6e09607: a phantom read on a register with a live producer makes the
+        // load wait on that scoreboard and CLEARS its tag, so the instruction that really
+        // consumes the register never waits and reads it stale.
+        encode.LDSM_OPCODE, encode.MOVM_OPCODE => pos == 24,
         else => pos != 32 or form == 1,
     };
 }
@@ -265,6 +306,48 @@ fn dstSpan(opcode: u32, inst: Inst) u32 {
             @intFromEnum(encode.AtomType.u64), @intFromEnum(encode.AtomType.i64) => 2,
             else => 1,
         };
+    // A tensor op writes a RUN of registers per lane, and the run length is in the
+    // instruction. Every tile HMMA names has a 16 by 8 result, so one lane holds 4 of its
+    // 128 values. An fp32 result takes one register per value, and an fp16 result packs
+    // two values per register. The result type is bit 76.
+    if (opcode == encode.HMMA_OPCODE)
+        return if (getField(inst, 76, 1) == @intFromEnum(encode.HmmaDstType.f32)) 4 else 2;
+    // An IMMA result is int32 whatever the input width is, so one register per value. An
+    // m8n8 tile holds 64 values over 32 lanes, that is 2 per lane, and an m16n8 tile holds
+    // 128, that is 4. The tile selector is split across bit 75 and bits 85..87.
+    //
+    // The LOW bit of the selector cannot change the answer today: it separates m16n8k32
+    // from m16n8k16, and both of those write 4 registers. The whole selector is rebuilt
+    // anyway, because the arms below then name the NAK tiles directly and stay correct if
+    // a later tile with a different result height reuses the low bit. A mutation that drops
+    // bit 75 here is therefore EQUIVALENT, not a gap in the tests.
+    if (opcode == encode.IMMA_OPCODE) {
+        const tile: u3 = @intCast(getField(inst, 75, 1) | (getField(inst, 85, 2) << 1));
+        return switch (tile) {
+            @intFromEnum(encode.ImmaSize.m8n8k16), @intFromEnum(encode.ImmaSize.m8n8k32) => 2,
+            @intFromEnum(encode.ImmaSize.m16n8k16),
+            @intFromEnum(encode.ImmaSize.m16n8k32),
+            @intFromEnum(encode.ImmaSize.m16n8k64),
+            => 4,
+            // 1, 3 and 7 are gaps in the NAK table and the encoder cannot produce them.
+            // The smallest span never tags a register the op does not write.
+            1, 3, 7 => 1,
+        };
+    }
+    // LDSM gives each lane 32 bits per fragment, so the fragment count at bits 72..74 is
+    // also the number of destination registers.
+    if (opcode == encode.LDSM_OPCODE) {
+        const count: u2 = @intCast(getField(inst, 72, 2));
+        return switch (count) {
+            @intFromEnum(encode.LdsmCount.x1) => 1,
+            @intFromEnum(encode.LdsmCount.x2) => 2,
+            @intFromEnum(encode.LdsmCount.x4) => 4,
+            // NAK panics on any other count and the encoder cannot produce one.
+            3 => 1,
+        };
+    }
+    // MOVM transposes ONE 8 by 8 fragment, which gives each lane 32 bits, so it writes a
+    // single register. It falls to the span of 1 below and needs no arm here.
     return 1;
 }
 
@@ -1011,4 +1094,246 @@ test "a TEX waits before it overwrites ANY register of its result block" {
     const tex_wait = getField(insts[2], 116, 6);
     try std.testing.expect((tex_wait & (@as(u32, 1) << @intCast(r5_bar))) != 0);
     try std.testing.expect((tex_wait & (@as(u32, 1) << @intCast(r6_bar))) != 0);
+}
+
+test "an HMMA result gets a scoreboard and its consumer waits on it" {
+    // NAK sm120_instr_latencies.rs gives HMMA the latency class `Hmma`, which
+    // `SM120Latency::needs_scoreboards` accepts, so an HMMA result lands an unknown number
+    // of cycles after issue. Without a barrier the instruction that reads the result gets
+    // whatever the register held before the multiply.
+    var insts: [3]Inst = undefined;
+    insts[0] = encode.hmma(8, 0, 4, 8, .m16n8k16, .f32, .{}); // D fragment into R8..R11
+    insts[1] = encode.iadd3(20, 8, 8, .{}); // consumes R8
+    insts[2] = encode.exit(.{});
+    scheduleBlocks(&insts, &.{0});
+
+    const hmma_bar = getField(insts[0], 110, 3);
+    try std.testing.expect(hmma_bar < 6); // a real scoreboard, not 7 = none
+    const consumer_wait = getField(insts[1], 116, 6);
+    try std.testing.expect((consumer_wait & (@as(u32, 1) << @intCast(hmma_bar))) != 0);
+}
+
+test "an HMMA tags its WHOLE fp32 destination run, and only that run" {
+    // The D fragment of a 16 by 8 fp32 result is 4 registers per lane, all under ONE write
+    // barrier. A consumer of ANY of the four must wait. With only the first register tagged,
+    // a read of R9, R10 or R11 races the still-running multiply and gets a stale value.
+    var insts: [6]Inst = undefined;
+    insts[0] = encode.hmma(8, 0, 4, 8, .m16n8k16, .f32, .{}); // R8..R11
+    insts[1] = encode.iadd3(20, 9, 9, .{}); // consumes R9
+    insts[2] = encode.iadd3(21, 10, 10, .{}); // consumes R10
+    insts[3] = encode.iadd3(22, 11, 11, .{}); // consumes R11
+    insts[4] = encode.iadd3(23, 12, 12, .{}); // R12 is PAST the run
+    insts[5] = encode.exit(.{});
+    scheduleBlocks(&insts, &.{0});
+
+    const hmma_bar = getField(insts[0], 110, 3);
+    try std.testing.expect(hmma_bar < 6);
+    const bit = @as(u32, 1) << @intCast(hmma_bar);
+    try std.testing.expect((getField(insts[1], 116, 6) & bit) != 0);
+    try std.testing.expect((getField(insts[2], 116, 6) & bit) != 0);
+    try std.testing.expect((getField(insts[3], 116, 6) & bit) != 0);
+    // R12 is outside the run, so gating it would be a wasted wait on a register the tensor
+    // op never writes.
+    try std.testing.expectEqual(@as(u32, 0), getField(insts[4], 116, 6));
+}
+
+test "an fp16 HMMA result packs two elements per register, so its run is half as long" {
+    // The same 16 by 8 result written as fp16 is 2 registers, not 4, because each register
+    // holds two elements. A span read off the tile shape alone would tag R10 and R11 as
+    // well and gate a later write to them for no reason.
+    var insts: [4]Inst = undefined;
+    insts[0] = encode.hmma(8, 0, 4, 8, .m16n8k16, .f16, .{}); // R8..R9 only
+    insts[1] = encode.iadd3(20, 9, 9, .{}); // consumes R9, inside the run
+    insts[2] = encode.iadd3(21, 10, 10, .{}); // R10 is PAST the run
+    insts[3] = encode.exit(.{});
+    scheduleBlocks(&insts, &.{0});
+
+    const hmma_bar = getField(insts[0], 110, 3);
+    try std.testing.expect(hmma_bar < 6);
+    try std.testing.expect((getField(insts[1], 116, 6) & (@as(u32, 1) << @intCast(hmma_bar))) != 0);
+    try std.testing.expectEqual(@as(u32, 0), getField(insts[2], 116, 6));
+}
+
+test "an HMMA waits on the in-flight producer of EACH of its three fragment bases" {
+    // A, B and C sit at bits 24, 32 and 64. Each is the first register of one lane's run.
+    // A missed wait here feeds the tensor core a register the load has not filled yet.
+    var insts: [5]Inst = undefined;
+    insts[0] = encode.ldgU32(0, 30, .{}); // R0 = the A base
+    insts[1] = encode.ldgU32(4, 30, .{}); // R4 = the B base
+    insts[2] = encode.ldgU32(12, 30, .{}); // R12 = the C base
+    insts[3] = encode.hmma(16, 0, 4, 12, .m16n8k16, .f32, .{});
+    insts[4] = encode.exit(.{});
+    scheduleBlocks(&insts, &.{0});
+
+    const wait = getField(insts[3], 116, 6);
+    for (insts[0..3]) |p| {
+        const bar = getField(p, 110, 3);
+        try std.testing.expect(bar < 6);
+        try std.testing.expect((wait & (@as(u32, 1) << @intCast(bar))) != 0);
+    }
+}
+
+test "an IMMA claims NO scoreboard but still waits on its fragment producers" {
+    // NAK sm120_instr_latencies.rs gives IMMA the latency class `Imma`, which
+    // `SM120Latency::needs_scoreboards` does NOT accept, so IMMA is a coupled op that the
+    // stall delay covers. A write barrier on an op the hardware never signals would hang
+    // every consumer, so the exclusion is deliberate. Its SOURCE waits still matter.
+    var insts: [4]Inst = undefined;
+    insts[0] = encode.ldgU32(0, 30, .{}); // R0 = the A base
+    insts[1] = encode.ldgU32(4, 30, .{}); // R4 = the B base
+    insts[2] = encode.imma(8, 0, 4, 8, .m16n8k32, .{ .signed = true }, .{ .signed = true }, false, .{});
+    insts[3] = encode.exit(.{});
+    scheduleBlocks(&insts, &.{0});
+
+    try std.testing.expectEqual(@as(u32, 7), getField(insts[2], 110, 3)); // no write barrier
+    const wait = getField(insts[2], 116, 6);
+    for (insts[0..2]) |p| {
+        const bar = getField(p, 110, 3);
+        try std.testing.expect(bar < 6);
+        try std.testing.expect((wait & (@as(u32, 1) << @intCast(bar))) != 0);
+    }
+}
+
+test "an IMMA waits before it overwrites ANY register of its int32 destination run" {
+    // IMMA gets no scoreboard of its own, but it still WRITES a run of registers. If one of
+    // them still has an in-flight load, the load lands after the multiply and destroys the
+    // result. An m16n8 tile writes 4 int32 registers per lane.
+    var insts: [4]Inst = undefined;
+    insts[0] = encode.ldgU32(11, 30, .{}); // R11 is the LAST register of the run below
+    insts[1] = encode.iadd3(20, 21, 22, .{}); // filler, reads nothing in flight
+    insts[2] = encode.imma(8, 0, 4, 8, .m16n8k32, .{ .signed = true }, .{ .signed = true }, false, .{});
+    insts[3] = encode.exit(.{});
+    scheduleBlocks(&insts, &.{0});
+
+    const ldg_bar = getField(insts[0], 110, 3);
+    try std.testing.expect(ldg_bar < 6);
+    try std.testing.expect((getField(insts[2], 116, 6) & (@as(u32, 1) << @intCast(ldg_bar))) != 0);
+}
+
+test "an m8n8 IMMA writes half the run of an m16n8 IMMA" {
+    // 64 result values over 32 lanes is 2 registers per lane, and 128 is 4. The tile
+    // selector is split across bit 75 and bits 85..87, so a span that read only one half of
+    // it would give the wrong run for two of the five tiles.
+    const plain: encode.ImmaOperand = .{ .signed = true };
+    var small: [4]Inst = undefined;
+    small[0] = encode.ldgU32(10, 30, .{}); // R10 is PAST an m8n8 run of R8..R9
+    small[1] = encode.iadd3(20, 21, 22, .{});
+    small[2] = encode.imma(8, 0, 4, 8, .m8n8k16, plain, plain, false, .{});
+    small[3] = encode.exit(.{});
+    scheduleBlocks(&small, &.{0});
+    try std.testing.expectEqual(@as(u32, 0), getField(small[2], 116, 6));
+
+    var large: [4]Inst = undefined;
+    large[0] = encode.ldgU32(10, 30, .{}); // R10 is INSIDE an m16n8 run of R8..R11
+    large[1] = encode.iadd3(20, 21, 22, .{});
+    large[2] = encode.imma(8, 0, 4, 8, .m16n8k16, plain, plain, false, .{});
+    large[3] = encode.exit(.{});
+    scheduleBlocks(&large, &.{0});
+    const bar = getField(large[0], 110, 3);
+    try std.testing.expect(bar < 6);
+    try std.testing.expect((getField(large[2], 116, 6) & (@as(u32, 1) << @intCast(bar))) != 0);
+}
+
+test "an LDSM result gets a scoreboard and tags every fragment register it fills" {
+    // NAK sm120_instr_latencies.rs gives LDSM the class DecoupledAgu, the same class as an
+    // LDS, so its result lands an unknown number of cycles after issue. It fills one
+    // register per fragment, so an x4 load fills four and a consumer of ANY of them waits.
+    var insts: [5]Inst = undefined;
+    insts[0] = encode.ldsm(8, 2, .x4, false, .{}); // R8..R11 <- shared[R2]
+    insts[1] = encode.iadd3(20, 11, 11, .{}); // consumes R11, the last of the run
+    insts[2] = encode.iadd3(21, 12, 12, .{}); // R12 is PAST the run
+    insts[3] = encode.iadd3(22, 23, 24, .{});
+    insts[4] = encode.exit(.{});
+    scheduleBlocks(&insts, &.{0});
+
+    const ldsm_bar = getField(insts[0], 110, 3);
+    try std.testing.expect(ldsm_bar < 6);
+    try std.testing.expect((getField(insts[1], 116, 6) & (@as(u32, 1) << @intCast(ldsm_bar))) != 0);
+    try std.testing.expectEqual(@as(u32, 0), getField(insts[2], 116, 6));
+}
+
+test "the LDSM destination run follows the fragment count, for EVERY count" {
+    // x1 fills R8, x2 fills R8..R9 and x4 fills R8..R11. A consumer of the LAST register of
+    // the run must wait, and a consumer of the register just PAST it must not. The middle
+    // case earns its place: with only x1 and x4 checked, a span that collapsed x2 to one
+    // register passed every test.
+    const cases = [_]struct { count: encode.LdsmCount, last: u8, past: u8 }{
+        .{ .count = .x1, .last = 8, .past = 9 },
+        .{ .count = .x2, .last = 9, .past = 10 },
+        .{ .count = .x4, .last = 11, .past = 12 },
+    };
+    for (cases) |c| {
+        var insts: [4]Inst = undefined;
+        insts[0] = encode.ldsm(8, 2, c.count, false, .{});
+        insts[1] = encode.iadd3(20, c.last, c.last, .{}); // inside the run
+        insts[2] = encode.iadd3(21, c.past, c.past, .{}); // past the run
+        insts[3] = encode.exit(.{});
+        scheduleBlocks(&insts, &.{0});
+        const bar = getField(insts[0], 110, 3);
+        try std.testing.expect(bar < 6);
+        try std.testing.expect((getField(insts[1], 116, 6) & (@as(u32, 1) << @intCast(bar))) != 0);
+        try std.testing.expectEqual(@as(u32, 0), getField(insts[2], 116, 6));
+    }
+}
+
+test "an LDSM does not read a phantom R0 at bit 64" {
+    // Regression shape: LDSM's 24-bit immediate offset stops at bit 63, so bits 64..71 are
+    // ZERO and the ALU source rule read them as a read of R0. With a live producer in R0 the
+    // load waited on that scoreboard and CLEARED its tag, so the real consumer of R0 never
+    // waited and read it stale.
+    var insts: [4]Inst = undefined;
+    insts[0] = encode.ldgU32(0, 20, .{}); // R0 <- global, variable latency
+    insts[1] = encode.ldsm(8, 2, .x2, false, .{}); // reads R2 only
+    insts[2] = encode.iadd3(1, 0, 0, .{}); // the REAL consumer of R0
+    insts[3] = encode.exit(.{});
+    scheduleBlocks(&insts, &.{0});
+
+    const ldg_bar = getField(insts[0], 110, 3);
+    try std.testing.expect(ldg_bar < 6);
+    try std.testing.expectEqual(@as(u32, 0), getField(insts[1], 116, 6)); // no phantom wait
+    try std.testing.expect((getField(insts[2], 116, 6) & (@as(u32, 1) << @intCast(ldg_bar))) != 0);
+}
+
+test "an LDSM waits on the in-flight producer of its ADDRESS register" {
+    // Every lane gives its own shared-window offset, and that offset normally comes from an
+    // S2R lane id. Without the wait the load reads whatever the register held before.
+    var insts: [3]Inst = undefined;
+    insts[0] = encode.s2r(2, encode.SR_LANEID, .{});
+    insts[1] = encode.ldsm(8, 2, .x2, false, .{});
+    insts[2] = encode.exit(.{});
+    scheduleBlocks(&insts, &.{0});
+
+    const s2r_bar = getField(insts[0], 110, 3);
+    try std.testing.expect(s2r_bar < 6);
+    try std.testing.expect((getField(insts[1], 116, 6) & (@as(u32, 1) << @intCast(s2r_bar))) != 0);
+}
+
+test "a MOVM reads only its source and gets its own scoreboard" {
+    // MOVM writes nothing above bit 31 except its mode field, so the ALU rule read TWO
+    // phantom R0 sources on it. Its class is DecoupledAgu, so its single result register
+    // needs a barrier of its own.
+    var insts: [4]Inst = undefined;
+    insts[0] = encode.ldgU32(0, 20, .{}); // R0 <- global, variable latency
+    insts[1] = encode.movm(8, 4, .{}); // transposes R4 into R8
+    insts[2] = encode.iadd3(1, 0, 0, .{}); // the REAL consumer of R0
+    insts[3] = encode.exit(.{});
+    scheduleBlocks(&insts, &.{0});
+
+    const ldg_bar = getField(insts[0], 110, 3);
+    try std.testing.expect(ldg_bar < 6);
+    try std.testing.expectEqual(@as(u32, 0), getField(insts[1], 116, 6)); // no phantom wait
+    try std.testing.expect(getField(insts[1], 110, 3) < 6); // MOVM got a real scoreboard
+    try std.testing.expect((getField(insts[2], 116, 6) & (@as(u32, 1) << @intCast(ldg_bar))) != 0);
+}
+
+test "a MOVM waits on the producer of the fragment it transposes" {
+    var insts: [3]Inst = undefined;
+    insts[0] = encode.ldsm(4, 2, .x1, false, .{}); // R4 <- one fragment
+    insts[1] = encode.movm(8, 4, .{}); // transposes R4
+    insts[2] = encode.exit(.{});
+    scheduleBlocks(&insts, &.{0});
+
+    const ldsm_bar = getField(insts[0], 110, 3);
+    try std.testing.expect(ldsm_bar < 6);
+    try std.testing.expect((getField(insts[1], 116, 6) & (@as(u32, 1) << @intCast(ldsm_bar))) != 0);
 }
