@@ -93,6 +93,17 @@ fn pointerArith(func: *const Function, a: function.Arith) bool {
     return (l_ptr and rt == .int) or (r_ptr and lt == .int);
 }
 
+/// Pointer arithmetic must not change the address space. `shared_ptr + i` is still a shared
+/// pointer, and a result typed otherwise makes the backend emit an access to the wrong memory
+/// space, which is a silent miscompile. Pointer types intern by their address space alone, so
+/// comparing the result type against the pointer operand's type compares the spaces.
+fn pointerArithChangesSpace(func: *const Function, a: function.Arith, result: Value) bool {
+    if (!pointerArith(func, a)) return false;
+    const lt = func.types.type_kind(func.valueType(a.lhs));
+    const operand_ty = if (lt == .ptr) func.valueType(a.lhs) else func.valueType(a.rhs);
+    return func.valueType(result) != operand_ty;
+}
+
 /// Binary arithmetic and comparison operands must have matching types.
 fn checkOperandTypes(func: *const Function, diags: *Diagnostics) std.mem.Allocator.Error!void {
     var bi: usize = 0;
@@ -100,8 +111,12 @@ fn checkOperandTypes(func: *const Function, diags: *Diagnostics) std.mem.Allocat
         const block: Block = @enumFromInt(bi);
         for (func.blockInsts(block)) |inst| {
             switch (func.opcode(inst)) {
-                .arith => |a| if (func.valueType(a.lhs) != func.valueType(a.rhs) and !pointerArith(func, a)) {
-                    if (func.instResult(inst)) |result| try diags.add(.{ .operand_type_mismatch = result });
+                .arith => |a| if (func.instResult(inst)) |result| {
+                    const mismatch = func.valueType(a.lhs) != func.valueType(a.rhs) and
+                        !pointerArith(func, a);
+                    if (mismatch or pointerArithChangesSpace(func, a, result)) {
+                        try diags.add(.{ .operand_type_mismatch = result });
+                    }
                 },
                 .icmp => |c| if (func.valueType(c.lhs) != func.valueType(c.rhs)) {
                     if (func.instResult(inst)) |result| try diags.add(.{ .operand_type_mismatch = result });
@@ -1012,4 +1027,67 @@ test "an edge passing a mismatched argument type is reported" {
         Diagnostic{ .arg_type_mismatch = .{ .target = target, .index = 0, .expected = i64_t, .found = i32_t } },
         d.items()[0],
     );
+}
+
+test "pointer arithmetic that changes the address space is reported" {
+    // The exact miscompile this milestone exists to prevent: a shared pointer plus an offset
+    // typed as a GLOBAL pointer. A backend would then emit a global access where a shared one
+    // is correct. No frontend builds this today, so the shape is constructed here on purpose.
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+
+    const shared_t = try func.types.intern(.{ .ptr = .shared });
+    const global_t = try func.types.ptrGlobal();
+    const i64_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
+    const entry = try func.appendBlock();
+    const base = try func.appendBlockParam(entry, shared_t);
+    const off = try func.appendBlockParam(entry, i64_t);
+    const bad = try func.appendInst(entry, global_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = off } });
+    func.setTerminator(entry, .{ .ret = function.Ret.none() });
+
+    var d = try verify(std.testing.allocator, &func, .low);
+    defer d.deinit();
+    try std.testing.expect(!d.ok());
+    try std.testing.expectEqual(@as(usize, 1), d.count());
+    try std.testing.expectEqual(Diagnostic{ .operand_type_mismatch = bad }, d.items()[0]);
+}
+
+test "pointer arithmetic that keeps the address space verifies clean" {
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+
+    const shared_t = try func.types.intern(.{ .ptr = .shared });
+    const i64_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
+    const entry = try func.appendBlock();
+    const base = try func.appendBlockParam(entry, shared_t);
+    const off = try func.appendBlockParam(entry, i64_t);
+    _ = try func.appendInst(entry, shared_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = off } });
+    func.setTerminator(entry, .{ .ret = function.Ret.none() });
+
+    var d = try verify(std.testing.allocator, &func, .low);
+    defer d.deinit();
+    try std.testing.expect(d.ok());
+}
+
+test "an int plus a shared pointer keeps the shared space, in either operand order" {
+    // `int + ptr` is legal pointer arithmetic too, so the check must read the space off
+    // whichever side is the pointer rather than always off the left one.
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+
+    const shared_t = try func.types.intern(.{ .ptr = .shared });
+    const global_t = try func.types.ptrGlobal();
+    const i64_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
+    const entry = try func.appendBlock();
+    const off = try func.appendBlockParam(entry, i64_t);
+    const base = try func.appendBlockParam(entry, shared_t);
+    _ = try func.appendInst(entry, shared_t, .{ .arith = .{ .op = .add, .lhs = off, .rhs = base } });
+    const bad = try func.appendInst(entry, global_t, .{ .arith = .{ .op = .add, .lhs = off, .rhs = base } });
+    func.setTerminator(entry, .{ .ret = function.Ret.none() });
+
+    var d = try verify(std.testing.allocator, &func, .low);
+    defer d.deinit();
+    try std.testing.expect(!d.ok());
+    try std.testing.expectEqual(@as(usize, 1), d.count());
+    try std.testing.expectEqual(Diagnostic{ .operand_type_mismatch = bad }, d.items()[0]);
 }

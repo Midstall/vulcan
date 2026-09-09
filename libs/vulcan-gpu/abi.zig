@@ -81,19 +81,20 @@ pub fn layoutParams(
     for (func.blockParams(@enumFromInt(0))) |p| {
         if (attrs.builtinOf(func, p) != null) continue;
 
-        const is_ptr = func.types.type_kind(func.valueType(p)) == .ptr;
-        const size: u32 = if (is_ptr) a.pointer_bytes else scalarBytes(func, p) orelse
+        const param_kind = func.types.type_kind(func.valueType(p));
+        const size: u32 = if (param_kind == .ptr) a.pointer_bytes else scalarBytes(func, p) orelse
             return error.UnsupportedParamType;
         const alignment = @max(@as(u32, a.param_align), size);
 
         cursor = alignUp(cursor, alignment);
-        try placed.append(allocator, .{
-            .offset = cursor,
-            .size = size,
-            // M1 has no IR address space, so every pointer parameter is global. M1.5 reads
-            // the space off the pointer type instead.
-            .kind = if (is_ptr) .{ .pointer = .global } else .{ .scalar = @intCast(size) },
-        });
+        // The address space comes off the pointer type, so a shared parameter reports `shared`
+        // and the runtime does not have to guess. A non-pointer type reaches the scalar arm
+        // only after `scalarBytes` accepted it, so the composite arms are unreachable here.
+        const kind: kernel.ParamKind = switch (param_kind) {
+            .ptr => |space| .{ .pointer = space },
+            .bool, .int, .float, .vector, .@"struct", .array, .slice => .{ .scalar = @intCast(size) },
+        };
+        try placed.append(allocator, .{ .offset = cursor, .size = size, .kind = kind });
         cursor += size;
     }
 
@@ -238,4 +239,20 @@ test "an f64 parameter aligns to eight" {
 
     try std.testing.expectEqual(@as(u32, 8), layout.params[1].offset);
     try std.testing.expectEqual(@as(u32, 8), layout.params[1].size);
+}
+
+test "a shared pointer parameter reports its address space in the layout" {
+    var func = try testFunc(std.testing.allocator);
+    defer func.deinit();
+    const shared_t = try func.types.intern(.{ .ptr = .shared });
+    const global_t = try func.types.ptrGlobal();
+    const b = try func.appendBlock();
+    _ = try func.appendBlockParam(b, global_t);
+    _ = try func.appendBlockParam(b, shared_t);
+
+    var layout = try layoutParams(std.testing.allocator, &func, nvidia_test_abi, false);
+    defer layout.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(kernel.AddressSpace.global, layout.params[0].kind.pointer);
+    try std.testing.expectEqual(kernel.AddressSpace.shared, layout.params[1].kind.pointer);
 }

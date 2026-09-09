@@ -2,14 +2,16 @@
 //! it never needs the instruction selector to do so.
 
 const std = @import("std");
+const ir = @import("vulcan-ir");
 
 /// Where a pointer points. A backend maps this to its own memory spaces: on NVIDIA `global`
 /// is LDG and `shared` is LDS, on ET-SoC `shared` is the shire scratchpad, and on the CPU
 /// offload path `shared` is a stack buffer.
 ///
-/// M1 always reports `global`. The IR pointer type gains an address space in M1.5, and only
-/// then can a frontend express the others.
-pub const AddressSpace = enum { global, shared, private, constant };
+/// The IR owns this enum, because the IR pointer type carries it and `vulcan-ir` cannot depend
+/// on this module. It is re-exported here so a runtime that reads a `LaunchInfo` does not need
+/// to import the IR.
+pub const AddressSpace = ir.types.AddressSpace;
 
 /// What a parameter carries.
 pub const ParamKind = union(enum) {
