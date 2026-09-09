@@ -16,6 +16,7 @@ pub const builtin = @import("vulcan-gpu/builtin.zig");
 pub const attrs = @import("vulcan-gpu/attrs.zig");
 pub const kernel = @import("vulcan-gpu/kernel.zig");
 pub const abi = @import("vulcan-gpu/abi.zig");
+pub const offload = @import("vulcan-gpu/offload.zig");
 
 /// A value the hardware provides rather than the parameter block. See `builtin.Builtin`.
 pub const Builtin = builtin.Builtin;
@@ -29,6 +30,8 @@ pub const Param = kernel.Param;
 pub const AddressSpace = kernel.AddressSpace;
 /// Place a kernel's parameter block. See `abi.layoutParams`.
 pub const layoutParams = abi.layoutParams;
+/// Rewrite a kernel into a host-runnable loop nest. See `offload.lowerToLoopNest`.
+pub const lowerToLoopNest = offload.lowerToLoopNest;
 
 test {
     std.testing.refAllDecls(@This());
