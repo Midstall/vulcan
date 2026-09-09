@@ -418,6 +418,100 @@ pub fn stgU32(addr: u8, data: u8, c: Control) Inst {
     return w;
 }
 
+// Workgroup shared memory. A shared address is NOT a 64-bit global address: it
+// is a 32-bit byte offset into the CTA's shared-memory window, so LDS and STS
+// read it out of ONE register, not out of an aligned pair. These three
+// encodings are transcribed from Mesa NAK `sm70_encode.rs`, which is the
+// authoritative bit-level reference (see the `nak-sass-encoding-reference`
+// note). None of them is hardware-verified here, because this repository
+// cannot execute SASS.
+
+/// `LDS dst, [addr]`: load a 32-bit value from workgroup shared memory at the
+/// 32-bit window offset in `addr`.
+///
+/// Source: NAK `sm70_encode.rs`, `impl SM70Op for OpLd`, the `MemSpace::Shared`
+/// arm plus the common tail of that `encode`. Opcode 0x984 (bits 0..12);
+/// `set_dst` at 16..24; `set_reg_src(24..32)` for the address; `set_ureg_src(32)`
+/// for the uniform base, which is URZ here because there is none (8 bits wide on
+/// sm>=100, the Blackwell target of this backend); `set_field(40..64)` for the
+/// 24-bit immediate offset, which stays 0 because the isel materializes every
+/// offset into the address register; `set_mem_type(73..76)` = 4 (B32);
+/// `set_field(78..80)` = 0 (`OffsetStride::X1.encode_sm75()`);
+/// `set_upred_src(87..90, 90)` = UPT, NAK's `true_reg` index 7, so the access is
+/// unconditional; and `set_bit(91, true)`, NAK's "always enable UGPR mode".
+///
+/// The shared arm sets NO memory order and NO eviction priority: NAK asserts
+/// that a shared access is `Strong(CTA)`/`Normal` and then leaves bits 77 and
+/// 81..87 at zero, unlike the global LDG/STG path above. Variable latency: the
+/// scoreboard scheduler assigns the write barrier and the consumer waits.
+pub fn ldsU32(dst: u8, addr: u8, c: Control) Inst {
+    var w = base(c);
+    setBits(&w, 0, 12, 0x984);
+    setBits(&w, 16, 8, dst);
+    setBits(&w, 24, 8, addr); // 32-bit shared-window offset, ONE register
+    setBits(&w, 32, 8, URZ); // no uniform base
+    setBits(&w, 40, 24, 0); // immediate offset
+    setBits(&w, 73, 3, 4); // type B32
+    setBits(&w, 78, 2, 0); // offset stride X1
+    setBits(&w, 87, 3, PT); // UPT: unconditional
+    setBits(&w, 91, 1, 1); // UGPR mode
+    return w;
+}
+
+/// `STS [addr], data`: store a 32-bit GPR to workgroup shared memory at the
+/// 32-bit window offset in `addr`.
+///
+/// Source: NAK `sm70_encode.rs`, `impl SM70Op for OpSt`, the `MemSpace::Shared`
+/// arm plus the common tail of that `encode`. Opcode 0x988 (bits 0..12);
+/// `set_reg_src(24..32)` for the address; `set_reg_src(32..40)` for the data;
+/// `set_field(40..64)` for the 24-bit immediate offset, 0 here;
+/// `set_ureg_src(64)` for the uniform base, URZ here (8 bits on sm>=100);
+/// `set_mem_type(73..76)` = 4 (B32); `set_field(78..80)` = 0
+/// (`OffsetStride::X1`); and `set_bit(91, has_ugpr)`, true for this target.
+///
+/// The uniform base sits at bit 64 for a store and at bit 32 for a load. That
+/// is not a transcription slip: NAK uses the two different starts, because a
+/// store needs bits 32..40 for its data register.
+pub fn stsU32(addr: u8, data: u8, c: Control) Inst {
+    var w = base(c);
+    setBits(&w, 0, 12, 0x988);
+    setBits(&w, 24, 8, addr); // 32-bit shared-window offset, ONE register
+    setBits(&w, 32, 8, data);
+    setBits(&w, 40, 24, 0); // immediate offset
+    setBits(&w, 64, 8, URZ); // no uniform base
+    setBits(&w, 73, 3, 4); // type B32
+    setBits(&w, 78, 2, 0); // offset stride X1
+    setBits(&w, 91, 1, 1); // UGPR mode
+    return w;
+}
+
+/// `BAR.SYNC`: the workgroup barrier. Every thread of the CTA waits here, so a
+/// shared-memory tile one warp stages is visible to the others after it.
+///
+/// Source: NAK `sm70_encode.rs`, `impl SM70Op for OpBar`, which sets the opcode
+/// 0xb1d and NOTHING else. `nak/ir.rs` prints `OpBar` as `bar.sync`, and
+/// `from_nir.rs` emits it for a `nir_intrinsic_barrier` whose execution scope is
+/// the workgroup. The guard predicate in bits 12..15 comes from `base`, which is
+/// where NAK's driver loop puts it too (`encode_sm70_shader` calls `set_pred`
+/// after each op's own `encode`).
+///
+/// Two things a caller must get right, neither of them in this encoding:
+///
+///   - The launch descriptor has to declare the barrier. NAK sets
+///     `info.num_control_barriers = 1` next to this op, and `qmd.rs` writes it
+///     into the QMD `BARRIER_COUNT` field. A dispatch that leaves BARRIER_COUNT
+///     at 0 and runs a kernel with a BAR.SYNC is undefined.
+///   - Every thread must reach the barrier. A divergent branch AROUND a
+///     BAR.SYNC corrupts a staged shared tile on Blackwell (measured on the
+///     GB10). Guard the work with a predicate, or make sure the divergent
+///     region is wrapped in the BSSY/BSYNC pair the isel emits, so the warp is
+///     reconverged before the barrier.
+pub fn barSync(c: Control) Inst {
+    var w = base(c);
+    setBits(&w, 0, 12, 0xb1d);
+    return w;
+}
+
 /// `S2R dst, sysval`: read a special register (thread/block id, etc.). Variable
 /// latency: set a `wr_barrier` and drain it before use. Verified (prism).
 pub fn s2r(dst: u8, sysval: u8, c: Control) Inst {
@@ -1149,4 +1243,58 @@ test "graphics attribute load/store/interpolate (prism-verified layout)" {
     try std.testing.expectEqual(@as(u32, 0x326), i[0] & 0xfff);
     try std.testing.expectEqual(@as(u32, 5), (i[0] >> 16) & 0xff); // dst R5
     try std.testing.expectEqual(@as(u32, ATTR_GENERIC0 >> 2), i[2] & 0xff);
+}
+
+test "LDS reads shared memory through ONE address register (NAK OpLd, MemSpace::Shared)" {
+    const w = ldsU32(6, 4, .{});
+    // Every dword, so a stray bit anywhere in the 128-bit word fails this.
+    try std.testing.expectEqual([4]u32{ 0x04067984, 0x000000ff, 0x0b800800, 0x000fde00 }, w);
+    try std.testing.expectEqual(@as(u32, 0x984), w[0] & 0xfff); // LDS, not LDG (0x981)
+    try std.testing.expectEqual(@as(u32, 6), (w[0] >> 16) & 0xff); // dst R6
+    try std.testing.expectEqual(@as(u32, 4), (w[0] >> 24) & 0xff); // address R4
+    try std.testing.expectEqual(@as(u32, URZ), w[1] & 0xff); // uniform base URZ at bit 32
+    try std.testing.expectEqual(@as(u32, 0), (w[1] >> 8) & 0xffffff); // immediate offset 0 at 40..64
+    try std.testing.expectEqual(@as(u32, 4), (w[2] >> (73 - 64)) & 0x7); // mem type B32
+    try std.testing.expectEqual(@as(u32, 0), (w[2] >> (78 - 64)) & 0x3); // offset stride X1
+    try std.testing.expectEqual(@as(u32, PT), (w[2] >> (87 - 64)) & 0x7); // UPT, unconditional
+    try std.testing.expectEqual(@as(u32, 1), (w[2] >> (91 - 64)) & 0x1); // UGPR mode
+    // A shared access carries NO 64-bit-address bit and NO memory order, unlike LDG.
+    try std.testing.expectEqual(@as(u32, 0), (w[2] >> (90 - 64)) & 0x1);
+    try std.testing.expectEqual(@as(u32, 0), (w[2] >> (81 - 64)) & 0x3f); // 81..87 clear
+}
+
+test "STS writes shared memory through ONE address register (NAK OpSt, MemSpace::Shared)" {
+    const w = stsU32(4, 6, .{});
+    try std.testing.expectEqual([4]u32{ 0x04007988, 0x00000006, 0x080008ff, 0x000fde00 }, w);
+    try std.testing.expectEqual(@as(u32, 0x988), w[0] & 0xfff); // STS, not STG (0x986)
+    try std.testing.expectEqual(@as(u32, 4), (w[0] >> 24) & 0xff); // address R4
+    try std.testing.expectEqual(@as(u32, 6), w[1] & 0xff); // data R6 at bit 32
+    try std.testing.expectEqual(@as(u32, 0), (w[1] >> 8) & 0xffffff); // immediate offset 0 at 40..64
+    try std.testing.expectEqual(@as(u32, URZ), w[2] & 0xff); // uniform base URZ at bit 64
+    try std.testing.expectEqual(@as(u32, 4), (w[2] >> (73 - 64)) & 0x7); // mem type B32
+    try std.testing.expectEqual(@as(u32, 0), (w[2] >> (78 - 64)) & 0x3); // offset stride X1
+    try std.testing.expectEqual(@as(u32, 1), (w[2] >> (91 - 64)) & 0x1); // UGPR mode
+    try std.testing.expectEqual(@as(u32, 0), (w[2] >> (90 - 64)) & 0x1); // no 64-bit address bit
+}
+
+test "BAR.SYNC is the bare opcode plus the guard predicate (NAK OpBar)" {
+    const w = barSync(.{});
+    try std.testing.expectEqual([4]u32{ 0x00007b1d, 0, 0, 0x000fde00 }, w);
+    try std.testing.expectEqual(@as(u32, 0xb1d), w[0] & 0xfff);
+    try std.testing.expectEqual(@as(u32, PT), (w[0] >> 12) & 0x7); // unconditional
+    try std.testing.expectEqual(@as(u32, 0), (w[0] >> 15) & 0x1); // not negated
+    // NAK's OpBar writes the opcode and nothing else: no register, no field.
+    try std.testing.expectEqual(@as(u32, 0), (w[0] >> 16));
+    try std.testing.expectEqual(@as(u32, 0), w[1]);
+    try std.testing.expectEqual(@as(u32, 0), w[2]);
+}
+
+test "a barrier under a guard predicate keeps the predicate field" {
+    // The hardware quirk note: a divergent BRANCH around a BAR.SYNC corrupts a
+    // staged shared tile, so a guarded barrier region has to be PREDICATED. The
+    // predicate has to survive into the encoding for that to work.
+    const w = barSync(.{ .pred = 2, .pred_neg = true });
+    try std.testing.expectEqual(@as(u32, 0xb1d), w[0] & 0xfff);
+    try std.testing.expectEqual(@as(u32, 2), (w[0] >> 12) & 0x7);
+    try std.testing.expectEqual(@as(u32, 1), (w[0] >> 15) & 0x1);
 }

@@ -473,9 +473,21 @@ pub fn compileShader(allocator: std.mem.Allocator, func: *Function, stage: Stage
             const at: u16 = @intCast(a.param_base + slot.offset);
             const lo = gprOf(loc, p);
             try code.append(allocator, encode.ldc(lo, bank0, at, .{}));
-            // A pointer occupies a register pair, so its high word follows in lo + 1.
-            if (slot.kind == .pointer) {
-                try code.append(allocator, encode.ldc(lo + 1, bank0, at + 4, .{}));
+            // A 64-bit address occupies a register pair, so its high word follows in lo + 1.
+            //
+            // A SHARED address does not. It is a 32-bit byte offset into the CTA's
+            // shared-memory window, so the single LDC above is the whole load. The parameter
+            // block still reserves `pointer_bytes` for it, because `layoutParams` places every
+            // pointer at the target's address width, so the runtime writes the offset into the
+            // low dword of that slot and leaves the high dword alone.
+            switch (slot.kind) {
+                .scalar => {},
+                .pointer => |space| switch (space) {
+                    .global, .constant, .private => {
+                        try code.append(allocator, encode.ldc(lo + 1, bank0, at + 4, .{}));
+                    },
+                    .shared => {},
+                },
             }
         }
     } else {
@@ -658,7 +670,11 @@ pub fn compileShader(allocator: std.mem.Allocator, func: *Function, stage: Stage
                 ubo_slot += 1;
                 continue;
             }
-            if (isPtr(func, p)) {
+            // A graphics stage has no workgroup, so it has no workgroup shared memory. Refuse
+            // a shared pointer here rather than let it reach the attribute path below, which
+            // would silently interpolate a varying into the address register.
+            if (isSharedPtr(func, p)) return error.Unsupported;
+            if (isWidePtr(func, p)) {
                 const slot = attrTag(func, p, "binding") orelse ubo_slot;
                 const off = encode.graphics_ubo_cb_base + slot * 8;
                 try code.append(allocator, encode.ldc(rd, encode.graphics_const_bank, off, .{})); // address lo (root table 1)
@@ -1020,7 +1036,9 @@ fn assignLocs(allocator: std.mem.Allocator, func: *const Function, loc: *std.Aut
             const p = firstFree(pred_free[0..]) orelse return error.Unsupported;
             pred_free[p] = false;
             break :blk .{ .pred = @intCast(p) };
-        } else if (isPtr(func, v)) blk: {
+        } else if (isWidePtr(func, v)) blk: {
+            // A 64-bit address needs an aligned pair. A shared address is 32 bits, so it
+            // falls through to the single-register arm below.
             const r = firstFreePair(gpr_free[0..]) orelse return error.Unsupported;
             gpr_free[r] = false;
             gpr_free[r + 1] = false;
@@ -1033,7 +1051,7 @@ fn assignLocs(allocator: std.mem.Allocator, func: *const Function, loc: *std.Aut
             break :blk .{ .gpr = @intCast(r) };
         };
         try loc.put(allocator, v, l);
-        try active.append(allocator, .{ .end = iv.end, .loc = l, .is_ptr = isPtr(func, v) });
+        try active.append(allocator, .{ .end = iv.end, .loc = l, .is_ptr = isWidePtr(func, v) });
     }
 }
 
@@ -1102,7 +1120,10 @@ fn foldConstantsToImm(func: *Function) void {
         };
         if (a.op == .div or a.op == .rem) continue;
         const result = func.instResult(inst) orelse continue;
-        if (isPtr(func, result) or isBool(func, result)) continue;
+        // A 64-bit address add is a carry chain over a register pair, and a bool op is a
+        // predicate combine. Neither has an immediate form. A SHARED address add is plain
+        // 32-bit integer arithmetic, so it folds like any other integer.
+        if (isWidePtr(func, result) or isBool(func, result)) continue;
         if (constBits(func, a.rhs)) |c| {
             op.* = .{ .arith_imm = .{ .op = a.op, .lhs = a.lhs, .imm = c } };
         } else if (isCommutativeBinOp(a.op)) {
@@ -1113,8 +1134,42 @@ fn foldConstantsToImm(func: *Function) void {
     }
 }
 
-fn isPtr(func: *const Function, v: Value) bool {
-    return func.types.type_kind(func.valueType(v)) == .ptr;
+/// The address space a pointer-typed value points into, or null when the value is not a
+/// pointer at all.
+fn ptrSpace(func: *const Function, v: Value) ?ir.types.AddressSpace {
+    return switch (func.types.type_kind(func.valueType(v))) {
+        .ptr => |space| space,
+        .bool, .int, .float, .vector, .array, .slice, .@"struct" => null,
+    };
+}
+
+/// True when a value is an address that occupies an ALIGNED 64-BIT GPR PAIR (lo, lo+1).
+///
+/// This answers the WIDTH question, and the width depends on the address space. A `global` or
+/// `constant` address is a full 64-bit device address, so it needs a pair, a carry-chain add,
+/// and two constant-bank loads. A `private` address is one too on this backend, because the
+/// only local storage it models is reached through the generic 64-bit window.
+///
+/// A `shared` address is NOT. It is a 32-bit byte offset into the CTA's shared-memory window,
+/// which LDS and STS read out of ONE register. Giving it a pair would waste a register, add a
+/// meaningless high word to every address computation, and emit a 64-bit carry chain over an
+/// offset that cannot carry.
+fn isWidePtr(func: *const Function, v: Value) bool {
+    const space = ptrSpace(func, v) orelse return false;
+    return switch (space) {
+        .global, .constant, .private => true,
+        .shared => false,
+    };
+}
+
+/// True when a value is a workgroup-shared address: a 32-bit window offset in ONE register,
+/// which a load or a store reaches with LDS or STS instead of LDG or STG.
+fn isSharedPtr(func: *const Function, v: Value) bool {
+    const space = ptrSpace(func, v) orelse return false;
+    return switch (space) {
+        .shared => true,
+        .global, .constant, .private => false,
+    };
 }
 
 /// Emit the hardware read for a compute builtin parameter.
@@ -2004,7 +2059,7 @@ fn lowerInst(allocator: std.mem.Allocator, func: *const Function, loc: *std.Auto
             // a tag carrier: the load is replaced by the SHFL-quad
             // derivative, so its address arith is never emitted.
             if (deriv.grad_ptr.contains(result)) return;
-            if (isPtr(func, result) and a.op == .add) {
+            if (isWidePtr(func, result) and a.op == .add) {
                 // 64-bit pointer add: (dst:dst+1) = (base:base+1) +
                 // zext(offset). The low add produces a carry that the high
                 // add (`.X`) consumes.
@@ -2132,6 +2187,14 @@ fn lowerInst(allocator: std.mem.Allocator, func: *const Function, loc: *std.Auto
                 try code.append(allocator, encode.fswzadd(rd, scratch, vary, ops, .{}));
                 return;
             }
+            // A load through a SHARED pointer reads the CTA's shared-memory
+            // window, which is a different memory and a different
+            // instruction. Its address is a 32-bit offset in ONE register,
+            // so there is no pointer pair to read.
+            if (isSharedPtr(func, l.ptr)) {
+                try code.append(allocator, encode.ldsU32(rd, gprOf(loc.*, l.ptr), .{}));
+                return;
+            }
             // Otherwise this is an ordinary LDG from the 64-bit pointer pair
             // into the 32-bit result register. This is variable latency: the
             // scoreboard scheduler assigns its write barrier and the wait on
@@ -2165,6 +2228,11 @@ fn lowerInst(allocator: std.mem.Allocator, func: *const Function, loc: *std.Auto
                 // prologue pad already covers the async input-delivery
                 // window.
                 if (comp < 32) try code.append(allocator, encode.movReg(@intCast(comp), gprOf(loc.*, st.value), .{}));
+            } else if (isSharedPtr(func, st.ptr)) {
+                // A store through a SHARED pointer writes the CTA's
+                // shared-memory window. Its address is a 32-bit offset in ONE
+                // register, so there is no pointer pair to read.
+                try code.append(allocator, encode.stsU32(gprOf(loc.*, st.ptr), gprOf(loc.*, st.value), .{}));
             } else {
                 try code.append(allocator, encode.stgU32(gprOf(loc.*, st.ptr), gprOf(loc.*, st.value), .{}));
             }
@@ -3650,4 +3718,146 @@ test "a boolean-valued NOT (bit_xor bool, -1) lowers to PLOP3 (predicate negatio
         if (kernel.code[i] & 0xfff == 0x81c) saw_plop3 = true;
     }
     try testing.expect(saw_plop3);
+}
+
+/// The opcode of the instruction at index `i` in a compiled kernel's dword stream.
+fn opAt(code: []const u32, i: usize) u32 {
+    return code[i * 4] & 0xfff;
+}
+
+/// The 8-bit register field at bit `lo` of the instruction at index `i`.
+fn regAt(code: []const u32, i: usize, comptime lo: usize) u8 {
+    return @truncate(code[i * 4 + lo / 32] >> (lo % 32));
+}
+
+test "a shared pointer parameter is 32 bits: ONE LDC, and its accesses are LDS and STS" {
+    // The two things this pins, both of them silent miscompiles if they regress:
+    //   - a shared address takes ONE register, not an aligned pair, so the prologue reads
+    //     ONE dword out of the parameter block and the allocator gives it one register;
+    //   - a load or store through it reaches the CTA's shared window with LDS/STS, not the
+    //     global memory with LDG/STG.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const shared_t = try func.types.intern(.{ .ptr = .shared });
+    const b = try func.appendBlock();
+    const tile = try func.appendBlockParam(b, shared_t);
+    const n = try func.appendBlockParam(b, i32_t);
+    const v = try func.appendInst(b, i32_t, .{ .load = .{ .ptr = tile } });
+    const sum = try func.appendInst(b, i32_t, .{ .arith = .{ .op = .add, .lhs = v, .rhs = n } });
+    try func.appendStore(b, sum, tile);
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(v) });
+
+    var kernel = try compileKernel(allocator, &func, nvidia_abi);
+    defer kernel.deinit(allocator);
+
+    // LDC outptr lo, LDC outptr hi, LDC tile, LDC n, LDS, IADD3, STS, STG, EXIT.
+    // The tile pointer contributes ONE LDC. A 64-bit pointer would add a tenth.
+    try testing.expectEqual(@as(usize, 9 * 4), kernel.code.len);
+    try testing.expectEqual(@as(u32, 0xb82), opAt(kernel.code, 0)); // outptr lo
+    try testing.expectEqual(@as(u32, 0xb82), opAt(kernel.code, 1)); // outptr hi
+    try testing.expectEqual(@as(u32, 0xb82), opAt(kernel.code, 2)); // tile, the ONLY one
+    try testing.expectEqual(@as(u32, 0xb82), opAt(kernel.code, 3)); // n
+    try testing.expectEqual(@as(u32, 0x984), opAt(kernel.code, 4)); // LDS, not LDG (0x981)
+    try testing.expectEqual(@as(u32, 0x210), opAt(kernel.code, 5)); // IADD3
+    try testing.expectEqual(@as(u32, 0x988), opAt(kernel.code, 6)); // STS, not STG (0x986)
+    try testing.expectEqual(@as(u32, 0x986), opAt(kernel.code, 7)); // STG: the return, still global
+    try testing.expectEqual(@as(u32, 0x94d), opAt(kernel.code, 8)); // EXIT
+
+    // The tile parameter occupies exactly ONE register: the next parameter takes the very
+    // next register. A pair would have pushed `n` one further along.
+    const r_tile = regAt(kernel.code, 2, 16); // LDC dst
+    const r_n = regAt(kernel.code, 3, 16);
+    try testing.expectEqual(r_tile + 1, r_n);
+    try testing.expectEqual(@as(u8, value_reg_base), r_tile);
+
+    // LDS reads the shared window offset out of that one register at bit 24, and writes the
+    // loaded value into the register the STG then returns.
+    const r_v = regAt(kernel.code, 4, 16); // LDS dst
+    try testing.expectEqual(r_tile, regAt(kernel.code, 4, 24)); // LDS address
+    try testing.expectEqual(@as(u8, encode.URZ), regAt(kernel.code, 4, 32)); // no uniform base
+    // STS addresses the same register and stores the IADD3 result at bit 32.
+    try testing.expectEqual(r_tile, regAt(kernel.code, 6, 24)); // STS address
+    try testing.expectEqual(regAt(kernel.code, 5, 16), regAt(kernel.code, 6, 32)); // STS data
+    try testing.expectEqual(r_v, regAt(kernel.code, 7, 32)); // STG stores the loaded value
+
+    // The runtime is told the space, so it binds shared memory rather than a buffer.
+    try testing.expectEqual(@as(usize, 2), kernel.launch.params.len);
+    try testing.expectEqual(gpu.AddressSpace.shared, kernel.launch.params[0].kind.pointer);
+    try testing.expectEqual(@as(u8, 4), kernel.launch.params[1].kind.scalar);
+}
+
+test "shared address arithmetic is one 32-bit IADD3, where a global address is a carry chain" {
+    // A shared address cannot carry out of 32 bits, so `tile + i` is a plain integer add.
+    // The same shape on a global pointer stays the two-instruction carry chain.
+    const allocator = testing.allocator;
+
+    const Case = struct {
+        fn compile(alloc: std.mem.Allocator, space: ir.types.AddressSpace) !Kernel {
+            var func = Function.init(alloc);
+            defer func.deinit();
+            const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+            const ptr_t = try func.types.intern(.{ .ptr = space });
+            const b = try func.appendBlock();
+            const base_ptr = try func.appendBlockParam(b, ptr_t);
+            const i = try func.appendBlockParam(b, i32_t);
+            const elem = try func.appendInst(b, ptr_t, .{ .arith = .{ .op = .add, .lhs = base_ptr, .rhs = i } });
+            const v = try func.appendInst(b, i32_t, .{ .load = .{ .ptr = elem } });
+            func.setTerminator(b, .{ .ret = ir.function.Ret.one(v) });
+            return compileKernel(alloc, &func, nvidia_abi);
+        }
+    };
+
+    var shared_k = try Case.compile(allocator, .shared);
+    defer shared_k.deinit(allocator);
+    var global_k = try Case.compile(allocator, .global);
+    defer global_k.deinit(allocator);
+
+    const count = struct {
+        fn of(code: []const u32, opcode: u32) usize {
+            var n: usize = 0;
+            var i: usize = 0;
+            while (i < code.len) : (i += 4) {
+                if (code[i] & 0xfff == opcode) n += 1;
+            }
+            return n;
+        }
+    }.of;
+
+    // Shared: LDC outptr lo/hi, LDC tile, LDC i, IADD3, LDS, STG, EXIT.
+    try testing.expectEqual(@as(usize, 8 * 4), shared_k.code.len);
+    try testing.expectEqual(@as(usize, 1), count(shared_k.code, 0x210)); // ONE IADD3
+    try testing.expectEqual(@as(usize, 1), count(shared_k.code, 0x984)); // LDS
+    try testing.expectEqual(@as(usize, 0), count(shared_k.code, 0x981)); // no LDG
+    // The LDS reads the register the single IADD3 wrote.
+    try testing.expectEqual(@as(u32, 0x210), opAt(shared_k.code, 4));
+    try testing.expectEqual(@as(u32, 0x984), opAt(shared_k.code, 5));
+    try testing.expectEqual(regAt(shared_k.code, 4, 16), regAt(shared_k.code, 5, 24));
+
+    // Global: the pointer is a pair, so it is two LDCs and a two-instruction carry chain.
+    try testing.expectEqual(@as(usize, 2), count(global_k.code, 0x210)); // carry-out plus carry-in
+    try testing.expectEqual(@as(usize, 1), count(global_k.code, 0x981)); // LDG
+    try testing.expectEqual(@as(usize, 0), count(global_k.code, 0x984)); // no LDS
+    try testing.expectEqual(@as(usize, 5), count(global_k.code, 0xb82)); // outptr pair, base pair, i
+}
+
+test "a graphics stage rejects a shared pointer parameter instead of interpolating it" {
+    // A graphics stage has no workgroup and therefore no workgroup shared memory. Before the
+    // address-space split, `isPtr` sent this parameter down the UBO path and read a 64-bit
+    // address out of the graphics constant bank for it.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const shared_t = try func.types.intern(.{ .ptr = .shared });
+    const b = try func.appendBlock();
+    const tile = try func.appendBlockParam(b, shared_t);
+    const v = try func.appendInst(b, f32_t, .{ .load = .{ .ptr = tile } });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(v) });
+
+    try testing.expectError(
+        error.Unsupported,
+        compileShader(allocator, &func, .fragment, nvidia_abi),
+    );
 }

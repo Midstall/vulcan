@@ -458,8 +458,9 @@ const Builder = struct {
 };
 
 /// A bitmap over values: true for each `alloca` result that is promotable, i.e. its address
-/// never escapes (only ever a load/store `ptr`) and its element is a scalar (int/float/bool/ptr),
-/// so a load/store maps to exactly one SSA value. The caller owns the slice.
+/// never escapes (only ever a load/store `ptr`), it lives in a thread-private address space,
+/// and its element is a scalar (int/float/bool/ptr), so a load/store maps to exactly one SSA
+/// value. The caller owns the slice.
 fn findPromotable(allocator: std.mem.Allocator, func: *const Function) pass.Error![]bool {
     const promotable = try allocator.alloc(bool, func.valueCount());
     errdefer allocator.free(promotable);
@@ -471,8 +472,11 @@ fn findPromotable(allocator: std.mem.Allocator, func: *const Function) pass.Erro
     for (0..func.blockCount()) |bi| {
         for (func.blockInsts(@enumFromInt(bi))) |inst| {
             switch (func.opcode(inst)) {
-                .alloca => |al| if (isScalar(func, al.elem)) {
-                    promotable[@intFromEnum(func.instResult(inst).?)] = true;
+                .alloca => |al| {
+                    const result = func.instResult(inst).?;
+                    if (isScalar(func, al.elem) and isPromotableSpace(func, result)) {
+                        promotable[@intFromEnum(result)] = true;
+                    }
                 },
                 else => {},
             }
@@ -563,6 +567,30 @@ fn markEscapes(func: *const Function, promotable: []bool) void {
             .jump => |j| for (func.blockArgs(j)) |arg| esc(promotable, arg),
         };
     }
+}
+
+/// True if the storage an alloca RESULT names can move into a thread-private register.
+///
+/// Promotion deletes the slot and threads its value through block parameters, which puts the
+/// storage in a register that only one thread reads. That is correct for `private` (the slot is
+/// already per-thread) and for `global` (the default of every frontend that does not model
+/// address spaces, where an alloca is a stack slot). It is WRONG for `shared`, because every
+/// thread of a workgroup can see a shared slot, and `markEscapes` cannot find that: it examines
+/// intra-function uses only, and cross-thread visibility has no use to examine. It is also wrong
+/// for `constant`, which names read-only storage this pass must not rewrite.
+///
+/// The test is on the alloca RESULT, not on `al.elem`: `elem` says what the slot HOLDS, and
+/// where the slot LIVES is the question here.
+fn isPromotableSpace(func: *const Function, result: Value) bool {
+    return switch (func.types.type_kind(func.valueType(result))) {
+        .ptr => |space| switch (space) {
+            .private, .global => true,
+            .shared, .constant => false,
+        },
+        // An alloca whose result is not a pointer is malformed. Refuse to promote it and let
+        // the verifier report it.
+        .int, .float, .bool, .vector, .array, .slice, .@"struct" => false,
+    };
 }
 
 /// True for the scalar types a single load/store round-trips as one SSA value.
@@ -952,5 +980,63 @@ test "two independent scalar slots both promote" {
     const add = func.opcode(func.definingInst(sum).?).arith;
     try testing.expectEqual(x, add.lhs);
     try testing.expectEqual(y, add.rhs);
+    try expectNoMemoryInsts(&func, b);
+}
+
+test "a shared-address-space slot is not promoted" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try intTy(&func, 32, .signed);
+    const shared_t = try func.types.intern(.{ .ptr = .shared });
+    const b = try func.appendBlock();
+    const x = try func.appendBlockParam(b, t);
+    const slot = try func.appendInst(b, shared_t, .{ .alloca = .{ .elem = t } });
+    try func.appendStore(b, x, slot);
+    const y = try func.appendInst(b, t, .{ .load = .{ .ptr = slot } });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(y) });
+
+    // Every thread of the workgroup can see this slot, so the pass must report no change and
+    // leave the alloca, the store and the load in memory.
+    try testing.expect(!try runOnce(allocator, &func));
+    const insts = func.blockInsts(b);
+    try testing.expectEqual(@as(usize, 3), insts.len);
+    try testing.expectEqual(t, func.opcode(insts[0]).alloca.elem);
+    try testing.expectEqual(shared_t, func.valueType(func.instResult(insts[0]).?));
+    try testing.expectEqual(slot, func.opcode(insts[1]).store.ptr);
+    try testing.expectEqual(slot, func.opcode(insts[2]).load.ptr);
+    try testing.expectEqual(y, func.terminator(b).?.ret.values[0]);
+}
+
+test "a constant-address-space slot is not promoted" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try intTy(&func, 32, .signed);
+    const const_t = try func.types.intern(.{ .ptr = .constant });
+    const b = try func.appendBlock();
+    const slot = try func.appendInst(b, const_t, .{ .alloca = .{ .elem = t } });
+    const y = try func.appendInst(b, t, .{ .load = .{ .ptr = slot } });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(y) });
+
+    try testing.expect(!try runOnce(allocator, &func));
+    try testing.expectEqual(@as(usize, 2), func.blockInsts(b).len);
+}
+
+test "a private-address-space slot still promotes" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try intTy(&func, 32, .signed);
+    const private_t = try func.types.intern(.{ .ptr = .private });
+    const b = try func.appendBlock();
+    const x = try func.appendBlockParam(b, t);
+    const slot = try func.appendInst(b, private_t, .{ .alloca = .{ .elem = t } });
+    try func.appendStore(b, x, slot);
+    const y = try func.appendInst(b, t, .{ .load = .{ .ptr = slot } });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(y) });
+
+    try testing.expect(try runOnce(allocator, &func));
+    try testing.expectEqual(x, func.terminator(b).?.ret.values[0]);
     try expectNoMemoryInsts(&func, b);
 }
