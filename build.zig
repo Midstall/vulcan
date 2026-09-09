@@ -29,6 +29,16 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "vulcan-ir", .module = vulcan_ir }},
     });
 
+    // The target-neutral accelerator kernel ABI: builtins, parameter layout, and the launch
+    // metadata a runtime reads. Freestanding-clean. Depends only on the IR, so the frontends
+    // can tag kernels with it without depending on the target seam.
+    const vulcan_gpu = b.addModule("vulcan-gpu", .{
+        .root_source_file = b.path("libs/vulcan-gpu.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "vulcan-ir", .module = vulcan_ir }},
+    });
+
     // The shared static ELF linker: parse relocatable objects, resolve relocations,
     // bind external calls through per-arch GOT stubs, and wrap the result in a static
     // executable. Imports only `std` (defines its own ELF/reloc structs), so the target
@@ -246,6 +256,9 @@ pub fn build(b: *std.Build) void {
 
     const opt_tests = b.addTest(.{ .root_module = vulcan_opt });
     test_step.dependOn(&b.addRunArtifact(opt_tests).step);
+
+    const gpu_tests = b.addTest(.{ .root_module = vulcan_gpu });
+    test_step.dependOn(&b.addRunArtifact(gpu_tests).step);
 
     const spirv_tests = b.addTest(.{ .root_module = vulcan_spirv });
     test_step.dependOn(&b.addRunArtifact(spirv_tests).step);
