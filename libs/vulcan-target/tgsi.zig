@@ -30,6 +30,7 @@
 
 const std = @import("std");
 const ir = @import("vulcan-ir");
+const gpu = @import("vulcan-gpu");
 
 const Function = ir.function.Function;
 const Value = ir.function.Value;
@@ -490,19 +491,24 @@ pub fn lower(allocator: std.mem.Allocator, func: *const Function) Error![]u8 {
             if (reg >= in_present.len) return error.Unsupported;
             in_present[reg] = true;
             try src_of.put(allocator, p, .{ .input = .{ .reg = reg, .comp = comp } });
-        } else if (attrTag(func, p, "builtin")) |bi| {
-            if (bi == 15) {
+        } else if (gpu.attrs.builtinOf(func, p)) |bi| {
+            if (bi == .frag_coord) {
                 // gl_FragCoord: a component of the POSITION-semantic input register.
                 const comp = attrTag(func, p, "bicomp") orelse 0;
                 fc_used = true;
                 try src_of.put(allocator, p, .{ .fragcoord = @intCast(comp) });
             } else {
-                // gl_VertexIndex (42) / gl_InstanceIndex (43) / gl_FrontFacing (17): a
-                // system value input read as SV[idx].x.
+                // gl_VertexIndex / gl_InstanceIndex / gl_FrontFacing: a system value
+                // input read as SV[idx].x.
+                //
+                // The `else` here is deliberate, and it is the one switch in this
+                // backend that keeps one. `Builtin` has 22 members and TGSI supports 4,
+                // so a rejection arm that lists the other 18 would be noise, and it
+                // would rot every time the enum grows.
                 const sem: Sysval = switch (bi) {
-                    42 => .vertexid,
-                    43 => .instanceid,
-                    17 => .face,
+                    .vertex_index => .vertexid,
+                    .instance_index => .instanceid,
+                    .front_facing => .face,
                     else => return error.Unsupported,
                 };
                 if (sv_count >= sv_sem.len) return error.Unsupported;
@@ -1596,9 +1602,9 @@ test "lower a vertex shader reading gl_InstanceIndex to TGSI SV[] INSTANCEID" {
         pos[c] = try func.appendBlockParam(b, f32_t);
         try func.addAttr(.{ .value = pos[c] }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "attr", .value = .{ .int = ATTR_GENERIC0 + c * 4 } } });
     }
-    // gl_InstanceIndex (builtin 43), converted to float and added to position.x.
+    // gl_InstanceIndex, converted to float and added to position.x.
     const inst = try func.appendBlockParam(b, i32_t);
-    try func.addAttr(.{ .value = inst }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "builtin", .value = .{ .int = 43 } } });
+    try gpu.attrs.setBuiltin(&func, inst, .instance_index);
     const fi = try func.appendInst(b, f32_t, .{ .convert = .{ .value = inst } });
     const sx = try func.appendInst(b, f32_t, .{ .arith = .{ .op = .add, .lhs = pos[0], .rhs = fi } });
     const outs = [4]Value{ sx, pos[1], pos[2], pos[3] };
@@ -1616,6 +1622,47 @@ test "lower a vertex shader reading gl_InstanceIndex to TGSI SV[] INSTANCEID" {
     try testing.expect(std.mem.indexOf(u8, tgsi, "I2F TEMP[0].x, SV[0].x\n") != null);
     try testing.expect(std.mem.indexOf(u8, tgsi, "ADD TEMP[1].x, IN[0].x, TEMP[0].x\n") != null);
     try testing.expectEqual(@as(usize, 0), tgsi.len % 4);
+}
+
+test "a frontend-tagged vertex index reaches the TGSI system-value path" {
+    // Regression: this backend decoded the builtin attribute as a raw SPIR-V number, so when
+    // the frontend moved to vulcan's own numbering a lowered shader silently became
+    // Unsupported. No other test catches it, because the others hand-write the numbers.
+    // The tag is written through the same typed setter the SPIR-V lowering uses, and the
+    // assertions name the VERTEXID declaration and the SV read, so a decode that falls back
+    // to the rejection arm or to a generic input fails this test.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    try func.addAttr(.func, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "stage", .value = .{ .string = "vertex" } } });
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const b = try func.appendBlock();
+
+    var pos: [4]Value = undefined;
+    inline for (0..4) |c| {
+        pos[c] = try func.appendBlockParam(b, f32_t);
+        try func.addAttr(.{ .value = pos[c] }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "attr", .value = .{ .int = ATTR_GENERIC0 + c * 4 } } });
+    }
+    // gl_VertexIndex, converted to float and added to position.x.
+    const vi = try func.appendBlockParam(b, i32_t);
+    try gpu.attrs.setBuiltin(&func, vi, .vertex_index);
+    const fv = try func.appendInst(b, f32_t, .{ .convert = .{ .value = vi } });
+    const sx = try func.appendInst(b, f32_t, .{ .arith = .{ .op = .add, .lhs = pos[0], .rhs = fv } });
+    const outs = [4]Value{ sx, pos[1], pos[2], pos[3] };
+    inline for (0..4) |c| {
+        const ptr = try func.appendInst(b, i32_t, .{ .iconst = @intCast(ATTR_POSITION + c * 4) });
+        try func.addAttr(.{ .value = ptr }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "out_attr", .value = .{ .int = ATTR_POSITION + c * 4 } } });
+        try func.appendStore(b, outs[c], ptr);
+    }
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
+
+    const tgsi = try lower(allocator, &func);
+    defer allocator.free(tgsi);
+
+    try testing.expect(std.mem.indexOf(u8, tgsi, "DCL SV[0], VERTEXID\n") != null);
+    try testing.expect(std.mem.indexOf(u8, tgsi, "I2F TEMP[0].x, SV[0].x\n") != null);
+    try testing.expect(std.mem.indexOf(u8, tgsi, "ADD TEMP[1].x, IN[0].x, TEMP[0].x\n") != null);
 }
 
 test "lower a float remainder (mod) to the TGSI trunc-based sequence" {
@@ -1707,7 +1754,7 @@ test "lower a per-instance UBO fetch (dynamic CONST index by gl_InstanceIndex) t
     const ubo = try func.appendBlockParam(b, ptr_t);
     try func.addAttr(.{ .value = ubo }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "binding", .value = .{ .int = 0 } } });
     const inst = try func.appendBlockParam(b, i32_t);
-    try func.addAttr(.{ .value = inst }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "builtin", .value = .{ .int = 43 } } });
+    try gpu.attrs.setBuiltin(&func, inst, .instance_index);
 
     // offset = gl_InstanceIndex * 16 (the vec4 array stride). base_dyn = ubo + offset.
     const stride = try func.appendInst(b, i32_t, .{ .iconst = 16 });
@@ -1938,15 +1985,15 @@ test "lower a fragment shader reading gl_FragCoord + gl_FrontFacing to TGSI POSI
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const b = try func.appendBlock();
 
-    // gl_FragCoord (vec4, builtin 15) + gl_FrontFacing (bool, builtin 17).
+    // gl_FragCoord (vec4) + gl_FrontFacing (bool).
     var fc: [4]Value = undefined;
     inline for (0..4) |c| {
         fc[c] = try func.appendBlockParam(b, f32_t);
-        try func.addAttr(.{ .value = fc[c] }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "builtin", .value = .{ .int = 15 } } });
+        try gpu.attrs.setBuiltin(&func, fc[c], .frag_coord);
         try func.addAttr(.{ .value = fc[c] }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "bicomp", .value = .{ .int = c } } });
     }
     const ff = try func.appendBlockParam(b, f32_t);
-    try func.addAttr(.{ .value = ff }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "builtin", .value = .{ .int = 17 } } });
+    try gpu.attrs.setBuiltin(&func, ff, .front_facing);
     try func.addAttr(.{ .value = ff }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "bicomp", .value = .{ .int = 0 } } });
 
     // color = (fragcoord.x, fragcoord.y, frontfacing, fragcoord.w).

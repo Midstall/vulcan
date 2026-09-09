@@ -50,7 +50,7 @@ test "SPIR-V compute function -> IR -> SASS kernel (x*y - x)" {
     defer func.deinit();
 
     // SPIR-V -> IR -> SASS compute kernel.
-    var kernel = try isel.compileKernel(allocator, &func);
+    var kernel = try isel.compileKernel(allocator, &func, isel.nvidia_abi);
     defer kernel.deinit(allocator);
 
     // The kernel loads the output pointer + two inputs (4x LDC), multiplies,
@@ -92,7 +92,7 @@ test "SPIR-V function composes with the optimizer before SASS codegen" {
     defer func.deinit();
     _ = try opt.optimize(allocator, &func);
 
-    var kernel = try isel.compileKernel(allocator, &func);
+    var kernel = try isel.compileKernel(allocator, &func, isel.nvidia_abi);
     defer kernel.deinit(allocator);
     // Still a well-formed kernel: it loads the input, computes, stores, and exits.
     try std.testing.expect(hasOpcode(kernel.code, 0xb82)); // LDC
@@ -121,7 +121,7 @@ test "SPIR-V conversions -> SASS I2F/F2I" {
 
     var func = try spirv.lowerModule(allocator, b.words.items);
     defer func.deinit();
-    var kernel = try isel.compileKernel(allocator, &func);
+    var kernel = try isel.compileKernel(allocator, &func, isel.nvidia_abi);
     defer kernel.deinit(allocator);
 
     try std.testing.expect(hasOpcode(kernel.code, 0x306)); // I2F (base 0x106 | reg form)
@@ -166,7 +166,7 @@ test "SPIR-V compute shader -> SASS kernel (buffer load/store + thread id)" {
 
     var func = try spirv.lowerModule(allocator, b.words.items);
     defer func.deinit();
-    var kernel = try isel.compileKernel(allocator, &func);
+    var kernel = try isel.compileKernel(allocator, &func, isel.nvidia_abi);
     defer kernel.deinit(allocator);
 
     // The invocation id is blockIdx.x * local_size_x + threadIdx.x: two S2R reads
@@ -229,7 +229,7 @@ test "SASS: a lowered division compiles to a kernel (register reuse)" {
     func.setTerminator(b, .{ .ret = ir.function.Ret.one(q) });
 
     try std.testing.expect(try opt.lowerdiv.run(allocator, &func));
-    var kernel = try isel.compileKernel(allocator, &func);
+    var kernel = try isel.compileKernel(allocator, &func, isel.nvidia_abi);
     defer kernel.deinit(allocator);
 
     // The expansion lowers to shifts, compares, and selects, ending in STG + EXIT.

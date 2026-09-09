@@ -55,7 +55,8 @@ pub fn build(b: *std.Build) void {
 
     // The target seam: register sets, ABI, encoding, and codegen per target. Also
     // sees the SPIR-V frontend so it can execution-validate SPIR-V -> IR -> native,
-    // and the shared linker for object linking/JIT/executable emission.
+    // the kernel ABI so the accelerator backends read the launch contract, and the
+    // shared linker for object linking/JIT/executable emission.
     const vulcan_target = b.addModule("vulcan-target", .{
         .root_source_file = b.path("libs/vulcan-target.zig"),
         .target = target,
@@ -64,6 +65,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "vulcan-ir", .module = vulcan_ir },
             .{ .name = "vulcan-opt", .module = vulcan_opt },
             .{ .name = "vulcan-spirv", .module = vulcan_spirv },
+            .{ .name = "vulcan-gpu", .module = vulcan_gpu },
             .{ .name = "vulcan-link", .module = vulcan_link },
         },
     });

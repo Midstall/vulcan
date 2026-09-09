@@ -5,7 +5,8 @@
 //! is no call stack. The GPU has about 255 GPRs, so register allocation stays
 //! simple: a pointer takes an even-aligned register pair, and a boolean takes a
 //! predicate register (P0 to P5, where P6 holds the 64-bit-add carry). Kernel
-//! ABI: parameters arrive in constant bank 0 at `param_base`. A kernel that
+//! ABI: parameters arrive in constant bank 0 at the caller's `Abi.param_base`,
+//! and `vulcan-gpu` places them. A kernel that
 //! returns a value reads a 64-bit output pointer first (its `ret` stores the
 //! result there). A void compute kernel has no output pointer. Each parameter
 //! then loads in order: the tagged invocation ID comes from the hardware thread
@@ -22,6 +23,7 @@
 
 const std = @import("std");
 const ir = @import("vulcan-ir");
+const gpu = @import("vulcan-gpu");
 const encode = @import("encode.zig");
 const schedule = @import("schedule.zig");
 
@@ -31,12 +33,19 @@ const Block = ir.function.Block;
 const Terminator = ir.function.Terminator;
 const Inst = encode.Inst;
 
-pub const Error = std.mem.Allocator.Error || error{Unsupported};
+pub const Error = std.mem.Allocator.Error || gpu.abi.Error || error{Unsupported};
 
-/// The constant-bank byte offset where kernel parameters begin. 0x160 is the
-/// kernel-param base for Volta through Ampere. The dispatch side (prism's QMD)
-/// must use the same offset.
-pub const param_base: u16 = 0x160;
+/// The default NVIDIA parameter ABI. `param_base` 0x160 is the CUDA driver convention, where a
+/// driver-owned block sits in front of the kernel parameters. A runtime that binds its own
+/// parameter buffer as the base of constant bank 0 passes 0 instead, which is what the
+/// hardware-verified sm_120 dispatch in nvidia.zig does. Both values are correct for their own
+/// binding convention, so the caller chooses.
+pub const nvidia_abi: gpu.Abi = .{
+    .param_base = 0x160,
+    .pointer_bytes = 8,
+    .param_align = 4,
+    .max_shared_bytes = 48 * 1024,
+};
 const bank0: u5 = 0;
 
 /// Graphics prologue padding. These are throwaway instructions emitted before
@@ -118,9 +127,12 @@ pub const Kernel = struct {
     /// many color targets in the SPH omap and binds that many color surfaces
     /// to the ROP.
     color_targets: u8 = 1,
+    /// What a runtime needs to launch this kernel. `params` is owned by this Kernel.
+    launch: gpu.LaunchInfo,
 
     pub fn deinit(self: *Kernel, allocator: std.mem.Allocator) void {
         allocator.free(self.code);
+        allocator.free(self.launch.params);
     }
 };
 
@@ -358,13 +370,13 @@ fn computeConvergence(allocator: std.mem.Allocator, func: *const Function) Error
 /// (vertex inputs via ALD, fragment inputs via IPA, outputs via AST).
 pub const Stage = enum { compute, vertex, fragment };
 
-/// Lower `func` to a SASS compute kernel. The caller owns the result.
-pub fn compileKernel(allocator: std.mem.Allocator, func: *Function) Error!Kernel {
-    return compileShader(allocator, func, .compute);
+/// Lower `func` to a SASS compute kernel under the parameter ABI `a`. The caller owns the result.
+pub fn compileKernel(allocator: std.mem.Allocator, func: *Function, a: gpu.Abi) Error!Kernel {
+    return compileShader(allocator, func, .compute, a);
 }
 
-/// Lower `func` to a SASS shader for `stage`. The caller owns the result.
-pub fn compileShader(allocator: std.mem.Allocator, func: *Function, stage: Stage) Error!Kernel {
+/// Lower `func` to a SASS shader for `stage` under the parameter ABI `a`. The caller owns the result.
+pub fn compileShader(allocator: std.mem.Allocator, func: *Function, stage: Stage, a: gpu.Abi) Error!Kernel {
     // This backend does not lower f16 yet. Reject it cleanly instead of
     // silently treating it as f64. This check covers both this direct entry
     // and compileKernel, which calls this function.
@@ -431,34 +443,39 @@ pub fn compileShader(allocator: std.mem.Allocator, func: *Function, stage: Stage
     defer allocator.free(block_start);
 
     const eparams = func.blockParams(@enumFromInt(0));
+    // The graphics slice is allocated rather than a `&.{}` literal so `Kernel.deinit` can free
+    // it unconditionally, with no special case for a zero-length non-heap slice. A graphics
+    // shader sources its inputs from the attribute interface and not from a parameter block,
+    // so it never goes through `layoutParams`.
+    var layout: gpu.kernel.Layout = if (stage == .compute)
+        try gpu.layoutParams(allocator, func, a, returnsValue(func))
+    else
+        .{ .params = try allocator.alloc(gpu.Param, 0), .bytes = 0, .out_pointer = null };
+    errdefer layout.deinit(allocator);
+
     if (stage == .compute) {
         // A kernel that returns a value reads an output pointer from the front
         // of the constant bank (its `ret` stores the result there). A void
         // compute kernel has no output pointer.
-        var cursor: u16 = param_base;
-        if (returnsValue(func)) {
-            try code.append(allocator, encode.ldc(r_outptr, bank0, cursor, .{})); // outptr lo
-            try code.append(allocator, encode.ldc(r_outptr + 1, bank0, cursor + 4, .{})); // outptr hi
-            cursor += 8;
+        if (layout.out_pointer) |out| {
+            const at: u16 = @intCast(a.param_base + out.offset);
+            try code.append(allocator, encode.ldc(r_outptr, bank0, at, .{})); // outptr lo
+            try code.append(allocator, encode.ldc(r_outptr + 1, bank0, at + 4, .{})); // outptr hi
         }
+        var placed: usize = 0;
         for (eparams) |p| {
-            if (isInvocationId(func, p)) {
-                // gid.x = blockIdx.x * local_size_x + threadIdx.x. The workgroup
-                // size is a compile-time constant. The thread and block IDs
-                // come from S2R.
-                const gid = gprOf(loc, p);
-                try code.append(allocator, encode.movImm(gid, localSizeX(func), .{}));
-                try code.append(allocator, encode.s2r(r_scratch, encode.SR_TID_X, .{})); // threadIdx.x
-                try code.append(allocator, encode.s2r(r_scratch2, encode.SR_CTAID_X, .{})); // blockIdx.x
-                try code.append(allocator, encode.imad(gid, r_scratch2, gid, r_scratch, .{}));
-            } else if (isPtr(func, p)) {
-                const lo = gprOf(loc, p);
-                try code.append(allocator, encode.ldc(lo, bank0, cursor, .{}));
-                try code.append(allocator, encode.ldc(lo + 1, bank0, cursor + 4, .{}));
-                cursor += 8;
-            } else {
-                try code.append(allocator, encode.ldc(gprOf(loc, p), bank0, cursor, .{}));
-                cursor += 4;
+            if (gpu.attrs.builtinOf(func, p)) |bi| {
+                try emitComputeBuiltin(allocator, &code, func, loc, p, bi);
+                continue;
+            }
+            const slot = layout.params[placed];
+            placed += 1;
+            const at: u16 = @intCast(a.param_base + slot.offset);
+            const lo = gprOf(loc, p);
+            try code.append(allocator, encode.ldc(lo, bank0, at, .{}));
+            // A pointer occupies a register pair, so its high word follows in lo + 1.
+            if (slot.kind == .pointer) {
+                try code.append(allocator, encode.ldc(lo + 1, bank0, at + 4, .{}));
             }
         }
     } else {
@@ -513,21 +530,21 @@ pub fn compileShader(allocator: std.mem.Allocator, func: *Function, stage: Stage
             // UBO array with no vertex buffer. ALD is variable-latency: the
             // scheduler drains it before its use. The pipeline's SPH must
             // also declare the vertex-ID sysval input.
-            if (builtinTag(func, p)) |bi| {
+            if (gpu.attrs.builtinOf(func, p)) |bi| {
                 switch (bi) {
-                    // gl_FragCoord (BuiltIn 15): the window-space fragment
+                    // gl_FragCoord: the window-space fragment
                     // position. Each component is IPA'd (freq Pass) from the
                     // POSITION attribute a[0x70+c*4] (NAK_ATTR_POSITION),
                     // tagged `bicomp` = component. The SPH declares the
                     // position input as SCREEN_LINEAR (readsFragPosition), so
                     // the raster delivers x and y in pixels, z as the
                     // interpolated depth, and w as 1/clip_w.
-                    15 => {
+                    .frag_coord => {
                         const comp: u16 = attrTag(func, p, "bicomp") orelse 0;
                         try code.append(allocator, encode.ipa(rd, encode.ATTR_POSITION + comp * 4, .{}));
                         continue;
                     },
-                    // gl_FrontFacing (BuiltIn 17): the raster delivers a flat
+                    // gl_FrontFacing: the raster delivers a flat
                     // per-primitive facing flag at a[0x3fc]
                     // (NAK_ATTR_FRONT_FACE) as an integer mask: all-ones for
                     // a front face, zero for back. The frontend types this as
@@ -542,12 +559,12 @@ pub fn compileShader(allocator: std.mem.Allocator, func: *Function, stage: Stage
                     // the downstream FSETP behaves correctly. The raster
                     // always delivers a[0x3fc], so no extra SPH imap entry is
                     // needed.
-                    17 => {
+                    .front_facing => {
                         try code.append(allocator, encode.ipaConstant(rd, encode.ATTR_FRONT_FACE, .{}));
                         try code.append(allocator, encode.i2f(rd, rd, true, .{}));
                         continue;
                     },
-                    // gl_PointCoord (BuiltIn 16): a point sprite's s/t
+                    // gl_PointCoord: a point sprite's s/t
                     // coordinate, running 0..1 across the sprite quad. Each
                     // component is a normal IPA from the point-sprite
                     // attribute a[0x2e0]+comp*4 (NAK_ATTR_POINT_SPRITE_S/T).
@@ -556,19 +573,42 @@ pub fn compileShader(allocator: std.mem.Allocator, func: *Function, stage: Stage
                     // delivers the perspective-free sprite-local coordinate,
                     // and the draw state enables SET_POINT_SPRITE (done once
                     // at channel init).
-                    16 => {
+                    .point_coord => {
                         const comp: u16 = attrTag(func, p, "bicomp") orelse 0;
                         try code.append(allocator, encode.ipa(rd, encode.ATTR_POINT_SPRITE + comp * 4, .{}));
                         continue;
                     },
-                    // gl_VertexIndex (42) / gl_InstanceIndex (43): a vertex
-                    // shader reads them from the DA-delivered attribute
-                    // interface (ALD), not IPA.
-                    else => {
-                        const attr: u16 = if (bi == 43) encode.ATTR_INSTANCE_ID else encode.ATTR_VERTEX_ID;
+                    // gl_VertexIndex / gl_InstanceIndex: a vertex shader reads
+                    // them from the DA-delivered attribute interface (ALD),
+                    // not IPA.
+                    .vertex_index, .instance_index => {
+                        const attr: u16 = if (bi == .instance_index) encode.ATTR_INSTANCE_ID else encode.ATTR_VERTEX_ID;
                         try code.append(allocator, encode.ald(rd, attr, 1, .{}));
                         continue;
                     },
+                    // A compute builtin has no graphics delivery path. The
+                    // hardware gives it to a kernel, not to the attribute
+                    // interface, so a graphics shader that asks for one is a
+                    // frontend error and not a shape this backend can emit.
+                    .thread_id_x,
+                    .thread_id_y,
+                    .thread_id_z,
+                    .block_id_x,
+                    .block_id_y,
+                    .block_id_z,
+                    .block_dim_x,
+                    .block_dim_y,
+                    .block_dim_z,
+                    .grid_dim_x,
+                    .grid_dim_y,
+                    .grid_dim_z,
+                    .global_id_x,
+                    .global_id_y,
+                    .global_id_z,
+                    .lane_id,
+                    .warp_id,
+                    .subgroup_size,
+                    => return error.Unsupported,
                 }
             }
             // The host-sampler function pointer the SPIR-V image-sample
@@ -737,7 +777,22 @@ pub fn compileShader(allocator: std.mem.Allocator, func: *Function, stage: Stage
     const out = try allocator.alloc(u32, code.items.len * 4);
     errdefer allocator.free(out);
     for (code.items, 0..) |w, i| @memcpy(out[i * 4 ..][0..4], &w);
-    return .{ .code = out, .reg_count = regCount(max_reg), .writes_depth = writesFragDepth(func), .color_targets = colorTargetCount(func) };
+    // The parameter slice moves from `layout` to the Kernel here, so the Kernel's `deinit`
+    // releases it from this point on and the `errdefer layout.deinit` above must not fire.
+    const reg_count = regCount(max_reg);
+    return .{
+        .code = out,
+        .reg_count = reg_count,
+        .writes_depth = writesFragDepth(func),
+        .color_targets = colorTargetCount(func),
+        .launch = .{
+            .params = layout.params,
+            .param_bytes = layout.bytes,
+            .block = gpu.attrs.localSize(func),
+            .shared_bytes = gpu.attrs.sharedBytes(func),
+            .reg_count = reg_count,
+        },
+    };
 }
 
 fn regCount(max_reg: u8) u32 {
@@ -1052,33 +1107,57 @@ fn isPtr(func: *const Function, v: Value) bool {
     return func.types.type_kind(func.valueType(v)) == .ptr;
 }
 
-/// Whether `v` is the invocation-ID parameter the frontend tagged. This value
-/// is sourced from the hardware thread ID, not a uniform kernel argument.
-fn isInvocationId(func: *const Function, v: Value) bool {
-    var it = func.attributesOf(.{ .value = v });
-    while (it.next()) |attr| switch (attr) {
-        .custom => |c| if (std.mem.eql(u8, c.namespace, "vulcan.gpu") and std.mem.eql(u8, c.key, "builtin")) return true,
-        else => {},
-    };
-    return false;
-}
-
-/// The `vulcan.gpu.builtin` integer value attached to `v`: the BuiltIn ID the
-/// frontend tagged a synthesized param with (vertex_index=42,
-/// instance_index=43, global_invocation_id=28). Returns null if `v` is not a
-/// tagged builtin param.
-fn builtinTag(func: *const Function, v: Value) ?u32 {
-    var it = func.attributesOf(.{ .value = v });
-    while (it.next()) |attr| switch (attr) {
-        .custom => |c| if (std.mem.eql(u8, c.namespace, "vulcan.gpu") and std.mem.eql(u8, c.key, "builtin")) {
-            return switch (c.value) {
-                .int => |n| @intCast(n),
-                else => null,
-            };
+/// Emit the hardware read for a compute builtin parameter.
+///
+/// Only the builtins the encoder can currently reach are accepted. `encode.zig` has special
+/// registers for tid.x, ctaid.x and laneid only, so the remaining axes return
+/// `error.Unsupported` rather than silently producing the wrong index. M3 adds the missing
+/// SR_* constants and the arms that use them.
+fn emitComputeBuiltin(
+    allocator: std.mem.Allocator,
+    code: *std.ArrayList(Inst),
+    func: *const Function,
+    loc: std.AutoHashMapUnmanaged(Value, Loc),
+    p: Value,
+    bi: gpu.Builtin,
+) Error!void {
+    if (!bi.isCompute()) return error.Unsupported;
+    const dst = gprOf(loc, p);
+    switch (bi) {
+        .thread_id_x => try code.append(allocator, encode.s2r(dst, encode.SR_TID_X, .{})),
+        .block_id_x => try code.append(allocator, encode.s2r(dst, encode.SR_CTAID_X, .{})),
+        .lane_id => try code.append(allocator, encode.s2r(dst, encode.SR_LANEID, .{})),
+        .global_id_x => {
+            // gid.x = ctaid.x * ntid.x + tid.x. The workgroup size is a compile-time constant,
+            // so it becomes an immediate rather than a second hardware read.
+            const size = gpu.attrs.localSize(func)[0];
+            try code.append(allocator, encode.movImm(dst, size, .{}));
+            try code.append(allocator, encode.s2r(r_scratch, encode.SR_TID_X, .{}));
+            try code.append(allocator, encode.s2r(r_scratch2, encode.SR_CTAID_X, .{}));
+            try code.append(allocator, encode.imad(dst, r_scratch2, dst, r_scratch, .{}));
         },
-        else => {},
-    };
-    return null;
+        .thread_id_y,
+        .thread_id_z,
+        .block_id_y,
+        .block_id_z,
+        .block_dim_x,
+        .block_dim_y,
+        .block_dim_z,
+        .grid_dim_x,
+        .grid_dim_y,
+        .grid_dim_z,
+        .global_id_y,
+        .global_id_z,
+        .warp_id,
+        .subgroup_size,
+        => return error.Unsupported,
+        .vertex_index,
+        .instance_index,
+        .frag_coord,
+        .point_coord,
+        .front_facing,
+        => return error.Unsupported,
+    }
 }
 
 /// Whether `v` carries the named `vulcan.gpu` flag or attribute, in any value form.
@@ -1207,22 +1286,6 @@ fn attrTag(func: *const Function, v: Value, key: []const u8) ?u16 {
         else => {},
     };
     return null;
-}
-
-/// The workgroup x dimension the frontend recorded (the LocalSize execution
-/// mode), used to fold the block offset into the invocation ID. Defaults to 1.
-fn localSizeX(func: *const Function) u32 {
-    var it = func.attributesOf(.func);
-    while (it.next()) |attr| switch (attr) {
-        .custom => |c| if (std.mem.eql(u8, c.namespace, "vulcan.gpu") and std.mem.eql(u8, c.key, "local_size_x")) {
-            return switch (c.value) {
-                .int => |n| @intCast(n),
-                else => 1,
-            };
-        },
-        else => {},
-    };
-    return 1;
 }
 
 fn returnsValue(func: *const Function) bool {
@@ -2720,7 +2783,7 @@ test "compiles a vertex shader: attribute load, compute, attribute store, exit" 
     try func.appendStore(b, sum, out_ptr);
     func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
 
-    var kernel = try compileShader(allocator, &func, .vertex);
+    var kernel = try compileShader(allocator, &func, .vertex, nvidia_abi);
     defer kernel.deinit(allocator);
 
     // The sequence is: ALD (attribute fetch), FADD, AST (write position), EXIT.
@@ -2765,7 +2828,7 @@ test "graphics: a UBO pointer param loads its address from constant bank (LDC), 
     try func.appendStore(b, sum, out_ptr);
     func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
 
-    var kernel = try compileShader(allocator, &func, .vertex);
+    var kernel = try compileShader(allocator, &func, .vertex, nvidia_abi);
     defer kernel.deinit(allocator);
 
     // The prologue must source the UBO pointer from the constant bank (two
@@ -2808,14 +2871,14 @@ test "graphics: gl_VertexIndex sources from S2R and pulls a vec from a UBO array
     const b = try func.appendBlock();
 
     // Entry params, in vertex-pulling order with no attribute inputs: the
-    // gl_VertexIndex builtin (i32, tagged vulcan.gpu.builtin=42), then the
+    // gl_VertexIndex builtin (i32, tagged with the vertex_index builtin), then the
     // UBO base pointer. The body computes
     // &u.pos[gl_VertexIndex] = base + index*stride, loads a float through
     // it, and writes the clip-space position output. This is exactly the
     // IR the SPIR-V lowering produces for `u.pos[gl_VertexIndex]` with a
     // zero-attribute pipeline.
     const vi = try func.appendBlockParam(b, i32_t);
-    try func.addAttr(.{ .value = vi }, .{ .custom = .{ .namespace = "vulcan.gpu", .key = "builtin", .value = .{ .int = 42 } } });
+    try gpu.attrs.setBuiltin(&func, vi, .vertex_index);
     const ubo = try func.appendBlockParam(b, ptr_t);
     const stride = try func.appendInst(b, i32_t, .{ .iconst = 16 }); // std140 vec4 stride
     const off = try func.appendInst(b, i32_t, .{ .arith = .{ .op = .mul, .lhs = vi, .rhs = stride } });
@@ -2826,7 +2889,7 @@ test "graphics: gl_VertexIndex sources from S2R and pulls a vec from a UBO array
     try func.appendStore(b, uval, out_ptr);
     func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
 
-    var kernel = try compileShader(allocator, &func, .vertex);
+    var kernel = try compileShader(allocator, &func, .vertex, nvidia_abi);
     defer kernel.deinit(allocator);
 
     // This must source gl_VertexIndex through ALD a[ATTR_VERTEX_ID] (the
@@ -2871,15 +2934,18 @@ test "compiles a kernel: load params, multiply-add, store, exit" {
     const sum = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = prod, .rhs = x } });
     func.setTerminator(b, .{ .ret = ir.function.Ret.one(sum) });
 
-    var kernel = try compileKernel(allocator, &func);
+    var kernel = try compileKernel(allocator, &func, nvidia_abi);
     defer kernel.deinit(allocator);
 
     // Prologue: LDC outptr lo/hi plus two inputs equals 4 instructions,
     // then IMAD, IADD3, STG, EXIT equals 8 instructions total (32 dwords).
     try testing.expectEqual(@as(usize, 8 * 4), kernel.code.len);
     try testing.expectEqual(@as(u32, 0xb82), kernel.code[0] & 0xfff); // first LDC
-    // The first LDC reads the output pointer low word from the param base.
-    try testing.expectEqual(@as(u32, param_base), @as(u16, @truncate(kernel.code[1] >> 6)) & 0xffff);
+    // The first LDC reads the output pointer low word at the ABI's parameter base.
+    try testing.expectEqual(
+        @as(u32, nvidia_abi.param_base),
+        @as(u32, @as(u16, @truncate(kernel.code[1] >> 6)) & 0xffff),
+    );
 
     // The instruction words: LDC x4, IMAD, IADD3, STG, EXIT.
     const op = struct {
@@ -2894,6 +2960,67 @@ test "compiles a kernel: load params, multiply-add, store, exit" {
     try testing.expectEqual(@as(u32, 0x94d), op(kernel.code, 7)); // EXIT
 }
 
+test "the emitted LDC offsets match the offsets LaunchInfo reports" {
+    // The whole point of LaunchInfo is that a runtime can build a parameter buffer without
+    // reading the instruction stream. If codegen and the metadata ever disagree, the runtime
+    // writes a parameter where the kernel does not read it, and the failure is silent garbage
+    // rather than an error. This decodes the real LDC offsets back out of the SASS and
+    // compares them.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr_t = try func.types.intern(.ptr);
+    const b = try func.appendBlock();
+    const buf = try func.appendBlockParam(b, ptr_t);
+    const n = try func.appendBlockParam(b, i32_t);
+    const loaded = try func.appendInst(b, i32_t, .{ .load = .{ .ptr = buf } });
+    const sum = try func.appendInst(b, i32_t, .{ .arith = .{ .op = .add, .lhs = loaded, .rhs = n } });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(sum) });
+
+    var kernel = try compileKernel(allocator, &func, nvidia_abi);
+    defer kernel.deinit(allocator);
+
+    // Collect the static offset field of every LDC in the stream, in order.
+    var offsets: std.ArrayList(u32) = .empty;
+    defer offsets.deinit(allocator);
+    var i: usize = 0;
+    while (i < kernel.code.len) : (i += 4) {
+        if (kernel.code[i] & 0xfff != 0xb82) continue;
+        try offsets.append(allocator, @as(u16, @truncate(kernel.code[i + 1] >> 6)) & 0xffff);
+    }
+
+    // The output pointer is a pair, then the buffer pointer is a pair, then the scalar.
+    try testing.expectEqual(@as(usize, 5), offsets.items.len);
+    try testing.expectEqual(@as(usize, 2), kernel.launch.params.len);
+
+    const base = nvidia_abi.param_base;
+    try testing.expectEqual(base + kernel.launch.params[0].offset, offsets.items[2]);
+    try testing.expectEqual(base + kernel.launch.params[0].offset + 4, offsets.items[3]);
+    try testing.expectEqual(base + kernel.launch.params[1].offset, offsets.items[4]);
+
+    // The reported block size is the declared default, and the pointer is global in M1.
+    try testing.expectEqual([3]u32{ 1, 1, 1 }, kernel.launch.block);
+    try testing.expectEqual(@as(u32, 0), kernel.launch.shared_bytes);
+    try testing.expectEqual(gpu.AddressSpace.global, kernel.launch.params[0].kind.pointer);
+    try testing.expectEqual(@as(u8, 4), kernel.launch.params[1].kind.scalar);
+}
+
+test "a graphics builtin on a compute kernel is rejected, not miscompiled" {
+    // Regression: isInvocationId fired on ANY builtin attribute and compiled every tagged
+    // parameter into the global-id sequence, so a graphics builtin silently became gid.x.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const b = try func.appendBlock();
+    const v = try func.appendBlockParam(b, t);
+    try gpu.attrs.setBuiltin(&func, v, .vertex_index);
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(v) });
+
+    try testing.expectError(error.Unsupported, compileKernel(allocator, &func, nvidia_abi));
+}
+
 test "an f16 function is rejected cleanly, not miscompiled as f64" {
     const allocator = testing.allocator;
     var func = Function.init(allocator);
@@ -2905,7 +3032,7 @@ test "an f16 function is rejected cleanly, not miscompiled as f64" {
     const sum = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = y } });
     func.setTerminator(b, .{ .ret = ir.function.Ret.one(sum) });
 
-    try testing.expectError(error.Unsupported, compileKernel(allocator, &func));
+    try testing.expectError(error.Unsupported, compileKernel(allocator, &func, nvidia_abi));
 }
 
 test "compiles control flow: a max via if and a merge block" {
@@ -2923,7 +3050,7 @@ test "compiles control flow: a max via if and a merge block" {
     try func.appendIf(entry, c, .{ .target = exit_b, .args = &.{a} }, .{ .target = exit_b, .args = &.{b} });
     func.setTerminator(exit_b, .{ .ret = ir.function.Ret.one(r) });
 
-    var kernel = try compileKernel(allocator, &func);
+    var kernel = try compileKernel(allocator, &func, nvidia_abi);
     defer kernel.deinit(allocator);
 
     // The stream contains an ISETP (compare), at least two BRA instructions,
@@ -2973,7 +3100,7 @@ test "convergence: a DIVERGENT if (distinct then/else blocks) wraps in BCLEAR/BS
     func.setTerminator(else_b, .{ .jump = .{ .target = merge, .args = try func.internValues(&.{two}) } });
     func.setTerminator(merge, .{ .ret = ir.function.Ret.one(r) });
 
-    var kernel = try compileKernel(allocator, &func);
+    var kernel = try compileKernel(allocator, &func, nvidia_abi);
     defer kernel.deinit(allocator);
 
     var saw_bclear = false;
@@ -3017,7 +3144,7 @@ test "a FLOAT compare (max/min of floats) lowers to FSETP, not ISETP" {
     try func.appendStore(b, mx, outp);
     func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
 
-    var kernel = try compileKernel(allocator, &func);
+    var kernel = try compileKernel(allocator, &func, nvidia_abi);
     defer kernel.deinit(allocator);
 
     var saw_fsetp = false;
@@ -3079,7 +3206,7 @@ test "REPRO: derivative + multi-component color outputs stay distinct until thei
     }
     func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
 
-    var kernel = try compileShader(allocator, &func, .fragment);
+    var kernel = try compileShader(allocator, &func, .fragment, nvidia_abi);
     defer kernel.deinit(allocator);
 
     try assertNoColorClobber(&kernel);
@@ -3143,7 +3270,7 @@ test "REPRO: derivative FS with interleaved color stores does not clobber a colo
     }
     func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
 
-    var kernel = try compileShader(allocator, &func, .fragment);
+    var kernel = try compileShader(allocator, &func, .fragment, nvidia_abi);
     defer kernel.deinit(allocator);
     try assertNoColorClobber(&kernel);
 }
@@ -3184,7 +3311,7 @@ test "REPRO: a derivative SHFL's source varying register is not clobbered before
     try func.appendStore(b, red, slot);
     func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
 
-    var kernel = try compileShader(allocator, &func, .fragment);
+    var kernel = try compileShader(allocator, &func, .fragment, nvidia_abi);
     defer kernel.deinit(allocator);
 
     // Find the first SHFL (opcode 0xf89) and its source register (bits 24..31).
@@ -3358,7 +3485,7 @@ test "graphics: a texturing fragment shader lowers the host-sampler call to a TE
     }
     func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
 
-    var kernel = try compileShader(allocator, &func, .fragment);
+    var kernel = try compileShader(allocator, &func, .fragment, nvidia_abi);
     defer kernel.deinit(allocator);
 
     // The compiled fragment shader must load the bindless handle from the
@@ -3420,7 +3547,7 @@ test "a boolean-valued && (bit_and of two bool compares) lowers to PLOP3, not a 
     const sel = try func.appendInst(b, f32_t, .{ .select = .{ .cond = both, .then = one, .@"else" = zero } });
     try func.appendStore(b, sel, outp);
     func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
-    var kernel = try compileKernel(allocator, &func);
+    var kernel = try compileKernel(allocator, &func, nvidia_abi);
     defer kernel.deinit(allocator);
     var saw_plop3 = false;
     var i: usize = 0;
@@ -3450,7 +3577,7 @@ test "a boolean-valued NOT (bit_xor bool, -1) lowers to PLOP3 (predicate negatio
     const sel = try func.appendInst(b, f32_t, .{ .select = .{ .cond = nc, .then = one, .@"else" = zero } });
     try func.appendStore(b, sel, outp);
     func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
-    var kernel = try compileKernel(allocator, &func);
+    var kernel = try compileKernel(allocator, &func, nvidia_abi);
     defer kernel.deinit(allocator);
     var saw_plop3 = false;
     var i: usize = 0;
