@@ -315,6 +315,21 @@ pub fn build(b: *std.Build) void {
     }) });
     test_step.dependOn(&b.addRunArtifact(gpu_offload_tests).step);
 
+    // Matmul expansion execution tests: rewrite the et-soc tensor `matmul` into a scalar loop
+    // nest with `vulcan-ir.expand`, JIT it for the host, and assert the C matrix it wrote. A
+    // wrong index or a dropped accumulate has the same opcodes as a correct nest, so only running
+    // it tells them apart. This is the reference a tensor lowering gets checked against.
+    const matmul_expand_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("libs/vulcan-target/tests/matmul_expand.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "vulcan-ir", .module = vulcan_ir },
+            .{ .name = "vulcan-target", .module = vulcan_target },
+        },
+    }) });
+    test_step.dependOn(&b.addRunArtifact(matmul_expand_tests).step);
+
     // The Wasm frontend's tests: structural (parsing + lowering) plus the engine.
     const wasm_tests = b.addTest(.{ .root_module = vulcan_wasm });
     test_step.dependOn(&b.addRunArtifact(wasm_tests).step);
