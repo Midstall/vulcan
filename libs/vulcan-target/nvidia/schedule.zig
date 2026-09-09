@@ -11,11 +11,14 @@
 //! has waited on it (the data is then ready for any later read). Correctness pass:
 //! without it, a consumer could read a register before the load filling it completes.
 //!
-//! Limits: register reads are a conservative superset (the three ALU source
-//! fields), which only ever adds an unnecessary wait, never misses a real one. Read
-//! barriers (protecting a variable-latency op's source registers from being
-//! overwritten) are unnecessary here because the naive allocator never reuses a
-//! register. Stall delays are left as the isel set them.
+//! Register reads come from `readsSrc`. For an ALU op that is a conservative superset
+//! (the three ALU source fields), which only ever adds an unnecessary wait. For a memory
+//! op, an atomic or a barrier the superset is WRONG in both directions, because those
+//! opcodes put other things in the ALU source fields, so each names its own sources.
+//!
+//! Limits: read barriers (protecting a variable-latency op's source registers from being
+//! overwritten before it consumes them) are not assigned. Stall delays are left as the isel
+//! set them.
 
 const std = @import("std");
 const encode = @import("encode.zig");
@@ -69,7 +72,17 @@ fn isVariableLatency(opcode: u32) bool {
         // number of cycles after issue exactly as an LDG result does. Without a scoreboard
         // here a consumer reads the destination register STALE, which on a staged shared
         // tile means each thread reads whatever the register held before the tile load.
-        opcode == 0x984 or opcode == 0xb1d;
+        opcode == 0x984 or opcode == 0xb1d or
+        // The atomics that GIVE BACK the old value: ATOMG (0x9a8), ATOMS (0x98c) and the
+        // two compare-and-swap forms (0x3a9 global, 0x38d shared). NAK
+        // sm120_instr_latencies classes `Op::Atom(_) => DecoupledAgu`, the same class as a
+        // load, so the old value lands an unknown number of cycles after issue. A
+        // compare-and-swap loop reads that value to decide whether to retry, so without a
+        // scoreboard it tests a STALE register and either spins forever or accepts a swap
+        // that never happened. RED (0x98e) is deliberately absent: it writes no register,
+        // so there is nothing for a consumer to wait on.
+        opcode == encode.ATOMG_OPCODE or opcode == encode.ATOMS_OPCODE or
+        opcode == encode.ATOMG_CAS_OPCODE or opcode == encode.ATOMS_CAS_OPCODE;
 }
 
 /// Whether `opcode` writes a destination GPR at bits 16..23 (so the scheduler can
@@ -89,8 +102,87 @@ fn writesDst(opcode: u32) bool {
         // register (or RZ), NOT a GPR dst - excluding them keeps the GPR scoreboard
         // map from being polluted by a phantom "R0/R1" write.
         0x355, 0x945, 0x941 => false,
+        // RED (0x98e), the global atomic reduction. It applies the operation to memory and
+        // gives back nothing, so it is a store, not a load. The encoder writes RZ into bits
+        // 16..24, following NAK's set_dst(&Dst::None), and the RZ guard below would already
+        // skip it, but naming it here does not depend on that: if the destination field ever
+        // read as R0 the scheduler would record a phantom write, steal a live scoreboard and
+        // clear it, and the real consumer of R0 would read stale. That is the STS and BAR
+        // bug of 6e09607. The atomics that DO give back a value (ATOMG, ATOMS and the two
+        // compare-and-swap forms) write a real destination at 16..24 and stay out of this
+        // list.
+        encode.RED_OPCODE => false,
         else => true,
     };
+}
+
+/// Whether `opcode` reads a source GPR in the field at bit `pos` (24, 32 or 64).
+///
+/// The `else` arm is the conservative ALU superset the scheduler started with: srcA at 24,
+/// srcB at 32 but only in the register source form, srcC at 64. A memory or atomic op is not
+/// an ALU op, so that rule is wrong for it in BOTH directions, and both directions corrupt
+/// the scoreboard state:
+///
+///   - Too FEW reads. A store's data register sits at bit 32, but every store opcode carries
+///     form 4, not form 1, so the ALU rule skips it. The store then issues with no wait on
+///     the in-flight load that fills its data register and writes a STALE value to memory.
+///   - Too MANY reads. LDS leaves bits 64..71 at zero, which the ALU rule reads as R0. If R0
+///     has a live producer, the load waits on that scoreboard and CLEARS its tag, so the
+///     instruction that really consumes R0 never waits and reads stale. That is the
+///     phantom-read half of the STS and BAR bug fixed in 6e09607, on the source side.
+///
+/// So each memory and atomic opcode names its own source fields instead.
+fn readsSrc(opcode: u32, form: u32, pos: usize) bool {
+    return switch (opcode) {
+        // Convergence barriers (BCLEAR/BSSY/BSYNC) and BAR read no GPR at all: their
+        // bit-24/16 fields hold a Bar register, and BAR has no operand.
+        0x355, 0x945, 0x941, 0xb1d => false,
+        // LDG and LDS: the address at 24, nothing else. LDG holds URZ in bits 64..71 and LDS
+        // leaves them zero, so neither field is a GPR source.
+        0x981, 0x984 => pos == 24,
+        // STG, STS and RED: the address at 24 and the data at 32.
+        0x986, 0x988, encode.RED_OPCODE => pos == 24 or pos == 32,
+        // ATOMG and ATOMS: the address at 24 and the data at 32. Bits 64..71 hold URZ.
+        encode.ATOMG_OPCODE, encode.ATOMS_OPCODE => pos == 24 or pos == 32,
+        // Compare-and-swap: the address at 24, the compare operand at 32 and the swap data
+        // at 64. All three are real registers, so all three must be waited on.
+        encode.ATOMG_CAS_OPCODE, encode.ATOMS_CAS_OPCODE => true,
+        else => pos != 32 or form == 1 or isTexResult(opcode),
+    };
+}
+
+/// Whether `opcode` addresses memory through a 64-bit GPR PAIR at bit 24, so it reads
+/// `addr + 1` as well as `addr`. Every GLOBAL access does. The shared ones take a 32-bit
+/// offset into the CTA window in ONE register, so reading `addr + 1` for them would wait on
+/// and free an unrelated register's scoreboard.
+fn readsAddrPair(opcode: u32) bool {
+    return opcode == 0x981 or opcode == 0x986 or // LDG, STG
+        opcode == encode.ATOMG_OPCODE or opcode == encode.RED_OPCODE or
+        opcode == encode.ATOMG_CAS_OPCODE;
+}
+
+/// How many consecutive destination registers one instruction writes under its single write
+/// barrier. Every consumer of ANY register in the block must wait on that barrier, so the
+/// producer has to tag the whole block, not only the first register.
+///
+/// A TEX writes one register per channel of its channel mask (bits 72..76). A B64 load fills
+/// (dst, dst+1) and a B128 load fills (dst .. dst+3), from the memory type at bits 73..76. A
+/// 64-bit atomic gives back a value in (dst, dst+1), from the WIDER 4-bit atomic type at bits
+/// 73..77. Everything else writes one register.
+fn dstSpan(opcode: u32, inst: Inst) u32 {
+    if (isTexResult(opcode)) return @popCount(getField(inst, 72, 4));
+    if (opcode == 0x981 or opcode == 0x984) return switch (getField(inst, 73, 3)) { // LDG, LDS
+        @intFromEnum(encode.MemType.b64) => 2,
+        @intFromEnum(encode.MemType.b128) => 4,
+        else => 1,
+    };
+    if (opcode == encode.ATOMG_OPCODE or opcode == encode.ATOMS_OPCODE or
+        opcode == encode.ATOMG_CAS_OPCODE or opcode == encode.ATOMS_CAS_OPCODE)
+        return switch (getField(inst, 73, 4)) {
+            @intFromEnum(encode.AtomType.u64), @intFromEnum(encode.AtomType.i64) => 2,
+            else => 1,
+        };
+    return 1;
 }
 
 fn getField(inst: Inst, comptime lo: usize, comptime width: usize) u32 {
@@ -174,29 +266,24 @@ pub fn scheduleBlocks(insts: []Inst, block_starts: []const usize) void {
         // register at bit 24 and the bindless texture handle register at bit 32. The
         // handle comes from an LDC with variable latency, so TEX must wait on its
         // scoreboard, meaning its bit-32 source is a real register read.
-        const is_tex = isTexResult(opcode);
-        // Convergence barriers (BCLEAR/BSSY/BSYNC) read NO GPRs - their bit-24/16 fields
-        // encode a Bar register, not a source GPR. Skip the GPR source-wait/free scan so
-        // a barrier reg value (e.g. B0..B15) is not misread as "R0..R15" and made to
-        // spuriously wait on or free a live scoreboard.
-        // BAR (0xb1d), the workgroup barrier, is in the same position: it reads no GPR and
-        // leaves bits 24, 32 and 64 at zero, which the scan would otherwise read as three
-        // reads of R0, adding a spurious wait and freeing a scoreboard that is still live.
+        //
+        // The memory ops, the atomics and the barriers each name their own source fields.
+        // See `readsSrc` for why the ALU rule is wrong for them in both directions.
         const is_barrier = opcode == 0x355 or opcode == 0x945 or opcode == 0x941 or opcode == 0xb1d;
         var wait: u32 = 0;
-        if (!is_barrier) inline for (.{ 24, 32, 64 }) |pos| {
-            if (pos != 32 or form == 1 or is_tex) {
+        inline for (.{ 24, 32, 64 }) |pos| {
+            if (readsSrc(opcode, form, pos)) {
                 const reg = getField(inst.*, pos, 8);
                 if (reg != RZ and scoreboard_of[reg] != 0) wait |= @as(u32, 1) << @intCast(scoreboard_of[reg] - 1);
             }
-        };
-        // A global load/store addresses memory through a 64-bit REGISTER PAIR at the
-        // bit-24 source: it reads both `addr` (lo) and `addr+1` (hi). The hi half is
+        }
+        // A global load, store or atomic addresses memory through a 64-bit REGISTER PAIR at
+        // the bit-24 source: it reads both `addr` (lo) and `addr+1` (hi). The hi half is
         // not an explicit source field, so wait on its in-flight producer too -
         // otherwise the load issues with a stale high address dword (e.g. a UBO base
         // pointer whose hi LDC has not landed), reading garbage and faulting the GR
         // front-end (an "illegal instruction encoding" scoreboard hazard on Blackwell).
-        if (opcode == 0x981 or opcode == 0x986) { // LDG, STG
+        if (readsAddrPair(opcode)) {
             const addr_lo = getField(inst.*, 24, 8);
             if (addr_lo != RZ) {
                 const addr_hi = addr_lo + 1;
@@ -278,8 +365,10 @@ pub fn scheduleBlocks(insts: []Inst, block_starts: []const usize) void {
                 // SINGLE scalar (channel_mask = R only), so span it by the channel-mask popcount (bits
                 // 72..76): 4 for an RGBA sample/gather/fetch, 1 for the shadow scalar - tagging only the
                 // registers the TEX actually writes, so a later ALU write to dst+1..dst+3 is not
-                // needlessly gated on the shadow scoreboard.
-                const span: u32 = if (isTexResult(opcode)) @popCount(getField(inst.*, 72, 4)) else 1;
+                // needlessly gated on the shadow scoreboard. A B64 or B128 load and a 64-bit
+                // atomic write a register block for the same reason, so `dstSpan` covers
+                // all of them.
+                const span: u32 = dstSpan(opcode, inst.*);
                 var k: u32 = 0;
                 while (k < span and dst + k < RZ) : (k += 1) {
                     scoreboard_of[dst + k] = @as(u8, sb) + 1;
@@ -295,16 +384,15 @@ pub fn scheduleBlocks(insts: []Inst, block_starts: []const usize) void {
 /// 64-bit address pair's high half). A register that was NOT read keeps its tag, so a
 /// later instruction reading it re-waits (the multi-register TEX-result case).
 fn clearReadRegs(inst: Inst, opcode: u32, form: u32, scoreboard_of: *[256]u8, wait: u32) void {
-    const is_tex = isTexResult(opcode);
     inline for (.{ 24, 32, 64 }) |pos| {
-        if (pos != 32 or form == 1 or is_tex) {
+        if (readsSrc(opcode, form, pos)) {
             const reg = getField(inst, pos, 8);
             if (reg != RZ and scoreboard_of[reg] != 0 and
                 (wait & (@as(u32, 1) << @intCast(scoreboard_of[reg] - 1))) != 0)
                 scoreboard_of[reg] = 0;
         }
     }
-    if (opcode == 0x981 or opcode == 0x986) { // LDG, STG: clear the address-hi half too
+    if (readsAddrPair(opcode)) { // a global access: clear the address-hi half too
         const addr_lo = getField(inst, 24, 8);
         if (addr_lo != RZ) {
             const addr_hi = addr_lo + 1;
@@ -451,4 +539,156 @@ test "a BAR neither claims a destination register nor reads three phantom R0 sou
     try std.testing.expect(ldg_bar < 6);
     const consumer_wait = getField(insts[2], 116, 6);
     try std.testing.expect((consumer_wait & (@as(u32, 1) << @intCast(ldg_bar))) != 0);
+}
+
+test "an STG waits on the in-flight producer of its DATA register" {
+    // Regression: every store opcode carries source form 4, not form 1, so the ALU source
+    // rule skipped the bit-32 field and the store issued with no wait on the load filling
+    // its data register. The store then wrote a STALE value to memory, with no diagnostic.
+    var insts: [3]Inst = undefined;
+    insts[0] = encode.ldgU32(8, 2, .{}); // R8 <- global, variable latency
+    insts[1] = encode.stgU32(4, 8, .{}); // global[R4:R5] = R8
+    insts[2] = encode.exit(.{});
+    scheduleBlocks(&insts, &.{0});
+
+    const ldg_bar = getField(insts[0], 110, 3);
+    try std.testing.expect(ldg_bar < 6);
+    const store_wait = getField(insts[1], 116, 6);
+    try std.testing.expect((store_wait & (@as(u32, 1) << @intCast(ldg_bar))) != 0);
+}
+
+test "an LDS does not read a phantom R0 at bit 64" {
+    // Regression: LDS leaves bits 64..71 at zero, and the ALU source rule read that as a
+    // read of R0. With a live producer for R0 the load waited on its scoreboard and CLEARED
+    // the tag, so the instruction that really consumes R0 never waited and read it stale.
+    // Same shape as the STS and BAR phantom-write bug of 6e09607, on the source side.
+    var insts: [4]Inst = undefined;
+    insts[0] = encode.ldgU32(0, 2, .{}); // R0 <- global, variable latency
+    insts[1] = encode.ldsU32(4, 6, .{}); // R4 <- shared[R6], touches no other GPR
+    insts[2] = encode.iadd3(1, 0, 0, .{}); // the REAL consumer of R0
+    insts[3] = encode.exit(.{});
+    scheduleBlocks(&insts, &.{0});
+
+    const ldg_bar = getField(insts[0], 110, 3);
+    try std.testing.expect(ldg_bar < 6);
+    try std.testing.expectEqual(@as(u32, 0), getField(insts[1], 116, 6)); // the LDS waits on nothing
+    const consumer_wait = getField(insts[2], 116, 6);
+    try std.testing.expect((consumer_wait & (@as(u32, 1) << @intCast(ldg_bar))) != 0);
+}
+
+test "a 64-bit load tags its WHOLE destination register pair" {
+    // A B64 load fills (dst, dst+1) under one write barrier. Tagging only dst leaves a
+    // consumer of dst+1 with no wait, so it reads the high half before the load lands.
+    var insts: [3]Inst = undefined;
+    insts[0] = encode.ldg(6, 4, .b64, .{}); // R6:R7 <- global[R4:R5]
+    insts[1] = encode.iadd3(9, 7, 7, .{}); // consumes the HIGH half only
+    insts[2] = encode.exit(.{});
+    scheduleBlocks(&insts, &.{0});
+
+    const ldg_bar = getField(insts[0], 110, 3);
+    try std.testing.expect(ldg_bar < 6);
+    const consumer_wait = getField(insts[1], 116, 6);
+    try std.testing.expect((consumer_wait & (@as(u32, 1) << @intCast(ldg_bar))) != 0);
+}
+
+test "an ATOMG result gets a scoreboard and its consumer waits on it" {
+    // NAK sm120_instr_latencies classes Op::Atom as DecoupledAgu, the same class as a load,
+    // so the old value the atomic gives back lands an unknown number of cycles after issue.
+    // A consumer that does not wait reads the destination register STALE.
+    var insts: [3]Inst = undefined;
+    insts[0] = encode.atomg(6, 4, 8, .add, .u32, .{}); // R6 <- old value at global[R4:R5]
+    insts[1] = encode.iadd3(9, 6, 6, .{}); // consumes the returned old value
+    insts[2] = encode.exit(.{});
+    scheduleBlocks(&insts, &.{0});
+
+    const atom_bar = getField(insts[0], 110, 3);
+    try std.testing.expect(atom_bar < 6); // a real scoreboard, not 7 = none
+    const consumer_wait = getField(insts[1], 116, 6);
+    try std.testing.expect((consumer_wait & (@as(u32, 1) << @intCast(atom_bar))) != 0);
+}
+
+test "a global atomic waits on the producers of its ADDRESS PAIR and its DATA register" {
+    // The address is a 64-bit pair (R4, R5), and only its low half is an explicit source
+    // field. The data register sits at bit 32 under source form 4, which the ALU rule skips.
+    // Missing either wait sends the atomic at a stale address or with stale data, and an
+    // atomic writes memory, so both are silent corruption on real silicon.
+    var insts: [5]Inst = undefined;
+    insts[0] = encode.ldc(4, 0, 0x10, .{}); // R4 = address lo, variable latency
+    insts[1] = encode.ldc(5, 0, 0x14, .{}); // R5 = address hi
+    insts[2] = encode.ldgU32(8, 2, .{}); // R8 = the amount to add
+    insts[3] = encode.atomg(6, 4, 8, .add, .u32, .{});
+    insts[4] = encode.exit(.{});
+    scheduleBlocks(&insts, &.{0});
+
+    const lo_bar = getField(insts[0], 110, 3);
+    const hi_bar = getField(insts[1], 110, 3);
+    const data_bar = getField(insts[2], 110, 3);
+    try std.testing.expect(lo_bar < 6 and hi_bar < 6 and data_bar < 6);
+    const wait = getField(insts[3], 116, 6);
+    try std.testing.expect((wait & (@as(u32, 1) << @intCast(lo_bar))) != 0);
+    try std.testing.expect((wait & (@as(u32, 1) << @intCast(hi_bar))) != 0);
+    try std.testing.expect((wait & (@as(u32, 1) << @intCast(data_bar))) != 0);
+}
+
+test "a RED claims no scoreboard but still waits on its data producer" {
+    // RED gives back no value, so it must NOT take a write barrier: a scoreboard nobody ever
+    // waits on is one of six lost for the rest of the block. It DOES read memory operands,
+    // so it must still wait on the load that fills its data register, or it reduces a stale
+    // value into memory. Its destination field holds RZ (NAK's set_dst(&Dst::None)), so the
+    // scheduler must not record a write either.
+    var insts: [4]Inst = undefined;
+    insts[0] = encode.ldgU32(8, 2, .{}); // R8 = the amount to add, variable latency
+    insts[1] = encode.redg(4, 8, .add, .u32, .{}); // global[R4:R5] += R8
+    insts[2] = encode.iadd3(9, 8, 8, .{}); // a later reader of R8
+    insts[3] = encode.exit(.{});
+    scheduleBlocks(&insts, &.{0});
+
+    try std.testing.expectEqual(@as(u32, 7), getField(insts[1], 110, 3)); // no write barrier
+    const ldg_bar = getField(insts[0], 110, 3);
+    try std.testing.expect(ldg_bar < 6);
+    const red_wait = getField(insts[1], 116, 6);
+    try std.testing.expect((red_wait & (@as(u32, 1) << @intCast(ldg_bar))) != 0);
+    // The RED read R8, so the scoreboard is spent and the later reader adds no wait.
+    try std.testing.expectEqual(@as(u32, 0), getField(insts[2], 116, 6));
+}
+
+test "a compare-and-swap waits on its compare operand and on its swap data at bit 64" {
+    // The CAS forms put the compare operand at bit 32 and the swap data at bit 64. A stale
+    // compare operand makes the swap take or miss when it should not, and stale swap data
+    // writes the wrong value into memory.
+    var insts: [4]Inst = undefined;
+    insts[0] = encode.ldgU32(8, 2, .{}); // R8 = the expected value
+    insts[1] = encode.ldsU32(10, 12, .{}); // R10 = the value to swap in
+    insts[2] = encode.atomgCas(6, 4, 8, 10, .u32, .{});
+    insts[3] = encode.exit(.{});
+    scheduleBlocks(&insts, &.{0});
+
+    const cmp_bar = getField(insts[0], 110, 3);
+    const data_bar = getField(insts[1], 110, 3);
+    try std.testing.expect(cmp_bar < 6 and data_bar < 6);
+    const wait = getField(insts[2], 116, 6);
+    try std.testing.expect((wait & (@as(u32, 1) << @intCast(cmp_bar))) != 0);
+    try std.testing.expect((wait & (@as(u32, 1) << @intCast(data_bar))) != 0);
+    // The result is variable-latency, so the CAS itself takes a write barrier.
+    try std.testing.expect(getField(insts[2], 110, 3) < 6);
+}
+
+test "a shared atomic reads ONE address register, not a pair" {
+    // A shared address is a 32-bit offset into the CTA window. Reading `addr + 1` as the high
+    // half of a pair would wait on an unrelated register's scoreboard and CLEAR it, so the
+    // instruction that really consumes that register would read it stale.
+    var insts: [4]Inst = undefined;
+    insts[0] = encode.ldgU32(5, 2, .{}); // R5 is unrelated to the shared address in R4
+    insts[1] = encode.atoms(6, 4, 8, .add, .u32, .{}); // R6 <- old value at shared[R4]
+    insts[2] = encode.iadd3(9, 5, 5, .{}); // the REAL consumer of R5
+    insts[3] = encode.exit(.{});
+    scheduleBlocks(&insts, &.{0});
+
+    const ldg_bar = getField(insts[0], 110, 3);
+    try std.testing.expect(ldg_bar < 6);
+    try std.testing.expectEqual(@as(u32, 0), getField(insts[1], 116, 6)); // the atomic waits on nothing
+    const consumer_wait = getField(insts[2], 116, 6);
+    try std.testing.expect((consumer_wait & (@as(u32, 1) << @intCast(ldg_bar))) != 0);
+    // The shared atomic gives back a value, so it is variable-latency like ATOMG.
+    try std.testing.expect(getField(insts[1], 110, 3) < 6);
 }

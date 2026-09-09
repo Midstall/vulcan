@@ -384,16 +384,66 @@ pub fn ldc(dst: u8, bank: u5, offset: u16, c: Control) Inst {
     return w;
 }
 
-/// `LDG.E dst, [addr:addr+1]`: load a 32-bit value from the 64-bit global address
-/// in the register pair (addr, addr+1). Volta LDG 0x981, mirrors prism's STG.
-pub fn ldgU32(dst: u8, addr: u8, c: Control) Inst {
+/// The width of a memory access, and how a narrow load fills its destination
+/// register. The values are NAK's `MemType`: Mesa `sm70_encode.rs`,
+/// `SM70Encoder::set_mem_type`, which writes this 3-bit field at bits 73..76 of
+/// LDG, STG, LDS, STS and LDC.
+///
+/// An 8-bit or 16-bit load extends its value into the whole 32-bit destination
+/// register: `u8` and `u16` add zeros, `i8` and `i16` copy the sign bit. An
+/// 8-bit or 16-bit store writes only its own bytes, so it keeps the neighbouring
+/// bytes that a 32-bit store of a byte-wide value destroys.
+///
+/// `b64` and `b128` move a BLOCK of consecutive registers, `regCount` of them,
+/// that starts at the named register. The caller must own the whole block,
+/// because the hardware writes or reads every register in it.
+///
+/// An ATOMIC uses a DIFFERENT and wider width field. See `AtomType`.
+pub const MemType = enum(u3) {
+    u8 = 0,
+    i8 = 1,
+    u16 = 2,
+    i16 = 3,
+    b32 = 4,
+    b64 = 5,
+    b128 = 6,
+
+    /// How many consecutive 32-bit registers the access moves.
+    pub fn regCount(self: MemType) u8 {
+        return switch (self) {
+            .u8, .i8, .u16, .i16, .b32 => 1,
+            .b64 => 2,
+            .b128 => 4,
+        };
+    }
+
+    /// How many bytes of memory the access touches.
+    pub fn byteSize(self: MemType) u8 {
+        return switch (self) {
+            .u8, .i8 => 1,
+            .u16, .i16 => 2,
+            .b32 => 4,
+            .b64 => 8,
+            .b128 => 16,
+        };
+    }
+};
+
+/// `LDG.E dst, [addr:addr+1]`: load `ty` from the 64-bit global address in the
+/// register pair (addr, addr+1). Volta LDG 0x981, mirrors prism's STG.
+///
+/// Source of the width field: NAK `sm70_encode.rs`, `impl SM70Op for OpLd`, the
+/// `MemSpace::Global` arm, which calls `set_mem_access` and through it
+/// `set_mem_type(73..76, ...)`. A `b64` load writes (dst, dst+1) and a `b128`
+/// load writes (dst .. dst+3), so the caller must own the whole block.
+pub fn ldg(dst: u8, addr: u8, ty: MemType, c: Control) Inst {
     var w = base(c);
     setBits(&w, 0, 12, 0x981);
     setBits(&w, 16, 8, dst);
     setBits(&w, 24, 8, addr);
     setBits(&w, 64, 8, RZ); // URZ uniform base
     setBits(&w, 72, 1, 1); // 64-bit uniform
-    setBits(&w, 73, 3, 4); // type B32
+    setBits(&w, 73, 3, @intFromEnum(ty));
     setBits(&w, 77, 4, 0xa); // STRONG / SYS
     setBits(&w, 84, 3, 1); // eviction NORMAL
     setBits(&w, 90, 1, 1); // 64-bit GPR address
@@ -401,9 +451,20 @@ pub fn ldgU32(dst: u8, addr: u8, c: Control) Inst {
     return w;
 }
 
-/// `STG.E.STRONG.SYS [addr:addr+1], data`: store a 32-bit GPR to the 64-bit
-/// global address in (addr, addr+1). Verified bit-for-bit on hardware (prism).
-pub fn stgU32(addr: u8, data: u8, c: Control) Inst {
+/// `LDG.E.32 dst, [addr:addr+1]`: the single-word shorthand for `ldg`.
+pub fn ldgU32(dst: u8, addr: u8, c: Control) Inst {
+    return ldg(dst, addr, .b32, c);
+}
+
+/// `STG.E.STRONG.SYS [addr:addr+1], data`: store `ty` from the GPR block that
+/// starts at `data` to the 64-bit global address in (addr, addr+1). The 32-bit
+/// form is verified bit-for-bit on hardware (prism).
+///
+/// Source of the width field: NAK `sm70_encode.rs`, `impl SM70Op for OpSt`, the
+/// `MemSpace::Global` arm, which calls `set_mem_access` and through it
+/// `set_mem_type(73..76, ...)`. A `b64` store reads (data, data+1) and a `b128`
+/// store reads (data .. data+3).
+pub fn stg(addr: u8, data: u8, ty: MemType, c: Control) Inst {
     var w = base(c);
     setBits(&w, 0, 12, 0x986);
     setBits(&w, 24, 8, addr);
@@ -411,11 +472,16 @@ pub fn stgU32(addr: u8, data: u8, c: Control) Inst {
     setBits(&w, 64, 8, RZ); // URZ uniform base
     setBits(&w, 72, 1, 1); // 64-bit uniform
     setBits(&w, 32, 8, data);
-    setBits(&w, 73, 3, 4); // type B32
+    setBits(&w, 73, 3, @intFromEnum(ty));
     setBits(&w, 77, 4, 0xa); // STRONG / SYS
     setBits(&w, 84, 3, 1); // eviction NORMAL
     setBits(&w, 91, 1, 1); // UGPR mode (required or the SM traps)
     return w;
+}
+
+/// `STG.E.STRONG.SYS.32 [addr:addr+1], data`: the single-word shorthand for `stg`.
+pub fn stgU32(addr: u8, data: u8, c: Control) Inst {
+    return stg(addr, data, .b32, c);
 }
 
 // Workgroup shared memory. A shared address is NOT a 64-bit global address: it
@@ -426,8 +492,8 @@ pub fn stgU32(addr: u8, data: u8, c: Control) Inst {
 // note). None of them is hardware-verified here, because this repository
 // cannot execute SASS.
 
-/// `LDS dst, [addr]`: load a 32-bit value from workgroup shared memory at the
-/// 32-bit window offset in `addr`.
+/// `LDS dst, [addr]`: load `ty` from workgroup shared memory at the 32-bit
+/// window offset in `addr`.
 ///
 /// Source: NAK `sm70_encode.rs`, `impl SM70Op for OpLd`, the `MemSpace::Shared`
 /// arm plus the common tail of that `encode`. Opcode 0x984 (bits 0..12);
@@ -435,7 +501,7 @@ pub fn stgU32(addr: u8, data: u8, c: Control) Inst {
 /// for the uniform base, which is URZ here because there is none (8 bits wide on
 /// sm>=100, the Blackwell target of this backend); `set_field(40..64)` for the
 /// 24-bit immediate offset, which stays 0 because the isel materializes every
-/// offset into the address register; `set_mem_type(73..76)` = 4 (B32);
+/// offset into the address register; `set_mem_type(73..76)` for the width;
 /// `set_field(78..80)` = 0 (`OffsetStride::X1.encode_sm75()`);
 /// `set_upred_src(87..90, 90)` = UPT, NAK's `true_reg` index 7, so the access is
 /// unconditional; and `set_bit(91, true)`, NAK's "always enable UGPR mode".
@@ -444,44 +510,311 @@ pub fn stgU32(addr: u8, data: u8, c: Control) Inst {
 /// that a shared access is `Strong(CTA)`/`Normal` and then leaves bits 77 and
 /// 81..87 at zero, unlike the global LDG/STG path above. Variable latency: the
 /// scoreboard scheduler assigns the write barrier and the consumer waits.
-pub fn ldsU32(dst: u8, addr: u8, c: Control) Inst {
+pub fn lds(dst: u8, addr: u8, ty: MemType, c: Control) Inst {
     var w = base(c);
     setBits(&w, 0, 12, 0x984);
     setBits(&w, 16, 8, dst);
     setBits(&w, 24, 8, addr); // 32-bit shared-window offset, ONE register
     setBits(&w, 32, 8, URZ); // no uniform base
     setBits(&w, 40, 24, 0); // immediate offset
-    setBits(&w, 73, 3, 4); // type B32
+    setBits(&w, 73, 3, @intFromEnum(ty));
     setBits(&w, 78, 2, 0); // offset stride X1
     setBits(&w, 87, 3, PT); // UPT: unconditional
     setBits(&w, 91, 1, 1); // UGPR mode
     return w;
 }
 
-/// `STS [addr], data`: store a 32-bit GPR to workgroup shared memory at the
-/// 32-bit window offset in `addr`.
+/// `LDS.32 dst, [addr]`: the single-word shorthand for `lds`.
+pub fn ldsU32(dst: u8, addr: u8, c: Control) Inst {
+    return lds(dst, addr, .b32, c);
+}
+
+/// `STS [addr], data`: store `ty` from the GPR block that starts at `data` to
+/// workgroup shared memory at the 32-bit window offset in `addr`.
 ///
 /// Source: NAK `sm70_encode.rs`, `impl SM70Op for OpSt`, the `MemSpace::Shared`
 /// arm plus the common tail of that `encode`. Opcode 0x988 (bits 0..12);
 /// `set_reg_src(24..32)` for the address; `set_reg_src(32..40)` for the data;
 /// `set_field(40..64)` for the 24-bit immediate offset, 0 here;
 /// `set_ureg_src(64)` for the uniform base, URZ here (8 bits on sm>=100);
-/// `set_mem_type(73..76)` = 4 (B32); `set_field(78..80)` = 0
+/// `set_mem_type(73..76)` for the width; `set_field(78..80)` = 0
 /// (`OffsetStride::X1`); and `set_bit(91, has_ugpr)`, true for this target.
 ///
 /// The uniform base sits at bit 64 for a store and at bit 32 for a load. That
 /// is not a transcription slip: NAK uses the two different starts, because a
 /// store needs bits 32..40 for its data register.
-pub fn stsU32(addr: u8, data: u8, c: Control) Inst {
+pub fn sts(addr: u8, data: u8, ty: MemType, c: Control) Inst {
     var w = base(c);
     setBits(&w, 0, 12, 0x988);
     setBits(&w, 24, 8, addr); // 32-bit shared-window offset, ONE register
     setBits(&w, 32, 8, data);
     setBits(&w, 40, 24, 0); // immediate offset
     setBits(&w, 64, 8, URZ); // no uniform base
-    setBits(&w, 73, 3, 4); // type B32
+    setBits(&w, 73, 3, @intFromEnum(ty));
     setBits(&w, 78, 2, 0); // offset stride X1
     setBits(&w, 91, 1, 1); // UGPR mode
+    return w;
+}
+
+/// `STS.32 [addr], data`: the single-word shorthand for `sts`.
+pub fn stsU32(addr: u8, data: u8, c: Control) Inst {
+    return sts(addr, data, .b32, c);
+}
+
+// Atomic read-modify-write. An atomic reads a memory location, combines it with
+// a data operand and writes the result back. No other thread can see the
+// location between that read and that write.
+//
+// The encodings below are transcribed from Mesa NAK `sm70_encode.rs`,
+// `impl SM70Op for OpAtom`, which is the authoritative bit-level reference (see
+// the `nak-sass-encoding-reference` note). None of them is hardware-verified
+// here, because this repository cannot execute SASS.
+//
+// Nothing emits them yet: the IR has no atomic operation. Like `barSync` they
+// are encoder-only until it gets one.
+//
+// A GLOBAL atomic takes a 64-bit address in an aligned register PAIR
+// (addr, addr+1), the same as LDG and STG. A SHARED atomic takes a 32-bit
+// offset into the CTA window in ONE register, the same as LDS and STS.
+
+/// The read-modify-write operation an atomic applies. Values from NAK
+/// `sm70_encode.rs`, `SM70Encoder::set_atom_op`.
+///
+/// Compare-and-swap is deliberately absent. NAK gives it its own opcode and a
+/// second data operand, so it has its own encoders here: `atomgCas` and
+/// `atomsCas`.
+pub const AtomOp = enum(u4) {
+    add = 0,
+    min = 1,
+    max = 2,
+    /// Increment, but wrap to 0 when the value reaches the data operand.
+    inc = 3,
+    /// Decrement, but wrap to the data operand when the value reaches 0.
+    dec = 4,
+    bit_and = 5,
+    bit_or = 6,
+    bit_xor = 7,
+    /// Exchange: write the data operand and give back the old value.
+    exch = 8,
+};
+
+/// The type an atomic operates on. It sets the access width, and it tells
+/// `min` and `max` whether to compare signed or unsigned. Values from NAK
+/// `sm70_encode.rs`, `SM70Encoder::set_atom_type`, the `sm >= 90` arm, which
+/// writes a 4-bit field at bits 73..77.
+///
+/// That field is WIDER than the 3-bit `MemType` field of a load or a store, and
+/// it holds different values. Do not mix the two.
+///
+/// The float types are deliberately absent. On sm >= 90 a float atomic is a
+/// DIFFERENT opcode (0x9a3 with a destination, 0x9a6 without) with a different
+/// operation selector (`set_atom_op_sm90_float`), so a float type written into
+/// this field selects an integer atomic of the same width and quietly computes
+/// integer arithmetic on a float bit pattern.
+pub const AtomType = enum(u4) {
+    u32 = 0,
+    i32 = 1,
+    u64 = 2,
+    i64 = 3,
+
+    /// True for the 64-bit types. A shared atomic accepts these only for
+    /// `exch` and for compare-and-swap.
+    pub fn isWide(self: AtomType) bool {
+        return switch (self) {
+            .u32, .i32 => false,
+            .u64, .i64 => true,
+        };
+    }
+};
+
+/// `ATOMG`, the global atomic that gives back the old value. sm >= 100 form.
+pub const ATOMG_OPCODE: u32 = 0x9a8;
+/// `RED`, the global atomic reduction, which gives back nothing.
+pub const RED_OPCODE: u32 = 0x98e;
+/// `ATOMS`, the shared-memory atomic that gives back the old value.
+pub const ATOMS_OPCODE: u32 = 0x98c;
+/// `ATOMG.CAS`, the global compare-and-swap.
+pub const ATOMG_CAS_OPCODE: u32 = 0x3a9;
+/// `ATOMS.CAS`, the shared compare-and-swap.
+pub const ATOMS_CAS_OPCODE: u32 = 0x38d;
+
+/// `ATOMG.E.<op> dst, [addr:addr+1], data`: apply `op` to global memory at the
+/// 64-bit address in (addr, addr+1) and put the OLD value in `dst`.
+///
+/// Source: NAK `sm70_encode.rs`, `impl SM70Op for OpAtom`, the
+/// `MemSpace::Global` arm with a destination and an integer type, on the
+/// `has_ugpr` and `sm >= 100` path. Opcode 0x9a8; `set_atom_op(87..91)` for the
+/// operation, 4 bits wide because a destination form must fit `exch`;
+/// `set_reg_addr(24..32, addr, 63)` for the address, whose size bit is at 63 on
+/// sm >= 100 and NOT at 90 the way LDG and STG place it; `set_reg_src(32..40)`
+/// for the data; `set_field(40..63)` for the 23-bit immediate address offset,
+/// which stays 0 because the isel materializes every offset into the address
+/// register; `set_ureg_addr(64, ..., 72)` for the uniform base, URZ here, which
+/// also sets bit 72; `set_atom_type(73..77)` for the type; `set_mem_order`
+/// (77..81) = 0xa, `Strong(System)`; `set_pred_dst(81..84)` = PT for the
+/// fault predicate NAK leaves as `Dst::None`; `set_eviction_priority(84..87)`
+/// = 1, `Normal`; and `set_bit(91, has_ugpr)`.
+///
+/// The bit-63 address size is why this form is sm >= 100 only. On Volta through
+/// Hopper the same opcode puts that bit at 70. This backend targets Blackwell,
+/// which is also why `URZ` is 255 rather than 63.
+///
+/// Variable latency: the scoreboard scheduler assigns the write barrier for
+/// `dst` and the wait on each consumer.
+pub fn atomg(dst: u8, addr: u8, data: u8, op: AtomOp, ty: AtomType, c: Control) Inst {
+    var w = base(c);
+    setBits(&w, 0, 12, ATOMG_OPCODE);
+    setBits(&w, 16, 8, dst);
+    setBits(&w, 24, 8, addr); // 64-bit address in (addr, addr+1)
+    setBits(&w, 32, 8, data);
+    setBits(&w, 40, 23, 0); // immediate address offset
+    setBits(&w, 63, 1, 1); // the address GPR is a 64-bit pair
+    setBits(&w, 64, 8, URZ); // no uniform base
+    setBits(&w, 72, 1, 1); // the uniform base is 64 bits
+    setBits(&w, 73, 4, @intFromEnum(ty));
+    setBits(&w, 77, 4, 0xa); // STRONG / SYS
+    setBits(&w, 81, 3, PT); // no fault predicate
+    setBits(&w, 84, 3, 1); // eviction NORMAL
+    setBits(&w, 87, 4, @intFromEnum(op));
+    setBits(&w, 91, 1, 1); // UGPR mode
+    return w;
+}
+
+/// `RED.E.<op> [addr:addr+1], data`: apply `op` to global memory at the 64-bit
+/// address in (addr, addr+1) and give back NOTHING. This is the reduction form,
+/// which every atomic whose result nobody reads should use, because it writes no
+/// register and so needs no scoreboard.
+///
+/// Source: NAK `sm70_encode.rs`, `impl SM70Op for OpAtom`, the
+/// `MemSpace::Global` arm with `self.dst.is_none()` and an integer type. Opcode
+/// 0x98e; `set_atom_op(87..90)` for the operation, only 3 bits wide here;
+/// `set_reg_src(32..40)` for the data; `set_field(40..64)` for the 24-bit
+/// immediate address offset, 0 here; `set_reg_addr(24..32, addr, 90)` for the
+/// address, whose size bit stays at 90 in this form; `set_ureg_addr(64, ..., 72)`
+/// for the uniform base, URZ here, which also sets bit 72; `set_bit(91, true)`;
+/// `set_mem_order(77..81)` = 0xa; `set_eviction_priority(84..87)` = 1; and the
+/// common tail's `set_dst(&Dst::None)`, which writes RZ into bits 16..24.
+///
+/// The operation field is 3 bits, so `exch` (8) does not fit. NAK's `set_field`
+/// refuses a value that overflows its range; the assert below refuses it here,
+/// because a truncated 8 would silently become `add`. An exchange has to give
+/// back the old value anyway, so `atomg` is the correct encoder for it.
+pub fn redg(addr: u8, data: u8, op: AtomOp, ty: AtomType, c: Control) Inst {
+    std.debug.assert(op != .exch); // does not fit the 3-bit reduction operation field
+    var w = base(c);
+    setBits(&w, 0, 12, RED_OPCODE);
+    setBits(&w, 16, 8, RZ); // NAK's set_dst(Dst::None): the destination field reads RZ
+    setBits(&w, 24, 8, addr); // 64-bit address in (addr, addr+1)
+    setBits(&w, 32, 8, data);
+    setBits(&w, 40, 24, 0); // immediate address offset
+    setBits(&w, 64, 8, URZ); // no uniform base
+    setBits(&w, 72, 1, 1); // the uniform base is 64 bits
+    setBits(&w, 73, 4, @intFromEnum(ty));
+    setBits(&w, 77, 4, 0xa); // STRONG / SYS
+    setBits(&w, 84, 3, 1); // eviction NORMAL
+    setBits(&w, 87, 3, @intFromEnum(op));
+    setBits(&w, 90, 1, 1); // the address GPR is a 64-bit pair
+    setBits(&w, 91, 1, 1); // UGPR mode
+    return w;
+}
+
+/// `ATOMS.<op> dst, [addr], data`: apply `op` to workgroup shared memory at the
+/// 32-bit window offset in `addr` and put the OLD value in `dst`.
+///
+/// Source: NAK `sm70_encode.rs`, `impl SM70Op for OpAtom`, the
+/// `MemSpace::Shared` arm without compare-and-swap, on the `has_ugpr` path.
+/// Opcode 0x98c; `set_ureg_src(64)` for the uniform base, URZ here (8 bits on
+/// sm >= 100); `set_bit(91, true)`; `set_reg_src(32..40)` for the data;
+/// `set_atom_op(87..91)` for the operation; `set_reg_src(24..32)` for the
+/// address; `set_field(40..64)` for the 24-bit immediate offset, 0 here;
+/// `set_field(78..80)` = 0 (`OffsetStride::X1`); `set_dst` at 16..24; and
+/// `set_atom_type(73..77)`.
+///
+/// Like LDS and STS this sets NO memory order and NO eviction priority: NAK
+/// asserts a shared access is `Strong(CTA)`/`Normal` and leaves bits 77 and
+/// 81..87 at zero.
+///
+/// A 64-bit shared atomic only exists for `exch` and for compare-and-swap. NAK
+/// asserts that ("64-bit Shared atomics only support CmpExch or Exch"), naming
+/// `AtomType::U64`; the assert below covers `i64` too, because the limit is the
+/// access width, not the signedness. Refusing is safe: a wrong width here
+/// corrupts memory that no test in this repository can observe.
+///
+/// Variable latency, like `atomg`.
+pub fn atoms(dst: u8, addr: u8, data: u8, op: AtomOp, ty: AtomType, c: Control) Inst {
+    std.debug.assert(!ty.isWide() or op == .exch);
+    var w = base(c);
+    setBits(&w, 0, 12, ATOMS_OPCODE);
+    setBits(&w, 16, 8, dst);
+    setBits(&w, 24, 8, addr); // 32-bit shared-window offset, ONE register
+    setBits(&w, 32, 8, data);
+    setBits(&w, 40, 24, 0); // immediate offset
+    setBits(&w, 64, 8, URZ); // no uniform base
+    setBits(&w, 73, 4, @intFromEnum(ty));
+    setBits(&w, 78, 2, 0); // offset stride X1
+    setBits(&w, 87, 4, @intFromEnum(op));
+    setBits(&w, 91, 1, 1); // UGPR mode
+    return w;
+}
+
+/// `ATOMG.E.CAS dst, [addr:addr+1], cmp, data`: compare-and-swap in global
+/// memory. Read the location, write `data` into it if it equals `cmp`, and put
+/// the OLD value in `dst` either way. The caller compares `dst` with `cmp` to
+/// learn whether the swap happened.
+///
+/// Source: NAK `sm70_encode.rs`, `impl SM70Op for OpAtom`, the
+/// `MemSpace::Global` arm with `AtomOp::CmpExch` and a destination. Opcode
+/// 0x3a9; `set_reg_addr(24..32, addr, 72)` for the address, whose size bit is at
+/// 72 in THIS form; `set_reg_src(32..40)` for the compare operand;
+/// `set_field(40..64)` for the 24-bit immediate offset, 0 here;
+/// `set_reg_src(64..72)` for the swap data; `set_pred_dst(81..84)` = PT;
+/// `set_dst` at 16..24; `set_atom_type(73..77)`; `set_mem_order(77..81)` = 0xa;
+/// and `set_eviction_priority(84..87)` = 1.
+///
+/// This form has NO uniform base and does NOT set bit 91: NAK asserts the
+/// uniform address is zero and puts the swap data in bits 64..72 instead, so
+/// there is no room for one. That is also why the address size bit moves back to
+/// 72 here, where `atomg` puts it at 63.
+pub fn atomgCas(dst: u8, addr: u8, cmp: u8, data: u8, ty: AtomType, c: Control) Inst {
+    var w = base(c);
+    setBits(&w, 0, 12, ATOMG_CAS_OPCODE);
+    setBits(&w, 16, 8, dst);
+    setBits(&w, 24, 8, addr); // 64-bit address in (addr, addr+1)
+    setBits(&w, 32, 8, cmp);
+    setBits(&w, 40, 24, 0); // immediate address offset
+    setBits(&w, 64, 8, data);
+    setBits(&w, 72, 1, 1); // the address GPR is a 64-bit pair
+    setBits(&w, 73, 4, @intFromEnum(ty));
+    setBits(&w, 77, 4, 0xa); // STRONG / SYS
+    setBits(&w, 81, 3, PT); // no fault predicate
+    setBits(&w, 84, 3, 1); // eviction NORMAL
+    return w;
+}
+
+/// `ATOMS.CAS dst, [addr], cmp, data`: compare-and-swap in workgroup shared
+/// memory at the 32-bit window offset in `addr`. The result convention matches
+/// `atomgCas`.
+///
+/// Source: NAK `sm70_encode.rs`, `impl SM70Op for OpAtom`, the
+/// `MemSpace::Shared` arm with `AtomOp::CmpExch`. Opcode 0x38d;
+/// `set_reg_src(32..40)` for the compare operand; `set_reg_src(64..72)` for the
+/// swap data; `set_reg_src(24..32)` for the address; `set_field(40..64)` for the
+/// 24-bit immediate offset, 0 here; `set_field(78..80)` = 0
+/// (`OffsetStride::X1`); `set_dst` at 16..24; and `set_atom_type(73..77)`.
+///
+/// This form does NOT set bit 91 and writes no uniform base: NAK asserts the
+/// uniform address is zero and puts the swap data in bits 64..72. It sets no
+/// memory order and no eviction priority, for the same reason `atoms` does not.
+pub fn atomsCas(dst: u8, addr: u8, cmp: u8, data: u8, ty: AtomType, c: Control) Inst {
+    var w = base(c);
+    setBits(&w, 0, 12, ATOMS_CAS_OPCODE);
+    setBits(&w, 16, 8, dst);
+    setBits(&w, 24, 8, addr); // 32-bit shared-window offset, ONE register
+    setBits(&w, 32, 8, cmp);
+    setBits(&w, 40, 24, 0); // immediate offset
+    setBits(&w, 64, 8, data);
+    setBits(&w, 73, 4, @intFromEnum(ty));
+    setBits(&w, 78, 2, 0); // offset stride X1
     return w;
 }
 
@@ -1296,5 +1629,215 @@ test "a barrier under a guard predicate keeps the predicate field" {
     const w = barSync(.{ .pred = 2, .pred_neg = true });
     try std.testing.expectEqual(@as(u32, 0xb1d), w[0] & 0xfff);
     try std.testing.expectEqual(@as(u32, 2), (w[0] >> 12) & 0x7);
+    try std.testing.expectEqual(@as(u32, 1), (w[0] >> 15) & 0x1);
+}
+
+test "the memory type field carries every access width (NAK set_mem_type)" {
+    // NAK sm70_encode.rs, SM70Encoder::set_mem_type: U8 = 0, I8 = 1, U16 = 2,
+    // I16 = 3, B32 = 4, B64 = 5, B128 = 6, in the 3-bit field at bits 73..76.
+    // A wrong value here silently moves the wrong number of bytes, so pin each.
+    const cases = [_]struct { ty: MemType, code: u32, regs: u8, bytes: u8 }{
+        .{ .ty = .u8, .code = 0, .regs = 1, .bytes = 1 },
+        .{ .ty = .i8, .code = 1, .regs = 1, .bytes = 1 },
+        .{ .ty = .u16, .code = 2, .regs = 1, .bytes = 2 },
+        .{ .ty = .i16, .code = 3, .regs = 1, .bytes = 2 },
+        .{ .ty = .b32, .code = 4, .regs = 1, .bytes = 4 },
+        .{ .ty = .b64, .code = 5, .regs = 2, .bytes = 8 },
+        .{ .ty = .b128, .code = 6, .regs = 4, .bytes = 16 },
+    };
+    for (cases) |c| {
+        try std.testing.expectEqual(c.code, @as(u32, @intFromEnum(c.ty)));
+        try std.testing.expectEqual(c.regs, c.ty.regCount());
+        try std.testing.expectEqual(c.bytes, c.ty.byteSize());
+        // The same 3-bit field at 73..76 in all four memory encoders.
+        try std.testing.expectEqual(c.code, (ldg(6, 4, c.ty, .{})[2] >> (73 - 64)) & 0x7);
+        try std.testing.expectEqual(c.code, (stg(4, 6, c.ty, .{})[2] >> (73 - 64)) & 0x7);
+        try std.testing.expectEqual(c.code, (lds(6, 4, c.ty, .{})[2] >> (73 - 64)) & 0x7);
+        try std.testing.expectEqual(c.code, (sts(4, 6, c.ty, .{})[2] >> (73 - 64)) & 0x7);
+    }
+}
+
+test "a 64-bit LDG changes ONLY the memory type field" {
+    // The width must not disturb the address pair, the memory order, the
+    // eviction priority or the UGPR bits, all of which a global access needs.
+    const w32 = ldgU32(6, 4, .{});
+    const w64 = ldg(6, 4, .b64, .{});
+    try std.testing.expectEqual([4]u32{ 0x04067981, 0x00000000, 0x0c114bff, 0x000fde00 }, w64);
+    try std.testing.expectEqual(@as(u32, 5), (w64[2] >> (73 - 64)) & 0x7); // B64, not B32
+    try std.testing.expectEqual(@as(u32, 4), (w32[2] >> (73 - 64)) & 0x7);
+    // Every other bit of every dword is identical.
+    const mask: u32 = ~(@as(u32, 0x7) << (73 - 64));
+    try std.testing.expectEqual(w32[0], w64[0]);
+    try std.testing.expectEqual(w32[1], w64[1]);
+    try std.testing.expectEqual(w32[2] & mask, w64[2] & mask);
+    try std.testing.expectEqual(w32[3], w64[3]);
+    // The address is still a 64-bit register pair with STRONG/SYS order.
+    try std.testing.expectEqual(@as(u32, 4), (w64[0] >> 24) & 0xff); // address R4:R5
+    try std.testing.expectEqual(@as(u32, 1), (w64[2] >> (90 - 64)) & 0x1); // 64-bit GPR address
+    try std.testing.expectEqual(@as(u32, 0xa), (w64[2] >> (77 - 64)) & 0xf); // STRONG / SYS
+}
+
+test "a 128-bit STG and a byte STG keep the global store frame" {
+    const w128 = stg(4, 6, .b128, .{});
+    try std.testing.expectEqual([4]u32{ 0x04007986, 0x00000006, 0x0c114dff, 0x000fde00 }, w128);
+    try std.testing.expectEqual(@as(u32, 0x986), w128[0] & 0xfff);
+    try std.testing.expectEqual(@as(u32, 6), w128[1] & 0xff); // data block base R6 at bit 32
+    try std.testing.expectEqual(@as(u32, 6), (w128[2] >> (73 - 64)) & 0x7); // B128
+
+    const w8 = stg(4, 6, .u8, .{});
+    try std.testing.expectEqual(@as(u32, 0), (w8[2] >> (73 - 64)) & 0x7); // U8
+    try std.testing.expectEqual(@as(u32, 1), (w8[2] >> (91 - 64)) & 0x1); // UGPR mode still set
+}
+
+test "a 64-bit LDS keeps the ONE-register shared address form" {
+    const w = lds(6, 4, .b64, .{});
+    try std.testing.expectEqual([4]u32{ 0x04067984, 0x000000ff, 0x0b800a00, 0x000fde00 }, w);
+    try std.testing.expectEqual(@as(u32, 0x984), w[0] & 0xfff); // LDS
+    try std.testing.expectEqual(@as(u32, 5), (w[2] >> (73 - 64)) & 0x7); // B64
+    try std.testing.expectEqual(@as(u32, 4), (w[0] >> 24) & 0xff); // address R4, no pair
+    try std.testing.expectEqual(@as(u32, 0), (w[2] >> (90 - 64)) & 0x1); // no 64-bit address bit
+    try std.testing.expectEqual(@as(u32, 0), (w[2] >> (81 - 64)) & 0x3f); // 81..87 still clear
+}
+
+test "a 128-bit STS keeps the ONE-register shared address form" {
+    const w = sts(4, 6, .b128, .{});
+    try std.testing.expectEqual([4]u32{ 0x04007988, 0x00000006, 0x08000cff, 0x000fde00 }, w);
+    try std.testing.expectEqual(@as(u32, 0x988), w[0] & 0xfff); // STS
+    try std.testing.expectEqual(@as(u32, 6), (w[2] >> (73 - 64)) & 0x7); // B128
+    try std.testing.expectEqual(@as(u32, URZ), w[2] & 0xff); // uniform base URZ at bit 64
+}
+
+test "ATOMG places the operation, the type and the sm100 address size bit (NAK OpAtom global)" {
+    // NAK sm70_encode.rs, impl SM70Op for OpAtom, MemSpace::Global with a
+    // destination, has_ugpr and sm >= 100: opcode 0x9a8, atom op at 87..91,
+    // set_reg_addr(24..32, addr, 63), data at 32..40, ureg addr at 64 with its
+    // size bit at 72, atom type at 73..77, mem order at 77..81, fault pred at
+    // 81..84, eviction at 84..87, bit 91 for UGPR mode.
+    const w = atomg(6, 4, 8, .add, .u32, .{});
+    try std.testing.expectEqual([4]u32{ 0x040679a8, 0x80000008, 0x081f41ff, 0x000fde00 }, w);
+    try std.testing.expectEqual(@as(u32, ATOMG_OPCODE), w[0] & 0xfff);
+    try std.testing.expectEqual(@as(u32, 6), (w[0] >> 16) & 0xff); // old value into R6
+    try std.testing.expectEqual(@as(u32, 4), (w[0] >> 24) & 0xff); // address R4:R5
+    try std.testing.expectEqual(@as(u32, 8), w[1] & 0xff); // data R8 at bit 32
+    try std.testing.expectEqual(@as(u32, 0), (w[1] >> 8) & 0x7fffff); // 23-bit offset 0 at 40..63
+    try std.testing.expectEqual(@as(u32, 1), (w[1] >> 31) & 0x1); // address size bit at 63, NOT 90
+    try std.testing.expectEqual(@as(u32, 0), (w[2] >> (90 - 64)) & 0x1); // bit 90 stays clear
+    try std.testing.expectEqual(@as(u32, URZ), w[2] & 0xff); // uniform base URZ at bit 64
+    try std.testing.expectEqual(@as(u32, 1), (w[2] >> (72 - 64)) & 0x1); // 64-bit uniform base
+    try std.testing.expectEqual(@as(u32, 0), (w[2] >> (73 - 64)) & 0xf); // atom type U32, 4 bits
+    try std.testing.expectEqual(@as(u32, 0xa), (w[2] >> (77 - 64)) & 0xf); // STRONG / SYS
+    try std.testing.expectEqual(@as(u32, PT), (w[2] >> (81 - 64)) & 0x7); // no fault predicate
+    try std.testing.expectEqual(@as(u32, 1), (w[2] >> (84 - 64)) & 0x7); // eviction NORMAL
+    try std.testing.expectEqual(@as(u32, 0), (w[2] >> (87 - 64)) & 0xf); // atom op ADD
+    try std.testing.expectEqual(@as(u32, 1), (w[2] >> (91 - 64)) & 0x1); // UGPR mode
+}
+
+test "every ATOMG operation and type selector matches NAK" {
+    // NAK set_atom_op: Add 0, Min 1, Max 2, Inc 3, Dec 4, And 5, Or 6, Xor 7,
+    // Exch 8. NAK set_atom_type (sm >= 90): U32 0, I32 1, U64 2, I64 3. A wrong
+    // selector here does the wrong arithmetic to live memory on real silicon.
+    const ops = [_]struct { op: AtomOp, code: u32 }{
+        .{ .op = .add, .code = 0 },
+        .{ .op = .min, .code = 1 },
+        .{ .op = .max, .code = 2 },
+        .{ .op = .inc, .code = 3 },
+        .{ .op = .dec, .code = 4 },
+        .{ .op = .bit_and, .code = 5 },
+        .{ .op = .bit_or, .code = 6 },
+        .{ .op = .bit_xor, .code = 7 },
+        .{ .op = .exch, .code = 8 },
+    };
+    for (ops) |o| {
+        try std.testing.expectEqual(o.code, (atomg(6, 4, 8, o.op, .u32, .{})[2] >> (87 - 64)) & 0xf);
+        try std.testing.expectEqual(o.code, (atoms(6, 4, 8, o.op, .u32, .{})[2] >> (87 - 64)) & 0xf);
+    }
+    const types = [_]struct { ty: AtomType, code: u32 }{
+        .{ .ty = .u32, .code = 0 },
+        .{ .ty = .i32, .code = 1 },
+        .{ .ty = .u64, .code = 2 },
+        .{ .ty = .i64, .code = 3 },
+    };
+    for (types) |t| {
+        try std.testing.expectEqual(t.code, (atomg(6, 4, 8, .add, t.ty, .{})[2] >> (73 - 64)) & 0xf);
+        try std.testing.expectEqual(t.code, (redg(4, 8, .add, t.ty, .{})[2] >> (73 - 64)) & 0xf);
+        try std.testing.expectEqual(t.code, (atomgCas(6, 4, 8, 10, t.ty, .{})[2] >> (73 - 64)) & 0xf);
+    }
+}
+
+test "RED writes RZ as its destination and keeps the address size bit at 90 (NAK OpAtom, dst none)" {
+    // NAK's common tail calls set_dst(&Dst::None), which writes zero_reg(GPR) =
+    // RZ into bits 16..24. The reduction form also keeps the address size bit at
+    // 90, where the destination form moves it to 63.
+    const w = redg(4, 8, .add, .u32, .{});
+    try std.testing.expectEqual([4]u32{ 0x04ff798e, 0x00000008, 0x0c1141ff, 0x000fde00 }, w);
+    try std.testing.expectEqual(@as(u32, RED_OPCODE), w[0] & 0xfff);
+    try std.testing.expectEqual(@as(u32, RZ), (w[0] >> 16) & 0xff); // no destination register
+    try std.testing.expectEqual(@as(u32, 4), (w[0] >> 24) & 0xff); // address R4:R5
+    try std.testing.expectEqual(@as(u32, 8), w[1] & 0xff); // data R8 at bit 32
+    try std.testing.expectEqual(@as(u32, 0), (w[1] >> 8) & 0xffffff); // 24-bit offset 0 at 40..64
+    try std.testing.expectEqual(@as(u32, 1), (w[2] >> (90 - 64)) & 0x1); // address size bit at 90
+    try std.testing.expectEqual(@as(u32, 0), (w[1] >> 31) & 0x1); // bit 63 stays clear
+    try std.testing.expectEqual(@as(u32, 0), (w[2] >> (87 - 64)) & 0x7); // atom op ADD, 3 bits
+    try std.testing.expectEqual(@as(u32, 0xa), (w[2] >> (77 - 64)) & 0xf); // STRONG / SYS
+    // The 3-bit reduction operation field cannot reach the values above 7.
+    try std.testing.expectEqual(@as(u32, 7), (redg(4, 8, .bit_xor, .u32, .{})[2] >> (87 - 64)) & 0x7);
+}
+
+test "ATOMS reads ONE shared address register and sets no memory order (NAK OpAtom, MemSpace::Shared)" {
+    const w = atoms(6, 4, 8, .add, .u32, .{});
+    try std.testing.expectEqual([4]u32{ 0x0406798c, 0x00000008, 0x080000ff, 0x000fde00 }, w);
+    try std.testing.expectEqual(@as(u32, ATOMS_OPCODE), w[0] & 0xfff);
+    try std.testing.expectEqual(@as(u32, 6), (w[0] >> 16) & 0xff); // old value into R6
+    try std.testing.expectEqual(@as(u32, 4), (w[0] >> 24) & 0xff); // shared offset R4, no pair
+    try std.testing.expectEqual(@as(u32, 8), w[1] & 0xff); // data R8 at bit 32
+    try std.testing.expectEqual(@as(u32, URZ), w[2] & 0xff); // uniform base URZ at bit 64
+    try std.testing.expectEqual(@as(u32, 0), (w[2] >> (73 - 64)) & 0xf); // atom type U32
+    try std.testing.expectEqual(@as(u32, 0), (w[2] >> (78 - 64)) & 0x3); // offset stride X1
+    try std.testing.expectEqual(@as(u32, 0), (w[2] >> (87 - 64)) & 0xf); // atom op ADD
+    try std.testing.expectEqual(@as(u32, 1), (w[2] >> (91 - 64)) & 0x1); // UGPR mode
+    // A shared atomic carries no memory order, no fault predicate and no
+    // eviction priority: NAK asserts Strong(CTA)/Normal and writes nothing.
+    try std.testing.expectEqual(@as(u32, 0), (w[2] >> (77 - 64)) & 0x1);
+    try std.testing.expectEqual(@as(u32, 0), (w[2] >> (81 - 64)) & 0x3f);
+    try std.testing.expectEqual(@as(u32, 0), (w[2] >> (90 - 64)) & 0x1); // no 64-bit address bit
+}
+
+test "compare-and-swap takes a second data operand at bit 64 (NAK OpAtom CmpExch)" {
+    // The global form is opcode 0x3a9 with its address size bit back at 72, and
+    // the shared form is 0x38d. Both put the compare operand at 32..40 and the
+    // swap data at 64..72, and neither sets the UGPR bit 91, because the swap
+    // data occupies the field a uniform base would use.
+    const g = atomgCas(6, 4, 8, 10, .u32, .{});
+    try std.testing.expectEqual([4]u32{ 0x040673a9, 0x00000008, 0x001f410a, 0x000fde00 }, g);
+    try std.testing.expectEqual(@as(u32, ATOMG_CAS_OPCODE), g[0] & 0xfff);
+    try std.testing.expectEqual(@as(u32, 6), (g[0] >> 16) & 0xff); // old value into R6
+    try std.testing.expectEqual(@as(u32, 4), (g[0] >> 24) & 0xff); // address R4:R5
+    try std.testing.expectEqual(@as(u32, 8), g[1] & 0xff); // compare operand R8 at bit 32
+    try std.testing.expectEqual(@as(u32, 10), g[2] & 0xff); // swap data R10 at bit 64
+    try std.testing.expectEqual(@as(u32, 1), (g[2] >> (72 - 64)) & 0x1); // address size bit at 72
+    try std.testing.expectEqual(@as(u32, 0), (g[2] >> (73 - 64)) & 0xf); // atom type U32
+    try std.testing.expectEqual(@as(u32, 0xa), (g[2] >> (77 - 64)) & 0xf); // STRONG / SYS
+    try std.testing.expectEqual(@as(u32, PT), (g[2] >> (81 - 64)) & 0x7); // no fault predicate
+    try std.testing.expectEqual(@as(u32, 1), (g[2] >> (84 - 64)) & 0x7); // eviction NORMAL
+    try std.testing.expectEqual(@as(u32, 0), (g[2] >> (91 - 64)) & 0x1); // no UGPR bit
+
+    const s = atomsCas(6, 4, 8, 10, .u32, .{});
+    try std.testing.expectEqual([4]u32{ 0x0406738d, 0x00000008, 0x0000000a, 0x000fde00 }, s);
+    try std.testing.expectEqual(@as(u32, ATOMS_CAS_OPCODE), s[0] & 0xfff);
+    try std.testing.expectEqual(@as(u32, 6), (s[0] >> 16) & 0xff); // old value into R6
+    try std.testing.expectEqual(@as(u32, 4), (s[0] >> 24) & 0xff); // shared offset R4, no pair
+    try std.testing.expectEqual(@as(u32, 8), s[1] & 0xff); // compare operand R8 at bit 32
+    try std.testing.expectEqual(@as(u32, 10), s[2] & 0xff); // swap data R10 at bit 64
+    try std.testing.expectEqual(@as(u32, 0), (s[2] >> (73 - 64)) & 0xf); // atom type U32
+    try std.testing.expectEqual(@as(u32, 0), (s[2] >> (78 - 64)) & 0x3); // offset stride X1
+    try std.testing.expectEqual(@as(u32, 0), (s[2] >> (91 - 64)) & 0x1); // no UGPR bit
+    // A 64-bit compare-and-swap only changes the type field.
+    try std.testing.expectEqual(@as(u32, 2), (atomsCas(6, 4, 8, 10, .u64, .{})[2] >> (73 - 64)) & 0xf);
+}
+
+test "an atomic under a guard predicate keeps the predicate field" {
+    const w = atomg(6, 4, 8, .add, .u32, .{ .pred = 3, .pred_neg = true });
+    try std.testing.expectEqual(@as(u32, ATOMG_OPCODE), w[0] & 0xfff);
+    try std.testing.expectEqual(@as(u32, 3), (w[0] >> 12) & 0x7);
     try std.testing.expectEqual(@as(u32, 1), (w[0] >> 15) & 0x1);
 }

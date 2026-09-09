@@ -743,6 +743,14 @@ pub fn compileShader(allocator: std.mem.Allocator, func: *Function, stage: Stage
                 switch (r.count) {
                     0 => {},
                     1 => {
+                        // The width stays 32 bits on purpose. The out-pointer slot is laid out
+                        // by the kernel ABI, not by the isel, so narrowing this store to the
+                        // value's own width would leave the rest of the slot holding whatever
+                        // the host buffer held before. What the width check DOES buy is the
+                        // refusal of a return value wider than one register: `memTypeOf`
+                        // rejects a 64-bit scalar, which this store would otherwise truncate
+                        // to its low half with no diagnostic.
+                        _ = try memTypeOf(func, r.values[0]);
                         const src = gprOf(loc, r.values[0]);
                         try code.append(allocator, encode.stgU32(r_outptr, src, .{}));
                     },
@@ -1160,6 +1168,53 @@ fn isWidePtr(func: *const Function, v: Value) bool {
         .global, .constant, .private => true,
         .shared => false,
     };
+}
+
+/// The memory access width for the value a load produces or a store consumes.
+///
+/// The IR value type is the only thing that knows how many bytes the access moves, so an
+/// encoder that always used B32 read or wrote the wrong number of bytes for every other type,
+/// with no diagnostic: a byte store destroyed the three bytes next to it, and a 64-bit load
+/// took only the low half.
+///
+/// A value 32 bits wide or narrower lands in ONE GPR, which is what `assignLocs` gives it, so
+/// every such width is emitted here. A narrow load extends into the whole register, signed or
+/// unsigned to match the type.
+///
+/// A 64-BIT SCALAR is refused, and that refusal is deliberate. `assignLocs` gives a pointer an
+/// aligned GPR pair, but it gives every other non-boolean value exactly ONE register, and this
+/// backend has no 64-bit scalar arithmetic: an `arith` on an i64 lowers to a single 32-bit
+/// IADD3 or IMAD over the low half. A B64 load would therefore write a register the allocator
+/// has already given to a different live value, and its consumers would still do 32-bit
+/// arithmetic on it. Refusing follows `emitComputeBuiltin`: a kernel that looks right and
+/// computes garbage is worse than one that does not compile, because no test in this
+/// repository can execute SASS to catch it. Full 64-bit scalar support needs a paired register
+/// class plus a carry-chain lowering for every integer operation.
+///
+/// A POINTER is different: `isWidePtr` already reserves the aligned pair for a global,
+/// constant or private address, so a B64 access fills or reads exactly the pair that value
+/// owns. A shared address is a 32-bit window offset in one register.
+fn memTypeOf(func: *const Function, v: Value) Error!encode.MemType {
+    switch (func.types.type_kind(func.valueType(v))) {
+        // A boolean lives in a PREDICATE, not a GPR, so it has no register for a load to fill
+        // or a store to read. `gprOf` would trip its `unreachable` on the way here.
+        .bool => return error.Unsupported,
+        .int => |i| {
+            const is_signed = i.signedness == .signed;
+            if (i.bits <= 8) return if (is_signed) .i8 else .u8;
+            if (i.bits <= 16) return if (is_signed) .i16 else .u16;
+            if (i.bits <= 32) return .b32;
+            return error.Unsupported; // see the 64-bit note above
+        },
+        // f16 and f128 never reach here: `compileKernel` and `compileShader` refuse a function
+        // that holds either. f64 needs the register pair the note above describes.
+        .float => |f| return switch (f) {
+            .f32 => .b32,
+            .f16, .f64, .f128 => error.Unsupported,
+        },
+        .ptr => return if (isWidePtr(func, v)) .b64 else .b32,
+        .vector, .@"struct", .array, .slice => return error.Unsupported,
+    }
 }
 
 /// True when a value is a workgroup-shared address: a 32-bit window offset in ONE register,
@@ -2187,19 +2242,23 @@ fn lowerInst(allocator: std.mem.Allocator, func: *const Function, loc: *std.Auto
                 try code.append(allocator, encode.fswzadd(rd, scratch, vary, ops, .{}));
                 return;
             }
+            // The loaded value's own type decides how many bytes the access
+            // moves. Without it every load was a 32-bit one, which over-read a
+            // byte or a half word and truncated anything wider.
+            const width = try memTypeOf(func, func.instResult(inst).?);
             // A load through a SHARED pointer reads the CTA's shared-memory
             // window, which is a different memory and a different
             // instruction. Its address is a 32-bit offset in ONE register,
             // so there is no pointer pair to read.
             if (isSharedPtr(func, l.ptr)) {
-                try code.append(allocator, encode.ldsU32(rd, gprOf(loc.*, l.ptr), .{}));
+                try code.append(allocator, encode.lds(rd, gprOf(loc.*, l.ptr), width, .{}));
                 return;
             }
             // Otherwise this is an ordinary LDG from the 64-bit pointer pair
-            // into the 32-bit result register. This is variable latency: the
+            // into the result register. This is variable latency: the
             // scoreboard scheduler assigns its write barrier and the wait on
             // each consumer.
-            try code.append(allocator, encode.ldgU32(rd, gprOf(loc.*, l.ptr), .{}));
+            try code.append(allocator, encode.ldg(rd, gprOf(loc.*, l.ptr), width, .{}));
         },
         .store => |st| {
             // A store whose pointer is tagged with a graphics output
@@ -2231,10 +2290,14 @@ fn lowerInst(allocator: std.mem.Allocator, func: *const Function, loc: *std.Auto
             } else if (isSharedPtr(func, st.ptr)) {
                 // A store through a SHARED pointer writes the CTA's
                 // shared-memory window. Its address is a 32-bit offset in ONE
-                // register, so there is no pointer pair to read.
-                try code.append(allocator, encode.stsU32(gprOf(loc.*, st.ptr), gprOf(loc.*, st.value), .{}));
+                // register, so there is no pointer pair to read. The STORED
+                // VALUE's type decides the width: a 32-bit store of a byte
+                // value destroys the three bytes beside it.
+                const width = try memTypeOf(func, st.value);
+                try code.append(allocator, encode.sts(gprOf(loc.*, st.ptr), gprOf(loc.*, st.value), width, .{}));
             } else {
-                try code.append(allocator, encode.stgU32(gprOf(loc.*, st.ptr), gprOf(loc.*, st.value), .{}));
+                const width = try memTypeOf(func, st.value);
+                try code.append(allocator, encode.stg(gprOf(loc.*, st.ptr), gprOf(loc.*, st.value), width, .{}));
             }
         },
         .prefetch => {}, // a hint; this GPU target has no CPU-style prefetch, so it is dropped
@@ -3860,4 +3923,151 @@ test "a graphics stage rejects a shared pointer parameter instead of interpolati
         error.Unsupported,
         compileShader(allocator, &func, .fragment, nvidia_abi),
     );
+}
+
+/// The index of the first instruction with `opcode` in a compiled kernel's dword stream, or
+/// null when there is none.
+fn findOp(code: []const u32, opcode: u32) ?usize {
+    var i: usize = 0;
+    while (i * 4 < code.len) : (i += 1) if (opAt(code, i) == opcode) return i;
+    return null;
+}
+
+/// The 3-bit memory type field (bits 73..76) of the instruction at index `i`.
+fn memTypeAt(code: []const u32, i: usize) u32 {
+    return (code[i * 4 + 2] >> (73 - 64)) & 0x7;
+}
+
+test "a byte access uses the 8-bit memory type, not a 32-bit one" {
+    // Regression: the load and store arms ignored the IR value type and always emitted the
+    // B32 encoders. A byte store then wrote FOUR bytes, destroying the three bytes beside its
+    // own, and a byte load read four and kept whatever the neighbours held in the top 24 bits.
+    // Neither produced a diagnostic. The signed type picks I8 so the value sign-extends into
+    // the whole destination register.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i8_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 8 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const b = try func.appendBlock();
+    const p = try func.appendBlockParam(b, ptr_t);
+    const v = try func.appendInst(b, i8_t, .{ .load = .{ .ptr = p } });
+    try func.appendStore(b, v, p);
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
+
+    var kernel = try compileKernel(allocator, &func, nvidia_abi);
+    defer kernel.deinit(allocator);
+
+    const ld = findOp(kernel.code, 0x981).?; // LDG
+    const st = findOp(kernel.code, 0x986).?; // STG
+    try testing.expectEqual(@as(u32, @intFromEnum(encode.MemType.i8)), memTypeAt(kernel.code, ld));
+    try testing.expectEqual(@as(u32, @intFromEnum(encode.MemType.i8)), memTypeAt(kernel.code, st));
+    // The address is still the 64-bit pointer pair, and the data register is still at bit 32.
+    try testing.expectEqual(regAt(kernel.code, ld, 24), regAt(kernel.code, st, 24));
+    try testing.expectEqual(regAt(kernel.code, ld, 16), regAt(kernel.code, st, 32));
+}
+
+test "an unsigned 16-bit access uses U16 and a 32-bit one is unchanged" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const u16_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 16 } });
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const ptr_t = try func.types.ptrGlobal();
+    const b = try func.appendBlock();
+    const p = try func.appendBlockParam(b, ptr_t);
+    const half = try func.appendInst(b, u16_t, .{ .load = .{ .ptr = p } });
+    try func.appendStore(b, half, p);
+    const word = try func.appendInst(b, f32_t, .{ .load = .{ .ptr = p } });
+    try func.appendStore(b, word, p);
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
+
+    var kernel = try compileKernel(allocator, &func, nvidia_abi);
+    defer kernel.deinit(allocator);
+
+    // Two LDG/STG pairs in source order: the 16-bit one first, then the 32-bit one.
+    const first_ld = findOp(kernel.code, 0x981).?;
+    const first_st = findOp(kernel.code, 0x986).?;
+    try testing.expectEqual(@as(u32, @intFromEnum(encode.MemType.u16)), memTypeAt(kernel.code, first_ld));
+    try testing.expectEqual(@as(u32, @intFromEnum(encode.MemType.u16)), memTypeAt(kernel.code, first_st));
+    const second_ld = findOp(kernel.code[(first_ld + 1) * 4 ..], 0x981).? + first_ld + 1;
+    const second_st = findOp(kernel.code[(first_st + 1) * 4 ..], 0x986).? + first_st + 1;
+    try testing.expectEqual(@as(u32, @intFromEnum(encode.MemType.b32)), memTypeAt(kernel.code, second_ld));
+    try testing.expectEqual(@as(u32, @intFromEnum(encode.MemType.b32)), memTypeAt(kernel.code, second_st));
+}
+
+test "a shared byte access uses the 8-bit memory type on LDS and STS too" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const u8_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });
+    const shared_t = try func.types.intern(.{ .ptr = .shared });
+    const b = try func.appendBlock();
+    const tile = try func.appendBlockParam(b, shared_t);
+    const v = try func.appendInst(b, u8_t, .{ .load = .{ .ptr = tile } });
+    try func.appendStore(b, v, tile);
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
+
+    var kernel = try compileKernel(allocator, &func, nvidia_abi);
+    defer kernel.deinit(allocator);
+
+    const ld = findOp(kernel.code, 0x984).?; // LDS
+    const st = findOp(kernel.code, 0x988).?; // STS
+    try testing.expectEqual(@as(u32, @intFromEnum(encode.MemType.u8)), memTypeAt(kernel.code, ld));
+    try testing.expectEqual(@as(u32, @intFromEnum(encode.MemType.u8)), memTypeAt(kernel.code, st));
+    // A shared access still reads ONE address register, and the STS data is at bit 32.
+    try testing.expectEqual(regAt(kernel.code, ld, 24), regAt(kernel.code, st, 24));
+    try testing.expectEqual(regAt(kernel.code, ld, 16), regAt(kernel.code, st, 32));
+}
+
+test "a pointer load and store move BOTH halves of the address pair (B64)" {
+    // A pointer value owns an aligned GPR pair, so the 64-bit width fills exactly the pair
+    // the allocator reserved. Before the width came from the value type, this loaded only the
+    // low dword and left the high dword holding whatever the register had, so the next access
+    // through that pointer went to a garbage address.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ptr_t = try func.types.ptrGlobal();
+    const b = try func.appendBlock();
+    const pp = try func.appendBlockParam(b, ptr_t);
+    const inner = try func.appendInst(b, ptr_t, .{ .load = .{ .ptr = pp } });
+    try func.appendStore(b, inner, pp);
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
+
+    var kernel = try compileKernel(allocator, &func, nvidia_abi);
+    defer kernel.deinit(allocator);
+
+    const ld = findOp(kernel.code, 0x981).?;
+    const st = findOp(kernel.code, 0x986).?;
+    try testing.expectEqual(@as(u32, @intFromEnum(encode.MemType.b64)), memTypeAt(kernel.code, ld));
+    try testing.expectEqual(@as(u32, @intFromEnum(encode.MemType.b64)), memTypeAt(kernel.code, st));
+    // The loaded pointer lands in an EVEN register, so (dst, dst+1) is an aligned pair.
+    try testing.expectEqual(@as(u8, 0), regAt(kernel.code, ld, 16) % 2);
+}
+
+test "a 64-bit scalar access is REFUSED, not silently truncated" {
+    // The value model gives every non-pointer, non-boolean value exactly ONE 32-bit register,
+    // and this backend has no 64-bit scalar arithmetic. A B64 load would write a register the
+    // allocator gave to a different live value, and a B32 load would keep only the low half.
+    // Refusing is the only answer that does not produce a kernel which looks right and
+    // computes garbage.
+    const allocator = testing.allocator;
+    const cases = [_]ir.types.TypeKind{
+        .{ .int = .{ .signedness = .signed, .bits = 64 } },
+        .{ .float = .f64 },
+    };
+    for (cases) |kind| {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const wide_t = try func.types.intern(kind);
+        const ptr_t = try func.types.ptrGlobal();
+        const b = try func.appendBlock();
+        const p = try func.appendBlockParam(b, ptr_t);
+        const v = try func.appendInst(b, wide_t, .{ .load = .{ .ptr = p } });
+        try func.appendStore(b, v, p);
+        func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
+
+        try testing.expectError(error.Unsupported, compileKernel(allocator, &func, nvidia_abi));
+    }
 }
