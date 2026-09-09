@@ -62,7 +62,14 @@ fn isVariableLatency(opcode: u32) bool {
         // wall's final symptom: correct per-axis derivatives but a noisy normal). The SFU
         // ops the deriv FS uses (normalize) all go through MUFU, so a scoreboard here is
         // the fix. (NAK's default delay for a coupled op would NOT cover the SFU latency.)
-        opcode == encode.MUFU_OPCODE;
+        opcode == encode.MUFU_OPCODE or
+        // LDS (0x984), the shared-memory load, and BAR (0xb1d), the workgroup barrier. NAK
+        // sm120_instr_latencies classes Op::Ld as DecoupledAgu for EVERY memory space, not
+        // only the global one, and Op::Bar the same way. So an LDS result lands an unknown
+        // number of cycles after issue exactly as an LDG result does. Without a scoreboard
+        // here a consumer reads the destination register STALE, which on a staged shared
+        // tile means each thread reads whatever the register held before the tile load.
+        opcode == 0x984 or opcode == 0xb1d;
 }
 
 /// Whether `opcode` writes a destination GPR at bits 16..23 (so the scheduler can
@@ -70,6 +77,13 @@ fn isVariableLatency(opcode: u32) bool {
 fn writesDst(opcode: u32) bool {
     return switch (opcode) {
         0x986, 0x947, 0x94d => false, // STG, BRA, EXIT
+        // STS (0x988), the shared store, and BAR (0xb1d), the workgroup barrier. Neither
+        // writes a GPR, and both leave bits 16..23 at zero. Reading that as a write to R0
+        // is worse than a wasted entry: if R0 has an in-flight producer, the scheduler
+        // makes the store or the barrier wait on that scoreboard and CLEARS its tag, so
+        // the instruction that really consumes R0 never waits and reads it stale. STG is
+        // excluded just above for this same reason.
+        0x988, 0xb1d => false,
         // Convergence barriers operate on the Bar register file, not GPRs: BCLEAR
         // (0x355), BSSY (0x945), BSYNC (0x941). Their bits 16..23 encode a barrier
         // register (or RZ), NOT a GPR dst - excluding them keeps the GPR scoreboard
@@ -165,7 +179,10 @@ pub fn scheduleBlocks(insts: []Inst, block_starts: []const usize) void {
         // encode a Bar register, not a source GPR. Skip the GPR source-wait/free scan so
         // a barrier reg value (e.g. B0..B15) is not misread as "R0..R15" and made to
         // spuriously wait on or free a live scoreboard.
-        const is_barrier = opcode == 0x355 or opcode == 0x945 or opcode == 0x941;
+        // BAR (0xb1d), the workgroup barrier, is in the same position: it reads no GPR and
+        // leaves bits 24, 32 and 64 at zero, which the scan would otherwise read as three
+        // reads of R0, adding a spurious wait and freeing a scoreboard that is still live.
+        const is_barrier = opcode == 0x355 or opcode == 0x945 or opcode == 0x941 or opcode == 0xb1d;
         var wait: u32 = 0;
         if (!is_barrier) inline for (.{ 24, 32, 64 }) |pos| {
             if (pos != 32 or form == 1 or is_tex) {
@@ -380,4 +397,58 @@ test "an LDG consumer FAR from its LDC-address producer still waits (uniform-blo
     // The LDG reading R6:R7 must wait on BOTH LDC scoreboards.
     try std.testing.expect((ldg_wait & (@as(u32, 1) << @intCast(ldc_lo_bar))) != 0);
     try std.testing.expect((ldg_wait & (@as(u32, 1) << @intCast(ldc_hi_bar))) != 0);
+}
+
+test "an LDS result gets a scoreboard and its consumer waits on it" {
+    // Regression: isVariableLatency listed LDG but not LDS, so a shared-memory load got no
+    // write barrier and its consumer read the destination register STALE. NAK
+    // sm120_instr_latencies classes Op::Ld as DecoupledAgu for EVERY memory space, not only
+    // the global one. On a staged shared tile the symptom is each thread reading whatever the
+    // register held before the tile load.
+    var insts: [3]Inst = undefined;
+    insts[0] = encode.ldsU32(4, 2, .{}); // R4 <- shared[R2]
+    insts[1] = encode.iadd3(5, 4, 4, .{}); // consumes R4
+    insts[2] = encode.exit(.{});
+    scheduleBlocks(&insts, &.{0});
+
+    const lds_bar = getField(insts[0], 110, 3);
+    try std.testing.expect(lds_bar < 6); // a real scoreboard, not 7 = none
+    const consumer_wait = getField(insts[1], 116, 6);
+    try std.testing.expect((consumer_wait & (@as(u32, 1) << @intCast(lds_bar))) != 0);
+}
+
+test "an STS does not claim a phantom write to R0" {
+    // Regression: writesDst returned true for STS, whose bits 16..23 are zero, so the
+    // scheduler recorded a write to R0. When R0 had a live in-flight producer the store waited
+    // on that scoreboard and CLEARED its tag, so the instruction that really consumed R0 never
+    // waited and read it stale. STG is excluded for this same reason.
+    var insts: [4]Inst = undefined;
+    insts[0] = encode.ldgU32(0, 2, .{}); // R0 <- global, variable latency
+    insts[1] = encode.stsU32(6, 8, .{}); // shared[R6] = R8, touches no GPR dst
+    insts[2] = encode.iadd3(1, 0, 0, .{}); // the REAL consumer of R0
+    insts[3] = encode.exit(.{});
+    scheduleBlocks(&insts, &.{0});
+
+    const ldg_bar = getField(insts[0], 110, 3);
+    try std.testing.expect(ldg_bar < 6);
+    // The consumer must still wait on the LDG. If the STS stole and cleared the tag, this is 0.
+    const consumer_wait = getField(insts[2], 116, 6);
+    try std.testing.expect((consumer_wait & (@as(u32, 1) << @intCast(ldg_bar))) != 0);
+}
+
+test "a BAR neither claims a destination register nor reads three phantom R0 sources" {
+    // Regression: BAR (0xb1d) leaves bits 16..23, 24, 32 and 64 at zero. Without the writesDst
+    // and is_barrier exclusions the scheduler read those as a write to R0 plus three reads of
+    // R0, which both freed a live scoreboard and added a spurious wait.
+    var insts: [4]Inst = undefined;
+    insts[0] = encode.ldgU32(0, 2, .{}); // R0 <- global, variable latency
+    insts[1] = encode.barSync(.{}); // the workgroup barrier
+    insts[2] = encode.iadd3(1, 0, 0, .{}); // the REAL consumer of R0
+    insts[3] = encode.exit(.{});
+    scheduleBlocks(&insts, &.{0});
+
+    const ldg_bar = getField(insts[0], 110, 3);
+    try std.testing.expect(ldg_bar < 6);
+    const consumer_wait = getField(insts[2], 116, 6);
+    try std.testing.expect((consumer_wait & (@as(u32, 1) << @intCast(ldg_bar))) != 0);
 }
