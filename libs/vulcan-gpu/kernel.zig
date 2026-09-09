@@ -63,6 +63,13 @@ pub const LaunchInfo = struct {
     /// such budget, such as ET-SoC or the CPU offload path, writes 0 and its runtime ignores
     /// the field.
     reg_count: u32,
+    /// How many hardware control barriers the kernel needs. The runtime writes this into the
+    /// launch descriptor. It is meaningful ONLY for a target whose descriptor declares one,
+    /// such as the NVIDIA QMD `BARRIER_COUNT` field: a dispatch that leaves BARRIER_COUNT at 0
+    /// while the kernel runs a BAR.SYNC is UNDEFINED. Mesa NAK sets `num_control_barriers = 1`
+    /// beside its `OpBar` for the same reason. A backend that emits no barrier writes 0, and a
+    /// target with no such field writes 0 and its runtime ignores it.
+    barrier_count: u32,
 };
 
 test "a scalar param kind reports its width in bytes" {

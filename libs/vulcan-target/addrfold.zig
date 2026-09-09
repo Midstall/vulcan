@@ -151,7 +151,8 @@ fn countUses(func: *const Function, uses: []u32) void {
         const block: Block = @enumFromInt(bi);
         for (func.blockInsts(block)) |inst| {
             switch (func.opcode(inst)) {
-                .iconst, .fconst, .fconst128, .alloca, .global_addr => {},
+                // A barrier uses no Value, so it adds no use count.
+                .iconst, .fconst, .fconst128, .alloca, .global_addr, .barrier => {},
                 .arith => |a| {
                     uses[@intFromEnum(a.lhs)] += 1;
                     uses[@intFromEnum(a.rhs)] += 1;

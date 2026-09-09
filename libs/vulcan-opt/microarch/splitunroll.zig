@@ -105,7 +105,9 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, model: *const mm.Mod
     if (in_loop_blocks != 2) return null; // exactly header + one body block
     const bodyb = body orelse return null;
     for (func.blockInsts(bodyb)) |inst| switch (func.opcode(inst)) {
-        .@"if", .matmul => return null, // straight-line body only
+        // A barrier joins them: splitting one loop into two reorders the memory operations
+        // around each meeting point, which is the one thing a barrier forbids.
+        .@"if", .matmul, .barrier => return null, // straight-line body only
         else => {},
     };
 
@@ -444,7 +446,8 @@ fn rv(vmap: *const std.AutoHashMapUnmanaged(Value, Value), v: Value) Value {
 
 fn remapOp(func: *Function, op: Opcode, vmap: *const std.AutoHashMapUnmanaged(Value, Value), allocator: std.mem.Allocator) Error!Opcode {
     return switch (op) {
-        .iconst, .fconst, .fconst128, .alloca, .global_addr => op,
+        // A barrier carries only its scope, which is not a Value, so it copies unchanged.
+        .iconst, .fconst, .fconst128, .alloca, .global_addr, .barrier => op,
         .arith => |a| .{ .arith = .{ .op = a.op, .lhs = rv(vmap, a.lhs), .rhs = rv(vmap, a.rhs) } },
         .arith_imm => |a| .{ .arith_imm = .{ .op = a.op, .lhs = rv(vmap, a.lhs), .imm = a.imm } },
         .icmp => |c| .{ .icmp = .{ .op = c.op, .lhs = rv(vmap, c.lhs), .rhs = rv(vmap, c.rhs) } },
@@ -491,7 +494,8 @@ fn useCounts(allocator: std.mem.Allocator, func: *const Function) Error![]u32 {
     }.f;
     for (0..func.instCount()) |i| {
         switch (func.opcode(@enumFromInt(i))) {
-            .iconst, .fconst, .fconst128, .alloca, .global_addr => {},
+            // A barrier reads no Value operand.
+            .iconst, .fconst, .fconst128, .alloca, .global_addr, .barrier => {},
             .arith => |x| {
                 bump(counts, x.lhs);
                 bump(counts, x.rhs);

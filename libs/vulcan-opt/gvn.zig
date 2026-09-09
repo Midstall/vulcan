@@ -140,6 +140,9 @@ fn keyOf(func: *const Function, canon: []const Value, inst: Inst, result: Value)
         .alloca, .struct_new, .load, .store, .prefetch, .matmul, .call, .call_indirect, .@"if" => null,
         // SM12 T3: mutate/read the `va_list` object at `list`, like `load`/`store` above - not numbered.
         .va_start, .va_arg, .va_end => null,
+        // A barrier is not numbered. Two barriers with the same scope are NOT the same
+        // value: each one is a separate meeting point, and commoning them deletes one.
+        .barrier => null,
     };
 }
 
@@ -153,7 +156,8 @@ fn rewriteOperands(func: *Function, canon: []const Value) void {
     for (0..func.instCount()) |i| {
         const op = func.opcodeMut(@enumFromInt(i));
         switch (op.*) {
-            .iconst, .fconst, .fconst128, .alloca, .global_addr => {},
+            // A barrier carries no Value operand to canonicalize.
+            .iconst, .fconst, .fconst128, .alloca, .global_addr, .barrier => {},
             .arith => |*a| {
                 a.lhs = sub(canon, a.lhs);
                 a.rhs = sub(canon, a.rhs);
@@ -304,4 +308,32 @@ test "gvn does not merge a direct and a via_got global_addr of the same symbol" 
     try std.testing.expectEqual(got, func.opcode(g_conv).convert.value);
     try std.testing.expectEqual(false, func.opcode(func.definingInst(direct).?).global_addr.via_got);
     try std.testing.expectEqual(true, func.opcode(func.definingInst(got).?).global_addr.via_got);
+}
+
+test "gvn does not common two barriers of the same scope" {
+    // Two barriers are two separate meeting points, not one value computed twice.
+    // Commoning them deletes one, which changes how many times the threads meet.
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const b = try func.appendBlock();
+    const p = try func.appendBlockParam(b, ptr_t);
+    const v = try func.appendBlockParam(b, i32_t);
+    try func.appendBarrier(b, .workgroup);
+    try func.appendStore(b, v, p);
+    try func.appendBarrier(b, .workgroup);
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(v) });
+
+    var analyses = pass.Analyses{ .allocator = allocator, .func = &func };
+    defer analyses.deinit();
+    _ = try run(allocator, &func, &analyses);
+
+    const insts = func.blockInsts(b);
+    try std.testing.expectEqual(@as(usize, 3), insts.len);
+    try std.testing.expect(func.opcode(insts[0]) == .barrier);
+    try std.testing.expect(func.opcode(insts[1]) == .store);
+    try std.testing.expect(func.opcode(insts[2]) == .barrier);
 }

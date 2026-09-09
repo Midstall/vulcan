@@ -531,7 +531,8 @@ fn valueUseCount(func: *const Function, v: Value) usize {
         const block: Block = @enumFromInt(bi);
         for (func.blockInsts(block)) |inst| {
             switch (func.opcode(inst)) {
-                .iconst, .fconst, .fconst128, .alloca, .global_addr => {},
+                // A barrier uses no Value, so it never counts as a consumer.
+                .iconst, .fconst, .fconst128, .alloca, .global_addr, .barrier => {},
                 .arith => |x| {
                     if (x.lhs == v) n += 1;
                     if (x.rhs == v) n += 1;
@@ -821,6 +822,9 @@ fn isPure(op: ir.function.Opcode) bool {
         .load, .store, .prefetch, .matmul, .@"if", .call, .call_indirect => false,
         // SM12 T3: mutate/read the `va_list` object at `list`, like `load`/`store` above.
         .va_start, .va_arg, .va_end => false,
+        // A barrier has no result, so a purity rule keyed on an unused result would drop
+        // every one of them. Mirrors dce.zig.
+        .barrier => false,
     };
 }
 
@@ -833,7 +837,8 @@ fn countUses(func: *const Function, uses: []u32) void {
         const block: Block = @enumFromInt(bi);
         for (func.blockInsts(block)) |inst| {
             switch (func.opcode(inst)) {
-                .iconst, .fconst, .fconst128, .alloca, .global_addr => {},
+                // A barrier uses no Value, so it adds no use count.
+                .iconst, .fconst, .fconst128, .alloca, .global_addr, .barrier => {},
                 .arith => |x| {
                     uses[@intFromEnum(x.lhs)] += 1;
                     uses[@intFromEnum(x.rhs)] += 1;

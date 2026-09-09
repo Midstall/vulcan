@@ -894,6 +894,11 @@ const Emitter = struct {
     }
 
     fn emitInst(self: *Emitter, inst: ir.function.Inst) Error!void {
+        // A barrier has no result. The `orelse return` below drops every result-less
+        // instruction with no diagnostic, which for a barrier means deleting a
+        // synchronization point silently. SPIR-V spells one `OpControlBarrier`, which this
+        // emitter does not build yet, so it is refused here instead of dropped.
+        if (self.func.opcode(inst) == .barrier) return error.UnsupportedConstruct;
         const result = self.func.instResult(inst) orelse return;
         const res_ty = self.func.valueType(result);
         switch (self.func.opcode(inst)) {
@@ -1468,4 +1473,21 @@ test "emits a fragment shader entry point (in -> out)" {
     try testing.expect(saw_origin);
     try testing.expectEqual(@as(u32, 1), input_vars);
     try testing.expectEqual(@as(u32, 1), output_vars);
+}
+
+test "a barrier is refused, not silently dropped" {
+    // `emitInst` returns early for any result-less instruction. Without an explicit refusal
+    // a barrier would take that path and vanish from the module with no diagnostic, which
+    // is the exact failure a first-class barrier opcode exists to prevent.
+    const allocator = testing.allocator;
+
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const b = try func.appendBlock();
+    const x = try func.appendBlockParam(b, i32_t);
+    try func.appendBarrier(b, .workgroup);
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(x) });
+
+    try testing.expectError(error.UnsupportedConstruct, emitModule(allocator, &func, "sync"));
 }

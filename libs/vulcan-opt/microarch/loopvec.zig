@@ -474,7 +474,9 @@ fn recognizeReduction(func: *const Function, model: *const mm.Model, loop: *cons
     if (in_loop_blocks != 2) return null;
     const bodyb = body orelse return null;
     for (func.blockInsts(bodyb)) |inst| switch (func.opcode(inst)) {
-        .@"if", .matmul => return null,
+        // A barrier joins them: vectorizing by V divides the trip count by V, so the loop
+        // would meet V times fewer than the source says.
+        .@"if", .matmul, .barrier => return null,
         else => {},
     };
 

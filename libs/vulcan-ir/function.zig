@@ -293,6 +293,38 @@ pub const InputSigns = struct { a_unsigned: bool, b_unsigned: bool };
 /// et-soc VPU (riscv64) backend honors `embedded`; no other backend supports matmul at all.
 pub const MatMul = struct { a: Value, b: Value, c: Value, m: u16, n: u16, k: u16, dtype: MatMulType, accumulate: bool, embedded: bool = false, quant: ?MatMulQuant = null, input_signs: ?InputSigns = null };
 
+/// The set of threads a `barrier` synchronizes.
+///
+/// The scope is part of the operation from its first version on purpose. A scope-less barrier
+/// needs a breaking change to every layer the moment a second scope arrives, and the two scopes
+/// are not interchangeable: a subgroup barrier synchronizes one warp, a workgroup barrier
+/// synchronizes the whole workgroup. A backend that lowers only one of them must refuse the
+/// other, and it can only do that if the operation says which one it is.
+///
+/// Encoded as one byte in bitcode, so the tag values are pinned there.
+pub const BarrierScope = enum {
+    /// Every thread of the workgroup (the CUDA block, the NVIDIA CTA). This is what a
+    /// `__syncthreads()` in a compute kernel means.
+    workgroup,
+    /// Every thread of the subgroup (the warp, the wave). No backend lowers this yet.
+    subgroup,
+};
+
+/// An execution and memory barrier over `scope`. Every thread in the scope waits here, and
+/// memory a thread wrote before the barrier is visible to the other threads after it. Produces
+/// no result. EFFECTFUL, like `store` and `matmul`.
+///
+/// This is a first-class operation and not a recognised call for one reason: a barrier is a
+/// constraint the optimizer must read. `licm`, `gvn`, `dce` and `loadfwd` must not move a load
+/// or a store across it, must not common two of them, and must not delete one. A call is opaque
+/// to those passes only by accident of how side effects are modelled, so a call that a later
+/// pass learns to treat as pure becomes a SILENTLY DELETED barrier. A call also has no callee
+/// here, which makes it a lie in the IR.
+///
+/// It carries no memory-order operand. Each scope that lowers today is a full fence in the
+/// machine code, so a weaker order has no spelling to lower to.
+pub const Barrier = struct { scope: BarrierScope };
+
 /// A run of values in the function's value-list pool, used for variadic operands
 /// like the arguments passed across a control-flow edge.
 pub const ValueList = struct { start: u32, len: u32 };
@@ -446,6 +478,9 @@ pub const Opcode = union(enum) {
     /// A fixed-tile matrix multiply. Produces no result. EFFECTFUL (writes memory
     /// at `c`). Its preconditions are per target, see `MatMul`.
     matmul: MatMul,
+    /// An execution and memory barrier over a scope. Produces no result. EFFECTFUL.
+    /// See `Barrier` for why this is an opcode and not a call.
+    barrier: Barrier,
     /// A non-terminating conditional. Produces no result in its statement form.
     @"if": If,
 };
@@ -815,6 +850,12 @@ pub const Function = struct {
         try self.appendStmt(block, .{ .va_end = .{ .list = list } });
     }
 
+    /// Append an execution and memory barrier over `scope`. No result. EFFECTFUL: every
+    /// pass must keep it, and must not move a memory operation across it. See `Barrier`.
+    pub fn appendBarrier(self: *Function, block: Block, scope: BarrierScope) std.mem.Allocator.Error!void {
+        try self.appendStmt(block, .{ .barrier = .{ .scope = scope } });
+    }
+
     /// Append an INT8 4-way dot-product accumulate: `result = acc + dot(a, b)`.
     /// Pure, like `arith`. The result type is `acc`'s type.
     pub fn appendDot(self: *Function, block: Block, acc: Value, a: Value, b: Value) std.mem.Allocator.Error!Value {
@@ -1073,7 +1114,9 @@ pub const Function = struct {
         for (0..self.instCount()) |i| {
             const op = self.opcodeMut(@enumFromInt(i));
             switch (op.*) {
-                .iconst, .fconst, .fconst128, .alloca, .global_addr => {},
+                // A barrier carries a scope and no Value operand, so it has nothing to
+                // replace. It joins the constants here for that reason only.
+                .iconst, .fconst, .fconst128, .alloca, .global_addr, .barrier => {},
                 .arith => |*a| {
                     a.lhs = r(from, to, a.lhs);
                     a.rhs = r(from, to, a.rhs);
@@ -1308,7 +1351,9 @@ pub const Function = struct {
     /// `replaceAllUses` and `verify.zig`'s dominance check above.
     fn remapOpcode(self: *Function, allocator: std.mem.Allocator, op: Opcode, map: *const std.AutoHashMapUnmanaged(Value, Value)) std.mem.Allocator.Error!Opcode {
         return switch (op) {
-            .iconst, .fconst, .fconst128, .alloca, .global_addr => op,
+            // A barrier's only field is its scope, which is not a Value, so the whole
+            // opcode copies unchanged.
+            .iconst, .fconst, .fconst128, .alloca, .global_addr, .barrier => op,
             .arith => |a| .{ .arith = .{ .op = a.op, .lhs = remapValue(map, a.lhs), .rhs = remapValue(map, a.rhs) } },
             .arith_imm => |a| .{ .arith_imm = .{ .op = a.op, .lhs = remapValue(map, a.lhs), .imm = a.imm } },
             .icmp => |c| .{ .icmp = .{ .op = c.op, .lhs = remapValue(map, c.lhs), .rhs = remapValue(map, c.rhs) } },
@@ -1738,6 +1783,9 @@ fn printInst(self: *const Function, w: *std.Io.Writer, inst: Inst) std.Io.Writer
             self.valueName(va.list),
         }),
         .va_end => |ve| try w.print("va_end v{d}", .{self.valueName(ve.list)}),
+        // A result-less statement, printed the same way as `prefetch` and `va_end`: the
+        // mnemonic and its one operand. The operand here is the scope name, not a value.
+        .barrier => |bar| try w.print("barrier {s}", .{@tagName(bar.scope)}),
         .dot => |d| try w.print("let v{d} = dot v{d}, v{d}, v{d}", .{
             self.valueName(data.result.?),
             self.valueName(d.acc),

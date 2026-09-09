@@ -353,6 +353,14 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
         }
         return;
     }
+    if (func.opcode(inst) == .barrier) {
+        // A barrier synchronizes threads. This backend compiles one thread of a scalar loop
+        // nest, so there is nothing to synchronize and no honest lowering. It is refused
+        // HERE, beside the other result-less opcodes, and not in the `else` prong of the
+        // switch below: the `.?` result unwrap between here and that switch panics on any
+        // result-less opcode it reaches, so the switch never sees this one.
+        return error.Unsupported;
+    }
     if (func.opcode(inst) == .va_start) {
         // Initialize the `va_list` object. It has no result, so (like `store` above) this is
         // handled before the result unwrap below.
@@ -1455,7 +1463,8 @@ fn emitFromAllocation(allocator: std.mem.Allocator, ctx: *Ctx, func: *const Func
 /// the exact way the fold rewrite repoints operands.
 fn forEachOperand(func: *const Function, inst: ir.function.Inst, fold: *const addrfold.Analysis, ctx: anytype, comptime f: fn (@TypeOf(ctx), Value, bool) void) void {
     switch (func.opcode(inst)) {
-        .iconst, .fconst, .fconst128, .alloca, .global_addr => {},
+        // A barrier reads no Value operand.
+        .iconst, .fconst, .fconst128, .alloca, .global_addr, .barrier => {},
         .arith => |a| {
             f(ctx, a.lhs, false);
             f(ctx, a.rhs, false);
@@ -1799,6 +1808,21 @@ test "an f16 function is rejected cleanly, not miscompiled as f64" {
     const y = try func.appendBlockParam(b, t);
     const s = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = y } });
     func.setTerminator(b, .{ .ret = ir.function.Ret.one(s) });
+
+    try std.testing.expectError(error.Unsupported, selectFunction(allocator, &func));
+}
+
+test "a barrier is rejected, not dropped like a prefetch" {
+    // This backend compiles one thread of a scalar loop nest. There is nothing to
+    // synchronize, so there is no honest lowering, and refusing must not be a panic.
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const e = try func.appendBlock();
+    const x = try func.appendBlockParam(e, i32_t);
+    try func.appendBarrier(e, .workgroup);
+    func.setTerminator(e, .{ .ret = ir.function.Ret.one(x) });
 
     try std.testing.expectError(error.Unsupported, selectFunction(allocator, &func));
 }

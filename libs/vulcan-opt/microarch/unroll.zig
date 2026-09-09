@@ -147,6 +147,9 @@ pub fn cloneBlocks(
                 .va_start => |vs| .{ .va_start = .{ .list = remapValue(value_map, vs.list) } },
                 .va_arg => |va| .{ .va_arg = .{ .list = remapValue(value_map, va.list), .ty = va.ty } },
                 .va_end => |ve| .{ .va_end = .{ .list = remapValue(value_map, ve.list) } },
+                // A barrier has no Value to remap. Each unrolled copy of the body keeps its
+                // own barrier, so the number of times a thread meets is unchanged.
+                .barrier => |bar| .{ .barrier = bar },
                 .dot => |d| .{ .dot = .{
                     .acc = remapValue(value_map, d.acc),
                     .a = remapValue(value_map, d.a),
@@ -196,7 +199,7 @@ pub fn cloneBlocks(
             switch (rebuilt) {
                 // `va_arg` has a result (like `load`), so it stays out of this result-less
                 // list and falls to the `else` (appendInst) branch below (SM12 T3).
-                .store, .prefetch, .matmul, .@"if", .va_start, .va_end => _ = try func.appendStmtRaw(cloned, rebuilt),
+                .store, .prefetch, .matmul, .@"if", .va_start, .va_end, .barrier => _ = try func.appendStmtRaw(cloned, rebuilt),
                 else => {
                     const result = func.instResult(inst) orelse unreachable;
                     const cloned_result = try func.appendInst(cloned, func.valueType(result), rebuilt);
@@ -663,7 +666,8 @@ fn collectOperands(
 ) Error!void {
     for (func.blockInsts(block)) |inst| {
         switch (func.opcode(inst)) {
-            .iconst, .fconst, .fconst128, .alloca, .global_addr => {},
+            // A barrier reads no Value operand.
+            .iconst, .fconst, .fconst128, .alloca, .global_addr, .barrier => {},
             .arith => |x| {
                 try set.put(a, x.lhs, {});
                 try set.put(a, x.rhs, {});
@@ -730,7 +734,8 @@ fn replaceInBlock(func: *Function, block: Block, from: Value, to: Value) void {
     for (func.blockInsts(block)) |inst| {
         const op = func.opcodeMut(inst);
         switch (op.*) {
-            .iconst, .fconst, .fconst128, .alloca, .global_addr => {},
+            // A barrier reads no Value operand.
+            .iconst, .fconst, .fconst128, .alloca, .global_addr, .barrier => {},
             .arith => |*x| {
                 x.lhs = rep(from, to, x.lhs);
                 x.rhs = rep(from, to, x.rhs);

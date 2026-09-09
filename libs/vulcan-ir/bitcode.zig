@@ -48,6 +48,7 @@ const op_va_start: u8 = 20;
 const op_va_arg: u8 = 21;
 const op_va_end: u8 = 22;
 const op_fconst128: u8 = 23;
+const op_barrier: u8 = 24;
 
 const Writer = struct {
     bytes: std.ArrayList(u8) = .empty,
@@ -298,6 +299,19 @@ fn writeInst(w: *Writer, func: *const Function, inst: Inst, serial: []const u32,
         .va_end => |ve| {
             try w.u8v(op_va_end);
             try w.u32v(sv(serial, ve.list));
+        },
+        .barrier => |bar| {
+            try w.u8v(op_barrier);
+            // The decoder maps this byte back with `std.enums.fromInt`, so pin the tag
+            // values here. A future reorder of `BarrierScope` would otherwise desync the
+            // two sides and silently turn a workgroup barrier into a subgroup one,
+            // instead of failing to build. This follows the `float` and `ptr` arms of
+            // `writeType`.
+            comptime {
+                std.debug.assert(@intFromEnum(function.BarrierScope.workgroup) == 0);
+                std.debug.assert(@intFromEnum(function.BarrierScope.subgroup) == 1);
+            }
+            try w.u8v(@intFromEnum(bar.scope));
         },
         .dot => |d| {
             try w.u8v(op_dot);
@@ -564,7 +578,8 @@ const Fixup = struct {
             .inst => |inst| {
                 const op = func.opcodeMut(inst);
                 switch (op.*) {
-                    .iconst, .fconst, .fconst128, .alloca, .global_addr => {},
+                    // A barrier reserves no operand slot, because it carries no Value.
+                    .iconst, .fconst, .fconst128, .alloca, .global_addr, .barrier => {},
                     .arith => |*a| {
                         a.lhs = next(&i, self.slots, serial);
                         a.rhs = next(&i, self.slots, serial);
@@ -748,6 +763,15 @@ fn readInst(r: *Reader, func: *Function, block: Block, type_map: []const Type, b
         op_va_end => blk: {
             try slots.append(allocator, try r.take(u32));
             break :blk try appendStmtOp(func, block, .{ .va_end = .{ .list = dummy } });
+        },
+        op_barrier => blk: {
+            // The stream is UNTRUSTED. An unknown scope byte is malformed bitcode, never
+            // an invalid enum: `@enumFromInt` here would build an out-of-range tag that
+            // every later exhaustive switch reads as undefined behavior.
+            const raw = try r.take(u8);
+            const scope = std.enums.fromInt(function.BarrierScope, raw) orelse
+                return error.MalformedBitcode;
+            break :blk try appendStmtOp(func, block, .{ .barrier = .{ .scope = scope } });
         },
         op_dot => blk: {
             try slots.append(allocator, try r.take(u32));
@@ -1457,4 +1481,63 @@ test "regression: rejects an unknown address-space byte instead of @enumFromInt 
     patched[space_offset] = 0xff;
 
     try std.testing.expectError(error.MalformedBitcode, decode(allocator, patched));
+}
+
+test "round-trips a barrier and its scope through bitcode" {
+    const allocator = std.testing.allocator;
+
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const entry = try func.appendBlock();
+    try func.appendBarrier(entry, .workgroup);
+    try func.appendBarrier(entry, .subgroup);
+    func.setTerminator(entry, .{ .ret = function.Ret.none() });
+
+    const bytes = try encode(allocator, &func);
+    defer allocator.free(bytes);
+
+    var decoded = try decode(allocator, bytes);
+    defer decoded.deinit();
+
+    const insts = decoded.blockInsts(entry);
+    try std.testing.expectEqual(@as(usize, 2), insts.len);
+    try std.testing.expectEqual(
+        function.BarrierScope.workgroup,
+        decoded.opcode(insts[0]).barrier.scope,
+    );
+    try std.testing.expectEqual(
+        function.BarrierScope.subgroup,
+        decoded.opcode(insts[1]).barrier.scope,
+    );
+}
+
+test "an unknown barrier scope byte is rejected as malformed bitcode" {
+    // Suspicious case: the stream is untrusted. An out-of-range byte must not become an
+    // invalid enum tag that every later exhaustive switch reads as undefined behavior.
+    const allocator = std.testing.allocator;
+
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const entry = try func.appendBlock();
+    try func.appendBarrier(entry, .workgroup);
+    func.setTerminator(entry, .{ .ret = function.Ret.none() });
+
+    const bytes = try encode(allocator, &func);
+    defer allocator.free(bytes);
+
+    // The barrier record is the opcode tag byte followed by the scope byte. This function
+    // holds exactly one instruction, so the first `op_barrier` byte found is that tag, and
+    // the byte after it is the scope.
+    const mutable = try allocator.dupe(u8, bytes);
+    defer allocator.free(mutable);
+    var i: usize = 0;
+    const patched = while (i + 1 < mutable.len) : (i += 1) {
+        if (mutable[i] == op_barrier and mutable[i + 1] == 0) {
+            mutable[i + 1] = 0xff;
+            break true;
+        }
+    } else false;
+    try std.testing.expect(patched);
+
+    try std.testing.expectError(error.MalformedBitcode, decode(allocator, mutable));
 }

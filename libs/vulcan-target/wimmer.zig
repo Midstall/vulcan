@@ -276,7 +276,8 @@ fn normalizeRanges(ranges: *std.ArrayList(Range)) void {
 /// target-independent `Opcode` set (exhaustive, so a new opcode forces an update here).
 fn visitOperands(func: *const Function, inst: Inst, ctx: anytype, comptime f: fn (@TypeOf(ctx), Value, bool) void) void {
     switch (func.opcode(inst)) {
-        .iconst, .fconst, .fconst128, .alloca, .global_addr => {},
+        // A barrier carries no Value operand to visit.
+        .iconst, .fconst, .fconst128, .alloca, .global_addr, .barrier => {},
         .arith => |a| {
             f(ctx, a.lhs, false);
             f(ctx, a.rhs, false);

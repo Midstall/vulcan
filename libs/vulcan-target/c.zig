@@ -417,6 +417,10 @@ const Emitter = struct {
             .dot => return error.Unsupported,
             // matmul is et-soc-only (a later task). The C backend has no lowering for it.
             .matmul => return error.Unsupported,
+            // A barrier synchronizes threads. This backend emits a single-threaded C
+            // function, so there is nothing to synchronize and no honest lowering: a
+            // silent no-op would be a lie about what the code does.
+            .barrier => return error.Unsupported,
             // The IR ops exist already (frontend and IR construction only). This backend
             // has no lowering for them yet. That is a later task, like `dot` and `matmul`
             // above.
@@ -878,4 +882,19 @@ test "emits an if/else diamond with a merge parameter" {
         \\}
         \\
     , src);
+}
+
+test "a barrier is rejected, not emitted as a silent no-op" {
+    // This backend emits a single-threaded C function. There is nothing to synchronize, so
+    // there is no honest lowering. Dropping it the way a `prefetch` is dropped would be a
+    // lie: a prefetch is only a hint, a barrier is a memory-ordering requirement.
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const entry = try func.appendBlock();
+    const x = try func.appendBlockParam(entry, i32_t);
+    try func.appendBarrier(entry, .workgroup);
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(x) });
+
+    try std.testing.expectError(error.Unsupported, emitFunction(std.testing.allocator, &func, "sync"));
 }

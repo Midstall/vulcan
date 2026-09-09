@@ -1231,6 +1231,11 @@ fn emitInst(
         // These IR ops exist for frontend and IR construction only. Wasm has no lowering
         // for them yet, a later task, mirroring `dot` and `matmul` above.
         .va_start, .va_arg, .va_end => return error.Unsupported,
+        // A barrier synchronizes threads. This backend emits a single-threaded wasm
+        // function, so there is nothing to synchronize and no honest lowering. A silent
+        // drop, the way `prefetch` is dropped, would be a lie: a prefetch is only a hint,
+        // a barrier is a memory-ordering requirement.
+        .barrier => return error.Unsupported,
         .call => |c| {
             // Resolve the callee by NAME, to its module function index. `c.symbol` is a
             // per-function interned id. Its ordering need not match the module layout, so
@@ -1572,4 +1577,19 @@ test "an f16 function lowers: held as f32, with reserved software-convert scratc
     try std.testing.expect(std.mem.indexOf(u8, text, "1 x f32") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "3 x i32") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "f32.add") != null);
+}
+
+test "a barrier is rejected, not dropped like a prefetch" {
+    // Wasm has no thread this backend can synchronize. A prefetch is a hint and is dropped;
+    // a barrier is a memory-ordering requirement and is refused.
+    const a = std.testing.allocator;
+    var func = Function.init(a);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const e = try func.appendBlock();
+    const x = try func.appendBlockParam(e, i32_t);
+    try func.appendBarrier(e, .workgroup);
+    func.setTerminator(e, .{ .ret = ir.function.Ret.one(x) });
+
+    try std.testing.expectError(error.Unsupported, selectFunction(a, &func, null));
 }

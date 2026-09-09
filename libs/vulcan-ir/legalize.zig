@@ -326,6 +326,9 @@ fn isPure(op: function.Opcode) bool {
         .load, .store, .prefetch, .matmul, .@"if", .call, .call_indirect => false,
         // These mutate or read the `va_list` object at `list`, like `load`/`store` above.
         .va_start, .va_arg, .va_end => false,
+        // A barrier synchronizes threads and fences memory. It has no result, so a purity
+        // rule keyed on an unused result would drop it. It is effectful.
+        .barrier => false,
     };
 }
 
@@ -375,7 +378,8 @@ fn applySubst(func: *Function, subst: *const Subst) void {
     for (0..func.instCount()) |i| {
         const op = func.opcodeMut(@enumFromInt(i));
         switch (op.*) {
-            .iconst, .fconst, .fconst128, .alloca, .global_addr => {},
+            // A barrier carries no Value operand, so it joins the constants here.
+            .iconst, .fconst, .fconst128, .alloca, .global_addr, .barrier => {},
             .arith => |*a| {
                 a.lhs = sub(subst, a.lhs);
                 a.rhs = sub(subst, a.rhs);
@@ -481,7 +485,8 @@ fn countUses(func: *const Function, uses: []u32) void {
         const block: function.Block = @enumFromInt(bi);
         for (func.blockInsts(block)) |inst| {
             switch (func.opcode(inst)) {
-                .iconst, .fconst, .fconst128, .alloca, .global_addr => {},
+                // A barrier carries no Value operand, so it joins the constants here.
+                .iconst, .fconst, .fconst128, .alloca, .global_addr, .barrier => {},
                 .arith => |a| {
                     uses[@intFromEnum(a.lhs)] += 1;
                     uses[@intFromEnum(a.rhs)] += 1;

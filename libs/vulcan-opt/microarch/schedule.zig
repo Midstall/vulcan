@@ -35,6 +35,9 @@ fn movable(op: ir.function.Opcode) bool {
         // `list` (a later backend expansion turns `va_arg` into a load-then-advance) - a
         // barrier, like `load`/`store`, not freely reordered.
         .va_start, .va_arg, .va_end => false,
+        // An IR barrier IS a scheduling barrier. Moving it, or moving anything across it,
+        // defeats the whole operation.
+        .barrier => false,
     };
 }
 
@@ -47,7 +50,8 @@ fn collectOperands(
 ) std.mem.Allocator.Error!void {
     buf.clearRetainingCapacity();
     switch (func.opcode(inst)) {
-        .iconst, .fconst, .fconst128, .alloca, .global_addr => {},
+        // A barrier reads no Value operand.
+        .iconst, .fconst, .fconst128, .alloca, .global_addr, .barrier => {},
         .arith => |a| {
             try buf.append(allocator, a.lhs);
             try buf.append(allocator, a.rhs);
@@ -374,7 +378,7 @@ fn windowTestLatency(op: ir.function.Opcode) u32 {
             .mul, .mulh => 5,
             .div, .rem, .add, .sub, .bit_and, .bit_or, .bit_xor, .shl, .shr => 1,
         },
-        .arith_imm, .iconst, .fconst, .fconst128, .icmp, .select, .struct_new, .extract, .convert, .unary, .alloca, .global_addr, .load, .store, .prefetch, .dot, .matmul, .@"if", .call, .call_indirect, .va_start, .va_arg, .va_end => 1,
+        .arith_imm, .iconst, .fconst, .fconst128, .icmp, .select, .struct_new, .extract, .convert, .unary, .alloca, .global_addr, .load, .store, .prefetch, .dot, .matmul, .@"if", .call, .call_indirect, .va_start, .va_arg, .va_end, .barrier => 1,
     };
 }
 fn windowTestUnit(op: ir.function.Opcode) UnitClass {

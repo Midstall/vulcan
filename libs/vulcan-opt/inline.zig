@@ -207,7 +207,9 @@ fn mapOpcode(caller: *Function, callee: *const Function, vmap: std.AutoHashMapUn
         // Excluded by `inlinable`: these never reach here. `va_start`/`va_arg`/`va_end` are
         // excluded by `inlinable`'s `callee.is_variadic` guard (SM12 T3) - a variadic callee
         // is never considered inlinable at all, so these three never reach here either.
-        .extract, .struct_new, .store, .prefetch, .matmul, .call, .call_indirect, .@"if", .va_start, .va_arg, .va_end => unreachable,
+        // `barrier` joins them: it has no result, so `inlinable`'s result-less check refuses
+        // a callee that contains one and this arm is never reached.
+        .extract, .struct_new, .store, .prefetch, .matmul, .call, .call_indirect, .@"if", .va_start, .va_arg, .va_end, .barrier => unreachable,
     };
 }
 
@@ -222,7 +224,8 @@ fn substituteValue(func: *Function, from: Value, to: Value) void {
     for (0..func.instCount()) |i| {
         const op = func.opcodeMut(@enumFromInt(i));
         switch (op.*) {
-            .iconst, .fconst, .fconst128, .alloca, .global_addr => {},
+            // A barrier carries no Value operand to substitute.
+            .iconst, .fconst, .fconst128, .alloca, .global_addr, .barrier => {},
             .arith => |*a| {
                 a.lhs = r(from, to, a.lhs);
                 a.rhs = r(from, to, a.rhs);

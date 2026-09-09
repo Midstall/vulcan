@@ -365,6 +365,126 @@ fn computeConvergence(allocator: std.mem.Allocator, func: *const Function) Error
     return .{ .bar_at_if = bar_at_if, .merge_of_if = merge_of_if, .syncs_at = syncs_at };
 }
 
+/// Whether `block` holds a `barrier` instruction.
+fn blockHasBarrier(func: *const Function, bi: usize) bool {
+    for (func.blockInsts(@as(Block, @enumFromInt(bi)))) |inst| {
+        if (func.opcode(inst) == .barrier) return true;
+    }
+    return false;
+}
+
+/// Whether `target` is reachable from a SUCCESSOR of block `from`, never entering `avoid` and
+/// never leaving `stop`. A path that arrives at `stop` ends there, because `stop` is a region
+/// join and everything past it is outside the region. `avoid` and `stop` are optional.
+fn reachesFromSuccessors(
+    allocator: std.mem.Allocator,
+    func: *const Function,
+    from: usize,
+    target: usize,
+    stop: ?usize,
+    avoid: ?usize,
+) Error!bool {
+    const n = func.blockCount();
+    const seen = try allocator.alloc(bool, n);
+    defer allocator.free(seen);
+    @memset(seen, false);
+
+    var stack: std.ArrayList(usize) = .empty;
+    defer stack.deinit(allocator);
+
+    var buf: [2]usize = undefined;
+    for (blockSuccessors(func, from, &buf)) |s| {
+        if (avoid != null and s == avoid.?) continue;
+        if (seen[s]) continue;
+        seen[s] = true;
+        try stack.append(allocator, s);
+    }
+    while (stack.pop()) |b| {
+        if (b == target) return true;
+        if (stop != null and b == stop.?) continue;
+        var sbuf: [2]usize = undefined;
+        for (blockSuccessors(func, b, &sbuf)) |s| {
+            if (avoid != null and s == avoid.?) continue;
+            if (seen[s]) continue;
+            seen[s] = true;
+            try stack.append(allocator, s);
+        }
+    }
+    return false;
+}
+
+/// Refuse a `barrier` the warp can split around. Returns `error.Unsupported` for one, and
+/// nothing when every barrier in `func` is safely placed.
+///
+/// The hardware fact, measured on the GB10 (Blackwell): a divergent branch AROUND a BAR.SYNC
+/// corrupts a staged shared-memory tile. The BSSY/BSYNC pair this backend emits does NOT save
+/// such a barrier. BSYNC sits at the JOIN, which is AFTER the arm's body, so a BAR.SYNC inside
+/// an arm still executes with the warp split. A barrier placed AFTER a divergent region is
+/// genuinely safe here, and this check accepts that one.
+///
+/// The rule: for a divergent `if` at block A whose join is M, a barrier in a block B inside that
+/// region must lie on EVERY path from A to M. Two shapes fail it:
+///   - A barrier in one arm of a diamond. The other arm reaches M without running it.
+///   - A barrier in a loop body. The loop's exit branch is such a region, and a thread that
+///     leaves the loop skips a barrier the other threads still run. That is safe only when
+///     every thread makes the same number of trips, which the IR cannot state and this backend
+///     will not assume.
+///
+/// Both refusals are deliberate. The frontend is not trusted to have predicated the guard: a
+/// wrong answer that varies with scheduling is much worse than a compile error. A guard around
+/// a barrier must be PREDICATED, not branched, and `encode.barSync` takes a full `Control` so a
+/// predicated barrier stays expressible once a lowering builds one.
+fn checkBarrierConvergence(allocator: std.mem.Allocator, func: *const Function, conv: *const Convergence) Error!void {
+    const n = func.blockCount();
+
+    var any = false;
+    for (0..n) |bi| {
+        if (blockHasBarrier(func, bi)) {
+            any = true;
+            break;
+        }
+    }
+    if (!any) return;
+
+    for (0..n) |ai| {
+        if (divergentIf(func, ai) == null) continue;
+        // `computeConvergence` records a join only where it found an immediate post-dominator.
+        // Without one the two arms never meet again (each one exits), so nothing reconverges
+        // the warp and every barrier the branch can reach runs split.
+        const merge: ?usize = if (conv.bar_at_if[ai] != null) @intFromEnum(conv.merge_of_if[ai]) else null;
+
+        for (0..n) |b| {
+            if (!blockHasBarrier(func, b)) continue;
+            // The branch sits at the END of block A, so A's own instructions run with the warp
+            // still whole.
+            if (b == ai) continue;
+
+            const m = merge orelse {
+                if (try reachesFromSuccessors(allocator, func, ai, b, null, null)) return error.Unsupported;
+                continue;
+            };
+            // The join is where the BSYNC reconverges the warp, so a barrier there is safe.
+            if (b == m) continue;
+            // Outside this region: some other region, or after it. Not this check's business.
+            if (!try reachesFromSuccessors(allocator, func, ai, b, m, null)) continue;
+            // Inside. If the join is still reachable with B cut out, some thread reaches the
+            // join without running the barrier.
+            if (try reachesFromSuccessors(allocator, func, ai, m, m, b)) return error.Unsupported;
+        }
+    }
+}
+
+/// How many hardware control barriers `func` needs in its launch descriptor. The NVIDIA QMD has
+/// a BARRIER_COUNT field, and a dispatch that leaves it at 0 while the kernel runs a BAR.SYNC is
+/// UNDEFINED. NAK sets `info.num_control_barriers = 1` beside its `OpBar`, and this matches: one
+/// barrier register serves every BAR.SYNC in the kernel, so the count is 1 or 0.
+fn barrierCount(func: *const Function) u32 {
+    for (0..func.blockCount()) |bi| {
+        if (blockHasBarrier(func, bi)) return 1;
+    }
+    return 0;
+}
+
 /// The shader stage being compiled. Compute kernels source parameters from the
 /// constant bank and store via STG. Graphics shaders use the attribute interface
 /// (vertex inputs via ALD, fragment inputs via IPA, outputs via AST).
@@ -707,6 +827,10 @@ pub fn compileShader(allocator: std.mem.Allocator, func: *Function, stage: Stage
     var conv = try computeConvergence(allocator, func);
     defer conv.deinit(allocator);
 
+    // Refuse a barrier the warp can split around, before a single instruction is emitted. See
+    // `checkBarrierConvergence` for the hardware fact behind this.
+    try checkBarrierConvergence(allocator, func, &conv);
+
     for (0..nblocks) |bi| {
         const block: Block = @enumFromInt(bi);
         // Reconverge: emit a BSYNC for every divergent region whose join is
@@ -815,6 +939,7 @@ pub fn compileShader(allocator: std.mem.Allocator, func: *Function, stage: Stage
             .block = gpu.attrs.localSize(func),
             .shared_bytes = gpu.attrs.sharedBytes(func),
             .reg_count = reg_count,
+            .barrier_count = barrierCount(func),
         },
     };
 }
@@ -2608,6 +2733,16 @@ fn lowerInst(allocator: std.mem.Allocator, func: *const Function, loc: *std.Auto
                 encode.tex(dst, call.coord, handle, tex_dim, .{ .wr_barrier = 0 });
             try code.append(allocator, tex_inst);
         },
+        .barrier => |bar| switch (bar.scope) {
+            // BAR.SYNC makes every thread of the CTA wait, and the CTA is the workgroup.
+            // `checkBarrierConvergence` has already refused a placement the warp can split
+            // around, so this emits the plain unpredicated form.
+            .workgroup => try code.append(allocator, encode.barSync(.{})),
+            // A subgroup (warp) barrier is a different instruction. Emitting BAR.SYNC for it
+            // would make every warp of the workgroup wait, not just the asking one, which
+            // deadlocks a kernel whose other warps never reach the barrier. Refuse instead.
+            .subgroup => return error.Unsupported,
+        },
         .@"if" => {}, // handled by the caller (it terminates the block)
         else => return error.Unsupported,
     }
@@ -2737,7 +2872,8 @@ fn markUse(last_use: []u32, v: Value, pos: u32) void {
 
 fn forEachUse(func: *const Function, inst: ir.function.Inst, last_use: []u32, pos: u32) void {
     switch (func.opcode(inst)) {
-        .iconst, .fconst, .fconst128, .alloca, .global_addr => {},
+        // A barrier reads no Value operand.
+        .iconst, .fconst, .fconst128, .alloca, .global_addr, .barrier => {},
         .arith => |a| {
             markUse(last_use, a.lhs, pos);
             markUse(last_use, a.rhs, pos);
@@ -2801,7 +2937,8 @@ fn setUsed(row: []bool, v: Value) void {
 
 fn markUsedBitset(func: *const Function, inst: ir.function.Inst, row: []bool) void {
     switch (func.opcode(inst)) {
-        .iconst, .fconst, .fconst128, .alloca, .global_addr => {},
+        // A barrier reads no Value operand.
+        .iconst, .fconst, .fconst128, .alloca, .global_addr, .barrier => {},
         .arith => |a| {
             setUsed(row, a.lhs);
             setUsed(row, a.rhs);
@@ -4070,4 +4207,171 @@ test "a 64-bit scalar access is REFUSED, not silently truncated" {
 
         try testing.expectError(error.Unsupported, compileKernel(allocator, &func, nvidia_abi));
     }
+}
+
+test "a workgroup barrier lowers to BAR.SYNC and declares one control barrier" {
+    // The launch descriptor half matters as much as the instruction: the NVIDIA QMD has a
+    // BARRIER_COUNT field, and a dispatch that leaves it at 0 while the kernel runs a
+    // BAR.SYNC is UNDEFINED.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const shared_t = try func.types.intern(.{ .ptr = .shared });
+    const b = try func.appendBlock();
+    const tile = try func.appendBlockParam(b, shared_t);
+    const n = try func.appendBlockParam(b, i32_t);
+    try func.appendStore(b, n, tile);
+    try func.appendBarrier(b, .workgroup);
+    const v = try func.appendInst(b, i32_t, .{ .load = .{ .ptr = tile } });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(v) });
+
+    var kernel = try compileKernel(allocator, &func, nvidia_abi);
+    defer kernel.deinit(allocator);
+
+    var bars: usize = 0;
+    var bar_at: usize = 0;
+    var i: usize = 0;
+    while (i < kernel.code.len) : (i += 4) {
+        if (kernel.code[i] & 0xfff == 0xb1d) {
+            bars += 1;
+            bar_at = i / 4;
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), bars);
+
+    // The BAR.SYNC sits between the STS and the LDS, in program order.
+    try testing.expectEqual(@as(u32, 0x988), opAt(kernel.code, bar_at - 1)); // STS
+    try testing.expectEqual(@as(u32, 0x984), opAt(kernel.code, bar_at + 1)); // LDS
+
+    try testing.expectEqual(@as(u32, 1), kernel.launch.barrier_count);
+}
+
+test "a kernel with no barrier declares zero control barriers" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const b = try func.appendBlock();
+    const n = try func.appendBlockParam(b, i32_t);
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(n) });
+
+    var kernel = try compileKernel(allocator, &func, nvidia_abi);
+    defer kernel.deinit(allocator);
+    try testing.expectEqual(@as(u32, 0), kernel.launch.barrier_count);
+}
+
+test "a subgroup barrier is refused, not lowered to a workgroup BAR.SYNC" {
+    // BAR.SYNC makes every warp of the CTA wait. Using it for a warp-scope request would
+    // deadlock a kernel whose other warps never reach the barrier, so the backend refuses.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const b = try func.appendBlock();
+    const n = try func.appendBlockParam(b, i32_t);
+    try func.appendBarrier(b, .subgroup);
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(n) });
+
+    try testing.expectError(error.Unsupported, compileKernel(allocator, &func, nvidia_abi));
+}
+
+test "a barrier INSIDE a divergent arm is refused" {
+    // The Blackwell quirk, measured on the GB10: a divergent branch around a BAR.SYNC
+    // corrupts a staged shared-memory tile. The BSSY/BSYNC pair this backend emits does not
+    // save it, because BSYNC sits at the JOIN, after the arm's body. The other arm reaches
+    // the merge without running the barrier, so this placement is refused rather than
+    // trusted to a frontend that may not have predicated the guard.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+
+    const entry = try func.appendBlock();
+    const a = try func.appendBlockParam(entry, t);
+    const b = try func.appendBlockParam(entry, t);
+    const then_b = try func.appendBlock();
+    const else_b = try func.appendBlock();
+    const merge = try func.appendBlock();
+    const r = try func.appendBlockParam(merge, t);
+    const c = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .gt, .lhs = a, .rhs = b } });
+    try func.appendIf(entry, c, .{ .target = then_b, .args = &.{} }, .{ .target = else_b, .args = &.{} });
+    try func.appendBarrier(then_b, .workgroup); // only ONE arm runs it
+    const one = try func.appendInst(then_b, t, .{ .iconst = 1 });
+    func.setTerminator(then_b, .{ .jump = .{ .target = merge, .args = try func.internValues(&.{one}) } });
+    const two = try func.appendInst(else_b, t, .{ .iconst = 2 });
+    func.setTerminator(else_b, .{ .jump = .{ .target = merge, .args = try func.internValues(&.{two}) } });
+    func.setTerminator(merge, .{ .ret = ir.function.Ret.one(r) });
+
+    try testing.expectError(error.Unsupported, compileKernel(allocator, &func, nvidia_abi));
+}
+
+test "a barrier BEFORE and AFTER a divergent region is accepted" {
+    // The same CFG, with the barrier moved out of the arm. Before the branch the warp is
+    // still whole, and at the merge the BSYNC has reconverged it, so both placements are
+    // safe and both must compile. This is the case vulcan is genuinely better off in than a
+    // hand assembler with no reconvergence markers.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+
+    const entry = try func.appendBlock();
+    const a = try func.appendBlockParam(entry, t);
+    const b = try func.appendBlockParam(entry, t);
+    const then_b = try func.appendBlock();
+    const else_b = try func.appendBlock();
+    const merge = try func.appendBlock();
+    const r = try func.appendBlockParam(merge, t);
+    const c = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .gt, .lhs = a, .rhs = b } });
+    try func.appendBarrier(entry, .workgroup); // before the branch
+    try func.appendIf(entry, c, .{ .target = then_b, .args = &.{} }, .{ .target = else_b, .args = &.{} });
+    const one = try func.appendInst(then_b, t, .{ .iconst = 1 });
+    func.setTerminator(then_b, .{ .jump = .{ .target = merge, .args = try func.internValues(&.{one}) } });
+    const two = try func.appendInst(else_b, t, .{ .iconst = 2 });
+    func.setTerminator(else_b, .{ .jump = .{ .target = merge, .args = try func.internValues(&.{two}) } });
+    try func.appendBarrier(merge, .workgroup); // at the join, after the BSYNC
+    func.setTerminator(merge, .{ .ret = ir.function.Ret.one(r) });
+
+    var kernel = try compileKernel(allocator, &func, nvidia_abi);
+    defer kernel.deinit(allocator);
+
+    var bars: usize = 0;
+    var i: usize = 0;
+    while (i < kernel.code.len) : (i += 4) {
+        if (kernel.code[i] & 0xfff == 0xb1d) bars += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), bars);
+    try testing.expectEqual(@as(u32, 1), kernel.launch.barrier_count);
+}
+
+test "a barrier in a LOOP body is refused, because a thread that exits early skips it" {
+    // The loop's exit branch is a divergent region whose join is the exit block. A thread
+    // that leaves the loop reaches that join without running the last barrier the others
+    // still run. That is safe only when every thread makes the same number of trips, which
+    // the IR cannot state, so the backend refuses rather than assuming it.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+
+    const entry = try func.appendBlock();
+    const head = try func.appendBlock();
+    const body = try func.appendBlock();
+    const done = try func.appendBlock();
+    const n = try func.appendBlockParam(entry, t);
+    const i = try func.appendBlockParam(head, t);
+    const zero = try func.appendInst(entry, t, .{ .iconst = 0 });
+    func.setTerminator(entry, .{ .jump = .{ .target = head, .args = try func.internValues(&.{zero}) } });
+    const c = try func.appendInst(head, bool_t, .{ .icmp = .{ .op = .lt, .lhs = i, .rhs = n } });
+    try func.appendIf(head, c, .{ .target = body, .args = &.{} }, .{ .target = done, .args = &.{} });
+    try func.appendBarrier(body, .workgroup);
+    const next = try func.appendArithImm(body, t, .add, i, 1);
+    func.setTerminator(body, .{ .jump = .{ .target = head, .args = try func.internValues(&.{next}) } });
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(n) });
+
+    try testing.expectError(error.Unsupported, compileKernel(allocator, &func, nvidia_abi));
 }

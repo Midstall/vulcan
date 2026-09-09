@@ -489,6 +489,11 @@ fn widenFlattened(func: *Function) Error!void {
             // SM12 T3: `va_start`/`va_arg`/`va_end` are a C-frontend-only construct; a shader
             // function never contains one, same reasoning as `dot`/`matmul` above.
             .va_start, .va_arg, .va_end => return error.NotWidenable,
+            // Widening runs 4 fragment invocations in the lanes of one vector. A barrier
+            // synchronizes real threads, and 4 lanes of one thread cannot meet each other,
+            // so there is no correct lane-widened form of it. Refuse, and let the caller
+            // keep the scalar path.
+            .barrier => return error.NotWidenable,
             .convert, .call, .global_addr, .@"if" => return error.NotWidenable,
         }
     }

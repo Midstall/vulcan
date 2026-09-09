@@ -42,6 +42,10 @@ fn altraLatency(op: ir.function.Opcode) u32 {
         // never actually schedules one today - priced like any other cheap bookkeeping op
         // (`iconst`/`store`/...) so a future backend expansion doesn't silently under-model.
         .va_start, .va_arg, .va_end => 1,
+        // No CPU backend lowers a barrier: every one of them refuses it. This model can
+        // therefore never price a real one, so it is priced as cheap bookkeeping like the
+        // `va_list` ops above rather than left to a wrong default.
+        .barrier => 1,
     };
 }
 
@@ -86,6 +90,10 @@ fn altraThroughput(op: ir.function.Opcode, elem_float: bool) u32 {
         // never actually schedules one today - priced like any other cheap bookkeeping op
         // (`iconst`/`store`/...) so a future backend expansion doesn't silently under-model.
         .va_start, .va_arg, .va_end => 1,
+        // No CPU backend lowers a barrier: every one of them refuses it. This model can
+        // therefore never price a real one, so it is priced as cheap bookkeeping like the
+        // `va_list` ops above rather than left to a wrong default.
+        .barrier => 1,
     };
 }
 
@@ -110,6 +118,10 @@ fn cascadelakeLatency(op: ir.function.Opcode) u32 {
         // never actually schedules one today - priced like any other cheap bookkeeping op
         // (`iconst`/`store`/...) so a future backend expansion doesn't silently under-model.
         .va_start, .va_arg, .va_end => 1,
+        // No CPU backend lowers a barrier: every one of them refuses it. This model can
+        // therefore never price a real one, so it is priced as cheap bookkeeping like the
+        // `va_list` ops above rather than left to a wrong default.
+        .barrier => 1,
     };
 }
 
@@ -139,6 +151,10 @@ fn cascadelakeThroughput(op: ir.function.Opcode, elem_float: bool) u32 {
         // never actually schedules one today - priced like any other cheap bookkeeping op
         // (`iconst`/`store`/...) so a future backend expansion doesn't silently under-model.
         .va_start, .va_arg, .va_end => 1,
+        // No CPU backend lowers a barrier: every one of them refuses it. This model can
+        // therefore never price a real one, so it is priced as cheap bookkeeping like the
+        // `va_list` ops above rather than left to a wrong default.
+        .barrier => 1,
     };
 }
 
@@ -167,6 +183,10 @@ fn etsocLatency(op: ir.function.Opcode) u32 {
         // never actually schedules one today - priced like any other cheap bookkeeping op
         // (`iconst`/`store`/...) so a future backend expansion doesn't silently under-model.
         .va_start, .va_arg, .va_end => 1,
+        // No CPU backend lowers a barrier: every one of them refuses it. This model can
+        // therefore never price a real one, so it is priced as cheap bookkeeping like the
+        // `va_list` ops above rather than left to a wrong default.
+        .barrier => 1,
     };
 }
 
@@ -208,6 +228,10 @@ fn etsocThroughput(op: ir.function.Opcode, elem_float: bool) u32 {
         // never actually schedules one today - priced like any other cheap bookkeeping op
         // (`iconst`/`store`/...) so a future backend expansion doesn't silently under-model.
         .va_start, .va_arg, .va_end => 1,
+        // No CPU backend lowers a barrier: every one of them refuses it. This model can
+        // therefore never price a real one, so it is priced as cheap bookkeeping like the
+        // `va_list` ops above rather than left to a wrong default.
+        .barrier => 1,
     };
 }
 
@@ -237,6 +261,10 @@ fn riverInorderLatency(op: ir.function.Opcode) u32 {
         // never actually schedules one today - priced like any other cheap bookkeeping op
         // (`iconst`/`store`/...) so a future backend expansion doesn't silently under-model.
         .va_start, .va_arg, .va_end => 1,
+        // No CPU backend lowers a barrier: every one of them refuses it. This model can
+        // therefore never price a real one, so it is priced as cheap bookkeeping like the
+        // `va_list` ops above rather than left to a wrong default.
+        .barrier => 1,
     };
 }
 
@@ -268,6 +296,10 @@ fn riverMacroLatency(op: ir.function.Opcode) u32 {
         // never actually schedules one today - priced like any other cheap bookkeeping op
         // (`iconst`/`store`/...) so a future backend expansion doesn't silently under-model.
         .va_start, .va_arg, .va_end => 1,
+        // No CPU backend lowers a barrier: every one of them refuses it. This model can
+        // therefore never price a real one, so it is priced as cheap bookkeeping like the
+        // `va_list` ops above rather than left to a wrong default.
+        .barrier => 1,
     };
 }
 
@@ -299,6 +331,10 @@ fn riverInorderThroughput(op: ir.function.Opcode, elem_float: bool) u32 {
         // never actually schedules one today - priced like any other cheap bookkeeping op
         // (`iconst`/`store`/...) so a future backend expansion doesn't silently under-model.
         .va_start, .va_arg, .va_end => 1,
+        // No CPU backend lowers a barrier: every one of them refuses it. This model can
+        // therefore never price a real one, so it is priced as cheap bookkeeping like the
+        // `va_list` ops above rather than left to a wrong default.
+        .barrier => 1,
     };
 }
 
@@ -331,6 +367,10 @@ fn riverPipelinedThroughput(op: ir.function.Opcode, elem_float: bool) u32 {
         // never actually schedules one today - priced like any other cheap bookkeeping op
         // (`iconst`/`store`/...) so a future backend expansion doesn't silently under-model.
         .va_start, .va_arg, .va_end => 1,
+        // No CPU backend lowers a barrier: every one of them refuses it. This model can
+        // therefore never price a real one, so it is priced as cheap bookkeeping like the
+        // `va_list` ops above rather than left to a wrong default.
+        .barrier => 1,
     };
 }
 
@@ -365,6 +405,9 @@ fn unitOfShared(op: ir.function.Opcode) UnitClass {
         // `extract` above.
         .va_arg => .mem,
         .va_start, .va_end => .none,
+        // A barrier binds no execution unit on any CPU this models, because no CPU backend
+        // lowers one. See the latency arms above.
+        .barrier => .none,
     };
 }
 

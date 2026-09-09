@@ -4,7 +4,8 @@
 //! whose address never escapes, this handles the memory that stays in memory (escaped locals, heap,
 //! incoming pointers). A light alias oracle keeps it cheap and correct: two distinct allocas never
 //! alias, two distinct globals never alias, an alloca and a global never alias, and anything else is
-//! conservatively assumed to alias. A call or a matmul may touch any memory, so it clears everything.
+//! conservatively assumed to alias. A call, a matmul, a `va_list` operation or a barrier may touch
+//! any memory, so each of them clears everything.
 
 const std = @import("std");
 const ir = @import("vulcan-ir");
@@ -56,10 +57,37 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
                     invalidateAliasing(&avail, func, st.ptr);
                     if (!st.@"volatile") try avail.append(allocator, .{ .ptr = st.ptr, .value = st.value });
                 },
-                // A call or matmul may write any memory; a prefetch is a pure hint. Everything else is
-                // pure (no memory effect) and leaves availability intact.
+                // A call or a matmul may write any memory, so everything recorded is dropped.
                 .call, .call_indirect, .matmul => avail.clearRetainingCapacity(),
-                else => {},
+                // A barrier makes memory another thread wrote before it visible after it, so
+                // every value this block believes it holds may now be stale. Forwarding a
+                // store to a load across a barrier is exactly the bug the barrier exists to
+                // prevent, so drop the whole availability set.
+                .barrier => avail.clearRetainingCapacity(),
+                // These three read and mutate the `va_list` object through `list`, so they
+                // may write memory a recorded entry names. Drop the set, like a call.
+                .va_start, .va_arg, .va_end => avail.clearRetainingCapacity(),
+                // The rest are pure (no memory effect) and leave availability intact. A
+                // prefetch is a hint and writes nothing. The switch is exhaustive with no
+                // `else` prong on purpose: an `else` reads a newly added effectful opcode as
+                // pure, which is how a barrier gets silently forwarded across.
+                .iconst,
+                .fconst,
+                .fconst128,
+                .arith,
+                .arith_imm,
+                .icmp,
+                .select,
+                .struct_new,
+                .extract,
+                .convert,
+                .unary,
+                .alloca,
+                .global_addr,
+                .prefetch,
+                .dot,
+                .@"if",
+                => {},
             }
             try keep.append(allocator, inst);
         }
@@ -271,4 +299,46 @@ test "a store and a load of different widths at the same address do not forward"
     _ = try runOnce(allocator, &func); // may still run (nothing else to fold), but must not forward
     const term = func.terminator(b).?;
     try testing.expectEqual(narrow, term.ret.values[0]); // the narrow load must survive, not be replaced by `wide`
+}
+
+test "a store does not forward to a load across a barrier" {
+    // The point of a barrier: memory another thread wrote before it becomes visible after
+    // it, so the value this block stored is not necessarily what the load reads.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try i32Ty(&func);
+    const ptr_t = try func.types.ptrGlobal();
+    const b = try func.appendBlock();
+    const p = try func.appendBlockParam(b, ptr_t);
+    const v = try func.appendBlockParam(b, t);
+    try func.appendStore(b, v, p);
+    try func.appendBarrier(b, .workgroup);
+    const y = try func.appendInst(b, t, .{ .load = .{ .ptr = p } });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(y) });
+
+    try testing.expect(!try runOnce(allocator, &func));
+    // The load survives and still feeds the return: nothing was forwarded.
+    try testing.expectEqual(y, func.terminator(b).?.ret.values[0]);
+    try testing.expectEqual(@as(usize, 3), func.blockInsts(b).len);
+}
+
+test "a load does not satisfy a later load across a barrier" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try i32Ty(&func);
+    const ptr_t = try func.types.ptrGlobal();
+    const b = try func.appendBlock();
+    const p = try func.appendBlockParam(b, ptr_t);
+    const y1 = try func.appendInst(b, t, .{ .load = .{ .ptr = p } });
+    try func.appendBarrier(b, .workgroup);
+    const y2 = try func.appendInst(b, t, .{ .load = .{ .ptr = p } });
+    const sum = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = y1, .rhs = y2 } });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(sum) });
+
+    try testing.expect(!try runOnce(allocator, &func));
+    const add = func.opcode(func.definingInst(sum).?).arith;
+    try testing.expectEqual(y1, add.lhs);
+    try testing.expectEqual(y2, add.rhs); // the second load was NOT replaced by the first
 }

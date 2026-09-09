@@ -417,7 +417,8 @@ fn blockUsesValueFromBlock(func: *const Function, block: Block, def_bi: u32, def
     }.f;
     for (func.blockInsts(block)) |inst| {
         switch (func.opcode(inst)) {
-            .iconst, .fconst, .fconst128, .alloca, .global_addr => {},
+            // A barrier uses no Value, so it can never use a value defined in `def_bi`.
+            .iconst, .fconst, .fconst128, .alloca, .global_addr, .barrier => {},
             .arith => |a| if (usesB(def_block, a.lhs, def_bi) or usesB(def_block, a.rhs, def_bi)) return true,
             .arith_imm => |a| if (usesB(def_block, a.lhs, def_bi)) return true,
             .icmp => |c| if (usesB(def_block, c.lhs, def_bi) or usesB(def_block, c.rhs, def_bi)) return true,
@@ -469,6 +470,9 @@ fn hasSideEffect(func: *const Function, block: Block) bool {
     for (func.blockInsts(block)) |inst| {
         switch (func.opcode(inst)) {
             .store, .call, .call_indirect, .prefetch, .matmul => return true,
+            // A barrier is a synchronization point. A thread that drops it changes the
+            // program, so a block holding one is never duplicated away.
+            .barrier => return true,
             // SM12 T3: mutate/read the `va_list` object at `list`, like `store`/`prefetch` above.
             .va_start, .va_arg, .va_end => return true,
             .iconst,

@@ -1466,6 +1466,14 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
         // lowering of a hint.
         return;
     }
+    if (func.opcode(inst) == .barrier) {
+        // A barrier synchronizes threads. This backend compiles one thread of a scalar
+        // loop nest, so there is nothing to synchronize and no honest lowering. It is
+        // refused HERE, beside the other result-less opcodes, and not in the `else` prong
+        // of the switch below: the `.?` result unwrap between here and that switch panics
+        // on any result-less opcode it reaches, so the switch never sees this one.
+        return error.Unsupported;
+    }
     if (func.opcode(inst) == .va_start) {
         // Initialize the `va_list` object. It has no result, so, like `store`
         // and `prefetch` above, the code handles it before the result unwrap
@@ -3429,7 +3437,8 @@ pub fn compileFunctionWimmerX86Fold(allocator: std.mem.Allocator, func: *Functio
 /// predicate scores, carrying the edge-arg flag that predicate needs.
 fn forEachOperand(func: *const Function, inst: ir.function.Inst, fold: *const addrfold.Analysis, ctx: anytype, comptime f: fn (@TypeOf(ctx), Value, bool) void) void {
     switch (func.opcode(inst)) {
-        .iconst, .fconst, .fconst128, .alloca, .global_addr => {},
+        // A barrier reads no Value operand.
+        .iconst, .fconst, .fconst128, .alloca, .global_addr, .barrier => {},
         .arith => |a| {
             f(ctx, a.lhs, false);
             f(ctx, a.rhs, false);
@@ -4088,4 +4097,20 @@ test "emitSplitActionX86 .slot_to_slot round-trips a 256-bit ymm through the xmm
     try expected.appendSlice(allocator, encode.vmovupsLoad(xmm_scratch, ctx.xmmDisp(4)).slice());
     try expected.appendSlice(allocator, encode.vmovupsStore(ctx.xmmDisp(2), xmm_scratch).slice());
     try std.testing.expectEqualSlices(u8, expected.items, ctx.code.items);
+}
+
+test "a barrier is rejected, not dropped like a prefetch" {
+    // This backend compiles one thread of a scalar loop nest. There is nothing to
+    // synchronize, so there is no honest lowering. A prefetch is a hint and is dropped; a
+    // barrier is a memory-ordering requirement and is refused.
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const e = try func.appendBlock();
+    const x = try func.appendBlockParam(e, i32_t);
+    try func.appendBarrier(e, .workgroup);
+    func.setTerminator(e, .{ .ret = ir.function.Ret.one(x) });
+
+    try std.testing.expectError(error.Unsupported, selectFunction(allocator, &func));
 }

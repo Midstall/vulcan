@@ -19,6 +19,9 @@ fn isPure(op: ir.function.Opcode) bool {
         .load, .store, .prefetch, .matmul, .@"if", .call, .call_indirect => false,
         // SM12 T3: mutate/read the `va_list` object at `list`, like `load`/`store` above.
         .va_start, .va_arg, .va_end => false,
+        // A barrier synchronizes threads and fences memory. It produces no result, so a
+        // purity rule keyed on an unused result would delete every one of them.
+        .barrier => false,
     };
 }
 
@@ -29,7 +32,8 @@ pub fn countUses(func: *const Function, uses: []u32) void {
         const block: ir.function.Block = @enumFromInt(bi);
         for (func.blockInsts(block)) |inst| {
             switch (func.opcode(inst)) {
-                .iconst, .fconst, .fconst128, .alloca, .global_addr => {},
+                // A barrier uses no Value, so it adds no use count.
+                .iconst, .fconst, .fconst128, .alloca, .global_addr, .barrier => {},
                 .arith => |a| {
                     uses[@intFromEnum(a.lhs)] += 1;
                     uses[@intFromEnum(a.rhs)] += 1;
@@ -183,4 +187,24 @@ test "keeps a matmul even though it has no result to be used" {
     defer analyses.deinit();
     try std.testing.expect(!try run(allocator, &func, &analyses));
     try std.testing.expectEqual(@as(usize, 1), func.blockInsts(b).len);
+}
+
+test "keeps a barrier even though it has no result to be used" {
+    // The whole reason a barrier is an opcode and not a call: a purity rule keyed on an
+    // unused result would delete it, and the deletion would be silent.
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const b = try func.appendBlock();
+    const x = try func.appendBlockParam(b, i32_t);
+    try func.appendBarrier(b, .workgroup);
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(x) });
+
+    var analyses = pass.Analyses{ .allocator = allocator, .func = &func };
+    defer analyses.deinit();
+    try std.testing.expect(!try run(allocator, &func, &analyses));
+    try std.testing.expectEqual(@as(usize, 1), func.blockInsts(b).len);
+    try std.testing.expect(func.opcode(func.blockInsts(b)[0]) == .barrier);
 }

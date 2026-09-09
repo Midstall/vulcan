@@ -35,6 +35,10 @@ fn hoistable(opcode: ir.function.Opcode) bool {
         .alloca, .struct_new, .load, .store, .prefetch, .matmul, .call, .call_indirect, .@"if" => false,
         // SM12 T3: mutate/read the `va_list` object at `list`, like `load`/`store` above.
         .va_start, .va_arg, .va_end => false,
+        // A barrier must stay where the frontend put it. Hoisting one to the preheader
+        // makes the threads meet once before the loop instead of once per iteration,
+        // which is a different program.
+        .barrier => false,
     };
 }
 
@@ -208,4 +212,90 @@ test "does not hoist a loop-variant value" {
     var analyses = pass.Analyses{ .allocator = allocator, .func = &func };
     defer analyses.deinit();
     try std.testing.expect(!try run(allocator, &func, &analyses));
+}
+
+test "does not hoist a barrier out of a loop, but still hoists beside it" {
+    // A barrier must run once per iteration. Hoisting it to the preheader makes the
+    // threads meet once before the loop instead, which is a different program. The
+    // invariant multiply beside it proves the pass really ran on this loop.
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const loop = try func.appendBlock();
+    const body = try func.appendBlock();
+    const done = try func.appendBlock();
+    const x = try func.appendBlockParam(entry, i32_t);
+    const y = try func.appendBlockParam(entry, i32_t);
+    const n = try func.appendBlockParam(entry, i32_t);
+    const i = try func.appendBlockParam(loop, i32_t);
+
+    const zero = try func.appendInst(entry, i32_t, .{ .iconst = 0 });
+    try func.setJump(entry, loop, &.{zero});
+    const cmp = try func.appendInst(loop, bool_t, .{ .icmp = .{ .op = .lt, .lhs = i, .rhs = n } });
+    try func.appendIf(loop, cmp, .{ .target = body, .args = &.{i} }, .{ .target = done });
+    const bi = try func.appendBlockParam(body, i32_t);
+    try func.appendBarrier(body, .workgroup);
+    _ = try func.appendInst(body, i32_t, .{ .arith = .{ .op = .mul, .lhs = x, .rhs = y } });
+    const next = try func.appendArithImm(body, i32_t, .add, bi, 1);
+    try func.setJump(body, loop, &.{next});
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(n) });
+
+    var analyses = pass.Analyses{ .allocator = allocator, .func = &func };
+    defer analyses.deinit();
+    try std.testing.expect(try run(allocator, &func, &analyses));
+
+    // The invariant multiply left the body; the barrier did not.
+    var in_body: usize = 0;
+    for (func.blockInsts(body)) |inst| {
+        if (func.opcode(inst) == .barrier) in_body += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), in_body);
+    for (func.blockInsts(entry)) |inst| {
+        try std.testing.expect(func.opcode(inst) != .barrier);
+    }
+}
+
+test "does not hoist a load or a store out of a loop that holds a barrier" {
+    // A barrier orders memory. Speculating a load ahead of the loop, or sinking a store
+    // behind it, would read or publish across the meeting point.
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const ptr_t = try func.types.ptrGlobal();
+    const entry = try func.appendBlock();
+    const loop = try func.appendBlock();
+    const body = try func.appendBlock();
+    const done = try func.appendBlock();
+    const p = try func.appendBlockParam(entry, ptr_t); // invariant address
+    const n = try func.appendBlockParam(entry, i32_t);
+    const i = try func.appendBlockParam(loop, i32_t);
+
+    const zero = try func.appendInst(entry, i32_t, .{ .iconst = 0 });
+    try func.setJump(entry, loop, &.{zero});
+    const cmp = try func.appendInst(loop, bool_t, .{ .icmp = .{ .op = .lt, .lhs = i, .rhs = n } });
+    try func.appendIf(loop, cmp, .{ .target = body, .args = &.{i} }, .{ .target = done });
+    const bi = try func.appendBlockParam(body, i32_t);
+    try func.appendStore(body, bi, p);
+    try func.appendBarrier(body, .workgroup);
+    _ = try func.appendInst(body, i32_t, .{ .load = .{ .ptr = p } });
+    const next = try func.appendArithImm(body, i32_t, .add, bi, 1);
+    try func.setJump(body, loop, &.{next});
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(n) });
+
+    var analyses = pass.Analyses{ .allocator = allocator, .func = &func };
+    defer analyses.deinit();
+    try std.testing.expect(!try run(allocator, &func, &analyses));
+
+    // The body still holds the store, the barrier and the load, in that order.
+    const insts = func.blockInsts(body);
+    try std.testing.expect(func.opcode(insts[0]) == .store);
+    try std.testing.expect(func.opcode(insts[1]) == .barrier);
+    try std.testing.expect(func.opcode(insts[2]) == .load);
 }

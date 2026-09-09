@@ -3423,7 +3423,8 @@ fn forEachOperand(
     comptime f: fn (@TypeOf(ctx), Value, bool) void,
 ) void {
     switch (func.opcode(inst)) {
-        .iconst, .fconst, .fconst128, .alloca, .global_addr => {},
+        // A barrier reads no Value operand.
+        .iconst, .fconst, .fconst128, .alloca, .global_addr, .barrier => {},
         .arith => |a| {
             f(ctx, a.lhs, false);
             f(ctx, a.rhs, false);
@@ -3856,7 +3857,8 @@ fn countUses(func: *const Function, v: Value) usize {
 fn usesOfInInst(func: *const Function, inst: ir.function.Inst, v: Value) usize {
     var c: usize = 0;
     switch (func.opcode(inst)) {
-        .iconst, .fconst, .fconst128, .alloca, .global_addr => {},
+        // A barrier reads no Value operand.
+        .iconst, .fconst, .fconst128, .alloca, .global_addr, .barrier => {},
         .arith => |a| {
             if (a.lhs == v) c += 1;
             if (a.rhs == v) c += 1;
@@ -3955,7 +3957,8 @@ fn setUsed(row: []bool, v: Value) void {
 
 fn markUsedBitset(func: *const Function, inst: ir.function.Inst, fold: *const addrfold.Analysis, row: []bool) void {
     switch (func.opcode(inst)) {
-        .iconst, .fconst, .fconst128, .alloca, .global_addr => {},
+        // A barrier reads no Value operand.
+        .iconst, .fconst, .fconst128, .alloca, .global_addr, .barrier => {},
         .arith => |a| {
             setUsed(row, a.lhs);
             setUsed(row, a.rhs);
@@ -4675,4 +4678,20 @@ test "emitSplitAction .slot_to_slot round-trips a full 128-bit vector through th
     try std.testing.expectEqual(@as(usize, 2), code.items.len);
     try std.testing.expectEqual(encode.ldrQ(fp_move, sp, 0 * 16), code.items[0]);
     try std.testing.expectEqual(encode.strQ(fp_move, sp, 7 * 16), code.items[1]);
+}
+
+test "a barrier is rejected, not dropped like a prefetch" {
+    // This backend compiles one thread of a scalar loop nest. There is nothing to
+    // synchronize, so there is no honest lowering. A prefetch is a hint and is dropped; a
+    // barrier is a memory-ordering requirement and is refused.
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const e = try func.appendBlock();
+    const x = try func.appendBlockParam(e, i32_t);
+    try func.appendBarrier(e, .workgroup);
+    func.setTerminator(e, .{ .ret = ir.function.Ret.one(x) });
+
+    try std.testing.expectError(error.Unsupported, selectFunction(allocator, &func));
 }

@@ -320,6 +320,9 @@ const FunctionParser = struct {
             } else if (std.mem.eql(u8, word, "store")) {
                 if (pending.items.len != 0) return error.InvalidSyntax;
                 try self.parseStore(block);
+            } else if (std.mem.eql(u8, word, "barrier")) {
+                if (pending.items.len != 0) return error.InvalidSyntax;
+                try self.parseBarrier(block);
             } else if (std.mem.eql(u8, word, "call")) {
                 if (pending.items.len != 0) return error.InvalidSyntax;
                 try self.parseVoidCall(block);
@@ -567,6 +570,18 @@ const FunctionParser = struct {
         self.skipWs();
         const ptr = try self.parseValueRef();
         try self.func.appendStore(block, value, ptr);
+    }
+
+    /// Parse a barrier statement: `barrier workgroup`. A result-less statement with one
+    /// word operand, the same shape as `store`.
+    fn parseBarrier(self: *FunctionParser, block: Block) Error!void {
+        self.skipWs();
+        const word = self.readWord();
+        // The text is UNTRUSTED, so an unknown scope is a parse error and never an
+        // invalid enum.
+        const scope = std.meta.stringToEnum(function.BarrierScope, word) orelse
+            return error.InvalidSyntax;
+        try self.func.appendBarrier(block, scope);
     }
 
     /// Parse a void call statement: `call @name(args)`.
@@ -1117,4 +1132,74 @@ test "regression: rejects an out-of-range block label instead of OOB indexing th
     // the pre-fix code did @enumFromInt(7) then indexed blocks.items[7] OOB.
     const text = "fn {\n  block7():\n    ret\n}";
     try std.testing.expectError(error.InvalidSyntax, parse(std.testing.allocator, text));
+}
+
+test "round-trips a workgroup barrier" {
+    const text =
+        \\fn {
+        \\  block0(v0: ptr, v1: i32):
+        \\    store v1, v0
+        \\    barrier workgroup
+        \\    let v2 = load i32, v0
+        \\    ret v2
+        \\}
+    ;
+
+    var func = try parse(std.testing.allocator, text);
+    defer func.deinit();
+
+    try std.testing.expectFmt(text, "{f}", .{func});
+}
+
+test "round-trips a subgroup barrier" {
+    // The second scope round-trips too, even though no backend lowers it. A scope that
+    // parses but does not print, or the reverse, would lose the operation silently.
+    const text =
+        \\fn {
+        \\  block0(v0: i32):
+        \\    barrier subgroup
+        \\    ret v0
+        \\}
+    ;
+
+    var func = try parse(std.testing.allocator, text);
+    defer func.deinit();
+
+    try std.testing.expectFmt(text, "{f}", .{func});
+}
+
+test "an unknown barrier scope is a parse error, not an invalid enum" {
+    // Suspicious case: the text is untrusted, so stringToEnum must reject the word rather
+    // than build an out-of-range tag every later exhaustive switch reads as undefined.
+    //
+    // The `barrier workgroup` control below is what makes this test mean anything. Every
+    // other token in these three strings is identical, so the control proves the two
+    // refusals come from the scope word and not from some unrelated syntax error.
+    var good = try parse(std.testing.allocator, "fn {\n  block0():\n    barrier workgroup\n    ret void\n}");
+    good.deinit();
+
+    const unknown = "fn {\n  block0():\n    barrier nonsense\n    ret void\n}";
+    try std.testing.expectError(error.InvalidSyntax, parse(std.testing.allocator, unknown));
+    const missing = "fn {\n  block0():\n    barrier\n    ret void\n}";
+    try std.testing.expectError(error.InvalidSyntax, parse(std.testing.allocator, missing));
+}
+
+test "a barrier verifies clean and keeps its scope through a clone" {
+    const verify = @import("verify.zig");
+    const text = "fn {\n  block0(v0: i32):\n    barrier workgroup\n    ret v0\n}";
+    var func = try parse(std.testing.allocator, text);
+    defer func.deinit();
+
+    var diags = try verify.verify(std.testing.allocator, &func, .high);
+    defer diags.deinit();
+    try std.testing.expect(diags.ok());
+
+    var copy = try func.clone(std.testing.allocator);
+    defer copy.deinit();
+    const insts = copy.blockInsts(@enumFromInt(0));
+    try std.testing.expectEqual(@as(usize, 1), insts.len);
+    try std.testing.expectEqual(
+        function.BarrierScope.workgroup,
+        copy.opcode(insts[0]).barrier.scope,
+    );
 }

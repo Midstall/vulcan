@@ -1909,7 +1909,8 @@ fn countUses(func: *const Function, v: Value) usize {
 fn usesInInst(func: *const Function, inst: ir.function.Inst, v: Value) usize {
     var c: usize = 0;
     switch (func.opcode(inst)) {
-        .iconst, .fconst, .fconst128, .alloca, .global_addr => {},
+        // A barrier reads no Value operand.
+        .iconst, .fconst, .fconst128, .alloca, .global_addr, .barrier => {},
         .arith => |a| {
             if (a.lhs == v) c += 1;
             if (a.rhs == v) c += 1;
@@ -7814,4 +7815,20 @@ test "emitSplitAction .slot_to_slot round-trips an et-soc VPU <8 x f32> vector t
     try expected.append(allocator, encode.flw_ps(float_scratch, .x2, vpu_vspill_base + 0 * 32));
     try expected.append(allocator, encode.fsw_ps(float_scratch, .x2, vpu_vspill_base + 2 * 32));
     try std.testing.expectEqualSlices(u32, expected.items, code.items);
+}
+
+test "a barrier is rejected, not dropped like a prefetch" {
+    // This backend compiles one thread of a scalar loop nest. There is nothing to
+    // synchronize, so there is no honest lowering. A prefetch is a hint and is dropped; a
+    // barrier is a memory-ordering requirement and is refused.
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const e = try func.appendBlock();
+    const x = try func.appendBlockParam(e, i32_t);
+    try func.appendBarrier(e, .workgroup);
+    func.setTerminator(e, .{ .ret = ir.function.Ret.one(x) });
+
+    try std.testing.expectError(error.Unsupported, selectFunction(allocator, &func));
 }

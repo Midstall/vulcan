@@ -507,7 +507,11 @@ fn markEscapes(func: *const Function, promotable: []bool) void {
                 esc(promotable, st.value);
                 if (st.@"volatile") esc(promotable, st.ptr);
             },
-            .alloca, .iconst, .fconst, .fconst128, .global_addr => {},
+            // A barrier names no address, so it lets nothing escape. An alloca this pass
+            // promotes is one whose address never escapes, so it is private to the thread
+            // and no other thread can write it. A barrier therefore cannot make its
+            // contents stale, and promotion across one stays correct.
+            .alloca, .iconst, .fconst, .fconst128, .global_addr, .barrier => {},
             .arith => |a| {
                 esc(promotable, a.lhs);
                 esc(promotable, a.rhs);
