@@ -795,10 +795,20 @@ pub fn compileShader(allocator: std.mem.Allocator, func: *Function, stage: Stage
     };
 }
 
+/// Registers per thread for the launch descriptor.
+///
+/// The hardware RESERVES the top two GPRs of each thread's allocation. A write to one of them
+/// is dropped and a read gives zero, with no fault, so a kernel that uses register `max_reg`
+/// needs an allocation of `max_reg + 1 + 2`. Rounding to the granularity does not always
+/// absorb the two: with `max_reg = 14` the used count is 15, which rounds to 16, and the
+/// kernel then silently loses R14. This was measured on Blackwell (GB10) silicon.
 fn regCount(max_reg: u8) u32 {
-    const used = @as(u32, max_reg) + 1;
+    const used = @as(u32, max_reg) + 1 + hw_reserved_regs;
     return @max(16, (used + 7) & ~@as(u32, 7)); // hardware granularity: multiples of 8, min 16
 }
+
+/// The top GPRs of each thread's allocation that the hardware keeps for itself. See `regCount`.
+const hw_reserved_regs: u32 = 2;
 
 fn gprOf(loc: std.AutoHashMapUnmanaged(Value, Loc), v: Value) u8 {
     return switch (loc.get(v).?) {
@@ -3052,6 +3062,28 @@ test "a graphics builtin on a compute kernel is rejected, not miscompiled" {
     func.setTerminator(b, .{ .ret = ir.function.Ret.one(v) });
 
     try testing.expectError(error.Unsupported, compileKernel(allocator, &func, nvidia_abi));
+}
+
+test "the register count covers the two GPRs the hardware reserves" {
+    // Regression, measured on Blackwell (GB10) silicon: the hardware keeps the top two GPRs of
+    // each thread's allocation, dropping writes and reading zero with NO fault. A launch
+    // descriptor built from a count that omits them loses the kernel's highest registers and
+    // computes silent garbage.
+    //
+    // The granularity rounding hides this for most values, so the cases that matter are the
+    // ones where the used count already sits on or just under a multiple of 8.
+    try testing.expectEqual(@as(u32, 16), regCount(0)); // the 16 floor dominates
+    try testing.expectEqual(@as(u32, 16), regCount(13)); // used 14, +2 = 16, exactly fits
+    try testing.expectEqual(@as(u32, 24), regCount(14)); // used 15, +2 = 17: the old code gave 16
+    try testing.expectEqual(@as(u32, 24), regCount(15)); // used 16, +2 = 18: the old code gave 16
+    try testing.expectEqual(@as(u32, 32), regCount(22)); // used 23, +2 = 25: the old code gave 24
+
+    // Every register the allocator may hand out stays inside the reported count, with the two
+    // reserved registers still free above it. This is the property the launch depends on.
+    var reg: u8 = 0;
+    while (reg < 200) : (reg += 1) {
+        try testing.expect(regCount(reg) >= @as(u32, reg) + 1 + hw_reserved_regs);
+    }
 }
 
 test "an f16 function is rejected cleanly, not miscompiled as f64" {
