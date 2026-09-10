@@ -30,13 +30,27 @@
 //!
 //! ## The reserved address window
 //!
-//! The driver keeps the virtual addresses from 0x0000_0000_FFE0_0000 up to
-//! 0x0000_0002_0000_0000 for itself. Measured on this machine: a mapping at
-//! 0x1_0000_0000 is REFUSED, and a mapping anywhere else in that window is
-//! accepted and then silently drops every store the GPU sends to it. Addresses
-//! below 0xF800_0000 and at or above 0x2_0000_0000 behave. Every address in this
-//! file is therefore chosen outside that window, which is why the pair sits at
-//! 0x2_FFE0_0000 and 0x3_FFE0_0000 and not at the more obvious 0xFFE0_0000.
+//! The driver keeps a range of virtual addresses for itself. A mapping at
+//! 0x1_0000_0000 is REFUSED outright, and a mapping anywhere else in the range is
+//! accepted and then silently drops every store the GPU sends to it. No error, no
+//! fault, the writes simply vanish.
+//!
+//! The nvidia.zig session measured the range more carefully than the first pass
+//! here did, sweeping with a FRESH CHANNEL PER ADDRESS because a hung dispatch
+//! poisons the channel and makes a shared-channel sweep report a false result.
+//! Their figures, on a GB10: 0xFE00_0000 works, everything from 0xFF00_0000 up to
+//! 0x1_FFF0_0000 swallows stores, and 0x2_0000_0000 works again. So the lower
+//! bound is 0xFF00_0000, lower than the 0xFFE0_0000 this file first recorded, and
+//! real code mapping at 0xFF00_0000 would have vanished.
+//!
+//! TREAT THE EXACT EDGES AS DRIVER AND PART DEPENDENT. That sweep ran on a GB10;
+//! this machine is an RTX 5070. Both agree the window exists and that
+//! 0x2_0000_0000 and above is safe, which is what the addresses below rely on.
+//! Every address in this file sits well clear of it, which is why the pair is at
+//! 0x2_FFE0_0000 and 0x3_FFE0_0000 rather than the more obvious 0xFFE0_0000.
+//!
+//! nvidia.zig now refuses the whole range in `rm.Client.mapToGpu` with
+//! `error.ReservedGpuAddress`, so a consumer of that allocator is protected.
 //!
 //! ## Skipping
 //!
