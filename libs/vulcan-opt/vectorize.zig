@@ -481,6 +481,11 @@ fn analyzeLoadRun(func: *const Function, block: Block, scalars: []const Value, g
         // from the survivor. Refuse the whole run; the caller packs the scalars instead, which keeps
         // every load, in order, with its flag.
         if (func.opcode(inst).load.@"volatile") return null;
+        // An `endian`-tagged load moves its element's bytes in reverse (see `Attribute.endian`).
+        // One wide load over `lanes` of them reverses the WHOLE vector, which puts the elements
+        // themselves in the wrong lanes, and the survivor keeps at most lane 0's tag. Refuse the
+        // run; the caller packs the scalars, so every load keeps its own width and its own tag.
+        if (func.isByteOrderTagged(inst)) return null;
         const p = instPos(func, block, inst) orelse return null; // the load must live in this block
         loads[k] = inst;
         if (p < min_pos) min_pos = p;
@@ -545,10 +550,12 @@ fn resultsAreCoalesceableStores(func: *const Function, block: Block, results: []
     var i = lo;
     while (i <= hi) : (i += 1) {
         switch (func.opcode(insts[i])) {
-            // A `volatile` store never coalesces (see `coalesceStoreRun`), so a window holding one
-            // is priced as scalar. This keeps the cost model in step with the rewrite that follows.
+            // A `volatile` store never coalesces (see `coalesceStoreRun`), and neither does an
+            // `endian`-tagged one, so a window holding either is priced as scalar. This keeps the
+            // cost model in step with the rewrite that follows. It is a PREDICTOR, not a guard:
+            // `coalesceStoreRun` refuses both on its own.
             .store => |st| {
-                if (st.@"volatile") return false;
+                if (st.@"volatile" or func.isByteOrderTagged(insts[i])) return false;
                 store_count += 1;
             },
             // Touches memory, or orders it, so the window is not safe to coalesce. See
@@ -787,7 +794,11 @@ fn coalesceStoreRun(allocator: std.mem.Allocator, func: *Function, block: Block,
                     // it into a wide store coalesces accesses the contract forbids coalescing, and
                     // the merged store keeps only lane 0's flag. It also may not move relative to
                     // another volatile access. So it ends the window and never joins one.
-                    if (st.@"volatile") {
+                    //
+                    // An `endian`-tagged store ends the window for the byte-order reason (see
+                    // `Attribute.endian`): the wide store would reverse the whole vector rather
+                    // than each element, and it would keep at most lane 0's tag.
+                    if (st.@"volatile" or func.isByteOrderTagged(insts[i])) {
                         broke = true;
                         break;
                     }
@@ -1517,6 +1528,112 @@ test "volatile: four volatile stores never merge into one wide store" {
     try std.testing.expectEqual(@as(usize, 0), countVolatileStores(&func, false));
     try std.testing.expect(!hasVectorStore(&func));
     // The loads are plain, so operand coalescing still fires: the refusal is store-side only.
+    try std.testing.expect(hasVectorLoad(&func));
+
+    var diags = try ir.verify.verify(allocator, &func, .low);
+    defer diags.deinit();
+    try std.testing.expect(diags.ok());
+}
+
+/// `buildMemElementwiseVol`'s byte-order sibling: the same scalar `out[i] = a[i] * b[i]` kernel over
+/// `n` f32 elements, with `tag_loads` marking every `a` load `endian(big)` and `tag_stores` marking
+/// every `out` store `endian(big)`. The `b` loads and the address arithmetic stay plain, so one side
+/// of the group always has a legal coalesce to compare the refusal against.
+fn buildMemElementwiseEndian(n: usize, tag_loads: bool, tag_stores: bool) !Function {
+    var func = Function.init(std.testing.allocator);
+    errdefer func.deinit();
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const ptr_t = try func.types.ptrGlobal();
+    const block = try func.appendBlock();
+    const ptr_a = try func.appendBlockParam(block, ptr_t);
+    const ptr_b = try func.appendBlockParam(block, ptr_t);
+    const ptr_out = try func.appendBlockParam(block, ptr_t);
+
+    var av: [MAX_LANES]Value = undefined;
+    for (0..n) |i| {
+        const addr = try func.appendArithImm(block, ptr_t, .add, ptr_a, @intCast(i * 4));
+        av[i] = try func.appendInst(block, f32_t, .{ .load = .{ .ptr = addr } });
+        if (tag_loads) try func.addAttr(.{ .value = av[i] }, .{ .endian = .big });
+    }
+    var bv: [MAX_LANES]Value = undefined;
+    for (0..n) |i| {
+        const addr = try func.appendArithImm(block, ptr_t, .add, ptr_b, @intCast(i * 4));
+        bv[i] = try func.appendInst(block, f32_t, .{ .load = .{ .ptr = addr } });
+    }
+    var cv: [MAX_LANES]Value = undefined;
+    for (0..n) |i| cv[i] = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .mul, .lhs = av[i], .rhs = bv[i] } });
+    for (0..n) |i| {
+        const addr = try func.appendArithImm(block, ptr_t, .add, ptr_out, @intCast(i * 4));
+        const st = try func.appendStmtRaw(block, .{ .store = .{ .value = cv[i], .ptr = addr } });
+        if (tag_stores) try func.addAttr(.{ .inst = st }, .{ .endian = .big });
+    }
+    func.setTerminator(block, .{ .ret = ir.function.Ret.none() });
+    return func;
+}
+
+/// Count the block-0 instructions of kind `want` whose byte-order tag state is `tagged`.
+fn countTagged(func: *const Function, want: std.meta.Tag(ir.function.Opcode), tagged: bool) usize {
+    var n: usize = 0;
+    for (func.blockInsts(@enumFromInt(0))) |inst| {
+        if (func.opcode(inst) != want) continue;
+        if (func.isByteOrderTagged(inst) == tagged) n += 1;
+    }
+    return n;
+}
+
+test "endian: four byte-order-tagged loads never fuse into one wide load" {
+    const allocator = std.testing.allocator;
+
+    // NEGATIVE CONTROL: the identical kernel with untagged loads DOES coalesce. Four `a` loads and
+    // four `b` loads become two wide loads, so the refusal below is a byte-order rule, not a dead
+    // pass.
+    var control = try buildMemElementwiseEndian(4, false, false);
+    defer control.deinit();
+    try std.testing.expect(try runLanes(allocator, &control, 4));
+    try std.testing.expectEqual(@as(usize, 2), countOpcode(&control, .load));
+    try std.testing.expect(hasVectorLoad(&control));
+
+    // One wide load over four tagged elements would reverse the whole vector rather than each
+    // element, and would keep at most lane 0's tag. Four tagged loads must stay four, each with
+    // its own tag.
+    var func = try buildMemElementwiseEndian(4, true, false);
+    defer func.deinit();
+    try std.testing.expect(try runLanes(allocator, &func, 4));
+    try std.testing.expectEqual(@as(usize, 4), countTagged(&func, .load, true));
+    // The plain `b` side still coalesces to one wide load, so exactly one untagged load remains.
+    try std.testing.expectEqual(@as(usize, 1), countTagged(&func, .load, false));
+    // The wide load that did form reads `b`, never the tagged `a` addresses.
+    for (func.blockInsts(@enumFromInt(0))) |inst| switch (func.opcode(inst)) {
+        .load => if (func.types.type_kind(func.valueType(func.instResult(inst).?)) == .vector) {
+            try std.testing.expect(!func.isByteOrderTagged(inst));
+        },
+        else => {},
+    };
+
+    var diags = try ir.verify.verify(allocator, &func, .low);
+    defer diags.deinit();
+    try std.testing.expect(diags.ok());
+}
+
+test "endian: four byte-order-tagged stores never merge into one wide store" {
+    const allocator = std.testing.allocator;
+
+    // NEGATIVE CONTROL: with untagged stores the run merges to a single wide store.
+    var control = try buildMemElementwiseEndian(4, false, false);
+    defer control.deinit();
+    try std.testing.expect(try runLanes(allocator, &control, 4));
+    try std.testing.expectEqual(@as(usize, 1), countOpcode(&control, .store));
+    try std.testing.expect(hasVectorStore(&control));
+
+    // A wide store would reverse the whole vector rather than each element, and would keep at most
+    // lane 0's tag. Four tagged stores must stay four, each with its own tag.
+    var func = try buildMemElementwiseEndian(4, false, true);
+    defer func.deinit();
+    _ = try runLanes(allocator, &func, 4);
+    try std.testing.expectEqual(@as(usize, 4), countTagged(&func, .store, true));
+    try std.testing.expectEqual(@as(usize, 0), countTagged(&func, .store, false));
+    try std.testing.expect(!hasVectorStore(&func));
+    // The loads are untagged, so operand coalescing still fires: the refusal is store-side only.
     try std.testing.expect(hasVectorLoad(&func));
 
     var diags = try ir.verify.verify(allocator, &func, .low);

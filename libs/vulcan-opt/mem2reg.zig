@@ -497,15 +497,22 @@ fn markEscapes(func: *const Function, promotable: []bool) void {
         }
     }.hit;
     for (0..func.instCount()) |i| {
-        switch (func.opcode(@enumFromInt(i))) {
+        const inst: Inst = @enumFromInt(i);
+        switch (func.opcode(inst)) {
             // ld.ptr is the sanctioned use - UNLESS the load is `volatile` (SM9 Plan 2 Task 4):
             // a volatile access must observably hit memory, so its alloca cannot be promoted
             // to an SSA value and the load must stay in the IR.
-            .load => |ld| if (ld.@"volatile") esc(promotable, ld.ptr),
-            // ptr is fine, value escapes; a `volatile` store likewise pins its alloca unpromotable.
+            //
+            // An `endian`-tagged access pins the slot as well (see `Attribute.endian`). Promotion
+            // deletes the load and hands the stored SSA value straight to its readers, and the
+            // byte swap the backend would have emitted for the tag goes with it. The slot must
+            // keep its real storage so the tagged access survives to codegen.
+            .load => |ld| if (ld.@"volatile" or func.isByteOrderTagged(inst)) esc(promotable, ld.ptr),
+            // ptr is fine, value escapes; a `volatile` or `endian`-tagged store likewise pins its
+            // alloca unpromotable.
             .store => |st| {
                 esc(promotable, st.value);
-                if (st.@"volatile") esc(promotable, st.ptr);
+                if (st.@"volatile" or func.isByteOrderTagged(inst)) esc(promotable, st.ptr);
             },
             // A barrier names no address, so it lets nothing escape. An alloca this pass
             // promotes is one whose address never escapes, so it is private to the thread
@@ -1043,4 +1050,56 @@ test "a private-address-space slot still promotes" {
     try testing.expect(try runOnce(allocator, &func));
     try testing.expectEqual(x, func.terminator(b).?.ret.values[0]);
     try expectNoMemoryInsts(&func, b);
+}
+
+/// Which of `buildSlotRoundTrip`'s two accesses carries the `endian` tag.
+const EndianTag = enum { none, load, store };
+
+/// `int s; s = x; return s;` over one alloca in one block, with `tag` marking the load, the store,
+/// or neither `endian(big)`. A tagged access must pin the slot in memory: promotion would delete
+/// the access and hand `x` straight to the reader, and the byte swap the tag names would go with
+/// it. Returns the stored value, the loaded value and the block.
+fn buildSlotRoundTrip(func: *Function, tag: EndianTag) !struct { stored: Value, loaded: Value, block: Block } {
+    const t = try intTy(func, 32, .signed);
+    const ptr_t = try func.types.ptrGlobal();
+    const b = try func.appendBlock();
+    const x = try func.appendBlockParam(b, t);
+    const slot = try func.appendInst(b, ptr_t, .{ .alloca = .{ .elem = t } });
+    const st = try func.appendStmtRaw(b, .{ .store = .{ .value = x, .ptr = slot } });
+    if (tag == .store) try func.addAttr(.{ .inst = st }, .{ .endian = .big });
+    const y = try func.appendInst(b, t, .{ .load = .{ .ptr = slot } });
+    if (tag == .load) try func.addAttr(.{ .value = y }, .{ .endian = .big });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(y) });
+    return .{ .stored = x, .loaded = y, .block = b };
+}
+
+test "endian: a slot with a tagged load or store is left in memory" {
+    const allocator = testing.allocator;
+    for ([_]EndianTag{ .load, .store }) |tag| {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const s = try buildSlotRoundTrip(&func, tag);
+
+        try testing.expect(!try runOnce(allocator, &func)); // not promotable, nothing changes
+        // The alloca, the store and the load all survive, and the tag is still on the access
+        // that had it, so the backend still emits the swap.
+        try testing.expectEqual(@as(usize, 3), func.blockInsts(s.block).len);
+        try testing.expectEqual(s.loaded, func.terminator(s.block).?.ret.values[0]);
+        const tagged = switch (tag) {
+            .load => func.definingInst(s.loaded).?,
+            .store => func.blockInsts(s.block)[1],
+            .none => unreachable,
+        };
+        try testing.expect(func.isByteOrderTagged(tagged));
+    }
+    // The identical shape WITHOUT a tag still promotes, so the refusal is about the tag and not
+    // about the shape.
+    {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const s = try buildSlotRoundTrip(&func, .none);
+        try testing.expect(try runOnce(allocator, &func));
+        try testing.expectEqual(s.stored, func.terminator(s.block).?.ret.values[0]);
+        try expectNoMemoryInsts(&func, s.block);
+    }
 }

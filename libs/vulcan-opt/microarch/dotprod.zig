@@ -231,6 +231,10 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, loop: *const loops.L
     // A `volatile` load is an observable access (see `Load.@"volatile"`). The `dot` rewrite reads 16
     // elements per operand with ONE wide vector load and DELETES this scalar loop, so 16 observable
     // accesses would become one and the flag would be lost. Refuse the loop; it stays scalar.
+    //
+    // The same wide load refuses an `endian`-tagged element load (see `Attribute.endian`). This is
+    // a WIDENING: one `<16 x i8>` load cannot express a per-element byte order, and the tag would
+    // be dropped from the survivor. Refuse the loop; it stays scalar and keeps every tag.
     const bp_x = switch (func.opcode(la_inst)) {
         .load => |l| if (l.@"volatile") return null else l.ptr,
         else => return null,
@@ -239,6 +243,7 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, loop: *const loops.L
         .load => |l| if (l.@"volatile") return null else l.ptr,
         else => return null,
     };
+    if (func.isByteOrderTagged(la_inst) or func.isByteOrderTagged(lb_inst)) return null;
     const sign_a = int8Sign(func, func.valueType(la)) orelse return null;
     const sign_b = int8Sign(func, func.valueType(lb)) orelse return null;
     if (sign_a != sign_b) return null; // mixed signedness is not a single SDOT/UDOT
@@ -459,6 +464,7 @@ const LoopSpec = struct {
     mixed_sign: bool = false, // make b's element the opposite signedness of a's
     start: i64 = 0, // the induction variable's initial value (must be 0 to match)
     vol: DotVol = .none, // mark one element load `volatile`, which must make the loop unrecognizable
+    endian_tag: DotVol = .none, // tag one element load `endian(big)`, which must also make it unrecognizable
 };
 
 fn buildDotLoop(func: *Function, spec: LoopSpec) Error!void {
@@ -497,6 +503,8 @@ fn buildDotLoop(func: *Function, spec: LoopSpec) Error!void {
 
     const la = try func.appendInst(body, ea, .{ .load = .{ .ptr = bpa, .@"volatile" = spec.vol == .a } });
     const lb = try func.appendInst(body, eb, .{ .load = .{ .ptr = bpb, .@"volatile" = spec.vol == .b } });
+    if (spec.endian_tag == .a) try func.addAttr(.{ .value = la }, .{ .endian = .big });
+    if (spec.endian_tag == .b) try func.addAttr(.{ .value = lb }, .{ .endian = .big });
     const ca = try func.appendInst(body, i32_t, .{ .convert = .{ .value = la } });
     const cb = try func.appendInst(body, i32_t, .{ .convert = .{ .value = lb } });
     const prod = try func.appendInst(body, i32_t, .{ .arith = .{ .op = .mul, .lhs = ca, .rhs = cb } });
@@ -935,5 +943,33 @@ test "volatile: a dot loop over a volatile element load is left scalar" {
         const body_insts = func.blockInsts(@enumFromInt(2));
         try std.testing.expect(func.opcode(body_insts[0]).load.@"volatile" == (vol == .a));
         try std.testing.expect(func.opcode(body_insts[1]).load.@"volatile" == (vol == .b));
+    }
+}
+
+test "endian: a dot loop over a byte-order-tagged element load is left scalar" {
+    // The `dot` rewrite reads 16 elements per operand with ONE `<16 x i8>` load. That is a
+    // WIDENING: a tile-wide load cannot express a per-element byte order, so the tag would simply
+    // be dropped and the elements would reach `dot` in the wrong order. The loop must stay scalar.
+    const allocator = std.testing.allocator;
+    const model = registry.modelFor(.@"ampere-altra");
+
+    // NEGATIVE CONTROL: the same loop with untagged loads still raises a `dot`.
+    var plain = Function.init(allocator);
+    defer plain.deinit();
+    try buildDotLoop(&plain, .{ .sign = .signed });
+    try std.testing.expect(try run(allocator, &plain, model));
+    try std.testing.expectEqual(@as(usize, 1), countDots(&plain));
+
+    for ([_]DotVol{ .a, .b }) |tag| {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        try buildDotLoop(&func, .{ .sign = .signed, .endian_tag = tag });
+        try expectRejectedUnchanged(allocator, &func, model);
+        try std.testing.expectEqual(@as(usize, 0), countDots(&func));
+
+        // Both element loads are still in the body, and the tagged one still carries its tag.
+        const body_insts = func.blockInsts(@enumFromInt(2));
+        try std.testing.expectEqual(tag == .a, func.isByteOrderTagged(body_insts[0]));
+        try std.testing.expectEqual(tag == .b, func.isByteOrderTagged(body_insts[1]));
     }
 }

@@ -955,6 +955,13 @@ fn matchBody(func: *const Function, def_block: []const u32, inner: *const LoopMa
         extra_len = 2;
     }
 
+    // The same refusal for an `endian`-tagged element load, for the byte-order reason (see
+    // `Attribute.endian`). Raising the nest replaces the per-element fetches with one `matmul`
+    // over whole tiles, which is a WIDENING: a tile op cannot express a per-element byte order,
+    // and the tag would simply be dropped. One check covers all three dtype branches above,
+    // because each of them ends with the two element loads in `la_inst` and `lb_inst`.
+    if (func.isByteOrderTagged(la_inst) or func.isByteOrderTagged(lb_inst)) return null;
+
     const pa_i = paramIndex(bparams, la_ptr) orelse return null; // must be a k_header/k_body param
     const pb_i = paramIndex(bparams, lb_ptr) orelse return null;
     if (pa_i == pb_i) return null; // the same pointer feeding both loads is not two distinct operands
@@ -1028,7 +1035,11 @@ fn matchBody(func: *const Function, def_block: []const u32, inner: *const LoopMa
             // A `volatile` C write is observable (see `Store.@"volatile"`). Raising the nest deletes
             // these loops, so m*n observable stores would become one `matmul` and the flag would be
             // lost. Refuse the nest rather than drop the write.
-            if (s.@"volatile") return null;
+            //
+            // An `endian`-tagged C write is refused for the byte-order reason (see
+            // `Attribute.endian`): the `matmul` writes the whole C tile and cannot byte-swap each
+            // element, so the tag would be dropped and the output would come out in native order.
+            if (s.@"volatile" or func.isByteOrderTagged(inst)) return null;
             if (store_inst != null) return null; // more than one store of the accumulator: ambiguous
             store_inst = inst;
         },
@@ -1381,14 +1392,16 @@ fn isFconstZero(func: *const Function, v: Value) bool {
     };
 }
 
-/// If `v` is defined by a plain (non-`volatile`) `load` instruction, its pointer operand; else null.
-/// Used to recognize a memory-accumulator init (`acc0 = load(C[i][j])`), whose pointer must then equal
-/// the store target. A `volatile` init load is an observable access (see `Load.@"volatile"`) that the
-/// raised `matmul` would delete, so it answers null and the caller keeps the scalar loops.
+/// If `v` is defined by a plain `load` instruction, its pointer operand; else null. Used to
+/// recognize a memory-accumulator init (`acc0 = load(C[i][j])`), whose pointer must then equal
+/// the store target. A `volatile` init load is an observable access (see `Load.@"volatile"`) that
+/// the raised `matmul` would delete, so it answers null and the caller keeps the scalar loops. An
+/// `endian`-tagged init load answers null for the byte-order reason (see `Attribute.endian`): the
+/// `matmul` reads the whole C tile and cannot byte-swap each element.
 fn loadPtrOf(func: *const Function, v: Value) ?Value {
     const di = func.definingInst(v) orelse return null;
     return switch (func.opcode(di)) {
-        .load => |l| if (l.@"volatile") null else l.ptr,
+        .load => |l| if (l.@"volatile" or func.isByteOrderTagged(di)) null else l.ptr,
         else => null,
     };
 }
@@ -1519,6 +1532,10 @@ pub const NestSpec = struct {
     /// (raising it deletes the loops and coalesces every element access into one `matmul`). `.acc_init`
     /// only has an effect together with `mem_accumulate`, which is what creates that load.
     vol: enum { none, a_load, b_load, c_store, acc_init } = .none,
+    /// Tag one of the nest's memory accesses `endian(big)`, which must also make the nest
+    /// unrecognizable (the raised `matmul` moves whole tiles and cannot byte-swap each element).
+    /// `.acc_init` only has an effect together with `mem_accumulate`, which is what creates that load.
+    endian_tag: enum { none, a_load, b_load, c_store, acc_init } = .none,
 };
 
 /// Build the canonical matmul nest `fn(A, B, C) void` computing `C[i*n+j] = sum_k A[i*k+kk] * B[kk*n+j]`
@@ -1667,6 +1684,7 @@ pub fn buildMatmulNest(func: *Function, spec: NestSpec) Error!void {
         try func.appendInst(j_body, acc_t, .{ .load = .{ .ptr = jbc_ptr, .@"volatile" = spec.vol == .acc_init } })
     else
         facc0;
+    if (spec.mem_accumulate and spec.endian_tag == .acc_init) try func.addAttr(.{ .value = k_acc_init }, .{ .endian = .big });
     try func.setJump(j_body, k_header, &.{ zero, k_acc_init, jba_row, jbb_col });
 
     // k-loop: for kk in 0..k, acc += A[i*k+kk] * B[kk*n+j], advancing a_k by one element and b_k by
@@ -1686,6 +1704,8 @@ pub fn buildMatmulNest(func: *Function, spec: NestSpec) Error!void {
     // `alias_pointers` reads the SECOND load from `ba_k` too, instead of `bb_k`: both multiply operands
     // come from the same pointer, which Task 2's "two distinct pointers" gate must reject.
     const vb = try func.appendInst(k_body, b_elem_t, .{ .load = .{ .ptr = if (spec.alias_pointers) ba_k else bb_k, .@"volatile" = spec.vol == .b_load } });
+    if (spec.endian_tag == .a_load) try func.addAttr(.{ .value = va }, .{ .endian = .big });
+    if (spec.endian_tag == .b_load) try func.addAttr(.{ .value = vb }, .{ .endian = .big });
     // int8 family: convert each 8-bit load to the accumulator width before the multiply. fp32 multiplies
     // the direct loads. `oa`/`ob` are the multiply operands either way.
     const oa = if (has_convert) try func.appendInst(k_body, convert_t, .{ .convert = .{ .value = va } }) else va;
@@ -1734,6 +1754,10 @@ pub fn buildMatmulNest(func: *Function, spec: NestSpec) Error!void {
         try func.appendStore(k_exit, bogus, jbc_ptr);
     } else {
         try func.appendStoreVol(k_exit, kacc, jbc_ptr, spec.vol == .c_store);
+        if (spec.endian_tag == .c_store) {
+            const written = func.blockInsts(k_exit);
+            try func.addAttr(.{ .inst = written[written.len - 1] }, .{ .endian = .big });
+        }
     }
     const nj = try func.appendArithImm(k_exit, i32_t, .add, bj, 1);
     const nb_col = try func.appendArithImm(k_exit, ptr_t, .add, jbb_col, ie);
@@ -2558,4 +2582,72 @@ fn countVolatileAccesses(func: *const Function) usize {
         };
     }
     return n;
+}
+
+/// The number of byte-order-tagged loads and stores anywhere in `func`, so a refusal test can prove
+/// the access survived the pass with its tag intact.
+fn countTaggedAccesses(func: *const Function) usize {
+    var n: usize = 0;
+    for (0..func.blockCount()) |bi| {
+        for (func.blockInsts(@enumFromInt(bi))) |inst| switch (func.opcode(inst)) {
+            .load, .store => if (func.isByteOrderTagged(inst)) {
+                n += 1;
+            },
+            else => {},
+        };
+    }
+    return n;
+}
+
+test "endian: a nest with a byte-order-tagged A, B or C access is not raised to a matmul" {
+    // Raising the nest replaces every element access with one `matmul` over whole tiles. That is a
+    // WIDENING: a tile op cannot express a per-element byte order, so the tag would be dropped and
+    // the elements would reach (or leave) the tensor unit reversed. The nest must stay scalar.
+    const allocator = std.testing.allocator;
+    const model = registry.modelFor(.@"et-soc");
+
+    // NEGATIVE CONTROL: the identical nest with untagged accesses IS raised.
+    var plain = Function.init(allocator);
+    defer plain.deinit();
+    try buildMatmulNest(&plain, .{ .m = 2, .n = 4, .k = 3 });
+    try std.testing.expect(try run(allocator, &plain, model));
+    try std.testing.expectEqual(@as(usize, 1), countMatmuls(&plain));
+
+    for ([_]@FieldType(NestSpec, "endian_tag"){ .a_load, .b_load, .c_store }) |tag| {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        try buildMatmulNest(&func, .{ .m = 2, .n = 4, .k = 3, .endian_tag = tag });
+        const blocks_before = func.blockCount();
+        const insts_before = func.instCount();
+
+        try std.testing.expect((try recognizeIn(allocator, &func)) == null);
+        try std.testing.expect(!try run(allocator, &func, model));
+        try std.testing.expectEqual(@as(usize, 0), countMatmuls(&func));
+        // Nothing was rewritten, so the tagged access is still there with its tag.
+        try std.testing.expectEqual(blocks_before, func.blockCount());
+        try std.testing.expectEqual(insts_before, func.instCount());
+        try std.testing.expectEqual(@as(usize, 1), countTaggedAccesses(&func));
+    }
+}
+
+test "endian: a memory-accumulator nest whose init load is byte-order-tagged is not raised" {
+    // The `mem_accumulate` shape seeds the reduction with `load(C[i][j])`. `loadPtrOf` reads that
+    // load's pointer to prove the nest accumulates into its own output. A tagged init load would be
+    // deleted with the loops and its byte swap with it, so it makes the nest unrecognizable instead.
+    const allocator = std.testing.allocator;
+    const model = registry.modelFor(.@"et-soc");
+
+    // NEGATIVE CONTROL: the same memory-accumulator nest with an untagged init load IS raised.
+    var plain = Function.init(allocator);
+    defer plain.deinit();
+    try buildMatmulNest(&plain, .{ .m = 2, .n = 4, .k = 3, .mem_accumulate = true });
+    try std.testing.expect(try run(allocator, &plain, model));
+    try std.testing.expectEqual(@as(usize, 1), countMatmuls(&plain));
+
+    var func = Function.init(allocator);
+    defer func.deinit();
+    try buildMatmulNest(&func, .{ .m = 2, .n = 4, .k = 3, .mem_accumulate = true, .endian_tag = .acc_init });
+    try std.testing.expect(!try run(allocator, &func, model));
+    try std.testing.expectEqual(@as(usize, 0), countMatmuls(&func));
+    try std.testing.expectEqual(@as(usize, 1), countTaggedAccesses(&func));
 }

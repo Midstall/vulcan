@@ -147,8 +147,16 @@ fn checkOperandTypes(func: *const Function, diags: *Diagnostics) std.mem.Allocat
     }
 }
 
-/// Attribute shape/placement checks. Currently: `endian` only belongs on a
-/// memory operation (a load result value, or a load/store instruction).
+/// Attribute shape/placement checks. Currently: `endian` only belongs on a memory operation,
+/// which `isMemoryOp` reads as `load`, `store`, `prefetch` or `matmul`. A load carries it on
+/// its result value, the other three on the instruction.
+///
+/// This is a PLACEMENT check and nothing more. It proves a tag SITS on a memory operation. It
+/// cannot prove that a memory operation which HAD a tag still has one, because a pass that
+/// deletes or fuses the access leaves the entry pointing at an instruction that is out of every
+/// block but still in the instruction pool, where the check passes exactly as before. So the
+/// verifier is not a backstop against a lost byte swap: the pass guards are (see
+/// `Attribute.endian`).
 fn checkAttributes(func: *const Function, diags: *Diagnostics) std.mem.Allocator.Error!void {
     for (func.attributeEntries()) |entry| {
         switch (entry.attr) {

@@ -39,7 +39,24 @@ pub const Attribute = union(enum) {
     cold,
     /// Required alignment, in bytes.
     @"align": u32,
-    /// Byte order of a memory operation. Verified to sit only on loads/stores.
+    /// Byte order of a memory operation. Verified to sit only on memory operations.
+    ///
+    /// The tag says the data at that address is in the named order, and codegen compares it
+    /// with the target's native order. `riscv64/isel` emits a real `rev8` byte swap for a
+    /// tagged load or store, so the tag is part of what the access DOES, not decoration.
+    ///
+    /// The optimizer must not lose it. A pass that REPLICATES an access (loop unroll, tail
+    /// duplication, inlining, the map path of the loop vectorizer) copies the tag onto every
+    /// copy: each copy still moves the same bytes at the same width, so the tag still
+    /// describes it. A pass that WIDENS or FUSES accesses (SLP load fusion and store
+    /// coalescing, the reduction path of the loop vectorizer, `dot` and `matmul`
+    /// recognition) must REFUSE a tagged access: one wide access over several tagged
+    /// elements needs a different swap from the per-element one, and the fused survivor
+    /// would carry at most one element's tag. A pass that answers a tagged load from a value
+    /// held elsewhere (`loadfwd`, `mem2reg`) must refuse as well, because the value in
+    /// memory and the value in the register differ by the swap.
+    ///
+    /// `Function.isByteOrderTagged` is the one test every pass uses.
     endian: Endianness,
     /// A namespaced attribute from the open bag.
     custom: Custom,

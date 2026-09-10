@@ -280,6 +280,11 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, model: *const mm.Mod
                 // A `volatile` access is observable (see `Load.@"volatile"`). Widening the loop
                 // turns V iterations of this scalar load into ONE vector load, which coalesces V
                 // observable accesses into one and drops the flag. Refuse the loop.
+                //
+                // An `endian` tag is NOT refused here. This path REPLICATES: `apply` emits V
+                // scalar copies of this load, each of the same width and each keeping the tag
+                // (see `apply`'s clone comment). The widening happens in the SLP pass that runs
+                // after, and that pass refuses a tagged load on its own.
                 if (l.@"volatile") return bail(&accesses, allocator);
                 const sa = stridedAddress(func, l.ptr, i_alias) orelse return bail(&accesses, allocator);
                 if (sa.stride != byteSize(func, func.valueType(func.instResult(inst).?))) return bail(&accesses, allocator);
@@ -549,7 +554,13 @@ fn recognizeReduction(func: *const Function, model: *const mm.Model, loop: *cons
         // A `volatile` load is an observable access (see `Load.@"volatile"`). The new main body
         // reads V elements with ONE wide load, so V observable accesses would become one and the
         // flag would be lost. A plain load is pure and may be widened.
-        .load => |l| if (l.@"volatile") return null,
+        //
+        // An `endian`-tagged load is refused for the byte-order reason (see `Attribute.endian`).
+        // This path WIDENS: `applyReduction` builds one `<V x elem>` load and carries no
+        // attribute onto it. Even carrying the tag would be wrong, because reversing a V-element
+        // vector is not the same as reversing each element. The map path above REPLICATES
+        // instead, and carries the tag onto every copy, which is correct there.
+        .load => |l| if (l.@"volatile" or func.isByteOrderTagged(inst)) return null,
         // Pure, or a hint with no observable effect. `applyReduction` reads the load and the
         // reduction arith it recognized below and needs nothing else from this body.
         .prefetch,
@@ -1073,4 +1084,40 @@ fn countBigEndianValues(func: *const Function) usize {
         }
     }
     return n;
+}
+
+test "endian: a reduction over a byte-order-tagged load is not widened" {
+    // `applyReduction` builds a new main body reading V elements with ONE `<V x i32>` load. That
+    // is a WIDENING, so a tagged source load cannot come along: reversing a V-element vector is
+    // not the same as reversing each element, and the wide load carries no tag at all. The
+    // reduction is declined and the scalar loop keeps its tag. Contrast the map path above, which
+    // REPLICATES and does carry the tag.
+    const allocator = testing.allocator;
+    const model = registry.modelFor(.@"ampere-altra");
+
+    // NEGATIVE CONTROL: the same reduction over an untagged load is still recognized.
+    var plain = Function.init(allocator);
+    defer plain.deinit();
+    try buildIntReduction(&plain, false);
+    var plain_info = try loops.analyze(allocator, &plain);
+    defer plain_info.deinit(allocator);
+    try testing.expect(recognizeReduction(&plain, model, &plain_info.loops[0], false) != null);
+
+    var func = Function.init(allocator);
+    defer func.deinit();
+    try buildIntReduction(&func, false);
+    // Tag the body's one load, changing nothing else about the shape.
+    const body: Block = @enumFromInt(2);
+    var marked: usize = 0;
+    for (func.blockInsts(body)) |inst| {
+        if (func.opcode(inst) != .load) continue;
+        try func.addAttr(.{ .value = func.instResult(inst).? }, .{ .endian = .big });
+        marked += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), marked);
+
+    var info = try loops.analyze(allocator, &func);
+    defer info.deinit(allocator);
+    try testing.expect(recognizeReduction(&func, model, &info.loops[0], false) == null);
+    try testing.expect(func.isByteOrderTagged(func.blockInsts(body)[2]));
 }

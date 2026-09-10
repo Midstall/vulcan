@@ -695,6 +695,35 @@ pub const Function = struct {
         return self.attributes.items;
     }
 
+    /// True when the memory operation `inst` carries an `endian` attribute, in either of the
+    /// two places the verifier accepts it: on the instruction, or on the instruction's result
+    /// value. A load is tagged on its result, a store on the instruction, and this answers for
+    /// both so a caller does not have to know which.
+    ///
+    /// ANY `endian` tag counts, `native` included. The attribute names the byte order of the
+    /// DATA, and codegen resolves that against the target's native order (see
+    /// `attribute.Endianness`). This layer does not know the target order, so it cannot tell a
+    /// tag that needs a byte swap from one that does not: `endian(little)` needs a swap on a
+    /// big-endian target exactly as `endian(big)` needs one on a little-endian target.
+    ///
+    /// The optimizer uses this to refuse a transform. See the doc on `Attribute.endian` for
+    /// which transforms must refuse and which may carry the tag onto a copy.
+    pub fn isByteOrderTagged(self: *const Function, inst: Inst) bool {
+        var on_inst = self.attributesOf(.{ .inst = inst });
+        while (on_inst.next()) |attr| switch (attr) {
+            .endian => return true,
+            .@"inline", .noreturn, .cold, .@"align", .custom => {},
+        };
+        if (self.instResult(inst)) |result| {
+            var on_result = self.attributesOf(.{ .value = result });
+            while (on_result.next()) |attr| switch (attr) {
+                .endian => return true,
+                .@"inline", .noreturn, .cold, .@"align", .custom => {},
+            };
+        }
+        return false;
+    }
+
     /// One `original -> clone` correspondence, for `cloneAttrs`.
     pub const ValuePair = struct { old: Value, new: Value };
 

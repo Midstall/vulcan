@@ -496,6 +496,12 @@ fn widenFlattened(func: *Function) Error!void {
                 const rv = func.instResult(inst).?;
                 if (!isF32(func, func.valueType(rv))) return error.NotWidenable;
                 // Is this a reload off a sampler out-slot? Gather across lanes if so.
+                //
+                // The gather path DROPS this load and replaces its value with a cross-lane pack,
+                // so a `volatile` flag or an `endian` tag on it would be lost. Neither can reach
+                // this path: the shape is a reload off an alloca the sampler call wrote, which no
+                // frontend qualifies. The broadcast path below is the reachable one, and it keeps
+                // both. If the recognized subset ever widens, this arm needs a refusal.
                 if (samplerReloadFor(func, &sampler_map, l.ptr)) |gather| {
                     const packed_val = try gatherSamplerComp(func, &new_insts, gather.slots, gather.comp, vec_ty, f32_t, ptr_t);
                     func.replaceAllUses(rv, packed_val);
@@ -504,7 +510,13 @@ fn widenFlattened(func: *Function) Error!void {
                     // Carry `volatile`: the widened form is still one load of the same address, so
                     // it must keep the observability the source load had.
                     const scalar_load = try func.createInst(f32_t, .{ .load = .{ .ptr = l.ptr, .@"volatile" = l.@"volatile" } });
-                    try new_insts.append(func.allocator, func.definingInst(scalar_load).?);
+                    const scalar_inst = func.definingInst(scalar_load).?;
+                    // Carry the attributes for the same reason. This path REPLICATES rather than
+                    // widens: the new load is still ONE scalar f32 load of the same address, and
+                    // only the splat above it is wide. So an `endian` tag still describes it, and
+                    // dropping the tag would delete the byte swap the backend emits for it.
+                    try func.cloneAttrs(&.{.{ .old = rv, .new = scalar_load }}, &.{.{ .old = inst, .new = scalar_inst }});
+                    try new_insts.append(func.allocator, scalar_inst);
                     const fields = try func.internValues(&.{ scalar_load, scalar_load, scalar_load, scalar_load });
                     const splat = try func.createInst(vec_ty, .{ .struct_new = .{ .fields = fields } });
                     func.replaceAllUses(rv, splat);
@@ -1059,4 +1071,35 @@ test "widen heavy: a gathered call_indirect keeps its variadic metadata on every
         try testing.expectEqual(@as(u32, 1), c.num_fixed);
     }
     try testing.expectEqual(@as(usize, 4), lane_calls);
+}
+
+test "widen heavy: a broadcast load keeps its endian tag, and an untagged one gains none" {
+    // The broadcast REPLICATES rather than widens: it keeps ONE scalar f32 load of the same
+    // address and splats the result, so an `endian` tag still describes that load exactly. A
+    // rebuild from just `.ptr` creates a fresh instruction whose attributes are empty, which would
+    // delete the byte swap the backend emits for the tag.
+    const gpa = testing.allocator;
+    for ([_]bool{ true, false }) |tag| {
+        var func = Function.init(gpa);
+        defer func.deinit();
+        const f32_t = try func.types.intern(.{ .float = .f32 });
+        const ptr_t = try func.types.ptrGlobal();
+        const entry = try func.appendBlock();
+        const vin = try func.appendBlockParam(entry, f32_t);
+        const gbuf = try func.appendBlockParam(entry, ptr_t);
+        const g = try func.appendInst(entry, f32_t, .{ .load = .{ .ptr = gbuf } });
+        if (tag) try func.addAttr(.{ .value = g }, .{ .endian = .big });
+        const r = try func.appendInst(entry, f32_t, .{ .arith = .{ .op = .add, .lhs = g, .rhs = vin } });
+        const slot = try func.appendInst(entry, ptr_t, .{ .iconst = 0 });
+        try func.appendStore(entry, r, slot);
+
+        try widenGraphics(&func);
+
+        // The negative control (`tag == false`) proves the carry is driven by the source load's
+        // tag and does not fabricate one.
+        try testing.expectEqual(@as(usize, 1), countOp(&func, entry, .load));
+        for (func.blockInsts(entry)) |inst| {
+            if (func.opcode(inst) == .load) try testing.expectEqual(tag, func.isByteOrderTagged(inst));
+        }
+    }
 }

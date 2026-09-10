@@ -40,7 +40,13 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
                     // A `volatile` load (SM9 Plan 2 Task 4) must observably re-read memory every
                     // time: it is never satisfied from a prior availability entry, and it is never
                     // itself recorded as one (so no later load can be forwarded from it either).
-                    if (!ld.@"volatile") {
+                    //
+                    // An `endian`-tagged load gets the same treatment, for a different reason (see
+                    // `Attribute.endian`). Its result is the bytes in memory REVERSED, so it does
+                    // not hold the value a plain store put there, and a later plain load must not
+                    // be answered from it either. Forwarding across the tag silently deletes the
+                    // byte swap the backend would have emitted.
+                    if (!ld.@"volatile" and !func.isByteOrderTagged(inst)) {
                         const result = func.instResult(inst).?;
                         if (find(avail.items, func, ld.ptr, func.valueType(result))) |v| {
                             func.replaceAllUses(result, v);
@@ -53,9 +59,11 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
                 .store => |st| {
                     // A `volatile` store is still a barrier to aliasing loads (invalidate as usual),
                     // but its value must not be handed out to satisfy a later load - so it is not
-                    // recorded as an availability entry.
+                    // recorded as an availability entry. An `endian`-tagged store is barred from
+                    // the table for the byte-order reason: it writes its value REVERSED, so what
+                    // the address now holds is not `st.value`.
                     invalidateAliasing(&avail, func, st.ptr);
-                    if (!st.@"volatile") try avail.append(allocator, .{ .ptr = st.ptr, .value = st.value });
+                    if (!st.@"volatile" and !func.isByteOrderTagged(inst)) try avail.append(allocator, .{ .ptr = st.ptr, .value = st.value });
                 },
                 // A call or a matmul may write any memory, so everything recorded is dropped.
                 .call, .call_indirect, .matmul => avail.clearRetainingCapacity(),
@@ -341,4 +349,118 @@ test "a load does not satisfy a later load across a barrier" {
     const add = func.opcode(func.definingInst(sum).?).arith;
     try testing.expectEqual(y1, add.lhs);
     try testing.expectEqual(y2, add.rhs); // the second load was NOT replaced by the first
+}
+
+/// `*p = v; y = *p; return y;` in one block. `tag` marks the LOAD `endian(big)`. A tagged load
+/// reads the bytes at `p` reversed, so it does not hold `v` and must not be answered from the
+/// store. Returns the stored value, the loaded value and the block.
+fn buildStoreThenLoad(func: *Function, tag: bool) !struct { stored: Value, loaded: Value, block: Block } {
+    const t = try i32Ty(func);
+    const ptr_t = try func.types.ptrGlobal();
+    const b = try func.appendBlock();
+    const p = try func.appendBlockParam(b, ptr_t); // an incoming pointer (mem2reg won't touch it)
+    const v = try func.appendBlockParam(b, t);
+    try func.appendStore(b, v, p);
+    const y = try func.appendInst(b, t, .{ .load = .{ .ptr = p } });
+    if (tag) try func.addAttr(.{ .value = y }, .{ .endian = .big });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(y) });
+    return .{ .stored = v, .loaded = y, .block = b };
+}
+
+test "endian: a tagged load is not answered from an earlier store of the same address" {
+    const allocator = testing.allocator;
+    // The tagged load must survive, still read memory, and still carry its tag: the backend
+    // emits the byte swap from the tag, and forwarding `v` here would delete the swap.
+    {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const s = try buildStoreThenLoad(&func, true);
+        try testing.expect(!try runOnce(allocator, &func));
+        try testing.expectEqual(@as(usize, 2), func.blockInsts(s.block).len); // store + load
+        try testing.expectEqual(s.loaded, func.terminator(s.block).?.ret.values[0]);
+        try testing.expect(func.isByteOrderTagged(func.definingInst(s.loaded).?));
+    }
+    // The identical shape WITHOUT the tag still forwards, so the refusal is about the tag and
+    // not about the shape.
+    {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const s = try buildStoreThenLoad(&func, false);
+        try testing.expect(try runOnce(allocator, &func));
+        try testing.expectEqual(s.stored, func.terminator(s.block).?.ret.values[0]);
+    }
+}
+
+/// `*p = v; y = *p; return y;` in one block. `tag` marks the STORE `endian(big)`. A tagged store
+/// writes `v` reversed, so what `p` holds afterwards is not `v` and the later plain load must not
+/// be answered from it. Returns the stored value, the loaded value and the block.
+fn buildTaggedStoreThenLoad(func: *Function, tag: bool) !struct { stored: Value, loaded: Value, block: Block } {
+    const t = try i32Ty(func);
+    const ptr_t = try func.types.ptrGlobal();
+    const b = try func.appendBlock();
+    const p = try func.appendBlockParam(b, ptr_t);
+    const v = try func.appendBlockParam(b, t);
+    const st = try func.appendStmtRaw(b, .{ .store = .{ .value = v, .ptr = p } });
+    if (tag) try func.addAttr(.{ .inst = st }, .{ .endian = .big });
+    const y = try func.appendInst(b, t, .{ .load = .{ .ptr = p } });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(y) });
+    return .{ .stored = v, .loaded = y, .block = b };
+}
+
+test "endian: a tagged store does not forward its value to a later load" {
+    const allocator = testing.allocator;
+    {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const s = try buildTaggedStoreThenLoad(&func, true);
+        try testing.expect(!try runOnce(allocator, &func));
+        try testing.expectEqual(@as(usize, 2), func.blockInsts(s.block).len);
+        try testing.expectEqual(s.loaded, func.terminator(s.block).?.ret.values[0]);
+        try testing.expect(func.isByteOrderTagged(func.blockInsts(s.block)[0]));
+    }
+    {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const s = try buildTaggedStoreThenLoad(&func, false);
+        try testing.expect(try runOnce(allocator, &func));
+        try testing.expectEqual(s.stored, func.terminator(s.block).?.ret.values[0]);
+    }
+}
+
+/// `y1 = *p; y2 = *p; return y1 + y2;` in one block. `tag` marks the FIRST load `endian(big)`.
+/// A tagged load holds the reversed bytes, so the later plain load must not reuse its result.
+fn buildTwoLoads(func: *Function, tag: bool) !struct { first: Value, second: Value, sum: Value } {
+    const t = try i32Ty(func);
+    const ptr_t = try func.types.ptrGlobal();
+    const b = try func.appendBlock();
+    const p = try func.appendBlockParam(b, ptr_t);
+    const y1 = try func.appendInst(b, t, .{ .load = .{ .ptr = p } });
+    if (tag) try func.addAttr(.{ .value = y1 }, .{ .endian = .big });
+    const y2 = try func.appendInst(b, t, .{ .load = .{ .ptr = p } });
+    const sum = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = y1, .rhs = y2 } });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(sum) });
+    return .{ .first = y1, .second = y2, .sum = sum };
+}
+
+test "endian: a tagged load is not reused for a later plain load of the same address" {
+    const allocator = testing.allocator;
+    {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const s = try buildTwoLoads(&func, true);
+        try testing.expect(!try runOnce(allocator, &func));
+        const add = func.opcode(func.definingInst(s.sum).?).arith;
+        try testing.expectEqual(s.first, add.lhs);
+        try testing.expectEqual(s.second, add.rhs); // the plain load was NOT replaced by the tagged one
+        try testing.expect(func.isByteOrderTagged(func.definingInst(s.first).?));
+    }
+    {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const s = try buildTwoLoads(&func, false);
+        try testing.expect(try runOnce(allocator, &func));
+        const add = func.opcode(func.definingInst(s.sum).?).arith;
+        try testing.expectEqual(s.first, add.lhs);
+        try testing.expectEqual(s.first, add.rhs); // the second load reused the first
+    }
 }
