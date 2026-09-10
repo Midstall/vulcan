@@ -167,9 +167,19 @@ pub const GlobalAddr = struct { symbol: u32, via_got: bool = false };
 /// treat it as having an observable side effect: it must not eliminate it, reorder it
 /// across another volatile access, or coalesce it with another load or store, even
 /// though a plain `load` is otherwise pure. Defaults to `false` (an ordinary load), so
-/// every existing named-field construction site is unaffected. A later change makes
-/// the optimizer honor it; this only carries the bit through IR construction, clone,
-/// and remap.
+/// every existing named-field construction site is unaffected.
+///
+/// The optimizer HONORS this today. Elimination is refused by `loadfwd`, `mem2reg` and
+/// `jumpthread`. Coalescing is refused by SLP load and store fusion (`vectorize`), by
+/// `loopvec` map and reduction, by `dotprod`, and by `matmul_recog`. Reordering holds
+/// structurally, because no pass moves a memory operation at all: if `licm`,
+/// `microarch/schedule`, `blocklayout` or `loadfwd` is ever loosened to move a plain
+/// load, that pass MUST gain a volatile-versus-volatile ordering check at the same time.
+///
+/// Two gaps remain, both recorded in the project memory. `microarch/prefetch` emits a
+/// hint for a volatile address, which is a question about what `prefetch` may name
+/// rather than a violation of the three rules above. `vulcan-spirv/widen`'s sampler
+/// gather path would drop the flag, and is unreachable from any current frontend.
 pub const Load = struct { ptr: Value, @"volatile": bool = false };
 
 /// A store to memory. Produces no result. `volatile` mirrors `Load.volatile` (see its doc).

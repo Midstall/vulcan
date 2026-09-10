@@ -260,12 +260,18 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, model: *const mm.Mod
     for (func.blockInsts(bodyb)) |inst| {
         switch (func.opcode(inst)) {
             .load => |l| {
+                // A `volatile` access is observable (see `Load.@"volatile"`). Widening the loop
+                // turns V iterations of this scalar load into ONE vector load, which coalesces V
+                // observable accesses into one and drops the flag. Refuse the loop.
+                if (l.@"volatile") return bail(&accesses, allocator);
                 const sa = stridedAddress(func, l.ptr, i_alias) orelse return bail(&accesses, allocator);
                 if (sa.stride != byteSize(func, func.valueType(func.instResult(inst).?))) return bail(&accesses, allocator);
                 try accesses.append(allocator, .{ .base = sa.base, .stride = sa.stride, .addr_inst = sa.addr_inst, .scale_inst = sa.scale_inst, .is_store = false });
                 try scale_insts.append(allocator, sa.scale_inst);
             },
             .store => |s| {
+                // Same reasoning as the `load` arm above: V observable stores must not become one.
+                if (s.@"volatile") return bail(&accesses, allocator);
                 const sa = stridedAddress(func, s.ptr, i_alias) orelse return bail(&accesses, allocator);
                 if (sa.stride != byteSize(func, func.valueType(s.value))) return bail(&accesses, allocator);
                 try accesses.append(allocator, .{ .base = sa.base, .stride = sa.stride, .addr_inst = sa.addr_inst, .scale_inst = sa.scale_inst, .is_store = true });
@@ -523,9 +529,12 @@ fn recognizeReduction(func: *const Function, model: *const mm.Model, loop: *cons
         .va_arg,
         .va_end,
         => return null,
+        // A `volatile` load is an observable access (see `Load.@"volatile"`). The new main body
+        // reads V elements with ONE wide load, so V observable accesses would become one and the
+        // flag would be lost. A plain load is pure and may be widened.
+        .load => |l| if (l.@"volatile") return null,
         // Pure, or a hint with no observable effect. `applyReduction` reads the load and the
         // reduction arith it recognized below and needs nothing else from this body.
-        .load,
         .prefetch,
         .iconst,
         .fconst,
@@ -732,9 +741,13 @@ fn buildTree(func: *Function, block: Block, op: BinOp, ty: ir.types.Type, items:
 const testing = std.testing;
 const registry = @import("registry.zig");
 
+/// Which access of `buildSaxpy`'s body carries the `volatile` flag.
+const SaxpyVol = enum { none, load, store };
+
 /// `for (i = 0; i < n; i += 1) y[i] = a*x[i] + y[i];` over f32 arrays. Induction only used in the two
-/// contiguous addresses; the classic saxpy the vectorizer should recognize.
-fn buildSaxpy(func: *Function) !void {
+/// contiguous addresses; the classic saxpy the vectorizer should recognize. `vol` marks the `x` load
+/// or the `y` store `volatile`, which must make the loop unrecognizable.
+fn buildSaxpy(func: *Function, vol: SaxpyVol) !void {
     const f32_t = try func.types.intern(.{ .float = .f32 });
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
     const ptr_t = try func.types.ptrGlobal();
@@ -755,12 +768,12 @@ fn buildSaxpy(func: *Function) !void {
     const bi = try func.appendBlockParam(body, i32_t);
     const off = try func.appendArithImm(body, i32_t, .mul, bi, 4); // i*4 (f32 elem bytes)
     const xaddr = try func.appendInst(body, ptr_t, .{ .arith = .{ .op = .add, .lhs = x, .rhs = off } });
-    const xv = try func.appendInst(body, f32_t, .{ .load = .{ .ptr = xaddr } });
+    const xv = try func.appendInst(body, f32_t, .{ .load = .{ .ptr = xaddr, .@"volatile" = vol == .load } });
     const yaddr = try func.appendInst(body, ptr_t, .{ .arith = .{ .op = .add, .lhs = y, .rhs = off } });
     const yv = try func.appendInst(body, f32_t, .{ .load = .{ .ptr = yaddr } });
     const ax = try func.appendInst(body, f32_t, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = xv } });
     const res = try func.appendInst(body, f32_t, .{ .arith = .{ .op = .add, .lhs = ax, .rhs = yv } });
-    try func.appendStore(body, res, yaddr);
+    try func.appendStoreVol(body, res, yaddr, vol == .store);
     const ni = try func.appendArithImm(body, i32_t, .add, bi, 1);
     try func.setJump(body, loop, &.{ni});
     func.setTerminator(done, .{ .ret = ir.function.Ret.none() });
@@ -770,7 +783,7 @@ test "recognizes a saxpy map loop: two contiguous loads, one contiguous store, V
     const allocator = testing.allocator;
     var func = Function.init(allocator);
     defer func.deinit();
-    try buildSaxpy(&func);
+    try buildSaxpy(&func, .none);
 
     var info = try loops.analyze(allocator, &func);
     defer info.deinit(allocator);
@@ -908,4 +921,79 @@ test "usesValue sees every operand slot, not only the arithmetic ones" {
     func.setTerminator(other, .{ .ret = ir.function.Ret.none() });
 
     for (func.blockInsts(block)) |inst| try testing.expect(usesValue(&func, inst, p));
+}
+
+test "volatile: a map loop whose access is volatile is not widened" {
+    // Widening runs V source iterations per main-body copy, so the V copies of one scalar access
+    // become the run the SLP pass fuses into a single wide vector load or store. That coalesces V
+    // observable accesses into one and loses the flag (see `Load.@"volatile"`), so the loop must
+    // not be recognized at all.
+    const allocator = testing.allocator;
+    const model = registry.modelFor(.@"ampere-altra");
+
+    // NEGATIVE CONTROL: the identical loop with plain accesses IS recognized, so the refusal below
+    // is a volatile rule and not a dead pass.
+    var plain = Function.init(allocator);
+    defer plain.deinit();
+    try buildSaxpy(&plain, .none);
+    var plain_info = try loops.analyze(allocator, &plain);
+    defer plain_info.deinit(allocator);
+    const plan = (try recognize(allocator, &plain, model, &plain_info.loops[0])) orelse return error.NotRecognized;
+    allocator.free(plan.accesses);
+
+    for ([_]SaxpyVol{ .load, .store }) |vol| {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        try buildSaxpy(&func, vol);
+        var info = try loops.analyze(allocator, &func);
+        defer info.deinit(allocator);
+        try testing.expect((try recognize(allocator, &func, model, &info.loops[0])) == null);
+
+        // The access is still in the body, still volatile: refusing kept it, it was not rewritten.
+        var seen = false;
+        for (func.blockInsts(@enumFromInt(2))) |inst| switch (func.opcode(inst)) {
+            .load => |l| if (l.@"volatile") {
+                seen = true;
+            },
+            .store => |s| if (s.@"volatile") {
+                seen = true;
+            },
+            else => {},
+        };
+        try testing.expect(seen);
+    }
+}
+
+test "volatile: a reduction over a volatile load is not widened" {
+    // `applyReduction` builds a new main body reading V elements with ONE wide load. A volatile
+    // source load must not be coalesced that way, so the reduction is declined and the scalar loop
+    // (with its flag) survives.
+    const allocator = testing.allocator;
+    const model = registry.modelFor(.@"ampere-altra");
+
+    // NEGATIVE CONTROL: the same reduction over a plain load is still recognized.
+    var plain = Function.init(allocator);
+    defer plain.deinit();
+    try buildIntReduction(&plain, false);
+    var plain_info = try loops.analyze(allocator, &plain);
+    defer plain_info.deinit(allocator);
+    try testing.expect(recognizeReduction(&plain, model, &plain_info.loops[0], false) != null);
+
+    var func = Function.init(allocator);
+    defer func.deinit();
+    try buildIntReduction(&func, false);
+    // Mark the body's one load volatile, changing nothing else about the shape.
+    const body: Block = @enumFromInt(2);
+    var marked: usize = 0;
+    for (func.blockInsts(body)) |inst| {
+        if (func.opcode(inst) != .load) continue;
+        func.opcodeMut(inst).load.@"volatile" = true;
+        marked += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), marked);
+
+    var info = try loops.analyze(allocator, &func);
+    defer info.deinit(allocator);
+    try testing.expect(recognizeReduction(&func, model, &info.loops[0], false) == null);
+    try testing.expect(func.opcode(func.blockInsts(body)[2]).load.@"volatile");
 }

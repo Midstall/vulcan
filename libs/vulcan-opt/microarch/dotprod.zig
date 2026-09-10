@@ -228,12 +228,15 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, loop: *const loops.L
     if (def_block[@intFromEnum(la)] != b_idx or def_block[@intFromEnum(lb)] != b_idx) return null;
     const la_inst = func.definingInst(la) orelse return null;
     const lb_inst = func.definingInst(lb) orelse return null;
+    // A `volatile` load is an observable access (see `Load.@"volatile"`). The `dot` rewrite reads 16
+    // elements per operand with ONE wide vector load and DELETES this scalar loop, so 16 observable
+    // accesses would become one and the flag would be lost. Refuse the loop; it stays scalar.
     const bp_x = switch (func.opcode(la_inst)) {
-        .load => |l| l.ptr,
+        .load => |l| if (l.@"volatile") return null else l.ptr,
         else => return null,
     };
     const bp_y = switch (func.opcode(lb_inst)) {
-        .load => |l| l.ptr,
+        .load => |l| if (l.@"volatile") return null else l.ptr,
         else => return null,
     };
     const sign_a = int8Sign(func, func.valueType(la)) orelse return null;
@@ -446,12 +449,16 @@ const registry = @import("registry.zig");
 /// Build the canonical INT8 dot-reduction `fn(a: ptr, b: ptr, n: i32) i32` returning
 /// `sum_{i<n} convert(a[i]) * convert(b[i])`, with the given element signedness and pointer stride
 /// (a stride other than 1, or an 8/32-bit element override, produces a deliberately non-matching loop).
+/// Which of `buildDotLoop`'s two element loads carries the `volatile` flag.
+const DotVol = enum { none, a, b };
+
 const LoopSpec = struct {
     sign: std.builtin.Signedness = .signed,
     stride: i64 = 1,
     elem_bits: u16 = 8,
     mixed_sign: bool = false, // make b's element the opposite signedness of a's
     start: i64 = 0, // the induction variable's initial value (must be 0 to match)
+    vol: DotVol = .none, // mark one element load `volatile`, which must make the loop unrecognizable
 };
 
 fn buildDotLoop(func: *Function, spec: LoopSpec) Error!void {
@@ -488,8 +495,8 @@ fn buildDotLoop(func: *Function, spec: LoopSpec) Error!void {
     const cmp = try func.appendInst(header, bool_t, .{ .icmp = .{ .op = .lt, .lhs = i, .rhs = n } });
     try func.appendIf(header, cmp, .{ .target = body, .args = &.{ i, acc, pa, pb } }, .{ .target = exit, .args = &.{} });
 
-    const la = try func.appendInst(body, ea, .{ .load = .{ .ptr = bpa } });
-    const lb = try func.appendInst(body, eb, .{ .load = .{ .ptr = bpb } });
+    const la = try func.appendInst(body, ea, .{ .load = .{ .ptr = bpa, .@"volatile" = spec.vol == .a } });
+    const lb = try func.appendInst(body, eb, .{ .load = .{ .ptr = bpb, .@"volatile" = spec.vol == .b } });
     const ca = try func.appendInst(body, i32_t, .{ .convert = .{ .value = la } });
     const cb = try func.appendInst(body, i32_t, .{ .convert = .{ .value = lb } });
     const prod = try func.appendInst(body, i32_t, .{ .arith = .{ .op = .mul, .lhs = ca, .rhs = cb } });
@@ -901,4 +908,32 @@ test "skips an otherwise-matching loop on an aarch64 model with dotprod disabled
     try std.testing.expect(no_dotprod.features.aarch64.dotprod); // sanity: altra ships it on
     no_dotprod.features.aarch64.dotprod = false;
     try expectRejectedUnchanged(allocator, &func, &no_dotprod);
+}
+
+test "volatile: a dot loop over a volatile element load is left scalar" {
+    // The `dot` rewrite reads 16 elements per operand with ONE wide vector load and DELETES the
+    // scalar loop. For a `volatile` load that is elimination and coalescing together, both of which
+    // `Load.@"volatile"` forbids, so the loop must stay exactly as it was.
+    const allocator = std.testing.allocator;
+    const model = registry.modelFor(.@"ampere-altra");
+
+    // NEGATIVE CONTROL: the same loop with plain loads still raises a `dot`.
+    var plain = Function.init(allocator);
+    defer plain.deinit();
+    try buildDotLoop(&plain, .{ .sign = .signed });
+    try std.testing.expect(try run(allocator, &plain, model));
+    try std.testing.expectEqual(@as(usize, 1), countDots(&plain));
+
+    for ([_]DotVol{ .a, .b }) |vol| {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        try buildDotLoop(&func, .{ .sign = .signed, .vol = vol });
+        try expectRejectedUnchanged(allocator, &func, model);
+        try std.testing.expectEqual(@as(usize, 0), countDots(&func));
+
+        // Both element loads are still in the body, and the marked one still carries its flag.
+        const body_insts = func.blockInsts(@enumFromInt(2));
+        try std.testing.expect(func.opcode(body_insts[0]).load.@"volatile" == (vol == .a));
+        try std.testing.expect(func.opcode(body_insts[1]).load.@"volatile" == (vol == .b));
+    }
 }

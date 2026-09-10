@@ -835,6 +835,11 @@ fn matchBody(func: *const Function, def_block: []const u32, inner: *const LoopMa
     // Recover the two load instructions, their pointers, and (for int8) the two convert instructions plus
     // per-operand signedness. `mulop.lhs` feeds the A operand, `mulop.rhs` the B operand; a commuted mul
     // is disambiguated (and, if genuinely swapped, rejected) by matchStrides' A-inner/B-inner checks.
+    // Each of the six `.load` arms below refuses a `volatile` element load. A `volatile` access is
+    // observable (see `Load.@"volatile"`): raising the nest DELETES these loops and replaces every
+    // element fetch with one `matmul`, so m*n*k observable accesses become a single op and the flag
+    // is lost. That is elimination and coalescing together, both of which the contract forbids. A
+    // nest whose A or B element load is volatile is therefore not recognized, and stays scalar.
     var la_inst: Inst = undefined;
     var lb_inst: Inst = undefined;
     var la_ptr: Value = undefined;
@@ -868,12 +873,12 @@ fn matchBody(func: *const Function, def_block: []const u32, inner: *const LoopMa
             la_inst = func.definingInst(la_val) orelse return null;
             lb_inst = func.definingInst(lb_val) orelse return null;
             la_ptr = switch (func.opcode(la_inst)) {
-                .load => |l| l.ptr,
+                .load => |l| if (l.@"volatile") return null else l.ptr,
                 // A convert whose source is not a load is not the element-fetch idiom.
                 else => return null,
             };
             lb_ptr = switch (func.opcode(lb_inst)) {
-                .load => |l| l.ptr,
+                .load => |l| if (l.@"volatile") return null else l.ptr,
                 else => return null,
             };
             // Each converted value must be an f16 load; any other width/kind (e.g. the bad_convert_src
@@ -891,14 +896,14 @@ fn matchBody(func: *const Function, def_block: []const u32, inner: *const LoopMa
             la_inst = func.definingInst(mulop.lhs) orelse return null;
             lb_inst = func.definingInst(mulop.rhs) orelse return null;
             la_ptr = switch (func.opcode(la_inst)) {
-                .load => |l| l.ptr,
+                .load => |l| if (l.@"volatile") return null else l.ptr,
                 // A multiply operand that is not a load is not the two-element-fetch idiom (this also
                 // rejects an int8-style body whose product is a FLOAT mul of converts: the operand is a
                 // convert, not a load).
                 else => return null,
             };
             lb_ptr = switch (func.opcode(lb_inst)) {
-                .load => |l| l.ptr,
+                .load => |l| if (l.@"volatile") return null else l.ptr,
                 else => return null,
             };
             // Both loaded elements must be fp32; the fp32 matmul never mixes widths or reduces integers.
@@ -918,12 +923,12 @@ fn matchBody(func: *const Function, def_block: []const u32, inner: *const LoopMa
         la_inst = func.definingInst(la_val) orelse return null;
         lb_inst = func.definingInst(lb_val) orelse return null;
         la_ptr = switch (func.opcode(la_inst)) {
-            .load => |l| l.ptr,
+            .load => |l| if (l.@"volatile") return null else l.ptr,
             // A convert whose source is not a load is not the element-fetch idiom.
             else => return null,
         };
         lb_ptr = switch (func.opcode(lb_inst)) {
-            .load => |l| l.ptr,
+            .load => |l| if (l.@"volatile") return null else l.ptr,
             else => return null,
         };
         // Each converted value must be an 8-bit integer load; a wider (e.g. i16) or non-integer source is
@@ -1020,6 +1025,10 @@ fn matchBody(func: *const Function, def_block: []const u32, inner: *const LoopMa
     for (func.blockInsts(k_exit)) |inst| switch (func.opcode(inst)) {
         .store => |s| {
             if (s.value != acc_out) continue; // a store of something else is not the C write we need
+            // A `volatile` C write is observable (see `Store.@"volatile"`). Raising the nest deletes
+            // these loops, so m*n observable stores would become one `matmul` and the flag would be
+            // lost. Refuse the nest rather than drop the write.
+            if (s.@"volatile") return null;
             if (store_inst != null) return null; // more than one store of the accumulator: ambiguous
             store_inst = inst;
         },
@@ -1372,12 +1381,14 @@ fn isFconstZero(func: *const Function, v: Value) bool {
     };
 }
 
-/// If `v` is defined by a `load` instruction, its pointer operand; else null. Used to recognize a
-/// memory-accumulator init (`acc0 = load(C[i][j])`), whose pointer must then equal the store target.
+/// If `v` is defined by a plain (non-`volatile`) `load` instruction, its pointer operand; else null.
+/// Used to recognize a memory-accumulator init (`acc0 = load(C[i][j])`), whose pointer must then equal
+/// the store target. A `volatile` init load is an observable access (see `Load.@"volatile"`) that the
+/// raised `matmul` would delete, so it answers null and the caller keeps the scalar loops.
 fn loadPtrOf(func: *const Function, v: Value) ?Value {
     const di = func.definingInst(v) orelse return null;
     return switch (func.opcode(di)) {
-        .load => |l| l.ptr,
+        .load => |l| if (l.@"volatile") null else l.ptr,
         else => null,
     };
 }
@@ -1504,6 +1515,10 @@ pub const NestSpec = struct {
     /// recognition raises it to matmul(accumulate=true). With this off the fresh (zero-init) path is
     /// byte-identical to before, so the existing accumulate=false differentials stay green.
     mem_accumulate: bool = false,
+    /// Mark one of the nest's memory accesses `volatile`, which must make the nest unrecognizable
+    /// (raising it deletes the loops and coalesces every element access into one `matmul`). `.acc_init`
+    /// only has an effect together with `mem_accumulate`, which is what creates that load.
+    vol: enum { none, a_load, b_load, c_store, acc_init } = .none,
 };
 
 /// Build the canonical matmul nest `fn(A, B, C) void` computing `C[i*n+j] = sum_k A[i*k+kk] * B[kk*n+j]`
@@ -1649,7 +1664,7 @@ pub fn buildMatmulNest(func: *Function, spec: NestSpec) Error!void {
     // back to) instead of the fresh `facc0` zero, so the nest computes `C += A*B`. jbc_ptr is a j_body
     // block param, so it dominates this load; the load reads the accumulator width (f32/i32, matching C).
     const k_acc_init = if (spec.mem_accumulate)
-        try func.appendInst(j_body, acc_t, .{ .load = .{ .ptr = jbc_ptr } })
+        try func.appendInst(j_body, acc_t, .{ .load = .{ .ptr = jbc_ptr, .@"volatile" = spec.vol == .acc_init } })
     else
         facc0;
     try func.setJump(j_body, k_header, &.{ zero, k_acc_init, jba_row, jbb_col });
@@ -1667,10 +1682,10 @@ pub fn buildMatmulNest(func: *Function, spec: NestSpec) Error!void {
     const bacc = try func.appendBlockParam(k_body, acc_t);
     const ba_k = try func.appendBlockParam(k_body, ptr_t);
     const bb_k = try func.appendBlockParam(k_body, ptr_t);
-    const va = try func.appendInst(k_body, a_elem_t, .{ .load = .{ .ptr = ba_k } });
+    const va = try func.appendInst(k_body, a_elem_t, .{ .load = .{ .ptr = ba_k, .@"volatile" = spec.vol == .a_load } });
     // `alias_pointers` reads the SECOND load from `ba_k` too, instead of `bb_k`: both multiply operands
     // come from the same pointer, which Task 2's "two distinct pointers" gate must reject.
-    const vb = try func.appendInst(k_body, b_elem_t, .{ .load = .{ .ptr = if (spec.alias_pointers) ba_k else bb_k } });
+    const vb = try func.appendInst(k_body, b_elem_t, .{ .load = .{ .ptr = if (spec.alias_pointers) ba_k else bb_k, .@"volatile" = spec.vol == .b_load } });
     // int8 family: convert each 8-bit load to the accumulator width before the multiply. fp32 multiplies
     // the direct loads. `oa`/`ob` are the multiply operands either way.
     const oa = if (has_convert) try func.appendInst(k_body, convert_t, .{ .convert = .{ .value = va } }) else va;
@@ -1718,7 +1733,7 @@ pub fn buildMatmulNest(func: *Function, spec: NestSpec) Error!void {
             try func.appendInst(k_exit, acc_t, .{ .iconst = 9 });
         try func.appendStore(k_exit, bogus, jbc_ptr);
     } else {
-        try func.appendStore(k_exit, kacc, jbc_ptr);
+        try func.appendStoreVol(k_exit, kacc, jbc_ptr, spec.vol == .c_store);
     }
     const nj = try func.appendArithImm(k_exit, i32_t, .add, bj, 1);
     const nb_col = try func.appendArithImm(k_exit, ptr_t, .add, jbb_col, ie);
@@ -2472,4 +2487,75 @@ test "run does not transform an fp16 nest whose K is not a multiple of 2" {
     try std.testing.expectEqual(@as(usize, 0), countMatmuls(&func));
     try std.testing.expectEqual(blocks_before, func.blockCount());
     try std.testing.expectEqual(insts_before, func.instCount());
+}
+
+test "volatile: a nest with a volatile A, B or C access is not raised to a matmul" {
+    // Raising the nest DELETES the three loops and replaces every element access with one `matmul`
+    // op. For a `volatile` access that is elimination and coalescing at once, both of which
+    // `Load.@"volatile"` forbids, so the nest must not be recognized and the loops must survive.
+    const allocator = std.testing.allocator;
+    const model = registry.modelFor(.@"et-soc");
+
+    // NEGATIVE CONTROL: the identical nest with plain accesses IS raised.
+    var plain = Function.init(allocator);
+    defer plain.deinit();
+    try buildMatmulNest(&plain, .{ .m = 2, .n = 4, .k = 3 });
+    try std.testing.expect(try run(allocator, &plain, model));
+    try std.testing.expectEqual(@as(usize, 1), countMatmuls(&plain));
+
+    for ([_]@FieldType(NestSpec, "vol"){ .a_load, .b_load, .c_store }) |vol| {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        try buildMatmulNest(&func, .{ .m = 2, .n = 4, .k = 3, .vol = vol });
+        const blocks_before = func.blockCount();
+        const insts_before = func.instCount();
+
+        try std.testing.expect((try recognizeIn(allocator, &func)) == null);
+        try std.testing.expect(!try run(allocator, &func, model));
+        try std.testing.expectEqual(@as(usize, 0), countMatmuls(&func));
+        // Nothing was rewritten, so the volatile access is still there with its flag set.
+        try std.testing.expectEqual(blocks_before, func.blockCount());
+        try std.testing.expectEqual(insts_before, func.instCount());
+        try std.testing.expectEqual(@as(usize, 1), countVolatileAccesses(&func));
+    }
+}
+
+test "volatile: a memory-accumulator nest whose init load is volatile is not raised" {
+    // The `mem_accumulate` shape seeds the reduction with `load(C[i][j])`. `loadPtrOf` reads that
+    // load's pointer to prove the nest accumulates into its own output. A volatile init load would
+    // be deleted with the loops, so it makes the nest unrecognizable instead.
+    const allocator = std.testing.allocator;
+    const model = registry.modelFor(.@"et-soc");
+
+    // NEGATIVE CONTROL: the same memory-accumulator nest with a plain init load IS raised.
+    var plain = Function.init(allocator);
+    defer plain.deinit();
+    try buildMatmulNest(&plain, .{ .m = 2, .n = 4, .k = 3, .mem_accumulate = true });
+    try std.testing.expect(try run(allocator, &plain, model));
+    try std.testing.expectEqual(@as(usize, 1), countMatmuls(&plain));
+
+    var func = Function.init(allocator);
+    defer func.deinit();
+    try buildMatmulNest(&func, .{ .m = 2, .n = 4, .k = 3, .mem_accumulate = true, .vol = .acc_init });
+    try std.testing.expect(!try run(allocator, &func, model));
+    try std.testing.expectEqual(@as(usize, 0), countMatmuls(&func));
+    try std.testing.expectEqual(@as(usize, 1), countVolatileAccesses(&func));
+}
+
+/// The number of `volatile` loads and stores anywhere in `func`, so a refusal test can prove the
+/// access survived the pass with its flag still set.
+fn countVolatileAccesses(func: *const Function) usize {
+    var n: usize = 0;
+    for (0..func.blockCount()) |bi| {
+        for (func.blockInsts(@enumFromInt(bi))) |inst| switch (func.opcode(inst)) {
+            .load => |l| if (l.@"volatile") {
+                n += 1;
+            },
+            .store => |s| if (s.@"volatile") {
+                n += 1;
+            },
+            else => {},
+        };
+    }
+    return n;
 }

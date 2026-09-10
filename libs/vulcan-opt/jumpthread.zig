@@ -470,6 +470,12 @@ fn hasSideEffect(func: *const Function, block: Block) bool {
     for (func.blockInsts(block)) |inst| {
         switch (func.opcode(inst)) {
             .store, .call, .call_indirect, .prefetch, .matmul => return true,
+            // A `volatile` load is an observable access (see `Load.@"volatile"`), so a block that
+            // holds one has a side effect. The non-dup thread routes P straight to S and never runs
+            // B, which ELIMINATES that access on the threaded path. Answering true here sends the
+            // edge to tail duplication, which copies B (flag and all) and keeps the access. A plain
+            // load is pure and may be skipped.
+            .load => |ld| if (ld.@"volatile") return true,
             // A barrier is a synchronization point. A thread that drops it changes the
             // program, so a block holding one is never duplicated away.
             .barrier => return true,
@@ -488,7 +494,6 @@ fn hasSideEffect(func: *const Function, block: Block) bool {
             .unary,
             .alloca,
             .global_addr,
-            .load,
             .dot,
             .@"if",
             => {},
@@ -1075,4 +1080,71 @@ test "jumpthread: a dispatch shape with tail-dup reaches a fixpoint (terminates,
 
     // Execution is equivalent on both dispatch arms, and the interpreter terminates (no hang).
     for (0..2) |i| try testing.expectEqual(expected[i], try evalFunc(&func, &.{ @as(i64, @intCast(i)), 41 }));
+}
+
+/// Build the constant-param threading shape with ONE load in B whose result nothing reads:
+/// `entry(x)` passes a true constant for B's condition param, B loads through a stack slot and
+/// branches to D, and every value the threaded edge would carry is already available at entry. So
+/// the only thing that decides between non-dup threading and tail duplication is whether that load
+/// counts as a side effect. `vol` marks it `volatile`.
+fn buildThreadWithLoad(func: *Function, vol: bool) !struct { entry: Block, b: Block, d: Block } {
+    const t = try i32Ty(func);
+    const bool_t = try func.types.intern(.bool);
+    const ptr_t = try func.types.ptrGlobal();
+    const entry = try func.appendBlock();
+    const b = try func.appendBlock();
+    const d = try func.appendBlock();
+    const e = try func.appendBlock();
+    const x = try func.appendBlockParam(entry, t);
+    const c = try func.appendBlockParam(b, bool_t);
+    const xp = try func.appendBlockParam(b, t);
+    const dp = try func.appendBlockParam(d, t);
+    const slot = try func.appendInst(entry, ptr_t, .{ .alloca = .{ .elem = t } });
+    const c_true = try func.appendInst(entry, bool_t, .{ .iconst = 1 });
+    try func.setJump(entry, b, &.{ c_true, x });
+    _ = try func.appendInst(b, t, .{ .load = .{ .ptr = slot, .@"volatile" = vol } });
+    try func.appendIf(b, c, .{ .target = d, .args = &.{xp} }, .{ .target = e, .args = &.{} });
+    func.setTerminator(d, .{ .ret = ir.function.Ret.one(dp) });
+    const em = try func.appendInst(e, t, .{ .iconst = 0 });
+    func.setTerminator(e, .{ .ret = ir.function.Ret.one(em) });
+    return .{ .entry = entry, .b = b, .d = d };
+}
+
+test "volatile: a block holding a volatile load is tail-duplicated, not threaded past" {
+    const allocator = testing.allocator;
+
+    // NEGATIVE CONTROL: with a PLAIN load, B is pure. Non-dup threading points entry straight at D
+    // and B never runs on that path, which is correct for a pure load and proves the pass still
+    // optimizes this shape.
+    var control = Function.init(allocator);
+    defer control.deinit();
+    const cb = try buildThreadWithLoad(&control, false);
+    try testing.expect(try runOnce(allocator, &control));
+    try testing.expectEqual(cb.d, control.terminator(cb.entry).?.jump.target);
+    try verifyClean(allocator, &control);
+
+    // A `volatile` load is an observable access. Threading entry past B would ELIMINATE it on that
+    // path, which `Load.@"volatile"` forbids. `hasSideEffect` answers true, so the edge falls to
+    // tail duplication instead: entry lands on a copy of B that still performs the access.
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const h = try buildThreadWithLoad(&func, true);
+    try testing.expect(try runOnce(allocator, &func));
+
+    const bprime = func.terminator(h.entry).?.jump.target;
+    try testing.expect(bprime != h.d); // NOT threaded straight past B
+    try testing.expect(bprime != h.b); // a duplicate, so B's other predecessors are undisturbed
+    try testing.expect(endsInIf(&func, bprime) == null);
+    try testing.expectEqual(h.d, func.terminator(bprime).?.jump.target);
+
+    // The duplicated access is still a load, and still volatile.
+    var vol_loads: usize = 0;
+    for (func.blockInsts(bprime)) |inst| switch (func.opcode(inst)) {
+        .load => |l| if (l.@"volatile") {
+            vol_loads += 1;
+        },
+        else => {},
+    };
+    try testing.expectEqual(@as(usize, 1), vol_loads);
+    try verifyClean(allocator, &func);
 }

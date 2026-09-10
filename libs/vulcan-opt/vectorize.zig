@@ -476,6 +476,11 @@ fn analyzeLoadRun(func: *const Function, block: Block, scalars: []const Value, g
     for (scalars, 0..) |s, k| {
         const inst = func.definingInst(s) orelse return null;
         if (func.opcode(inst) != .load) return null;
+        // A `volatile` load is an observable access (see `Load.@"volatile"`). Fusing `lanes` of them
+        // into ONE wide load coalesces accesses the contract forbids coalescing, and drops the flag
+        // from the survivor. Refuse the whole run; the caller packs the scalars instead, which keeps
+        // every load, in order, with its flag.
+        if (func.opcode(inst).load.@"volatile") return null;
         const p = instPos(func, block, inst) orelse return null; // the load must live in this block
         loads[k] = inst;
         if (p < min_pos) min_pos = p;
@@ -540,7 +545,12 @@ fn resultsAreCoalesceableStores(func: *const Function, block: Block, results: []
     var i = lo;
     while (i <= hi) : (i += 1) {
         switch (func.opcode(insts[i])) {
-            .store => store_count += 1,
+            // A `volatile` store never coalesces (see `coalesceStoreRun`), so a window holding one
+            // is priced as scalar. This keeps the cost model in step with the rewrite that follows.
+            .store => |st| {
+                if (st.@"volatile") return false;
+                store_count += 1;
+            },
             // Touches memory, or orders it, so the window is not safe to coalesce. See
             // `hasWriteBetween` for why `matmul`, the `va_*` family and `barrier` belong here.
             .load,
@@ -772,7 +782,15 @@ fn coalesceStoreRun(allocator: std.mem.Allocator, func: *Function, block: Block,
         var broke = false;
         while (i < insts.len and cnt < lanes) : (i += 1) {
             switch (func.opcode(insts[i])) {
-                .store => {
+                .store => |st| {
+                    // A `volatile` store is an observable access (see `Store.@"volatile"`). Merging
+                    // it into a wide store coalesces accesses the contract forbids coalescing, and
+                    // the merged store keeps only lane 0's flag. It also may not move relative to
+                    // another volatile access. So it ends the window and never joins one.
+                    if (st.@"volatile") {
+                        broke = true;
+                        break;
+                    }
                     store_positions[cnt] = i;
                     cnt += 1;
                 },
@@ -1389,4 +1407,119 @@ test "an effectful statement between two positions counts as a write" {
         const expect_write = case != .prefetch;
         try std.testing.expectEqual(expect_write, hasWriteBetween(&func, block, 0, 3));
     }
+}
+
+/// `buildMemElementwise`'s volatile sibling: the same scalar `out[i] = a[i] * b[i]` kernel over `n`
+/// f32 elements, with `vol_loads` marking every `a` load `volatile` and `vol_stores` marking every
+/// `out` store `volatile`. The `b` loads and the address arithmetic stay plain, so one side of the
+/// group always has a legal coalesce to compare the refusal against.
+fn buildMemElementwiseVol(n: usize, vol_loads: bool, vol_stores: bool) !Function {
+    var func = Function.init(std.testing.allocator);
+    errdefer func.deinit();
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const ptr_t = try func.types.ptrGlobal();
+    const block = try func.appendBlock();
+    const ptr_a = try func.appendBlockParam(block, ptr_t);
+    const ptr_b = try func.appendBlockParam(block, ptr_t);
+    const ptr_out = try func.appendBlockParam(block, ptr_t);
+
+    var av: [MAX_LANES]Value = undefined;
+    for (0..n) |i| {
+        const addr = try func.appendArithImm(block, ptr_t, .add, ptr_a, @intCast(i * 4));
+        av[i] = try func.appendInst(block, f32_t, .{ .load = .{ .ptr = addr, .@"volatile" = vol_loads } });
+    }
+    var bv: [MAX_LANES]Value = undefined;
+    for (0..n) |i| {
+        const addr = try func.appendArithImm(block, ptr_t, .add, ptr_b, @intCast(i * 4));
+        bv[i] = try func.appendInst(block, f32_t, .{ .load = .{ .ptr = addr } });
+    }
+    var cv: [MAX_LANES]Value = undefined;
+    for (0..n) |i| cv[i] = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .mul, .lhs = av[i], .rhs = bv[i] } });
+    for (0..n) |i| {
+        const addr = try func.appendArithImm(block, ptr_t, .add, ptr_out, @intCast(i * 4));
+        try func.appendStoreVol(block, cv[i], addr, vol_stores);
+    }
+    func.setTerminator(block, .{ .ret = ir.function.Ret.none() });
+    return func;
+}
+
+/// Count the block-0 loads carrying `want` in their `volatile` flag.
+fn countVolatileLoads(func: *const Function, want: bool) usize {
+    var n: usize = 0;
+    for (func.blockInsts(@enumFromInt(0))) |inst| switch (func.opcode(inst)) {
+        .load => |l| if (l.@"volatile" == want) {
+            n += 1;
+        },
+        else => {},
+    };
+    return n;
+}
+
+/// Count the block-0 stores carrying `want` in their `volatile` flag.
+fn countVolatileStores(func: *const Function, want: bool) usize {
+    var n: usize = 0;
+    for (func.blockInsts(@enumFromInt(0))) |inst| switch (func.opcode(inst)) {
+        .store => |s| if (s.@"volatile" == want) {
+            n += 1;
+        },
+        else => {},
+    };
+    return n;
+}
+
+test "volatile: four volatile loads never fuse into one wide load" {
+    const allocator = std.testing.allocator;
+
+    // NEGATIVE CONTROL: the identical kernel with plain loads DOES coalesce. Four `a` loads and four
+    // `b` loads become two wide loads, so the refusal below is a volatile rule, not a dead pass.
+    var control = try buildMemElementwiseVol(4, false, false);
+    defer control.deinit();
+    try std.testing.expect(try runLanes(allocator, &control, 4));
+    try std.testing.expectEqual(@as(usize, 2), countOpcode(&control, .load));
+    try std.testing.expect(hasVectorLoad(&control));
+
+    // A `volatile` load is an observable access. Four of them must stay four, each keeping its flag.
+    var func = try buildMemElementwiseVol(4, true, false);
+    defer func.deinit();
+    try std.testing.expect(try runLanes(allocator, &func, 4));
+    try std.testing.expectEqual(@as(usize, 4), countVolatileLoads(&func, true));
+    // The plain `b` side still coalesces to one wide load, so exactly one non-volatile load remains.
+    try std.testing.expectEqual(@as(usize, 1), countVolatileLoads(&func, false));
+    // The wide load that did form reads `b`, never the volatile `a` addresses.
+    for (func.blockInsts(@enumFromInt(0))) |inst| switch (func.opcode(inst)) {
+        .load => |l| if (func.types.type_kind(func.valueType(func.instResult(inst).?)) == .vector) {
+            try std.testing.expect(!l.@"volatile");
+        },
+        else => {},
+    };
+
+    var diags = try ir.verify.verify(allocator, &func, .low);
+    defer diags.deinit();
+    try std.testing.expect(diags.ok());
+}
+
+test "volatile: four volatile stores never merge into one wide store" {
+    const allocator = std.testing.allocator;
+
+    // NEGATIVE CONTROL: with plain stores the run merges to a single wide store.
+    var control = try buildMemElementwiseVol(4, false, false);
+    defer control.deinit();
+    try std.testing.expect(try runLanes(allocator, &control, 4));
+    try std.testing.expectEqual(@as(usize, 1), countOpcode(&control, .store));
+    try std.testing.expect(hasVectorStore(&control));
+
+    // A `volatile` store is an observable access. Four of them must stay four, each keeping its
+    // flag. Merging them kept only lane 0's flag and dropped three writes to the device.
+    var func = try buildMemElementwiseVol(4, false, true);
+    defer func.deinit();
+    _ = try runLanes(allocator, &func, 4);
+    try std.testing.expectEqual(@as(usize, 4), countVolatileStores(&func, true));
+    try std.testing.expectEqual(@as(usize, 0), countVolatileStores(&func, false));
+    try std.testing.expect(!hasVectorStore(&func));
+    // The loads are plain, so operand coalescing still fires: the refusal is store-side only.
+    try std.testing.expect(hasVectorLoad(&func));
+
+    var diags = try ir.verify.verify(allocator, &func, .low);
+    defer diags.deinit();
+    try std.testing.expect(diags.ok());
 }
