@@ -23,9 +23,26 @@
 //! or one lane's slice of a matrix fragment. `dstSpan` is the same idea on the destination
 //! side.
 //!
-//! Limits: read barriers (protecting a variable-latency op's source registers from being
-//! overwritten before it consumes them) are not assigned. Stall delays are left as the isel
-//! set them.
+//! READ barriers are the mirror. A decoupled op also reads its SOURCES on its own
+//! schedule, when its pipe reaches it, not when it issues. The register allocator ends a
+//! value's live range at the instruction that last uses it and gives the register to the
+//! next value, so a later write can land on an address or a data register that the op has
+//! not collected yet. The producer therefore sets a read barrier over its sources, and any
+//! later instruction that writes one of them waits on it first. `readsLate` says which
+//! opcodes need this, and `overwritesSourceLater` says whether this instance does: there
+//! are only six scoreboards, and one spent where nothing overwrites forces a drain that
+//! costs every result in flight.
+//!
+//! This absence was written down as a deliberate limit until 2026-09-10, on the assumption
+//! that a decoupled op's sources were never overwritten while it was in flight. The
+//! assumption was wrong. `assignLocs` frees a register at the last SSA use and the next
+//! interval takes it immediately, so `LDG R9, [R4:R5]` is routinely followed by an `IMAD
+//! R4`. Measured on an RTX 5070 (sm_120): with the address register overwritten one
+//! instruction later, a grid of 16384 or more blocks made the load return the value at the
+//! CLOBBERED address every time, and no fault. ptxas assigns a read barrier to exactly this
+//! shape, and so does NAK (`calc_instr_deps.rs`, `assign_barriers`).
+//!
+//! Limits: stall delays are left as the isel set them.
 
 const std = @import("std");
 const encode = @import("encode.zig");
@@ -598,6 +615,11 @@ pub fn scheduleBlocks(insts: []Inst, block_starts: []const usize) void {
     // scoreboard_of[reg] = scoreboard index + 1 (0 = the register has no in-flight
     // variable-latency producer).
     var scoreboard_of = [_]u8{0} ** 256;
+    // read_scoreboard_of[reg] = scoreboard index + 1 (0 = no in-flight decoupled op has
+    // this register as a SOURCE it has not consumed yet). The mirror of `scoreboard_of`
+    // on the read side: a write barrier says "the result is not there yet", a read
+    // barrier says "the operands are not collected yet". See `readsLate`.
+    var read_scoreboard_of = [_]u8{0} ** 256;
     var free_mask: u8 = (1 << num_scoreboards) - 1; // scoreboards 0..5 free
 
     for (insts, 0..) |*inst, idx| {
@@ -617,6 +639,7 @@ pub fn scheduleBlocks(insts: []Inst, block_starts: []const usize) void {
             for (block_starts) |bs| if (bs == idx and bs != entry_start) {
                 setField(inst, 116, 6, getField(inst.*, 116, 6) | ((1 << num_scoreboards) - 1));
                 @memset(&scoreboard_of, 0);
+                @memset(&read_scoreboard_of, 0);
                 free_mask = (1 << num_scoreboards) - 1;
                 break;
             };
@@ -678,11 +701,8 @@ pub fn scheduleBlocks(insts: []Inst, block_starts: []const usize) void {
             var sb: u3 = 0;
             while (sb < num_scoreboards) : (sb += 1) {
                 if (wait & (@as(u32, 1) << sb) != 0) {
-                    var still_used = false;
-                    for (scoreboard_of) |s| if (s == @as(u8, sb) + 1) {
-                        still_used = true;
-                    };
-                    if (!still_used) free_mask |= @as(u8, 1) << sb;
+                    if (!barrierHeld(&scoreboard_of, &read_scoreboard_of, sb))
+                        free_mask |= @as(u8, 1) << sb;
                 }
             }
         }
@@ -709,34 +729,57 @@ pub fn scheduleBlocks(insts: []Inst, block_starts: []const usize) void {
         // producer, so each needs its own wait. Before this scan spanned the block, the
         // texture ops got the dst + 2 half of that protection by accident, through the
         // second-destination field at bit 64 that `readsSrc` used to misread as a source.
+        //
+        // WRITE-AFTER-READ hazard, the mirror of the above and the reason the read
+        // scoreboards exist: a DECOUPLED op reads its own sources LATE, when its pipe
+        // reaches it, not when it issues. The linear-scan allocator ends a value's live
+        // range at the instruction that last USES it, so the very next value takes that
+        // register - and the write lands while the decoupled op is still queued. The load
+        // then addresses the wrong place, or the store sends the wrong data. The producer
+        // tagged its sources with a READ barrier, so a later write to any of them waits on
+        // that barrier first. See `readsLate`.
         if (writesDst(opcode)) {
             const wdst = getField(inst.*, 16, 8);
             const wspan = dstSpan(opcode, inst.*);
             var w: u32 = 0;
             while (w < wspan and wdst + w < RZ) : (w += 1) {
                 const wreg = wdst + w;
-                if (scoreboard_of[wreg] == 0) continue;
-                const sb_idx = scoreboard_of[wreg] - 1;
-                const wbit: u32 = @as(u32, 1) << @intCast(sb_idx);
-                setField(inst, 116, 6, getField(inst.*, 116, 6) | wbit);
-                // Clear this register's tag. Free the scoreboard if no other register
-                // (a multi-register TEX block) still holds it.
-                scoreboard_of[wreg] = 0;
-                var still_used = false;
-                for (scoreboard_of) |s| if (s == sb_idx + 1) {
-                    still_used = true;
-                };
-                if (!still_used) free_mask |= @as(u8, 1) << @intCast(sb_idx);
+                if (scoreboard_of[wreg] != 0) {
+                    const sb_idx = scoreboard_of[wreg] - 1;
+                    const wbit: u32 = @as(u32, 1) << @intCast(sb_idx);
+                    setField(inst, 116, 6, getField(inst.*, 116, 6) | wbit);
+                    // Clear this register's tag. Free the scoreboard if no other register
+                    // (a multi-register TEX block) still holds it.
+                    scoreboard_of[wreg] = 0;
+                    if (!barrierHeld(&scoreboard_of, &read_scoreboard_of, @intCast(sb_idx)))
+                        free_mask |= @as(u8, 1) << @intCast(sb_idx);
+                }
+                if (read_scoreboard_of[wreg] != 0) {
+                    const rb_idx: u3 = @intCast(read_scoreboard_of[wreg] - 1);
+                    setField(inst, 116, 6, getField(inst.*, 116, 6) | (@as(u32, 1) << rb_idx));
+                    // The barrier signals when the producer has collected EVERY source it
+                    // reads, so waiting once releases the whole run. Clear the tag from
+                    // all of them, or the next write to a sibling register waits on a
+                    // scoreboard that is already free and may since have been given to
+                    // another producer.
+                    for (&read_scoreboard_of) |*t| {
+                        if (t.* == @as(u8, rb_idx) + 1) t.* = 0;
+                    }
+                    if (!barrierHeld(&scoreboard_of, &read_scoreboard_of, rb_idx))
+                        free_mask |= @as(u8, 1) << rb_idx;
+                }
             }
         }
 
         // A variable-latency producer claims a scoreboard for its destination.
+        var own_write_barrier: u8 = num_scoreboards; // num_scoreboards = took none
         if (isVariableLatency(opcode) and writesDst(opcode)) {
             const dst = getField(inst.*, 16, 8);
             if (dst != RZ) {
-                if (free_mask == 0) drainAll(inst, &scoreboard_of, &free_mask);
+                if (free_mask == 0) drainAll(inst, &scoreboard_of, &read_scoreboard_of, &free_mask);
                 const sb: u3 = @intCast(@ctz(free_mask));
                 free_mask &= ~(@as(u8, 1) << sb);
+                own_write_barrier = sb;
                 setField(inst, 110, 3, sb); // write barrier
                 // TEX writes a 4-register RGBA result BLOCK (dst..dst+3), all gated by
                 // the one write barrier. Every consumer of ANY of the four must wait on
@@ -758,7 +801,179 @@ pub fn scheduleBlocks(insts: []Inst, block_starts: []const usize) void {
                 }
             }
         }
+
+        // A decoupled producer claims a READ scoreboard for its sources, but ONLY when a
+        // later instruction actually overwrites one of them. There are six scoreboards
+        // for the whole warp, and one spent where nothing needs it forces a drain that
+        // costs every in-flight result, so this asks the question rather than assuming
+        // the answer. `overwritesSourceLater` is the question.
+        if (readsLate(opcode) and overwritesSourceLater(insts, idx, block_starts, entry_start)) {
+            if (free_mask == 0) {
+                // No scoreboard is free. Drain, then re-claim the write barrier this same
+                // instruction took a moment ago, because the drain clears its tags too.
+                // The re-claim also keeps the read barrier off that number: one
+                // instruction cannot set the same scoreboard twice and still have the
+                // model know what each one guards.
+                drainAll(inst, &scoreboard_of, &read_scoreboard_of, &free_mask);
+                if (own_write_barrier < num_scoreboards) {
+                    const wb: u3 = @intCast(own_write_barrier);
+                    free_mask &= ~(@as(u8, 1) << wb);
+                    const dst = getField(inst.*, 16, 8);
+                    const span: u32 = dstSpan(opcode, inst.*);
+                    var k: u32 = 0;
+                    while (k < span and dst + k < RZ) : (k += 1) {
+                        scoreboard_of[dst + k] = @as(u8, wb) + 1;
+                    }
+                }
+            }
+            const rb: u3 = @intCast(@ctz(free_mask));
+            free_mask &= ~(@as(u8, 1) << rb);
+            setField(inst, 113, 3, rb); // read barrier
+            // Tag EVERY source register, not only the one the scan found overwritten. The
+            // one barrier covers the whole operand collection, and a second source
+            // overwritten further down must wait on it as well.
+            inline for (.{ 24, 32, 64 }) |pos| {
+                if (readsSrc(opcode, form, pos)) {
+                    const reg = getField(inst.*, pos, 8);
+                    if (reg != RZ) {
+                        const rspan = srcSpan(opcode, inst.*, pos);
+                        var r: u32 = 0;
+                        while (r < rspan and reg + r < RZ) : (r += 1) {
+                            read_scoreboard_of[reg + r] = @as(u8, rb) + 1;
+                        }
+                    }
+                }
+            }
+        }
     }
+}
+
+/// Whether `opcode` reads its GPR sources AFTER it issues, so an instruction that
+/// overwrites one of them has to wait on a read barrier first.
+///
+/// The hardware answer is one predicate: an op that the scoreboards cover at all also
+/// collects its operands on its own schedule. NAK `SM120Latency::needs_scoreboards`
+/// names the latency classes that qualify - Dmma, Hmma, RedirectedFp64, Branch,
+/// Decoupled and DecoupledAgu - and `sm120_instr_latencies.rs` puts every memory,
+/// atomic, texture, attribute, shuffle, special-function and tensor op in one of them.
+/// `isVariableLatency` already lists the ones whose RESULT needs a write barrier, and
+/// every one of those reads late too.
+///
+/// The four opcodes below are the difference between the two lists. Each is decoupled,
+/// so the hardware does signal a read barrier for it, but none of them writes a GPR, so
+/// `isVariableLatency` deliberately leaves them out: there is no result for a consumer
+/// to wait on. Their SOURCES still need protecting.
+///
+///   - STG (0x986) and STS (0x988), the global and shared stores: NAK `Op::St =>
+///     DecoupledAgu`. A store reads its address pair AND its data block late. The data
+///     register is the dangerous one, because the isel ends a stored value's live range
+///     at the store and hands its register straight to the next value.
+///   - RED (0x98e), the global atomic reduction: NAK `Op::Atom(_) => DecoupledAgu`. It
+///     is a store that applies an operation, and it reads an address and a data block
+///     exactly as STG does.
+///   - AST (0x322), the output attribute store: NAK `Op::ASt => DecoupledAgu`.
+///
+/// An opcode that reads no GPR at all (S2R, IPA, ALD, BAR, EXIT) needs no arm: it falls
+/// in here through `isVariableLatency`, and `overwritesSourceLater` then finds no source
+/// to protect and assigns nothing.
+fn readsLate(opcode: u32) bool {
+    if (isVariableLatency(opcode)) return true;
+    return opcode == 0x986 or opcode == 0x988 or // STG, STS
+        opcode == encode.RED_OPCODE or opcode == 0x322; // RED, AST
+}
+
+/// Whether any instruction after `idx` overwrites a register the instruction at `idx`
+/// reads. This is what decides whether a read barrier is worth one of the six
+/// scoreboards. Assigning one where nothing overwrites is not free: it holds a
+/// scoreboard until something waits on it, and a shader that runs out drains every
+/// in-flight result to get one back.
+///
+/// The scan ends at the first BLOCK START, because the boundary drain there waits on
+/// every scoreboard before the block's first instruction issues, so a write at or after
+/// that point already waits for this read. That argument needs the read to still be
+/// covered by a scoreboard at the boundary, which holds in exactly two ways:
+///
+///   - The instruction takes a WRITE barrier. The drain waits on it, and the result
+///     cannot be written before the sources are read. If instead a consumer already
+///     waited that barrier out, the op has COMPLETED, so its sources are long consumed.
+///   - The instruction takes no write barrier (a store). Nothing then keeps the drain
+///     alive on its behalf, so the boundary proves nothing and the scan has to assume
+///     the worst and say yes. This is the `has_write_barrier` split that nvidia.zig's
+///     `writesAnyLater` makes for the same reason.
+///
+/// The ENTRY block start does not drain (see `scheduleBlocks`), so it does not stop the
+/// scan. Every other branch target does.
+fn overwritesSourceLater(
+    insts: []const Inst,
+    idx: usize,
+    block_starts: []const usize,
+    entry_start: usize,
+) bool {
+    const inst = insts[idx];
+    const opcode = getField(inst, 0, 12);
+    const form = getField(inst, 9, 3);
+    // Nothing to guard when the instruction reads no GPR at all. BAR is the live case: it
+    // is decoupled and it has no operand, so without this it would take a scoreboard at
+    // every block boundary and hold it for a register it never reads. An AST or an LDC
+    // whose only register field is RZ is the same shape.
+    if (!readsAnyRegister(inst, opcode, form)) return false;
+    const covered_at_boundary = isVariableLatency(opcode) and writesDst(opcode) and
+        getField(inst, 16, 8) != RZ;
+    var j = idx + 1;
+    while (j < insts.len) : (j += 1) {
+        var drains = false;
+        for (block_starts) |bs| if (bs == j and bs != entry_start) {
+            drains = true;
+        };
+        if (drains) return !covered_at_boundary;
+        const later = insts[j];
+        const later_op = getField(later, 0, 12);
+        if (!writesDst(later_op)) continue;
+        const wdst = getField(later, 16, 8);
+        if (wdst == RZ) continue;
+        const wspan = dstSpan(later_op, later);
+        var w: u32 = 0;
+        while (w < wspan and wdst + w < RZ) : (w += 1) {
+            if (readsRegister(inst, opcode, form, wdst + w)) return true;
+        }
+    }
+    // The stream ends at EXIT, and nothing after it writes a register.
+    return false;
+}
+
+/// Whether the instruction names ANY GPR source. RZ is a fixed zero, not a register, so a
+/// field holding it does not count.
+fn readsAnyRegister(inst: Inst, opcode: u32, form: u32) bool {
+    inline for (.{ 24, 32, 64 }) |pos| {
+        if (readsSrc(opcode, form, pos) and getField(inst, pos, 8) != RZ) return true;
+    }
+    return false;
+}
+
+/// Whether the instruction reads `reg`. The same source set the wait computation scans:
+/// `readsSrc` for the three operand fields and `srcSpan` for the run each one names.
+fn readsRegister(inst: Inst, opcode: u32, form: u32, reg: u32) bool {
+    inline for (.{ 24, 32, 64 }) |pos| {
+        if (readsSrc(opcode, form, pos)) {
+            const first = getField(inst, pos, 8);
+            if (first != RZ) {
+                const span = srcSpan(opcode, inst, pos);
+                if (reg >= first and reg < first + span and reg < RZ) return true;
+            }
+        }
+    }
+    return false;
+}
+
+/// Whether scoreboard `sb` is still tagged on any register, as a write barrier or as a
+/// read barrier. A scoreboard returns to the free pool only when neither map holds it,
+/// or the next producer takes a number that a live register still names.
+fn barrierHeld(scoreboard_of: *const [256]u8, read_scoreboard_of: *const [256]u8, sb: u3) bool {
+    const tag: u8 = @as(u8, sb) + 1;
+    for (scoreboard_of, read_scoreboard_of) |w, r| {
+        if (w == tag or r == tag) return true;
+    }
+    return false;
 }
 
 /// Clear the in-flight-scoreboard tag from each register THIS instruction read whose
@@ -789,10 +1004,12 @@ fn clearReadRegs(inst: Inst, opcode: u32, form: u32, scoreboard_of: *[256]u8, wa
 }
 
 /// When all six scoreboards are in flight, make this instruction wait on every one
-/// (a full drain) so a scoreboard can be reused.
-fn drainAll(inst: *Inst, scoreboard_of: *[256]u8, free_mask: *u8) void {
+/// (a full drain) so a scoreboard can be reused. The wait covers the read scoreboards as
+/// well, so their map clears with the write one.
+fn drainAll(inst: *Inst, scoreboard_of: *[256]u8, read_scoreboard_of: *[256]u8, free_mask: *u8) void {
     setField(inst, 116, 6, (1 << num_scoreboards) - 1);
     @memset(scoreboard_of, 0);
+    @memset(read_scoreboard_of, 0);
     free_mask.* = (1 << num_scoreboards) - 1;
 }
 
@@ -2024,4 +2241,164 @@ test "a MOVM reads ONE source register, not a run" {
     try std.testing.expect(bar < 6);
     try std.testing.expectEqual(@as(u32, 0), getField(insts[1], 116, 6));
     try std.testing.expect((getField(insts[2], 116, 6) & (@as(u32, 1) << @intCast(bar))) != 0);
+}
+
+test "a load whose address register is overwritten gets a read barrier" {
+    // The write-after-read hazard, proved on an RTX 5070 before this barrier existed. The
+    // linear-scan allocator ends the address value's live range at the load and gives the
+    // register to the next value, so the IMAD lands on the address LOW half while the LDG
+    // is still queued. The LDG must set a read barrier and the IMAD must wait on it.
+    var insts = [_]Inst{
+        encode.ldgU32(7, 8, .{}), // LDG R7 <- [R8:R9]
+        encode.imad(8, 4, 5, RZ, .{}), // IMAD R8 - overwrites the address low half
+        encode.exit(.{}),
+    };
+    scheduleBlocks(&insts, &.{0});
+
+    const rd = getField(insts[0], 113, 3);
+    try std.testing.expect(rd < 6); // a real scoreboard, not 7 (none)
+    try std.testing.expect((getField(insts[1], 116, 6) & (@as(u32, 1) << @intCast(rd))) != 0);
+    // The read barrier is NOT the same scoreboard as the load's own write barrier: one
+    // instruction cannot set the same number twice and still have the two mean different
+    // things.
+    try std.testing.expect(rd != getField(insts[0], 110, 3));
+}
+
+test "a load whose address NOTHING overwrites gets no read barrier" {
+    // The negative control, and the whole reason `overwritesSourceLater` asks rather than
+    // assumes. There are six scoreboards, and one held where nothing overwrites forces a
+    // drain that costs every result in flight.
+    var insts = [_]Inst{
+        encode.ldgU32(7, 8, .{}), // LDG R7 <- [R8:R9]
+        encode.imad(20, 4, 5, RZ, .{}), // touches neither R8 nor R9
+        encode.exit(.{}),
+    };
+    scheduleBlocks(&insts, &.{0});
+    try std.testing.expectEqual(@as(u32, 7), getField(insts[0], 113, 3)); // none (7)
+    try std.testing.expectEqual(@as(u32, 0), getField(insts[1], 116, 6));
+}
+
+test "a load's address HIGH half is protected too, not only the register the field names" {
+    // The bit-24 field names R8, and the pair is (R8, R9). `srcSpan` gives the run length,
+    // so a write to the high half alone must still find the read barrier.
+    var insts = [_]Inst{
+        encode.ldgU32(7, 8, .{}),
+        encode.imad(9, 4, 5, RZ, .{}), // overwrites the address HIGH half
+        encode.exit(.{}),
+    };
+    scheduleBlocks(&insts, &.{0});
+    const rd = getField(insts[0], 113, 3);
+    try std.testing.expect(rd < 6);
+    try std.testing.expect((getField(insts[1], 116, 6) & (@as(u32, 1) << @intCast(rd))) != 0);
+}
+
+test "a store whose DATA register is overwritten gets a read barrier" {
+    // A store writes no GPR, so it takes no write barrier and `isVariableLatency` leaves
+    // it out. It is still a decoupled op that reads its address and its data late, and the
+    // isel ends a stored value's live range AT the store, so the next value takes that
+    // register. Without the read barrier the store sends whatever the IMAD wrote.
+    var insts = [_]Inst{
+        encode.stgU32(4, 6, .{}), // STG [R4:R5], R6
+        encode.imad(6, 7, 7, RZ, .{}), // overwrites the store's DATA register
+        encode.exit(.{}),
+    };
+    scheduleBlocks(&insts, &.{0});
+    const rd = getField(insts[0], 113, 3);
+    try std.testing.expect(rd < 6);
+    try std.testing.expect((getField(insts[1], 116, 6) & (@as(u32, 1) << @intCast(rd))) != 0);
+}
+
+test "a store nothing overwrites gets no read barrier in a straight line" {
+    var insts = [_]Inst{
+        encode.stgU32(4, 6, .{}),
+        encode.imad(20, 7, 7, RZ, .{}),
+        encode.exit(.{}),
+    };
+    scheduleBlocks(&insts, &.{0});
+    try std.testing.expectEqual(@as(u32, 7), getField(insts[0], 113, 3));
+}
+
+test "a shared store's data register is protected the same way" {
+    var insts = [_]Inst{
+        encode.stsU32(4, 6, .{}), // STS [R4], R6
+        encode.imad(6, 7, 7, RZ, .{}),
+        encode.exit(.{}),
+    };
+    scheduleBlocks(&insts, &.{0});
+    const rd = getField(insts[0], 113, 3);
+    try std.testing.expect(rd < 6);
+    try std.testing.expect((getField(insts[1], 116, 6) & (@as(u32, 1) << @intCast(rd))) != 0);
+}
+
+test "a read barrier returns to the free pool once its waiter has run" {
+    // Six scoreboards for the whole warp. The waiter releases the read barrier, so the
+    // next producer can have that number back.
+    var insts = [_]Inst{
+        encode.ldgU32(7, 8, .{}),
+        encode.imad(8, 4, 5, RZ, .{}), // waits the read barrier out
+        encode.iadd3(20, 7, 7, .{}), // waits the write barrier out
+        encode.ldgU32(21, 30, .{}),
+        encode.imad(30, 4, 5, RZ, .{}),
+        encode.exit(.{}),
+    };
+    scheduleBlocks(&insts, &.{0});
+    const first = getField(insts[0], 113, 3);
+    const second = getField(insts[3], 113, 3);
+    try std.testing.expect(first < 6);
+    try std.testing.expectEqual(first, second);
+    try std.testing.expectEqual(getField(insts[0], 110, 3), getField(insts[3], 110, 3));
+}
+
+test "a load needs no read barrier for a write past a block boundary, but a store does" {
+    // The boundary drain waits on every scoreboard before the block's first instruction
+    // issues. That covers a load, whose write barrier is what the drain waits for and
+    // whose result cannot land before its address is read. A store holds no write barrier,
+    // so nothing keeps the drain alive on its behalf and the scan has to assume the worst.
+    var loaded = [_]Inst{
+        encode.ldgU32(7, 8, .{}),
+        encode.iadd3(20, 21, 22, .{}), // the block-1 first instruction, which drains
+        encode.imad(8, 4, 5, RZ, .{}), // overwrites the address AFTER the boundary
+        encode.exit(.{}),
+    };
+    scheduleBlocks(&loaded, &.{ 0, 1 });
+    try std.testing.expectEqual(@as(u32, 7), getField(loaded[0], 113, 3));
+    // The drain is what covers it, so it must actually be there.
+    try std.testing.expectEqual(@as(u32, 0x3f), getField(loaded[1], 116, 6));
+
+    var stored = [_]Inst{
+        encode.stgU32(4, 6, .{}),
+        encode.iadd3(20, 21, 22, .{}),
+        encode.imad(6, 4, 5, RZ, .{}),
+        encode.exit(.{}),
+    };
+    scheduleBlocks(&stored, &.{ 0, 1 });
+    try std.testing.expect(getField(stored[0], 113, 3) < 6);
+}
+
+test "an S2R reads no GPR, so it never spends a read barrier" {
+    // The system value is a selector, not a register, and bits 24..31 and 64..71 stay
+    // zero. A read barrier here would hold a scoreboard for a register the S2R never
+    // reads, and R0 is a register this backend hands out.
+    var insts = [_]Inst{
+        encode.s2r(4, encode.SR_TID_X, .{}),
+        encode.movImm(0, 7, .{}), // writes R0, the register the zero field names
+        encode.imad(9, 4, 4, RZ, .{}),
+        encode.exit(.{}),
+    };
+    scheduleBlocks(&insts, &.{0});
+    try std.testing.expectEqual(@as(u32, 7), getField(insts[0], 113, 3));
+}
+
+test "an opcode with no GPR source never spends a read barrier at a block boundary" {
+    // BAR is decoupled and takes no operand at all. `overwritesSourceLater` says yes at a
+    // block boundary for anything that holds no write barrier, because the boundary proves
+    // nothing about it - but with no source to guard, a barrier there would hold a
+    // scoreboard for a register the BAR never reads until the next drain took it back.
+    var insts = [_]Inst{
+        encode.barSync(.{}),
+        encode.iadd3(20, 21, 22, .{}), // the block-1 first instruction
+        encode.exit(.{}),
+    };
+    scheduleBlocks(&insts, &.{ 0, 1 });
+    try std.testing.expectEqual(@as(u32, 7), getField(insts[0], 113, 3));
 }

@@ -97,6 +97,20 @@ const Harness = struct {
         return self.runner.alloc(.system, size);
     }
 
+    /// Allocate a zeroed buffer at the GPU virtual address `va`. The runner hands
+    /// addresses out of a bump pointer, so moving the pointer first places the mapping.
+    /// The read-barrier test needs this: a clobbered address must land in MAPPED memory,
+    /// or a missing barrier faults the channel instead of reporting a value.
+    ///
+    /// The driver keeps 0x0000_0000_FFE0_0000 up to 0x0000_0002_0000_0000 for itself, so
+    /// every address passed here sits at or above 0x2_0000_0000. See `tests/carry.zig`.
+    fn allocAt(self: *Harness, va: u64, size: u64) !compute.Buffer {
+        self.runner.next_va = va;
+        const buf = try self.runner.alloc(.system, size);
+        std.debug.assert(buf.va == va);
+        return buf;
+    }
+
     /// Compile `func` under `abi` and bind it to this context.
     fn compile(self: *Harness, func: *Function, abi: gpu_abi.Abi) !Launch {
         const kernel = try isel.compileKernel(testing.allocator, func, abi);
@@ -839,4 +853,73 @@ test "live: the tiled shape runs on hardware, staging a shared tile in a uniform
         for (0..tiles) |k| want += @intCast(k * threads + (threads - 1 - i) + 1);
         try testing.expectEqual(want, dst.read(i32, i));
     }
+}
+
+/// The buffer the load is TOLD to read. Placed, not bump-allocated, so its low half is
+/// known and differs from the poison buffer's. Above the driver's reserved window.
+const rb_good_va: u64 = 0x2_8000_0000;
+/// The buffer the load reaches when the clobber wins. Its HIGH half is the same as
+/// `rb_good_va`, and its low half is 0x4000_0000, which is `rb_clobber` squared. Both
+/// buffers are mapped, so a lost read barrier reports a value and does not fault.
+const rb_poison_va: u64 = 0x2_4000_0000;
+/// The kernel computes `v * v` into the register that held the load's address low half.
+/// 0x8000 squared is 0x4000_0000, the low half of `rb_poison_va`.
+const rb_clobber: u32 = 0x8000;
+const rb_good_magic: i32 = 0x1111_1111;
+const rb_poison_magic: i32 = 0x7777_7777;
+/// How many one-thread workgroups the dispatch needs before the memory pipe is busy
+/// enough for the race to show. Measured on an RTX 5070: 8192 was intermittent and
+/// 16384 was every run. This is four times the reliable figure.
+const rb_grid: u32 = 65535;
+
+test "live: a load's address register survives being reused one instruction later" {
+    // The WRITE-AFTER-READ hazard the read scoreboards exist for. `assignLocs` ends the
+    // address value's live range at the load and gives its register to the next value, so
+    // the emitted stream is:
+    //
+    //     LDG R9, [R4:R5]
+    //     IMAD R4, R8, R8      <- the address LOW half, one instruction later
+    //
+    // An LDG is decoupled: it reads its address when its pipe reaches it, not when it
+    // issues. Without a read barrier on the LDG the IMAD lands first under load, and the
+    // LDG reads the CLOBBERED address. Both addresses are mapped here, so the wrong answer
+    // is a value rather than an Xid.
+    //
+    // Measured with the barrier removed: every run at this grid returned the poison value.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const b = try func.appendBlock();
+    const p = try func.appendBlockParam(b, ptr_t);
+    const out = try func.appendBlockParam(b, ptr_t);
+    const v = try func.appendBlockParam(b, i32_t);
+    // `p` dies at the load, so the multiply below takes its register.
+    const x = try func.appendInst(b, i32_t, .{ .load = .{ .ptr = p } });
+    const y = try bin(&func, b, i32_t, .mul, v, v);
+    const z = try bin(&func, b, i32_t, .add, x, y);
+    try func.appendStore(b, z, out);
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
+
+    var h = try Harness.open();
+    defer h.deinit();
+    var launch = try h.compile(&func, runner_abi);
+    defer launch.deinit();
+
+    const good = try h.allocAt(rb_good_va, 0x1000);
+    const poison = try h.allocAt(rb_poison_va, 0x1000);
+    const out_buf = try h.alloc(0x1000);
+    good.slice(i32)[0] = rb_good_magic;
+    poison.slice(i32)[0] = rb_poison_magic;
+
+    launch.setPtr(launch.kernel.launch.params[0].offset, good.va);
+    launch.setPtr(launch.kernel.launch.params[1].offset, out_buf.va);
+    launch.setU32(launch.kernel.launch.params[2].offset, rb_clobber);
+    try launch.run(.{ rb_grid, 1, 1 });
+
+    // Every thread writes the same slot, so one surviving thread is enough to show it.
+    const squared: i32 = @bitCast(rb_clobber * rb_clobber);
+    try testing.expectEqual(rb_good_magic +% squared, out_buf.read(i32, 0));
+    try testing.expect(out_buf.read(i32, 0) != rb_poison_magic +% squared);
 }
