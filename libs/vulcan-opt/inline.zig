@@ -197,7 +197,9 @@ fn mapOpcode(caller: *Function, callee: *const Function, vmap: std.AutoHashMapUn
         .select => |s| .{ .select = .{ .cond = m(vmap, s.cond), .then = m(vmap, s.then), .@"else" = m(vmap, s.@"else") } },
         .convert => |cv| .{ .convert = .{ .value = m(vmap, cv.value) } },
         .unary => |u| .{ .unary = .{ .op = u.op, .value = m(vmap, u.value) } },
-        .load => |l| .{ .load = .{ .ptr = m(vmap, l.ptr) } },
+        // `volatile` is an observable side effect, not a hint. A callee that reads an MMIO
+        // register keeps that read observable after it is inlined, so carry the flag.
+        .load => |l| .{ .load = .{ .ptr = m(vmap, l.ptr), .@"volatile" = l.@"volatile" } },
         .alloca => |al| .{ .alloca = .{ .elem = try mapType(caller, callee, tmap, al.elem) } },
         .global_addr => |ga| .{ .global_addr = .{ .symbol = try caller.internSymbol(callee.symbolName(ga.symbol)), .via_got = ga.via_got } },
         // dot is pure, like arith: remap its 3 operands. (Its vector operand types
@@ -434,7 +436,10 @@ fn inlineCallMulti(allocator: std.mem.Allocator, caller: *Function, bi: u32, cal
         const nb = bmap.get(cb).?;
         for (callee.blockInsts(@enumFromInt(cb))) |cinst| switch (callee.opcode(cinst)) {
             .@"if" => {},
-            .store => |st| try caller.appendStore(nb, mapV(vmap, st.value), mapV(vmap, st.ptr)),
+            // `appendStoreVol`, not `appendStore`: `appendStore` hardcodes `volatile = false`, which
+            // turns an MMIO write in the callee into an ordinary store the next pass can move or
+            // delete. Carry the callee op's own flag instead.
+            .store => |st| try caller.appendStoreVol(nb, mapV(vmap, st.value), mapV(vmap, st.ptr), st.@"volatile"),
             .prefetch => |pf| try caller.appendPrefetch(nb, mapV(vmap, pf.ptr)),
             // A `per_column` scale's ScaleList handle (and a bias's BiasList handle) is relative to
             // the CALLEE's pools, which is meaningless in the caller (a different function, different
@@ -645,4 +650,144 @@ test "inlined via_got global_addr keeps via_got=true (not reconstructed as false
         }
     }
     try std.testing.expect(found);
+}
+
+test "inlined volatile load keeps volatile=true (single-block path)" {
+    const allocator = std.testing.allocator;
+    const i32k = ir.types.TypeKind{ .int = .{ .signedness = .signed, .bits = 32 } };
+
+    // callee read_reg(p): return *(volatile int *)p  -- the canonical MMIO read helper.
+    var callee = Function.init(allocator);
+    defer callee.deinit();
+    {
+        const t = try callee.types.intern(i32k);
+        const ptr_t = try callee.types.ptrGlobal();
+        const b = try callee.appendBlock();
+        const p = try callee.appendBlockParam(b, ptr_t);
+        const v = try callee.appendInst(b, t, .{ .load = .{ .ptr = p, .@"volatile" = true } });
+        callee.setTerminator(b, .{ .ret = ir.function.Ret.one(v) });
+    }
+
+    // caller f(p): return read_reg(p)
+    var caller = Function.init(allocator);
+    defer caller.deinit();
+    const t = try caller.types.intern(i32k);
+    const ptr_t = try caller.types.ptrGlobal();
+    const b = try caller.appendBlock();
+    const p = try caller.appendBlockParam(b, ptr_t);
+    const call = try caller.appendCall(b, t, "read_reg", &.{p});
+    caller.setTerminator(b, .{ .ret = ir.function.Ret.one(call) });
+
+    var lk = TestLookup{ .callee = &callee, .name = "read_reg" };
+    try std.testing.expect(try run(allocator, &caller, .{ .context = &lk, .func = TestLookup.get }));
+
+    // The cloned load must still be volatile. `mapOpcode`'s `.load` arm must forward the
+    // flag; a rebuild from just `.ptr` defaults it to false and makes a hardware register
+    // read an ordinary load that a later pass can move, duplicate or delete.
+    var loads: usize = 0;
+    for (caller.blockInsts(b)) |inst| {
+        if (caller.opcode(inst) == .load) {
+            loads += 1;
+            try std.testing.expect(caller.opcode(inst).load.@"volatile");
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), loads);
+}
+
+test "inlined volatile store and volatile load both keep volatile=true (multi-block path)" {
+    const allocator = std.testing.allocator;
+    const i32k = ir.types.TypeKind{ .int = .{ .signedness = .signed, .bits = 32 } };
+
+    // callee rmw(dst, src, v): *(volatile int *)dst = v; return *(volatile int *)src
+    // The store gives it no result, so `inlinable` refuses it and `inlineCallMulti` takes it.
+    var callee = Function.init(allocator);
+    defer callee.deinit();
+    {
+        const t = try callee.types.intern(i32k);
+        const ptr_t = try callee.types.ptrGlobal();
+        const b = try callee.appendBlock();
+        const dst = try callee.appendBlockParam(b, ptr_t);
+        const src = try callee.appendBlockParam(b, ptr_t);
+        const v = try callee.appendBlockParam(b, t);
+        try callee.appendStoreVol(b, v, dst, true);
+        const l = try callee.appendInst(b, t, .{ .load = .{ .ptr = src, .@"volatile" = true } });
+        callee.setTerminator(b, .{ .ret = ir.function.Ret.one(l) });
+    }
+
+    // caller f(dst, src, v): return rmw(dst, src, v)
+    var caller = Function.init(allocator);
+    defer caller.deinit();
+    const t = try caller.types.intern(i32k);
+    const ptr_t = try caller.types.ptrGlobal();
+    const b = try caller.appendBlock();
+    const dst = try caller.appendBlockParam(b, ptr_t);
+    const src = try caller.appendBlockParam(b, ptr_t);
+    const v = try caller.appendBlockParam(b, t);
+    const call = try caller.appendCall(b, t, "rmw", &.{ dst, src, v });
+    caller.setTerminator(b, .{ .ret = ir.function.Ret.one(call) });
+
+    var lk = TestLookup{ .callee = &callee, .name = "rmw" };
+    try std.testing.expect(try run(allocator, &caller, .{ .context = &lk, .func = TestLookup.get }));
+
+    // Both accesses must survive with the flag SET. The store goes through `appendStoreVol`,
+    // since `appendStore` hardcodes `volatile = false`; the load goes through `mapOpcode`.
+    var stores: usize = 0;
+    var loads: usize = 0;
+    for (0..caller.blockCount()) |bi| {
+        for (caller.blockInsts(@enumFromInt(bi))) |inst| switch (caller.opcode(inst)) {
+            .store => |st| {
+                stores += 1;
+                try std.testing.expect(st.@"volatile");
+            },
+            .load => |ld| {
+                loads += 1;
+                try std.testing.expect(ld.@"volatile");
+            },
+            else => {},
+        };
+    }
+    try std.testing.expectEqual(@as(usize, 1), stores);
+    try std.testing.expectEqual(@as(usize, 1), loads);
+}
+
+test "inlining a plain load and store leaves volatile=false (the flag is carried, not forced)" {
+    const allocator = std.testing.allocator;
+    const i32k = ir.types.TypeKind{ .int = .{ .signedness = .signed, .bits = 32 } };
+
+    // callee copy(dst, src): *dst = *src; return *src  -- ordinary, non-volatile memory.
+    var callee = Function.init(allocator);
+    defer callee.deinit();
+    {
+        const t = try callee.types.intern(i32k);
+        const ptr_t = try callee.types.ptrGlobal();
+        const b = try callee.appendBlock();
+        const dst = try callee.appendBlockParam(b, ptr_t);
+        const src = try callee.appendBlockParam(b, ptr_t);
+        const l = try callee.appendInst(b, t, .{ .load = .{ .ptr = src } });
+        try callee.appendStore(b, l, dst);
+        callee.setTerminator(b, .{ .ret = ir.function.Ret.one(l) });
+    }
+
+    var caller = Function.init(allocator);
+    defer caller.deinit();
+    const t = try caller.types.intern(i32k);
+    const ptr_t = try caller.types.ptrGlobal();
+    const b = try caller.appendBlock();
+    const dst = try caller.appendBlockParam(b, ptr_t);
+    const src = try caller.appendBlockParam(b, ptr_t);
+    const call = try caller.appendCall(b, t, "copy", &.{ dst, src });
+    caller.setTerminator(b, .{ .ret = ir.function.Ret.one(call) });
+
+    var lk = TestLookup{ .callee = &callee, .name = "copy" };
+    try std.testing.expect(try run(allocator, &caller, .{ .context = &lk, .func = TestLookup.get }));
+
+    // The other direction: a non-volatile access must NOT become volatile, which would block
+    // every legal optimization on ordinary memory.
+    for (0..caller.blockCount()) |bi| {
+        for (caller.blockInsts(@enumFromInt(bi))) |inst| switch (caller.opcode(inst)) {
+            .store => |st| try std.testing.expect(!st.@"volatile"),
+            .load => |ld| try std.testing.expect(!ld.@"volatile"),
+            else => {},
+        };
+    }
 }

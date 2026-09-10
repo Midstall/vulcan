@@ -496,17 +496,29 @@ fn remapOp(func: *Function, op: Opcode, vmap: *const std.AutoHashMapUnmanaged(Va
             for (func.valueList(sn.fields)) |v| try fields.append(allocator, rv(vmap, v));
             break :blk .{ .struct_new = .{ .fields = try func.internValues(fields.items) } };
         },
+        // Only `args` (and `target`/`ret_dest`) are Values. Every other field is call-site
+        // metadata: `is_variadic`/`num_fixed` tell the backend where the unnamed arguments
+        // start, and `ret_dest`/`ret_regs`/`ret_pieces`/`sret` describe a struct-by-value
+        // return. A clone that drops them makes a variadic call look fixed-arity and loses
+        // the return slot, so start from the source op and overwrite only the Values.
         .call => |c| blk: {
             var args: std.ArrayList(Value) = .empty;
             defer args.deinit(allocator);
             for (func.valueList(c.args)) |v| try args.append(allocator, rv(vmap, v));
-            break :blk .{ .call = .{ .symbol = c.symbol, .args = try func.internValues(args.items) } };
+            var out = c;
+            out.args = try func.internValues(args.items);
+            if (c.ret_dest) |rd| out.ret_dest = rv(vmap, rd);
+            break :blk .{ .call = out };
         },
         .call_indirect => |c| blk: {
             var args: std.ArrayList(Value) = .empty;
             defer args.deinit(allocator);
             for (func.valueList(c.args)) |v| try args.append(allocator, rv(vmap, v));
-            break :blk .{ .call_indirect = .{ .target = rv(vmap, c.target), .args = try func.internValues(args.items) } };
+            var out = c;
+            out.target = rv(vmap, c.target);
+            out.args = try func.internValues(args.items);
+            if (c.ret_dest) |rd| out.ret_dest = rv(vmap, rd);
+            break :blk .{ .call_indirect = out };
         },
         // SM12 T3: `va_start`/`va_arg`/`va_end` never appear in a loop body `recognize`
         // accepts (a straight-line arithmetic nest), same as `if`/`matmul` above.
@@ -625,4 +637,74 @@ test "a va_* statement in the body is declined, not sent into remapOp's unreacha
         if (plan) |p| allocator.free(p.reductions);
         try std.testing.expectEqual(!use_va, plan != null);
     }
+}
+
+test "remapOp keeps a call's variadic and struct-return metadata" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const b0 = try func.appendBlock();
+    const n = try func.appendInst(b0, i32_t, .{ .iconst = 7 });
+    const fmt = try func.appendGlobalAddr(b0, ptr_t, "fmt");
+    const call = try func.appendCallV(b0, i32_t, "printf", &.{ fmt, n }, 1);
+    const slot = try func.appendInst(b0, ptr_t, .{ .alloca = .{ .elem = i32_t } });
+    try func.appendCallIndirectStructRet(b0, fmt, &.{}, slot, &.{ .{}, .{ .fp = true, .offset = 8, .bytes = 4 } });
+    func.setTerminator(b0, .{ .ret = ir.function.Ret.one(call) });
+
+    var vmap: std.AutoHashMapUnmanaged(Value, Value) = .empty;
+    defer vmap.deinit(allocator);
+
+    // Only `args`, `target` and `ret_dest` are Values. A rebuild from just `.symbol`/`.args`
+    // defaults the rest, which makes a variadic call look fixed-arity to the backend and drops
+    // the struct return's destination slot.
+    for (func.blockInsts(b0)) |inst| switch (func.opcode(inst)) {
+        .call => |c| {
+            const out = (try remapOp(&func, .{ .call = c }, &vmap, allocator)).call;
+            try std.testing.expect(out.is_variadic);
+            try std.testing.expectEqual(@as(u32, 1), out.num_fixed);
+        },
+        .call_indirect => |c| {
+            const out = (try remapOp(&func, .{ .call_indirect = c }, &vmap, allocator)).call_indirect;
+            try std.testing.expectEqual(@as(u8, 2), out.ret_regs);
+            try std.testing.expectEqual(slot, out.ret_dest.?);
+            try std.testing.expect(out.ret_pieces[1].fp);
+            try std.testing.expectEqual(@as(u8, 8), out.ret_pieces[1].offset);
+            try std.testing.expectEqual(@as(u8, 4), out.ret_pieces[1].bytes);
+        },
+        else => {},
+    };
+}
+
+test "remapOp keeps volatile on a cloned load and store" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const b0 = try func.appendBlock();
+    const reg = try func.appendGlobalAddr(b0, ptr_t, "MMIO");
+    const v = try func.appendInst(b0, i32_t, .{ .load = .{ .ptr = reg, .@"volatile" = true } });
+    try func.appendStoreVol(b0, v, reg, true);
+    func.setTerminator(b0, .{ .ret = ir.function.Ret.none() });
+
+    var vmap: std.AutoHashMapUnmanaged(Value, Value) = .empty;
+    defer vmap.deinit(allocator);
+
+    // Splitting a loop that reads or writes a hardware register must not turn the access into
+    // ordinary memory a later pass can move, duplicate or delete.
+    var seen: usize = 0;
+    for (func.blockInsts(b0)) |inst| switch (func.opcode(inst)) {
+        .load => |l| {
+            seen += 1;
+            try std.testing.expect((try remapOp(&func, .{ .load = l }, &vmap, allocator)).load.@"volatile");
+        },
+        .store => |s| {
+            seen += 1;
+            try std.testing.expect((try remapOp(&func, .{ .store = s }, &vmap, allocator)).store.@"volatile");
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 2), seen);
 }

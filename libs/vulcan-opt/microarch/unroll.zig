@@ -117,22 +117,30 @@ pub fn cloneBlocks(
                 .convert => |cv| .{ .convert = .{ .value = remapValue(value_map, cv.value) } },
                 .unary => |u| .{ .unary = .{ .op = u.op, .value = remapValue(value_map, u.value) } },
                 .alloca => |a| .{ .alloca = .{ .elem = a.elem } },
+                // Only `args` (and `target`/`ret_dest`) are Values. `is_variadic`/`num_fixed` and
+                // the `ret_dest`/`ret_regs`/`ret_pieces`/`sret` struct-return description are
+                // call-site metadata that each unrolled copy must keep, so start from the source
+                // op and overwrite only the Values.
                 .call => |c| blk: {
                     args_buf.clearRetainingCapacity();
                     for (func.valueList(c.args)) |v| {
                         try args_buf.append(allocator, remapValue(value_map, v));
                     }
-                    break :blk .{ .call = .{ .symbol = c.symbol, .args = try func.internValues(args_buf.items) } };
+                    var out = c;
+                    out.args = try func.internValues(args_buf.items);
+                    if (c.ret_dest) |rd| out.ret_dest = remapValue(value_map, rd);
+                    break :blk .{ .call = out };
                 },
                 .call_indirect => |c| blk: {
                     args_buf.clearRetainingCapacity();
                     for (func.valueList(c.args)) |v| {
                         try args_buf.append(allocator, remapValue(value_map, v));
                     }
-                    break :blk .{ .call_indirect = .{
-                        .target = remapValue(value_map, c.target),
-                        .args = try func.internValues(args_buf.items),
-                    } };
+                    var out = c;
+                    out.target = remapValue(value_map, c.target);
+                    out.args = try func.internValues(args_buf.items);
+                    if (c.ret_dest) |rd| out.ret_dest = remapValue(value_map, rd);
+                    break :blk .{ .call_indirect = out };
                 },
                 .global_addr => |g| .{ .global_addr = .{ .symbol = g.symbol, .via_got = g.via_got } },
                 .load => |l| .{ .load = .{ .ptr = remapValue(value_map, l.ptr), .@"volatile" = l.@"volatile" } },
@@ -155,23 +163,21 @@ pub fn cloneBlocks(
                     .a = remapValue(value_map, d.a),
                     .b = remapValue(value_map, d.b),
                 } },
-                .matmul => |mmv| .{
-                    .matmul = .{
-                        .a = remapValue(value_map, mmv.a),
-                        .b = remapValue(value_map, mmv.b),
-                        .c = remapValue(value_map, mmv.c),
-                        .m = mmv.m,
-                        .n = mmv.n,
-                        .k = mmv.k,
-                        .dtype = mmv.dtype,
-                        .accumulate = mmv.accumulate,
-                        // Copied verbatim, including a `per_column` scale's ScaleList handle: unrolling
-                        // clones within the SAME function, so the handle stays relative to the same
-                        // `scale_pool` and needs no re-interning (unlike inline.zig's cross-function clone).
-                        .quant = mmv.quant,
-                        // Plain op metadata (not a Value, not a pool handle), so it copies as-is.
-                        .input_signs = mmv.input_signs,
-                    },
+                // Only a/b/c are Values. Everything else (m/n/k, dtype, accumulate, embedded,
+                // quant, input_signs) is compile-time metadata, so start from the source op and
+                // overwrite only the Values. A named-field rebuild silently defaulted `embedded`
+                // back to false, which told the backend a matmul inside a live-value region was a
+                // standalone kernel free to clobber registers.
+                // The `quant` handle copies verbatim, including a `per_column` scale's ScaleList:
+                // unrolling clones within the SAME function, so the handle stays relative to the
+                // same `scale_pool` and needs no re-interning (unlike inline.zig's cross-function
+                // clone).
+                .matmul => |mmv| blk: {
+                    var out = mmv;
+                    out.a = remapValue(value_map, mmv.a);
+                    out.b = remapValue(value_map, mmv.b);
+                    out.c = remapValue(value_map, mmv.c);
+                    break :blk .{ .matmul = out };
                 },
                 .@"if" => |cf| blk: {
                     args_buf.clearRetainingCapacity();
@@ -916,4 +922,136 @@ test "cloneBlocks keeps via_got=true on a cloned global_addr (loop-unroll body c
         }
     }
     try std.testing.expect(found);
+}
+
+test "cloneBlocks keeps a call's variadic and struct-return metadata (loop-unroll body copy)" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const b0 = try func.appendBlock();
+    const n = try func.appendInst(b0, i32_t, .{ .iconst = 7 });
+    // printf("%d", n): one declared parameter, then one variadic argument.
+    const fmt = try func.appendGlobalAddr(b0, ptr_t, "fmt");
+    _ = try func.appendCallV(b0, i32_t, "printf", &.{ fmt, n }, 1);
+    // A struct-by-value return into a caller slot.
+    const slot = try func.appendInst(b0, ptr_t, .{ .alloca = .{ .elem = i32_t } });
+    try func.appendCallStructRet(b0, "mkpair", &.{}, slot, &.{ .{}, .{ .fp = true, .offset = 8, .bytes = 4 } });
+    func.setTerminator(b0, .{ .ret = ir.function.Ret.none() });
+
+    var vmap: ValueMap = .empty;
+    defer vmap.deinit(allocator);
+    var bmap: BlockMap = .empty;
+    defer bmap.deinit(allocator);
+    const clones = try cloneBlocks(allocator, &func, &.{b0}, &vmap, &bmap);
+    defer allocator.free(clones);
+
+    // Every field but `args`/`ret_dest` describes the CALL SITE, not the operands. A rebuild
+    // from just `.symbol` and `.args` defaults them, which makes a variadic call look
+    // fixed-arity and loses the struct return's destination slot entirely.
+    var variadic_calls: usize = 0;
+    var sret_calls: usize = 0;
+    for (func.blockInsts(clones[0])) |inst| {
+        if (func.opcode(inst) != .call) continue;
+        const c = func.opcode(inst).call;
+        if (std.mem.eql(u8, func.symbolName(c.symbol), "printf")) {
+            variadic_calls += 1;
+            try std.testing.expect(c.is_variadic);
+            try std.testing.expectEqual(@as(u32, 1), c.num_fixed);
+        }
+        if (std.mem.eql(u8, func.symbolName(c.symbol), "mkpair")) {
+            sret_calls += 1;
+            try std.testing.expectEqual(@as(u8, 2), c.ret_regs);
+            try std.testing.expect(c.ret_dest != null);
+            try std.testing.expectEqual(vmap.get(slot).?, c.ret_dest.?); // remapped to the clone's slot
+            try std.testing.expect(c.ret_pieces[1].fp);
+            try std.testing.expectEqual(@as(u8, 8), c.ret_pieces[1].offset);
+            try std.testing.expectEqual(@as(u8, 4), c.ret_pieces[1].bytes);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), variadic_calls);
+    try std.testing.expectEqual(@as(usize, 1), sret_calls);
+}
+
+test "cloneBlocks keeps embedded=true on a cloned matmul (loop-unroll body copy)" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ptr_t = try func.types.ptrGlobal();
+    const b0 = try func.appendBlock();
+    const a = try func.appendGlobalAddr(b0, ptr_t, "A");
+    const b = try func.appendGlobalAddr(b0, ptr_t, "B");
+    const c = try func.appendGlobalAddr(b0, ptr_t, "C");
+    try func.appendMatmulEmbedded(b0, a, b, c, 4, 4, 4, .fp32, true, null);
+    func.setTerminator(b0, .{ .ret = ir.function.Ret.none() });
+
+    var vmap: ValueMap = .empty;
+    defer vmap.deinit(allocator);
+    var bmap: BlockMap = .empty;
+    defer bmap.deinit(allocator);
+    const clones = try cloneBlocks(allocator, &func, &.{b0}, &vmap, &bmap);
+    defer allocator.free(clones);
+
+    // `embedded` tells the backend the matmul sits inside a live-value region and must save
+    // every register it clobbers. A named-field rebuild defaults it to false, which turns the
+    // copy into a standalone kernel that is free to clobber the surrounding values.
+    var found: usize = 0;
+    for (func.blockInsts(clones[0])) |inst| {
+        if (func.opcode(inst) != .matmul) continue;
+        found += 1;
+        const m = func.opcode(inst).matmul;
+        try std.testing.expect(m.embedded);
+        try std.testing.expect(m.accumulate);
+        try std.testing.expectEqual(ir.function.MatMulType.fp32, m.dtype);
+    }
+    try std.testing.expectEqual(@as(usize, 1), found);
+}
+
+test "cloneBlocks keeps volatile on a cloned load and store (loop-unroll body copy)" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const b0 = try func.appendBlock();
+    const reg = try func.appendGlobalAddr(b0, ptr_t, "MMIO");
+    const v = try func.appendInst(b0, i32_t, .{ .load = .{ .ptr = reg, .@"volatile" = true } });
+    try func.appendStoreVol(b0, v, reg, true);
+    // A plain access in the same block proves the flag is carried, not forced on.
+    const p = try func.appendGlobalAddr(b0, ptr_t, "RAM");
+    const w = try func.appendInst(b0, i32_t, .{ .load = .{ .ptr = p } });
+    try func.appendStore(b0, w, p);
+    func.setTerminator(b0, .{ .ret = ir.function.Ret.none() });
+
+    var vmap: ValueMap = .empty;
+    defer vmap.deinit(allocator);
+    var bmap: BlockMap = .empty;
+    defer bmap.deinit(allocator);
+    const clones = try cloneBlocks(allocator, &func, &.{b0}, &vmap, &bmap);
+    defer allocator.free(clones);
+
+    // Unrolling a loop that reads or writes a hardware register must keep each copy volatile.
+    // An ordinary copy is one a later pass may move, duplicate or delete.
+    var vol_loads: usize = 0;
+    var vol_stores: usize = 0;
+    var plain_loads: usize = 0;
+    var plain_stores: usize = 0;
+    for (func.blockInsts(clones[0])) |inst| switch (func.opcode(inst)) {
+        .load => |l| if (l.@"volatile") {
+            vol_loads += 1;
+        } else {
+            plain_loads += 1;
+        },
+        .store => |s| if (s.@"volatile") {
+            vol_stores += 1;
+        } else {
+            plain_stores += 1;
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 1), vol_loads);
+    try std.testing.expectEqual(@as(usize, 1), vol_stores);
+    try std.testing.expectEqual(@as(usize, 1), plain_loads);
+    try std.testing.expectEqual(@as(usize, 1), plain_stores);
 }

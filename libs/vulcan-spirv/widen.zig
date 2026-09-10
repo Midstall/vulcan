@@ -501,7 +501,9 @@ fn widenFlattened(func: *Function) Error!void {
                     func.replaceAllUses(rv, packed_val);
                 } else {
                     // A lane-invariant load (grad_buf / descriptor): one scalar load + splat.
-                    const scalar_load = try func.createInst(f32_t, .{ .load = .{ .ptr = l.ptr } });
+                    // Carry `volatile`: the widened form is still one load of the same address, so
+                    // it must keep the observability the source load had.
+                    const scalar_load = try func.createInst(f32_t, .{ .load = .{ .ptr = l.ptr, .@"volatile" = l.@"volatile" } });
                     try new_insts.append(func.allocator, func.definingInst(scalar_load).?);
                     const fields = try func.internValues(&.{ scalar_load, scalar_load, scalar_load, scalar_load });
                     const splat = try func.createInst(vec_ty, .{ .struct_new = .{ .fields = fields } });
@@ -698,7 +700,13 @@ fn gatherCall(
             defer func.allocator.free(lane_args);
             for (args, 0..) |a, ai| lane_args[ai] = try laneOf(func, out, a, lane, f32_t);
             const list = try func.internValues(lane_args);
-            const call_res = try func.createInst(f32_t, .{ .call_indirect = .{ .target = c.target, .args = list } });
+            // Start from the source op, so the call-site metadata survives: `is_variadic`/
+            // `num_fixed`, and the `ret_dest`/`ret_regs`/`ret_pieces`/`sret` struct-return
+            // description. Each lane call has the same arity as the source, so those fields
+            // still describe it. Only `args` differ per lane.
+            var lane_op = c;
+            lane_op.args = list;
+            const call_res = try func.createInst(f32_t, .{ .call_indirect = lane_op });
             try out.append(func.allocator, func.definingInst(call_res).?);
             lane_results[lane] = call_res;
         }
@@ -741,7 +749,11 @@ fn gatherCall(
         // A result-less (void) call. createInst makes a result value we never read. The isel
         // simply leaves it dead. Emitting a dead f32 result is harmless and keeps us off the
         // function.zig API. Mark it by giving it a zero-width-equivalent: we use f32_t.
-        const call = try func.createInst(f32_t, .{ .call_indirect = .{ .target = c.target, .args = list } });
+        // The op starts from the source call, for the same reason as the value-returning gather
+        // above: every field but `args` describes the call site, not the operands.
+        var lane_op = c;
+        lane_op.args = list;
+        const call = try func.createInst(f32_t, .{ .call_indirect = lane_op });
         try out.append(func.allocator, func.definingInst(call).?);
     }
     // Record the slots against the original out_ptr alloca base.
@@ -991,4 +1003,60 @@ test "widen heavy: an effectful statement inside a diamond arm refuses the widen
 
         try testing.expectError(error.NotWidenable, widenGraphics(&func));
     }
+}
+
+test "widen heavy: a volatile broadcast load stays volatile" {
+    const gpa = testing.allocator;
+    var func = Function.init(gpa);
+    defer func.deinit();
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const ptr_t = try func.types.ptrGlobal();
+    const entry = try func.appendBlock();
+    const vin = try func.appendBlockParam(entry, f32_t);
+    const gbuf = try func.appendBlockParam(entry, ptr_t);
+    const g = try func.appendInst(entry, f32_t, .{ .load = .{ .ptr = gbuf, .@"volatile" = true } });
+    const r = try func.appendInst(entry, f32_t, .{ .arith = .{ .op = .add, .lhs = g, .rhs = vin } });
+    const slot = try func.appendInst(entry, ptr_t, .{ .iconst = 0 });
+    try func.appendStore(entry, r, slot);
+
+    try widenGraphics(&func);
+
+    // The broadcast keeps ONE load of the same address, so it must keep the observability the
+    // source load had. A rebuild from just `.ptr` defaults the flag to false.
+    try testing.expectEqual(@as(usize, 1), countOp(&func, entry, .load));
+    for (func.blockInsts(entry)) |inst| {
+        if (func.opcode(inst) == .load) try testing.expect(func.opcode(inst).load.@"volatile");
+    }
+}
+
+test "widen heavy: a gathered call_indirect keeps its variadic metadata on every lane" {
+    const gpa = testing.allocator;
+    var func = Function.init(gpa);
+    defer func.deinit();
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const entry = try func.appendBlock();
+    const x = try func.appendBlockParam(entry, f32_t);
+    const mathfn = try func.appendBlockParam(entry, ptr_t);
+    const sel = try func.appendInst(entry, i32_t, .{ .iconst = 0 });
+    const two = try func.appendInst(entry, f32_t, .{ .fconst = 2.0 });
+    const p = try func.appendCallIndirectV(entry, f32_t, mathfn, &.{ sel, x, two }, 1);
+    const slot = try func.appendInst(entry, ptr_t, .{ .iconst = 0 });
+    try func.appendStore(entry, p, slot);
+
+    try widenGraphics(&func);
+
+    // Each lane call has the same arity as the source, so the call-site metadata still
+    // describes it. Rebuilding from just `.target` and `.args` makes a variadic call look
+    // fixed-arity to the backend, which then passes the unnamed arguments the wrong way.
+    var lane_calls: usize = 0;
+    for (func.blockInsts(entry)) |inst| {
+        if (func.opcode(inst) != .call_indirect) continue;
+        lane_calls += 1;
+        const c = func.opcode(inst).call_indirect;
+        try testing.expect(c.is_variadic);
+        try testing.expectEqual(@as(u32, 1), c.num_fixed);
+    }
+    try testing.expectEqual(@as(usize, 4), lane_calls);
 }

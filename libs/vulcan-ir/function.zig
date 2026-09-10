@@ -601,10 +601,13 @@ pub const Function = struct {
         var out = Function.init(allocator);
         errdefer out.deinit();
 
-        // Whole-function variadic metadata is plain data, copied straight across.
+        // Whole-function metadata is plain data, copied straight across. `is_local` belongs
+        // here with the rest: a clone of a C `static` function that came back global would
+        // emit an object symbol two translation units can collide on.
         out.is_variadic = self.is_variadic;
         out.num_fixed_params = self.num_fixed_params;
         out.sret = self.sret;
+        out.is_local = self.is_local;
 
         // Types: re-intern each kind in the original's order. The original table is deduped (every
         // kind unique), and interning is order-preserving, so the n-th kind receives handle n exactly,
@@ -2714,9 +2717,29 @@ test "clone deep-copies a function and leaves the original untouched" {
     const called = try func.appendCall(entry, i32_t, "callee", &.{x});
     func.setTerminator(entry, .{ .ret = Ret.one(called) });
     try func.addAttr(.{ .inst = @enumFromInt(0) }, .{ .custom = .{ .namespace = "debug", .key = "line", .value = .{ .int = 12 } } });
+    func.is_variadic = true;
+    func.num_fixed_params = 1;
+    func.sret = true;
+    func.is_local = true;
 
     var copy = try func.clone(allocator);
     defer copy.deinit();
+
+    // Whole-function metadata must survive. Each of these changes how the function is called
+    // or how its symbol is bound, so a clone that defaults one of them back is a miscompile:
+    // `is_local` in particular decides local versus global object binding.
+    try std.testing.expect(copy.is_variadic);
+    try std.testing.expectEqual(@as(u32, 1), copy.num_fixed_params);
+    try std.testing.expect(copy.sret);
+    try std.testing.expect(copy.is_local);
+
+    // The attribute list carries over, with its string payloads re-owned by the copy.
+    var it = copy.attributesOf(.{ .inst = @enumFromInt(0) });
+    const attr = it.next() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("debug", attr.custom.namespace);
+    try std.testing.expectEqualStrings("line", attr.custom.key);
+    try std.testing.expectEqual(@as(i64, 12), attr.custom.value.int);
+    try std.testing.expect(attr.custom.namespace.ptr != func.attributeEntries()[0].attr.custom.namespace.ptr);
 
     // Structure and interned tables match by construction (handles are index-preserved).
     try std.testing.expectEqual(func.blockCount(), copy.blockCount());
@@ -2764,4 +2787,12 @@ test "clone preserves handles for a function holding two pointer address spaces"
         copy.types.type_kind(copy.valueType(ps)).ptr,
     );
     try std.testing.expectEqual(@as(u16, 32), copy.types.type_kind(copy.valueType(n)).int.bits);
+
+    // The other direction of the whole-function metadata copy: this function sets none of the
+    // flags, so the clone must set none either. A clone that forces one on would, for
+    // `is_local`, hide an external symbol from cross-object resolution.
+    try std.testing.expect(!copy.is_variadic);
+    try std.testing.expectEqual(@as(u32, 0), copy.num_fixed_params);
+    try std.testing.expect(!copy.sret);
+    try std.testing.expect(!copy.is_local);
 }
