@@ -516,6 +516,10 @@ fn customLatency(op: ir.function.Opcode) u32 {
         .iconst, .fconst, .fconst128, .icmp, .select, .struct_new, .extract, .alloca, .call, .call_indirect, .global_addr, .store, .prefetch, .@"if" => 1,
         // SM12 T3: no backend expands these yet, priced like any other cheap bookkeeping op.
         .va_start, .va_arg, .va_end => 1,
+        // A workgroup barrier and an atomic are GPU-only: this fictional CPU part has neither,
+        // so they never reach a model built for it. Priced as bookkeeping so the switch stays
+        // exhaustive and a new opcode keeps failing the build here.
+        .barrier, .atomic_rmw => 1,
     };
 }
 
@@ -543,6 +547,8 @@ fn customThroughput(op: ir.function.Opcode, elem_float: bool) u32 {
         .iconst, .fconst, .fconst128, .icmp, .select, .struct_new, .extract, .alloca, .call, .call_indirect, .global_addr, .store, .prefetch, .@"if" => 1,
         // SM12 T3: no backend expands these yet, priced like any other cheap bookkeeping op.
         .va_start, .va_arg, .va_end => 1,
+        // GPU-only, as above: never reached by a model for this CPU part.
+        .barrier, .atomic_rmw => 1,
     };
 }
 
@@ -568,6 +574,11 @@ fn customUnit(op: ir.function.Opcode) opt.microarch.UnitClass {
         // `va_end` are pure bookkeeping, like `struct_new`/`extract` above.
         .va_arg => .mem,
         .va_start, .va_end => .none,
+        // A barrier synchronizes, it does not compute; an atomic is a memory op. Neither is
+        // reachable on this CPU part, but naming them keeps the switch exhaustive so the next
+        // new opcode fails the build here instead of slipping through.
+        .barrier => .none,
+        .atomic_rmw => .mem,
     };
 }
 
