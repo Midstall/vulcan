@@ -8,6 +8,14 @@
             .url = "git+https://git.lilithsemi.com/LilithSemi/uefi.zig#e5c9c30f847845c406da08dea2faf79964b0e793",
             .hash = "uefi-0.1.0-1okz4b5QAAD-ImP4Q86o97td2DpQNfFhltlBjgnLdL8X",
         },
+        // The NVIDIA kernel-RM bindings and compute dispatch. TEST ONLY: it needs Linux
+        // ioctls, so no module under libs/ imports it. The hardware execution test in
+        // libs/vulcan-target/nvidia/tests/execute.zig uses it to run generated SASS on a
+        // real GPU, and that test skips when no GPU is present.
+        .nvidia = .{
+            .url = "git+https://git.lilithsemi.com/LilithSemi/nvidia.zig#7b45b8b17c3614e6fd219e8119ead97fd90ea409",
+            .hash = "nvidia-0.1.0-nX_09xQSCgC3mwvpdX_9gUHsUQABFWSpEWz4zhM364ps",
+        },
     },
     .paths = .{
         "build.zig",

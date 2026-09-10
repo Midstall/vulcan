@@ -629,6 +629,27 @@ pub fn build(b: *std.Build) void {
     }) });
     test_step.dependOn(&b.addRunArtifact(cross_target).step);
 
+    // NVIDIA hardware execution. This compiles kernels with the SASS backend and RUNS them on
+    // a real GPU through the nvidia.zig compute dispatch, then reads the buffers back. Every
+    // other NVIDIA test in this repository checks the STRUCTURE of the instruction stream, so
+    // this is the only one that proves the silicon agrees.
+    //
+    // nvidia.zig needs Linux ioctls, so it stays TEST ONLY: no module under libs/ imports it,
+    // and the freestanding proof does not see it. The test skips when no GPU answers.
+    const nvidia_dep = b.dependency("nvidia", .{ .target = target, .optimize = optimize });
+    const nvidia_execute = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("libs/vulcan-target/nvidia/tests/execute.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "vulcan-ir", .module = vulcan_ir },
+            .{ .name = "vulcan-gpu", .module = vulcan_gpu },
+            .{ .name = "vulcan-target", .module = vulcan_target },
+            .{ .name = "nvidia", .module = nvidia_dep.module("nvidia") },
+        },
+    }) });
+    test_step.dependOn(&b.addRunArtifact(nvidia_execute).step);
+
     // GLSL frontend tests: parsing/lowering (IR only), plus execution (GLSL -> IR ->
     // host JIT -> run) for scalar functions.
     const glsl_tests = b.addTest(.{ .root_module = vulcan_glsl });
