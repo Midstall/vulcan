@@ -923,3 +923,66 @@ test "live: a load's address register survives being reused one instruction late
     try testing.expectEqual(rb_good_magic +% squared, out_buf.read(i32, 0));
     try testing.expect(out_buf.read(i32, 0) != rb_poison_magic +% squared);
 }
+
+/// The two integers the convert test squares. They differ, so the poison a missed
+/// scoreboard produces (the SECOND convert's consumer reading the FIRST convert's result)
+/// is a different number from the right answer.
+const conv_v: u32 = 3;
+const conv_w: u32 = 5;
+/// `v * v + w * w`, the only right answer.
+const conv_want: f32 = 34.0;
+/// How many one-thread workgroups the dispatch needs. Measured on an RTX 5070 with the
+/// write barriers removed, over eight runs at each size: one block gave a wrong answer six
+/// times out of eight, and 1024 blocks gave one every run. The wrong answers were 9, 25,
+/// 50, 650, 1181, 1394786 and `inf`, so this hazard does not need occupancy the way the
+/// read-barrier one did. 1024 is the size that was wrong every time.
+const conv_grid: u32 = 1024;
+
+test "live: a converted value reaches its consumer, and not the register's old contents" {
+    // I2F and F2I are DECOUPLED on sm120 (NAK sm120_instr_latencies: `Op::I2F(_) =>
+    // Decoupled`), so the converted value lands an unknown number of cycles after issue.
+    // NAK's own RAW table gives a decoupled write "1 & sb" against every consumer class:
+    // one cycle of delay AND a scoreboard, because no fixed number covers it. The emitted
+    // stream is
+    //
+    //     I2F  R8, R7      <- (float) w
+    //     FMUL R7, R8, R8
+    //     I2F  R8, R6      <- (float) v, the SAME destination register
+    //     FMUL R6, R8, R8
+    //     FADD R8, R6, R7
+    //
+    // so if the second convert has not landed, the second FMUL squares the FIRST convert's
+    // result and the kernel answers `2 * w * w`. That is the tidy failure. The others were
+    // arbitrary, because the register held whatever the hardware left in it.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const ptr_t = try func.types.ptrGlobal();
+    const b = try func.appendBlock();
+    const out = try func.appendBlockParam(b, ptr_t);
+    const v = try func.appendBlockParam(b, i32_t);
+    const w = try func.appendBlockParam(b, i32_t);
+    const wf = try func.appendInst(b, f32_t, .{ .convert = .{ .value = w } });
+    const w2 = try bin(&func, b, f32_t, .mul, wf, wf);
+    const vf = try func.appendInst(b, f32_t, .{ .convert = .{ .value = v } });
+    const v2 = try bin(&func, b, f32_t, .mul, vf, vf);
+    const sum = try bin(&func, b, f32_t, .add, v2, w2);
+    try func.appendStore(b, sum, out);
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
+
+    var h = try Harness.open();
+    defer h.deinit();
+    var launch = try h.compile(&func, runner_abi);
+    defer launch.deinit();
+
+    const out_buf = try h.alloc(0x1000);
+    launch.setPtr(launch.kernel.launch.params[0].offset, out_buf.va);
+    launch.setU32(launch.kernel.launch.params[1].offset, conv_v);
+    launch.setU32(launch.kernel.launch.params[2].offset, conv_w);
+    try launch.run(.{ conv_grid, 1, 1 });
+
+    // Every thread writes the same slot, so one thread that lost the race shows it.
+    try testing.expectEqual(conv_want, out_buf.read(f32, 0));
+}

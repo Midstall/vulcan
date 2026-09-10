@@ -53,9 +53,10 @@ test "SPIR-V compute function -> IR -> SASS kernel (x*y - x)" {
     var kernel = try isel.compileKernel(allocator, &func, isel.nvidia_abi);
     defer kernel.deinit(allocator);
 
-    // The kernel loads the output pointer + two inputs (4x LDC), multiplies,
-    // subtracts, stores, and exits.
-    try std.testing.expectEqual(@as(usize, 4), countOpcode(kernel.code, 0xb82)); // LDC x4
+    // The kernel loads the output POINTER with one LDC.64 and the two scalar inputs with
+    // one 32-bit LDC each, multiplies, subtracts, stores, and exits. Three LDCs where the
+    // pointer used to take two of its own.
+    try std.testing.expectEqual(@as(usize, 3), countOpcode(kernel.code, 0xb82)); // LDC x3
     try std.testing.expect(hasOpcode(kernel.code, 0x224)); // IMAD
     try std.testing.expect(hasOpcode(kernel.code, 0x210)); // IADD3 (the subtract)
     try std.testing.expect(hasOpcode(kernel.code, 0x986)); // STG
@@ -169,34 +170,33 @@ test "SPIR-V compute shader -> SASS kernel (buffer load/store + thread id)" {
     var kernel = try isel.compileKernel(allocator, &func, isel.nvidia_abi);
     defer kernel.deinit(allocator);
 
-    // The invocation id is blockIdx.x * local_size_x + threadIdx.x: two S2R reads
-    // (tid + ctaid) and a MOV of the local size (64). The buffer base comes from the
-    // constant bank (a 64-bit pair = two LDC), the element address from a 64-bit
-    // IADD3 carry add, then LDG, the multiply, STG, and EXIT (no output pointer).
+    // The invocation id is blockIdx.x * local_size_x + threadIdx.x: two S2R reads (tid +
+    // ctaid) and ONE IMAD that carries the local size (64) in its own immediate field. The
+    // buffer base comes from the constant bank as ONE LDC.64, the element address from ONE
+    // IMAD.WIDE, then LDG, the multiply, STG, and EXIT (no output pointer).
     try std.testing.expectEqual(@as(usize, 2), countOpcode(kernel.code, 0x919)); // S2R x2 (tid + ctaid)
-    var saw_localsize_mov = false;
+    var saw_localsize_imm = false;
     var k: usize = 0;
     while (k < kernel.code.len) : (k += 4) {
-        if (kernel.code[k] & 0xfff == 0x802 and kernel.code[k + 1] == 64) saw_localsize_mov = true; // MOV imm 64
+        // IMAD in the 32-bit immediate form: base 0x024 | (4 << 9), value at word 1.
+        if (kernel.code[k] & 0xfff == 0x824 and kernel.code[k + 1] == 64) saw_localsize_imm = true;
     }
-    try std.testing.expect(saw_localsize_mov); // local_size_x folded in
-    try std.testing.expectEqual(@as(usize, 2), countOpcode(kernel.code, 0xb82)); // LDC x2 (buffer ptr)
+    try std.testing.expect(saw_localsize_imm); // local_size_x folded into IMAD
+    try std.testing.expectEqual(@as(usize, 1), countOpcode(kernel.code, 0xb82)); // one LDC.64 (buffer ptr)
     try std.testing.expect(hasOpcode(kernel.code, 0x981)); // LDG (load data[i])
     try std.testing.expect(hasOpcode(kernel.code, 0x986)); // STG (store data[i])
     try std.testing.expect(hasOpcode(kernel.code, 0x94d)); // EXIT
 
-    // The carry-add pair: an IADD3 writing a carry-out predicate (P6) at bits 81-83,
-    // and an IADD3 reading a carry-in predicate at bits 87-89.
-    var saw_cout = false;
-    var saw_cin = false;
+    // The 64-bit element address is ONE IMAD.WIDE.U32, which scales the byte offset,
+    // widens it and adds the 64-bit base in a single instruction. It replaced an IADD3
+    // writing a carry-out predicate plus an IADD3.X reading it, so NO carry predicate is
+    // named any more and the carry cannot be dropped: the hardware never splits it.
+    try std.testing.expect(hasOpcode(kernel.code, encode.IMAD_WIDE_IMM_OPCODE));
     var i: usize = 0;
     while (i < kernel.code.len) : (i += 4) {
         if (kernel.code[i] & 0xfff != 0x210) continue;
-        if ((kernel.code[i + 2] >> 17) & 0x7 == 6) saw_cout = true; // carry-out -> P6 at bit 81
-        if ((kernel.code[i + 2] >> 23) & 0x7 == 6) saw_cin = true; // carry-in <- P6 at bit 87
+        try std.testing.expect((kernel.code[i + 2] >> 17) & 0x7 != 6); // no carry-out to P6
     }
-    try std.testing.expect(saw_cout);
-    try std.testing.expect(saw_cin);
 
     // The scoreboard scheduler ran: the LDG (variable latency) carries a write
     // barrier (wr_bar at bits 110-112 is a real scoreboard, not 7 = none), and some
@@ -233,7 +233,12 @@ test "SASS: a lowered division compiles to a kernel (register reuse)" {
     defer kernel.deinit(allocator);
 
     // The expansion lowers to shifts, compares, and selects, ending in STG + EXIT.
-    try std.testing.expect(hasOpcode(kernel.code, 0x219)); // SHF (shift)
+    //
+    // The shifts are by CONSTANT counts, so they carry the count in their own immediate
+    // field (0x819 = base 0x019 | the imm form) rather than in a register (0x219). Either
+    // form proves the shift is there, and a lowering that stopped folding constants would
+    // still pass this line and fail the register-count check below.
+    try std.testing.expect(hasOpcode(kernel.code, 0x219) or hasOpcode(kernel.code, 0x819)); // SHF (shift)
     try std.testing.expect(hasOpcode(kernel.code, 0x20c)); // ISETP (compare)
     try std.testing.expect(hasOpcode(kernel.code, 0x207)); // SEL
     try std.testing.expect(hasOpcode(kernel.code, 0x986)); // STG (output)
@@ -270,6 +275,8 @@ const host_builtin = @import("builtin");
 const s2r_opcode: u32 = 0x919;
 const mov_imm_opcode: u32 = 0x802;
 const imad_opcode: u32 = 0x224;
+/// IMAD in the 32-bit immediate operand form: the same base 0x024 with form 4 in bits 9..11.
+const imad_imm_opcode: u32 = 0x824;
 const ldc_opcode: u32 = 0xb82;
 
 /// The workgroup size every probe kernel declares. The three axes differ, so a lowering that
@@ -512,34 +519,33 @@ test "grid builtins: global_id on each axis fuses ctaid * ntid + tid on that sam
     defer allocator.free(trace);
 
     for (cases) |case| {
-        // The SASS path. The lowering is four instructions: the declared workgroup size as an
-        // immediate, the two hardware reads, and the multiply-add that fuses them. Both
+        // The SASS path. The lowering is THREE instructions: the two hardware reads and the
+        // multiply-add that fuses them, with the declared workgroup size in the IMAD's own
+        // 32-bit immediate field. A MOV materialized that constant before, which cost an
+        // instruction and a register write on every kernel that reads a global index. Both
         // special-register indices and the whole register wiring are checked, so a read of
         // the right register into the wrong operand fails here.
         var kernel = try probeSass(allocator, case.tag);
         defer kernel.deinit(allocator);
         try std.testing.expectEqual(@as(usize, 2), countOpcode(kernel.code, s2r_opcode));
-        try std.testing.expectEqual(mov_imm_opcode, kernel.code[0] & 0xfff);
+        try std.testing.expectEqual(@as(usize, 0), countOpcode(kernel.code, mov_imm_opcode));
+        try std.testing.expectEqual(s2r_opcode, kernel.code[0] & 0xfff);
         try std.testing.expectEqual(s2r_opcode, kernel.code[4] & 0xfff);
-        try std.testing.expectEqual(s2r_opcode, kernel.code[8] & 0xfff);
-        try std.testing.expectEqual(imad_opcode, kernel.code[12] & 0xfff);
+        try std.testing.expectEqual(imad_imm_opcode, kernel.code[8] & 0xfff);
 
-        const size = decodeMovImm(kernel.code[0..4]);
-        const tid = decodeS2R(kernel.code[4..8]);
-        const ctaid = decodeS2R(kernel.code[8..12]);
-        const fuse = decodeImad(kernel.code[12..16]);
+        const tid = decodeS2R(kernel.code[0..4]);
+        const ctaid = decodeS2R(kernel.code[4..8]);
+        const fuse = decodeImad(kernel.code[8..12]);
 
         try std.testing.expectEqual(case.tid, tid.sysval);
         try std.testing.expectEqual(encode.sr_tid[case.axis], tid.sysval);
         try std.testing.expectEqual(case.ctaid, ctaid.sysval);
         try std.testing.expectEqual(encode.sr_ctaid[case.axis], ctaid.sysval);
-        try std.testing.expectEqual(probe_block[case.axis], size.imm);
-        // dst = ctaid * ntid + tid, with each operand coming from the instruction that
-        // produced it.
+        // dst = ctaid * ntid + tid. The workgroup size is the IMAD's srcB IMMEDIATE, at
+        // word 1, and each register operand comes from the instruction that produced it.
+        try std.testing.expectEqual(probe_block[case.axis], kernel.code[9]);
         try std.testing.expectEqual(ctaid.dst, fuse.a);
-        try std.testing.expectEqual(size.dst, fuse.b);
         try std.testing.expectEqual(tid.dst, fuse.c);
-        try std.testing.expectEqual(size.dst, fuse.dst);
         // The two hardware reads land in different registers, or the multiply-add would fold
         // one axis onto the other.
         try std.testing.expect(tid.dst != ctaid.dst);

@@ -121,7 +121,26 @@ fn isVariableLatency(opcode: u32) bool {
         // consumer forever, which is worse than the missing wait. See `dstSpan` for the
         // IMMA arm that this exclusion does not remove.
         opcode == encode.HMMA_OPCODE or opcode == encode.LDSM_OPCODE or
-        opcode == encode.MOVM_OPCODE;
+        opcode == encode.MOVM_OPCODE or
+        // The number-format conversions: I2F (0x306) and F2I (0x305). NAK
+        // sm120_instr_latencies classes `Op::I2F(_) => Decoupled` and `Op::F2I(_) =>
+        // Decoupled`, the same class as MUFU, so their results land an unknown number of
+        // cycles after issue. NAK's own RAW table gives the pair "1 & sb" for every
+        // consumer class, that is, a one-cycle delay and A SCOREBOARD: there is no fixed
+        // number that covers a decoupled write, so the stall delay is a guess and not a
+        // bound. ptxas agrees, and assigns a write barrier to I2F, F2I, FRND, F2F, POPC,
+        // FLO and BREV on sm_120 (it reaches for the separate COUPLED `I2FP` when it can,
+        // which is why an sm_120 dump often shows no barrier on an int-to-float).
+        //
+        // Measured on an RTX 5070 without this arm: `(float)v * (float)v + (float)w *
+        // (float)w` came back as `2 * w * w`, as 9, as 1181, and as `inf`, changing from
+        // run to run AT A GRID OF ONE BLOCK. The isel gives both converts the same
+        // destination register, so the second consumer read the FIRST convert's result,
+        // or a register the convert had not written yet. `floor`, `ceil` and `trunc` are
+        // the tightest shape of all: the isel lowers each to `F2I rd, rs` then `I2F rd,
+        // rd`, so the second decoupled op reads the first one's destination with nothing
+        // but the stall between them.
+        opcode == encode.I2F_OPCODE or opcode == encode.F2I_OPCODE;
 }
 
 /// Whether `opcode` writes a destination GPR at bits 16..23 (so the scheduler can
@@ -329,11 +348,25 @@ fn dstSpan(opcode: u32, inst: Inst) u32 {
     // the second read it before the attribute landed. `srcSpan` covers the AST that stores
     // the same block back.
     if (opcode == 0x321) return getField(inst, 74, 2) + 1;
-    if (opcode == 0x981 or opcode == 0x984) return switch (getField(inst, 73, 3)) { // LDG, LDS
+    // LDG, LDS and LDC. LDC fills as many registers as its own width field asks for, the
+    // SAME field at bits 73..75 the two memory loads use, and the parameter prologue now
+    // reads a 64-bit pointer with ONE `LDC.64` into a register pair. Left at a span of 1,
+    // the high half of that pair carried no scoreboard tag: an instruction reading only
+    // the high half emitted no wait and took the address dword STALE, and a later write to
+    // it got no write-after-write protection either.
+    if (opcode == 0x981 or opcode == 0x984 or opcode == 0xb82) return switch (getField(inst, 73, 3)) {
         @intFromEnum(encode.MemType.b64) => 2,
         @intFromEnum(encode.MemType.b128) => 4,
         else => 1,
     };
+    // IMAD.WIDE writes a 64-BIT RESULT into the register pair (dst, dst + 1), in both its
+    // register and its immediate operand form. It is the only ALU op in this backend that
+    // writes more than one register, and it forms every global array address. With a span
+    // of 1 the high half gets no write-after-write and no write-after-read wait, so a
+    // still-in-flight producer of that register is overwritten under it. NAK classes
+    // `Op::IMad64` as coupled, so it is fixed latency and takes no scoreboard of its own:
+    // it needs this arm and no `isVariableLatency` arm.
+    if (opcode == encode.IMAD_WIDE_OPCODE or opcode == encode.IMAD_WIDE_IMM_OPCODE) return 2;
     if (opcode == encode.ATOMG_OPCODE or opcode == encode.ATOMS_OPCODE or
         opcode == encode.ATOMG_CAS_OPCODE or opcode == encode.ATOMS_CAS_OPCODE)
         return switch (getField(inst, 73, 4)) {
@@ -414,6 +447,11 @@ fn srcSpan(opcode: u32, inst: Inst, pos: usize) u32 {
     // this the load issues with a stale high address dword (a UBO base pointer whose hi LDC
     // has not landed), reads garbage and faults the GR front-end.
     if (pos == 24 and readsAddrPair(opcode)) return 2;
+    // IMAD.WIDE adds a 64-BIT value, so its srcC at bits 64..71 names a register PAIR. That
+    // pair is the base pointer of every global array address, and its high half comes from
+    // the parameter prologue's LDC, which is variable latency. Read as ONE register the
+    // address would form with a high dword that had not landed.
+    if ((opcode == encode.IMAD_WIDE_OPCODE or opcode == encode.IMAD_WIDE_IMM_OPCODE) and pos == 64) return 2;
     // STG and STS read the data BLOCK that starts at bit 32. Its length is the register
     // count of the 3-bit memory type at bits 73..75, the same field `dstSpan` reads for a
     // load: a b64 store reads (data, data+1) and a b128 store (data .. data+3). The isel
@@ -2401,4 +2439,261 @@ test "an opcode with no GPR source never spends a read barrier at a block bounda
     };
     scheduleBlocks(&insts, &.{ 0, 1 });
     try std.testing.expectEqual(@as(u32, 7), getField(insts[0], 113, 3));
+}
+
+test "an I2F result gets a scoreboard and its consumer waits on it" {
+    // NAK sm120_instr_latencies.rs gives I2F the latency class `Decoupled`, which
+    // `SM120Latency::needs_scoreboards` accepts, so the converted value lands an unknown
+    // number of cycles after issue. The RAW table has no number for a decoupled write, it
+    // says "1 & sb", so the stall delay is a guess and not a bound. Measured on an RTX
+    // 5070 without this barrier: the consumer read the register before the convert wrote
+    // it, at a grid of ONE block.
+    var insts = [_]Inst{
+        encode.i2f(8, 4, true, .{}), // I2F R8 <- R4
+        encode.fmul(9, 8, 8, .{}), // consumes R8
+        encode.exit(.{}),
+    };
+    scheduleBlocks(&insts, &.{0});
+
+    const bar = getField(insts[0], 110, 3);
+    try std.testing.expect(bar < 6); // a real scoreboard, not 7 = none
+    try std.testing.expect((getField(insts[1], 116, 6) & (@as(u32, 1) << @intCast(bar))) != 0);
+}
+
+test "an F2I result gets a scoreboard, and the I2F that rounds through it waits on that" {
+    // The `floor` / `ceil` / `trunc` lowering, which is the tightest shape in the backend:
+    // `F2I rd, rs` then `I2F rd, rd`. Both are decoupled, and the second one reads the
+    // first one's destination with nothing but the stall delay between them. The F2I must
+    // set a write barrier and the I2F must wait on it.
+    var insts = [_]Inst{
+        encode.f2iRound(8, 4, true, .floor, .{}), // F2I.FLOOR R8 <- R4
+        encode.i2f(8, 8, true, .{}), // I2F R8 <- R8
+        encode.fmul(9, 8, 8, .{}), // consumes R8
+        encode.exit(.{}),
+    };
+    scheduleBlocks(&insts, &.{0});
+
+    const f2i_bar = getField(insts[0], 110, 3);
+    try std.testing.expect(f2i_bar < 6);
+    try std.testing.expect((getField(insts[1], 116, 6) & (@as(u32, 1) << @intCast(f2i_bar))) != 0);
+    const i2f_bar = getField(insts[1], 110, 3);
+    try std.testing.expect(i2f_bar < 6);
+    try std.testing.expect((getField(insts[2], 116, 6) & (@as(u32, 1) << @intCast(i2f_bar))) != 0);
+}
+
+test "a convert whose SOURCE register is overwritten gets a read barrier" {
+    // A decoupled op collects its operands when its pipe reaches it, so the write-after-
+    // read hazard applies to a convert exactly as it does to a load. NAK gates both
+    // barriers on the SAME predicate: `calc_instr_deps.rs` asks `op_needs_scoreboard` once
+    // and then assigns a read barrier and a write barrier from it. `readsLate` derives
+    // from `isVariableLatency` for that reason.
+    var insts = [_]Inst{
+        encode.i2f(8, 4, true, .{}), // I2F R8 <- R4
+        encode.imad(4, 5, 6, RZ, .{}), // overwrites R4, the convert's source
+        encode.exit(.{}),
+    };
+    scheduleBlocks(&insts, &.{0});
+
+    const rd = getField(insts[0], 113, 3);
+    try std.testing.expect(rd < 6); // a real scoreboard, not 7 = none
+    try std.testing.expect((getField(insts[1], 116, 6) & (@as(u32, 1) << @intCast(rd))) != 0);
+    try std.testing.expect(rd != getField(insts[0], 110, 3));
+}
+
+test "a convert whose source NOTHING overwrites gets no read barrier" {
+    // The negative control for the arm above. There are six scoreboards, and the backend
+    // emits a convert for every int-to-float in a shader, so one spent where nothing
+    // overwrites would drain every result in flight.
+    var insts = [_]Inst{
+        encode.i2f(8, 4, true, .{}), // I2F R8 <- R4
+        encode.imad(20, 5, 6, RZ, .{}), // touches neither R4 nor R8
+        encode.exit(.{}),
+    };
+    scheduleBlocks(&insts, &.{0});
+    try std.testing.expectEqual(@as(u32, 7), getField(insts[0], 113, 3)); // none (7)
+}
+
+test "an FMUL claims NO scoreboard, because a coupled op never signals one" {
+    // The negative control for `isVariableLatency` itself. NAK classes `Op::FMul(_) =>
+    // Fma`, a COUPLED class that `needs_scoreboards` rejects, so the stall delay covers
+    // it. A write barrier on an op the hardware never signals would hang the consumer
+    // forever, and it would also spend one of six scoreboards.
+    var insts = [_]Inst{
+        encode.fmul(8, 4, 5, .{}),
+        encode.fadd(9, 8, 8, .{}),
+        encode.exit(.{}),
+    };
+    scheduleBlocks(&insts, &.{0});
+    try std.testing.expectEqual(@as(u32, 7), getField(insts[0], 110, 3)); // none (7)
+    try std.testing.expectEqual(@as(u32, 0), getField(insts[1], 116, 6));
+}
+
+test "IMAD.WIDE's HIGH destination register waits on an in-flight producer" {
+    // The write-after-write half of `dstSpan`. IMAD.WIDE writes the pair (dst, dst + 1),
+    // and this puts a variable-latency producer into dst + 1 SPECIFICALLY, never into dst,
+    // so a span of 1 gives no wait at all. Without the wait the wide multiply-add
+    // overwrites the high register while the load that fills it is still in flight, and
+    // the load lands afterwards on top of the address the store then reads.
+    var insts = [_]Inst{
+        encode.ldgU32(11, 2, .{}), // R11 <- global, variable latency; R11 is dst + 1
+        encode.imadWideImm(10, 8, 1, 4, false, .{}), // R10:R11 = zext(R8) * 1 + R4:R5
+        encode.stg(10, 6, .b32, .{}),
+        encode.exit(.{}),
+    };
+    scheduleBlocks(&insts, &.{0});
+
+    const ldg_bar = getField(insts[0], 110, 3);
+    try std.testing.expect(ldg_bar < 6);
+    const imad_wait = getField(insts[1], 116, 6);
+    try std.testing.expect((imad_wait & (@as(u32, 1) << @intCast(ldg_bar))) != 0);
+}
+
+test "IMAD.WIDE's HIGH source register waits on an in-flight producer" {
+    // The read half of `srcSpan`. The addend at bits 64..71 is a 64-bit PAIR, and the high
+    // half of a base pointer comes from the parameter prologue's LDC. This puts the
+    // producer into src + 1 SPECIFICALLY, so a span of 1 gives no wait and the address
+    // forms with a high dword that has not landed.
+    var insts = [_]Inst{
+        encode.ldgU32(5, 2, .{}), // R5 <- global, variable latency; R5 is the addend's high half
+        encode.imadWideImm(10, 8, 1, 4, false, .{}), // reads R4:R5
+        encode.exit(.{}),
+    };
+    scheduleBlocks(&insts, &.{0});
+
+    const ldg_bar = getField(insts[0], 110, 3);
+    try std.testing.expect(ldg_bar < 6);
+    const imad_wait = getField(insts[1], 116, 6);
+    try std.testing.expect((imad_wait & (@as(u32, 1) << @intCast(ldg_bar))) != 0);
+}
+
+test "IMAD.WIDE claims NO scoreboard, because a wide multiply-add is coupled" {
+    // The negative control for the two spans above. NAK classes `Op::IMad64` as
+    // `ImadWide*`, a COUPLED class, so the stall delay covers it and it signals no
+    // scoreboard. A write barrier on an op the hardware never signals would hang every
+    // consumer, and it would spend one of the six scoreboards on every array index.
+    var insts = [_]Inst{
+        encode.imadWideImm(10, 8, 4, 4, false, .{}),
+        encode.stg(10, 6, .b32, .{}),
+        encode.exit(.{}),
+    };
+    scheduleBlocks(&insts, &.{0});
+    try std.testing.expectEqual(@as(u32, 7), getField(insts[0], 110, 3)); // none (7)
+    try std.testing.expectEqual(@as(u32, 0), getField(insts[1], 116, 6));
+}
+
+test "an LDC.64's HIGH destination register carries the write barrier too" {
+    // The parameter prologue reads a 64-bit pointer with ONE LDC.64 into a register pair,
+    // and LDC is variable latency. This makes the consumer read the HIGH half alone, so a
+    // span of 1 leaves it untagged and the consumer issues with a stale address dword.
+    // That is the "MaterialColor came back (1,1,0)" shape, one instruction earlier.
+    var insts = [_]Inst{
+        encode.ldcWide(4, 0, 0x8, .{}), // R4:R5 <- c[0][0x8]
+        encode.iadd3(9, 5, 5, .{}), // reads ONLY the high half
+        encode.exit(.{}),
+    };
+    scheduleBlocks(&insts, &.{0});
+
+    const ldc_bar = getField(insts[0], 110, 3);
+    try std.testing.expect(ldc_bar < 6);
+    const consumer_wait = getField(insts[1], 116, 6);
+    try std.testing.expect((consumer_wait & (@as(u32, 1) << @intCast(ldc_bar))) != 0);
+}
+
+test "a 32-bit LDC still tags ONE register" {
+    // The negative control for the arm above. A B32 LDC writes one register, so tagging a
+    // second would hold a scoreboard for a register the load never fills, and the next
+    // write to it would wait on a producer that does not exist.
+    var insts = [_]Inst{
+        encode.ldc(4, 0, 0x8, .{}), // R4 <- c[0][0x8], one register
+        encode.iadd3(9, 5, 5, .{}), // reads R5, which this LDC does NOT write
+        encode.exit(.{}),
+    };
+    scheduleBlocks(&insts, &.{0});
+    try std.testing.expectEqual(@as(u32, 0), getField(insts[1], 116, 6));
+}
+
+test "a BAR.SYNC carries an EMPTY wait mask, with a shared load still in flight" {
+    // The canonical tiled shape, in the arrangement that looks unsafe: an LDS reads the
+    // staged tile, the workgroup barrier comes next, and the FFMA that consumes the load
+    // comes AFTER the barrier. So the thread passes the barrier with a shared-memory load
+    // outstanding, and another thread's next-iteration STS writes that same tile.
+    //
+    // BOTH references say the barrier waits on nothing here.
+    //
+    //   - NAK `calc_instr_deps.rs`. `assign_barriers` calls `deps.add_barrier` (the full
+    //     drain of every active dependency) ONLY for `instr.is_branch()`, and `ir.rs`
+    //     `Op::is_branch` lists Bra, Sync, Brk, Cont and Exit. `Op::Bar` is NOT one of
+    //     them. `Op::Bar` does reach `op_needs_scoreboard`, because
+    //     `sm120_instr_latencies.rs` gives it `DecoupledAgu`, but `OpBar` is an EMPTY
+    //     struct with no source and no destination, so `for_each_instr_src_mut` and
+    //     `for_each_instr_dst_mut` never call `add_signal` for it. Its read and write
+    //     dependencies stay inactive, `dep_is_waited_after` is false for both, and the
+    //     barrier gets no scoreboard and no wait. The debug path agrees and is more
+    //     explicit: `assign_deps_serial` gives a branch `add_wt_bar_mask(0x3f)` and gives
+    //     `Op::Bar` only `set_yield(true)`.
+    //
+    //   - ptxas, which is the ground truth. A `__syncthreads()` tiled matmul compiled for
+    //     sm_120 holds 14 `BAR.SYNC` instructions, and every one of them has wait mask
+    //     0x00. ptxas positively emits THIS shape: two `LDS` with write barriers 0 and 1,
+    //     then the barrier with an empty mask, then the FFMAs that wait on barriers 0 and
+    //     1, then the `STS` that rewrites the tile.
+    //
+    // So the hardware completes the shared-memory ACCESS of a load before the barrier
+    // releases, even though the register writeback is still pending. Only the writeback
+    // carries a scoreboard, and only the writeback is late. A drain here would cost every
+    // result in flight at every barrier and would buy nothing.
+    var insts = [_]Inst{
+        encode.ldsU32(8, 4, .{}), // R8 <- tile[...]
+        encode.barSync(.{}),
+        encode.fadd(9, 8, 8, .{}), // consumes R8 AFTER the barrier
+        encode.stsU32(4, 9, .{}), // rewrites the same tile
+        encode.exit(.{}),
+    };
+    scheduleBlocks(&insts, &.{0});
+
+    // The barrier waits on nothing and claims nothing.
+    try std.testing.expectEqual(@as(u32, 0), getField(insts[1], 116, 6));
+    try std.testing.expectEqual(@as(u32, 7), getField(insts[1], 110, 3)); // none (7)
+    try std.testing.expectEqual(@as(u32, 7), getField(insts[1], 113, 3)); // none (7)
+
+    // The load keeps its scoreboard ACROSS the barrier, and the real consumer waits on it.
+    // A drain at the barrier would clear the tag and leave this consumer with no wait.
+    const lds_bar = getField(insts[0], 110, 3);
+    try std.testing.expect(lds_bar < 6);
+    try std.testing.expect((getField(insts[2], 116, 6) & (@as(u32, 1) << @intCast(lds_bar))) != 0);
+}
+
+test "a BSSY and a BSYNC carry an empty wait mask too" {
+    // The same question for the convergence ops. NAK `sm120_instr_latencies.rs` classes
+    // `Op::BClear`, `Op::BSSy` and `Op::BSync` as `Decoupled`, so all three pass
+    // `needs_scoreboards`, exactly as `Op::Bar` does. And exactly as with `Op::Bar` it
+    // changes nothing: each one addresses the Bar register file, none has a GPR source or
+    // a GPR destination, so `assign_barriers` signals no dependency for them and assigns
+    // no scoreboard and no wait. `Op::is_branch` does not name them either, so they do not
+    // take the drain that Bra and Exit take.
+    //
+    // ptxas agrees on sm_120: `BSSY.RECONVERGENT B0` and `BSYNC.RECONVERGENT B0` in a
+    // divergent kernel both carry wait mask 0x00.
+    //
+    // These three ops reconverge the WARP. They do not order memory, and a load in flight
+    // across them stays in flight, exactly as at a `BAR.SYNC`.
+    var insts = [_]Inst{
+        encode.ldgU32(8, 4, .{}), // R8 <- global, variable latency
+        encode.bclear(0, .{}),
+        encode.bssy(0, 0, .{}),
+        encode.bsync(0, .{}),
+        encode.fadd(9, 8, 8, .{}), // the real consumer
+        encode.exit(.{}),
+    };
+    scheduleBlocks(&insts, &.{0});
+
+    inline for (.{ 1, 2, 3 }) |i| {
+        try std.testing.expectEqual(@as(u32, 0), getField(insts[i], 116, 6));
+        try std.testing.expectEqual(@as(u32, 7), getField(insts[i], 110, 3)); // none (7)
+        try std.testing.expectEqual(@as(u32, 7), getField(insts[i], 113, 3)); // none (7)
+    }
+
+    const ldg_bar = getField(insts[0], 110, 3);
+    try std.testing.expect(ldg_bar < 6);
+    try std.testing.expect((getField(insts[4], 116, 6) & (@as(u32, 1) << @intCast(ldg_bar))) != 0);
 }

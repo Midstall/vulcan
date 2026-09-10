@@ -589,6 +589,14 @@ pub fn compileShader(allocator: std.mem.Allocator, func: *Function, stage: Stage
     // 251-GPR pool instead of exhausting it.
     foldConstantsToImm(func);
 
+    // Move each constant byte displacement into the load or store that reads it, so the
+    // access carries the offset in its own field instead of an IADD3 chain and a register.
+    // This runs before `assignLocs`, because it REWRITES each access to name the base
+    // pointer and the liveness scan must see that. See `foldAddressDisplacements`.
+    var disp = DispFold{};
+    defer disp.deinit(allocator);
+    try foldAddressDisplacements(allocator, func, &disp);
+
     var loc = std.AutoHashMapUnmanaged(Value, Loc){};
     defer loc.deinit(allocator);
     var max_reg: u8 = r_outptr + 1; // the output pointer pair is always live
@@ -656,8 +664,7 @@ pub fn compileShader(allocator: std.mem.Allocator, func: *Function, stage: Stage
         // compute kernel has no output pointer.
         if (layout.out_pointer) |out| {
             const at: u16 = @intCast(a.param_base + out.offset);
-            try code.append(allocator, encode.ldc(r_outptr, bank0, at, .{})); // outptr lo
-            try code.append(allocator, encode.ldc(r_outptr + 1, bank0, at + 4, .{})); // outptr hi
+            try emitPointerLdc(allocator, &code, r_outptr, bank0, at);
         }
         var placed: usize = 0;
         for (eparams) |p| {
@@ -669,21 +676,19 @@ pub fn compileShader(allocator: std.mem.Allocator, func: *Function, stage: Stage
             placed += 1;
             const at: u16 = @intCast(a.param_base + slot.offset);
             const lo = gprOf(loc, p);
-            try code.append(allocator, encode.ldc(lo, bank0, at, .{}));
-            // A 64-bit address occupies a register pair, so its high word follows in lo + 1.
+            // A 64-bit address occupies a register PAIR, so `emitPointerLdc` fills lo and
+            // lo + 1, with one LDC.64 where the offset allows it.
             //
             // A SHARED address does not. It is a 32-bit byte offset into the CTA's
-            // shared-memory window, so the single LDC above is the whole load. The parameter
+            // shared-memory window, so one 32-bit LDC is the whole load. The parameter
             // block still reserves `pointer_bytes` for it, because `layoutParams` places every
             // pointer at the target's address width, so the runtime writes the offset into the
             // low dword of that slot and leaves the high dword alone.
             switch (slot.kind) {
-                .scalar => {},
+                .scalar => try code.append(allocator, encode.ldc(lo, bank0, at, .{})),
                 .pointer => |space| switch (space) {
-                    .global, .constant, .private => {
-                        try code.append(allocator, encode.ldc(lo + 1, bank0, at + 4, .{}));
-                    },
-                    .shared => {},
+                    .global, .constant, .private => try emitPointerLdc(allocator, &code, lo, bank0, at),
+                    .shared => try code.append(allocator, encode.ldc(lo, bank0, at, .{})),
                 },
             }
         }
@@ -874,8 +879,7 @@ pub fn compileShader(allocator: std.mem.Allocator, func: *Function, stage: Stage
             if (isWidePtr(func, p)) {
                 const slot = attrTag(func, p, "binding") orelse ubo_slot;
                 const off = encode.graphics_ubo_cb_base + slot * 8;
-                try code.append(allocator, encode.ldc(rd, encode.graphics_const_bank, off, .{})); // address lo (root table 1)
-                try code.append(allocator, encode.ldc(rd + 1, encode.graphics_const_bank, off + 4, .{})); // address hi
+                try emitPointerLdc(allocator, &code, rd, encode.graphics_const_bank, off); // the 64-bit address (root table 1)
                 ubo_slot += 1;
                 continue;
             }
@@ -922,7 +926,7 @@ pub fn compileShader(allocator: std.mem.Allocator, func: *Function, stage: Stage
         var terminated = false;
 
         for (func.blockInsts(block)) |inst| {
-            try lowerInst(allocator, func, &loc, &code, &tex, &deriv, &math, &shared, inst);
+            try lowerInst(allocator, func, &loc, &code, &tex, &deriv, &math, &shared, &disp, inst);
             if (func.opcode(inst) == .@"if") {
                 // Set up the convergence barrier just before the divergent
                 // branch. BCLEAR initializes the barrier register, and BSSY
@@ -1288,9 +1292,9 @@ fn isBool(func: *const Function, v: Value) bool {
 
 /// The 32-bit value or bit pattern of a scalar constant value: an integer
 /// constant's value, or a float constant's IEEE-754 f32 bits. Returns null if
-/// `value` is not a constant. The nvidia `arith_imm` lowering materializes
-/// this with `movImm` into a scratch register, so any 32-bit constant, int or
-/// float, can be an immediate operand.
+/// `value` is not a constant. The nvidia `arith_imm` lowering writes this
+/// straight into the instruction's 32-bit immediate field, so any 32-bit
+/// constant, int or float, can be an immediate operand.
 fn constBits(func: *const Function, value: Value) ?i64 {
     const inst = func.definingInst(value) orelse return null;
     return switch (func.opcode(inst)) {
@@ -1307,19 +1311,18 @@ fn isCommutativeBinOp(op: ir.function.BinOp) bool {
     };
 }
 
-/// Fold a constant operand of an `arith` into `arith_imm`, so codegen
-/// materializes the constant as a scratch-register immediate (movImm) at the
-/// use, instead of holding it in an allocated GPR for its whole live range.
+/// Fold a constant operand of an `arith` into `arith_imm`, so codegen puts the
+/// constant in the instruction's own immediate field instead of holding it in
+/// an allocated GPR for its whole live range.
 /// The simplex-noise and terrain shaders define 100 or more float constants.
 /// Without this fold, those constants would each pin a register and exhaust
 /// the GPR pool, since the linear-scan allocator has no spilling. After
 /// folding, those constants are dead: each is a [def,def] interval that
 /// reuses one register, so peak pressure drops to the real computation
 /// pressure. This skips div and rem, since those are lowered specially and
-/// not through the general arith_imm movImm-plus-arith path, pointer adds
-/// (64-bit carry), and bool ops (predicate combines). Non-commutative ops
-/// fold only the right operand, since the arith_imm form computes
-/// `lhs op imm`.
+/// not through the general `arithImm` path, pointer adds (64-bit carry), and
+/// bool ops (predicate combines). Non-commutative ops fold only the right
+/// operand, since the arith_imm form computes `lhs op imm`.
 fn foldConstantsToImm(func: *Function) void {
     var i: usize = 0;
     while (i < func.instCount()) : (i += 1) {
@@ -1340,6 +1343,160 @@ fn foldConstantsToImm(func: *Function) void {
         } else if (isCommutativeBinOp(a.op)) {
             if (constBits(func, a.lhs)) |c| {
                 op.* = .{ .arith_imm = .{ .op = a.op, .lhs = a.rhs, .imm = c } };
+            }
+        }
+    }
+}
+
+/// What the address-displacement fold decided, per instruction.
+///
+/// LDG, STG, LDS and STS each carry a 24-BIT SIGNED BYTE DISPLACEMENT that the hardware
+/// adds to the address register. A constant array index or a struct field offset belongs
+/// there. Without this fold the instruction selector computed every such address with an
+/// IADD3, or with an IADD3 plus an IADD3.X for a 64-bit pointer, and gave the sum a
+/// register of its own: three instructions and one register for a number the access could
+/// have carried itself.
+const DispFold = struct {
+    /// The displacement each folded access carries, keyed by the load or store.
+    at: std.AutoHashMapUnmanaged(ir.function.Inst, i32) = .empty,
+    /// The address instructions the fold left with NO USE AT ALL. Emitting one would
+    /// compute a register nothing reads.
+    dead: std.AutoHashMapUnmanaged(ir.function.Inst, void) = .empty,
+
+    fn deinit(self: *DispFold, allocator: std.mem.Allocator) void {
+        self.at.deinit(allocator);
+        self.dead.deinit(allocator);
+    }
+
+    /// The byte displacement of a load or store. Zero when nothing folded into it.
+    fn offsetOf(self: *const DispFold, inst: ir.function.Inst) i32 {
+        return self.at.get(inst) orelse 0;
+    }
+
+    /// Whether `inst` computes an address that no instruction reads any more.
+    fn isDead(self: *const DispFold, inst: ir.function.Inst) bool {
+        return self.dead.contains(inst);
+    }
+};
+
+/// One step up an address chain: the pointer `v` is `base + imm` bytes, and the constant
+/// can move into the access that reads `v`. Returns null when it cannot.
+///
+/// THE PRIVATE ADDRESS SPACE IS REFUSED. The only private pointers this backend supports
+/// are the texture-sample result alloca and its element pointers, which `TexLowering`
+/// resolves to TEX result REGISTERS and never to memory at all.
+///
+/// A POINTER THAT CARRIES AN ATTRIBUTE IS REFUSED. A graphics output attribute, a fragment
+/// color, gl_FragDepth and the derivative gradient buffer are all identified by a tag on
+/// the pointer value, and each lowers to something other than a memory access. Folding
+/// would move the access onto a different value and lose the tag.
+fn addrChainStep(func: *const Function, v: Value) ?struct { base: Value, imm: i64 } {
+    const space = ptrSpace(func, v) orelse return null;
+    switch (space) {
+        .global, .constant, .shared => {},
+        .private => return null,
+    }
+    if (hasAnyAttribute(func, v)) return null;
+    const inst = func.definingInst(v) orelse return null;
+    const a = switch (func.opcode(inst)) {
+        .arith_imm => |x| x,
+        else => return null,
+    };
+    if (a.op != .add) return null;
+    return .{ .base = a.lhs, .imm = a.imm };
+}
+
+/// Whether any attribute is attached to `v`. See `addrChainStep` for why the fold cares.
+fn hasAnyAttribute(func: *const Function, v: Value) bool {
+    var it = func.attributesOf(.{ .value = v });
+    return it.next() != null;
+}
+
+/// Move every constant byte displacement out of a load's or store's address chain and into
+/// the access itself, then record which address instructions that left with nothing to do.
+///
+/// THE REWRITE CHANGES THE IR, and that is deliberate. The access now names the BASE
+/// pointer as its operand, so the liveness scan that follows extends the base's live range
+/// to the access on its own. A side table would not: the linear-scan allocator would end
+/// the base's range at the address instruction and hand its register to the next value
+/// before the access read it.
+///
+/// This runs BEFORE `assignLocs`, for that reason, and therefore before `TexLowering` and
+/// `DerivLowering` scan. `addrChainStep` refuses every pointer either of those owns.
+fn foldAddressDisplacements(allocator: std.mem.Allocator, func: *Function, out: *DispFold) Error!void {
+    const nblocks = func.blockCount();
+    for (0..nblocks) |bi| {
+        for (func.blockInsts(@enumFromInt(bi))) |inst| {
+            const ptr = switch (func.opcode(inst)) {
+                .load => |l| l.ptr,
+                .store => |s| s.ptr,
+                else => continue,
+            };
+            var base = ptr;
+            var total: i64 = 0;
+            // Collapse a whole chain, so `(p + 4) + 8` folds as one displacement of 12.
+            // The walk stops at the first step that would leave the field's range.
+            while (addrChainStep(func, base)) |step| {
+                if (!encode.fitsAddrOffset(total + step.imm)) break;
+                total += step.imm;
+                base = step.base;
+            }
+            if (base == ptr) continue;
+            // The base is what the access will read, so it must keep its own identity for
+            // the same reason `addrChainStep` refuses a tagged pointer.
+            if (hasAnyAttribute(func, base)) continue;
+            const op = func.opcodeMut(inst);
+            switch (op.*) {
+                .load => |l| {
+                    var moved = l;
+                    moved.ptr = base;
+                    op.* = .{ .load = moved };
+                },
+                .store => |s| {
+                    var moved = s;
+                    moved.ptr = base;
+                    op.* = .{ .store = moved };
+                },
+                else => continue,
+            }
+            try out.at.put(allocator, inst, @intCast(total));
+        }
+    }
+
+    // An address instruction whose result nothing reads any more. The fold above is the
+    // only thing that removes a use, so this finds exactly the addresses it emptied, plus
+    // any pointer arithmetic that was already dead.
+    //
+    // THE SCAN REPEATS UNTIL IT FINDS NOTHING NEW, because a chain dies from the far end
+    // inwards. In `(p + 4) + 8` the fold empties the outer add first, and the inner add
+    // still looks used until the outer one is known dead. One pass therefore leaves the
+    // inner add alive, and it is a 64-bit pointer add, so it costs two instructions and a
+    // register pair for an address the load no longer reads.
+    const nval = func.valueCount();
+    if (nval == 0) return;
+    const used = try allocator.alloc(bool, nval);
+    defer allocator.free(used);
+    var changed = true;
+    while (changed) {
+        changed = false;
+        @memset(used, false);
+        for (0..nblocks) |bi| {
+            const block: Block = @enumFromInt(bi);
+            for (func.blockInsts(block)) |inst| {
+                if (out.dead.contains(inst)) continue;
+                markUsedBitset(func, inst, used);
+            }
+            if (func.terminator(block)) |term| markUsedTermBitset(func, term, used);
+        }
+        for (0..nblocks) |bi| {
+            for (func.blockInsts(@enumFromInt(bi))) |inst| {
+                if (out.dead.contains(inst)) continue;
+                if (func.opcode(inst) != .arith_imm) continue;
+                const r = func.instResult(inst) orelse continue;
+                if (ptrSpace(func, r) == null) continue; // an address, not a value
+                if (used[@intFromEnum(r)]) continue;
+                try out.dead.put(allocator, inst, {});
+                changed = true;
             }
         }
     }
@@ -1616,11 +1773,39 @@ fn emitComputeBuiltin(
     }
 }
 
+/// Load a 64-bit address from a constant bank into the register pair (dst, dst + 1).
+///
+/// ONE `LDC.64` DOES BOTH HALVES. Two 32-bit LDCs were emitted before, and every kernel
+/// paid an extra instruction per pointer parameter in its prologue.
+///
+/// A 64-bit constant-bank read needs an 8-ALIGNED offset. `gpu.abi.layoutParams` aligns
+/// every pointer slot to the target's pointer width, so the offset inside the block is
+/// always 8-aligned, but `Abi.param_base` is DATA that a runtime chooses: the nvidia.zig
+/// dispatch uses 0 and the CUDA driver uses 0x160, both 8-aligned, and a base that is only
+/// 4-aligned would move every pointer off it. So the alignment is checked and not assumed,
+/// and a misaligned offset takes the two-LDC path that always worked.
+///
+/// `dst` is even, because `assignLocs` gives every 64-bit address an aligned pair.
+fn emitPointerLdc(
+    allocator: std.mem.Allocator,
+    code: *std.ArrayList(Inst),
+    dst: u8,
+    bank: u5,
+    at: u16,
+) Error!void {
+    if (at % 8 == 0 and dst % 2 == 0) {
+        try code.append(allocator, encode.ldcWide(dst, bank, at, .{}));
+        return;
+    }
+    try code.append(allocator, encode.ldc(dst, bank, at, .{})); // address lo
+    try code.append(allocator, encode.ldc(dst + 1, bank, at + 4, .{})); // address hi
+}
+
 /// Emit `gid.a = ctaid.a * ntid.a + tid.a` into `dst` for axis `a`.
 ///
-/// The workgroup size is a compile-time constant, so it becomes an immediate rather than a
-/// second hardware read. The two scratch registers hold the hardware reads: the prologue owns
-/// them, and the allocator keeps values out of them.
+/// The workgroup size is a compile-time constant, so it goes in IMAD's own immediate field
+/// rather than into a register of its own. The two scratch registers hold the hardware
+/// reads: the prologue owns them, and the allocator keeps values out of them.
 fn emitGlobalId(
     allocator: std.mem.Allocator,
     code: *std.ArrayList(Inst),
@@ -1629,10 +1814,9 @@ fn emitGlobalId(
     a: u2,
 ) Error!void {
     const size = gpu.attrs.localSize(func)[a];
-    try code.append(allocator, encode.movImm(dst, size, .{}));
     try code.append(allocator, encode.s2r(r_scratch, encode.sr_tid[a], .{}));
     try code.append(allocator, encode.s2r(r_scratch2, encode.sr_ctaid[a], .{}));
-    try code.append(allocator, encode.imad(dst, r_scratch2, dst, r_scratch, .{}));
+    try code.append(allocator, encode.imadImm(dst, r_scratch2, size, r_scratch, .{}));
 }
 
 /// Whether `v` carries the named `vulcan.gpu` flag or attribute, in any value form.
@@ -2410,7 +2594,7 @@ fn emitCubeAtlasUv(allocator: std.mem.Allocator, code: *std.ArrayList(Inst), loc
     try code.append(allocator, encode.ffma(call.coord + 1, s + 3, s + 1, s + 1, .{})); // v
 }
 
-fn lowerInst(allocator: std.mem.Allocator, func: *const Function, loc: *std.AutoHashMapUnmanaged(Value, Loc), code: *std.ArrayList(Inst), tex: *const TexLowering, deriv: *const DerivLowering, math: *const MathLowering, shared: *const gpu.abi.SharedFrame, inst: ir.function.Inst) Error!void {
+fn lowerInst(allocator: std.mem.Allocator, func: *const Function, loc: *std.AutoHashMapUnmanaged(Value, Loc), code: *std.ArrayList(Inst), tex: *const TexLowering, deriv: *const DerivLowering, math: *const MathLowering, shared: *const gpu.abi.SharedFrame, disp: *const DispFold, inst: ir.function.Inst) Error!void {
     switch (func.opcode(inst)) {
         .iconst => |c| {
             // A graphics output-attribute store pointer is a tag-carrier
@@ -2437,14 +2621,24 @@ fn lowerInst(allocator: std.mem.Allocator, func: *const Function, loc: *std.Auto
             // derivative, so its address arith is never emitted.
             if (deriv.grad_ptr.contains(result)) return;
             if (isWidePtr(func, result) and a.op == .add) {
-                // 64-bit pointer add: (dst:dst+1) = (base:base+1) +
-                // zext(offset). The low add produces a carry that the high
-                // add (`.X`) consumes.
+                // 64-bit pointer add: (dst:dst+1) = (base:base+1) + zext(offset).
+                //
+                // ONE IMAD.WIDE.U32 DOES ALL OF IT. The unsigned wide multiply-add
+                // computes `zext(offset) * 1 + (base:base+1)` as one 64-bit sum, which is
+                // exactly what the pair of adds computed: the low half, the carry out of
+                // it, and the high half. It replaces an IADD3 with a carry-out predicate
+                // plus an IADD3.X that reads it, so it also frees the carry predicate for
+                // the whole span the two adds used to hold it.
+                //
+                // The scale is 1 and not the element size on purpose. Folding the element
+                // size in would make the product a FULL 64-bit `index * size`, while the
+                // IR says the byte offset is computed in 32 bits and then widened, and the
+                // two differ whenever that 32-bit offset would wrap. See the report note
+                // on what folding the scale would need.
                 const dlo = gprOf(loc.*, result);
                 const base = gprOf(loc.*, a.lhs); // pointer pair (lo:hi)
                 const offset = gprOf(loc.*, a.rhs); // 32-bit, zero-extended
-                try code.append(allocator, encode.iadd3CarryOut(dlo, base, offset, carry_pred, .{}));
-                try code.append(allocator, encode.iadd3CarryIn(dlo + 1, base + 1, encode.RZ, carry_pred, .{}));
+                try code.append(allocator, encode.imadWideImm(dlo, offset, 1, base, false, .{}));
             } else if (isBool(func, result)) {
                 // A boolean-valued bitwise op is a logical predicate combine
                 // (`a && b`, `a || b`, `a ^^ b`). The shared lowering emits
@@ -2573,14 +2767,14 @@ fn lowerInst(allocator: std.mem.Allocator, func: *const Function, loc: *std.Auto
             // instruction. Its address is a 32-bit offset in ONE register,
             // so there is no pointer pair to read.
             if (isSharedPtr(func, l.ptr)) {
-                try code.append(allocator, encode.lds(rd, gprOf(loc.*, l.ptr), width, .{}));
+                try code.append(allocator, encode.ldsAt(rd, gprOf(loc.*, l.ptr), disp.offsetOf(inst), width, .{}));
                 return;
             }
             // Otherwise this is an ordinary LDG from the 64-bit pointer pair
             // into the result register. This is variable latency: the
             // scoreboard scheduler assigns its write barrier and the wait on
             // each consumer.
-            try code.append(allocator, encode.ldg(rd, gprOf(loc.*, l.ptr), width, .{}));
+            try code.append(allocator, encode.ldgAt(rd, gprOf(loc.*, l.ptr), disp.offsetOf(inst), width, .{}));
         },
         .store => |st| {
             // A store whose pointer is tagged with a graphics output
@@ -2616,15 +2810,19 @@ fn lowerInst(allocator: std.mem.Allocator, func: *const Function, loc: *std.Auto
                 // VALUE's type decides the width: a 32-bit store of a byte
                 // value destroys the three bytes beside it.
                 const width = try memTypeOf(func, st.value);
-                try code.append(allocator, encode.sts(gprOf(loc.*, st.ptr), gprOf(loc.*, st.value), width, .{}));
+                try code.append(allocator, encode.stsAt(gprOf(loc.*, st.ptr), gprOf(loc.*, st.value), disp.offsetOf(inst), width, .{}));
             } else {
                 const width = try memTypeOf(func, st.value);
-                try code.append(allocator, encode.stg(gprOf(loc.*, st.ptr), gprOf(loc.*, st.value), width, .{}));
+                try code.append(allocator, encode.stgAt(gprOf(loc.*, st.ptr), gprOf(loc.*, st.value), disp.offsetOf(inst), width, .{}));
             }
         },
         .prefetch => {}, // a hint; this GPU target has no CPU-style prefetch, so it is dropped
         .arith_imm => |a| {
             const result = func.instResult(inst).?;
+            // An address whose constant moved into the load or store that read it. The
+            // sum has no reader left, so computing it would waste an instruction and a
+            // register. See `foldAddressDisplacements`.
+            if (disp.isDead(inst)) return;
             // Logical NOT lowers to `bool ^ -1` (bit_xor against all-ones).
             // A boolean result lives in a predicate, so negate the source
             // predicate with PLOP3 (`p ^ PT` = `!p`, since PT is true). The
@@ -2634,11 +2832,35 @@ fn lowerInst(allocator: std.mem.Allocator, func: *const Function, loc: *std.Auto
                 const pd = predOf(loc.*, result);
                 const pa = predOf(loc.*, a.lhs);
                 try code.append(allocator, encode.plop3(pd, pa, encode.PT, encode.LUT_XOR, .{}));
+            } else if (isWidePtr(func, result) and a.op == .add) {
+                // A 64-bit pointer plus a CONSTANT byte offset, the same carry chain the
+                // register form uses: (dst:dst+1) = (base:base+1) + zext(imm).
+                //
+                // Before this arm the constant add fell to the 32-bit path below, which
+                // wrote the LOW half of the pair and LEFT THE HIGH HALF UNWRITTEN. The
+                // access that read the pair then took whatever the high register held.
+                // Every kernel that reached a constant array index through a global
+                // pointer had that shape. Most such adds now fold into the access itself,
+                // so this arm covers the ones that do not: a displacement too wide for the
+                // 24-bit field, or an address a second instruction still reads.
+                //
+                // THE CONSTANT IS SIGN EXTENDED, not zero extended. A negative byte offset
+                // is an ordinary thing to write, and its high word is 0xFFFFFFFF: added as
+                // zero it would move the address 4 GiB up instead of a few bytes down. The
+                // REGISTER form beside this one zero-extends, and that is right for it,
+                // because the offset there is a 32-bit IR value and not a signed constant.
+                const dlo = gprOf(loc.*, result);
+                const base = gprOf(loc.*, a.lhs);
+                const wide: i64 = a.imm;
+                const lo_bits: u32 = @truncate(@as(u64, @bitCast(wide)));
+                const hi_bits: u32 = @truncate(@as(u64, @bitCast(wide)) >> 32);
+                try code.append(allocator, encode.iadd3CarryOutImm(dlo, base, lo_bits, carry_pred, .{}));
+                try code.append(allocator, encode.iadd3CarryInImm(dlo + 1, base + 1, hi_bits, carry_pred, .{}));
             } else {
                 const rd = gprOf(loc.*, result);
                 const ra = gprOf(loc.*, a.lhs);
-                try code.append(allocator, encode.movImm(r_scratch, @truncate(@as(u64, @bitCast(a.imm))), .{}));
-                try code.append(allocator, try arith(func, a.op, rd, ra, r_scratch, a.lhs));
+                const bits: u32 = @truncate(@as(u64, @bitCast(a.imm)));
+                try code.append(allocator, try arithImm(func, a.op, rd, ra, bits, a.lhs));
             }
         },
         .icmp => |cmp| {
@@ -2973,6 +3195,37 @@ fn arith(func: *const Function, op: ir.function.BinOp, rd: u8, ra: u8, rb: u8, l
     };
 }
 
+/// The same binary operation as `arith`, but with a CONSTANT right operand that
+/// goes straight into the instruction's immediate field.
+///
+/// Every ALU op here has a form that reads a 32-bit immediate in place of its
+/// second source register, so the constant costs no MOV and no register. The
+/// old lowering emitted `movImm` into a scratch register and then the register
+/// form, which is two instructions and an extra write for every constant in the
+/// kernel. See the immediate-form section of `encode.zig`.
+///
+/// SUBTRACTION NEGATES THE VALUE rather than the operand. The register forms
+/// subtract by setting the srcB negate bit, which is bit 63, and the immediate
+/// forms use bit 63 as a value bit.
+///
+/// The shift ops read a shift COUNT, not a general operand, so their immediate
+/// is the count and the value stays in a register.
+fn arithImm(func: *const Function, op: ir.function.BinOp, rd: u8, ra: u8, imm: u32, lhs: Value) Error!Inst {
+    const is_float = isFloat(func, lhs);
+    return switch (op) {
+        .add => if (is_float) encode.faddImm(rd, ra, imm, .{}) else encode.iadd3Imm(rd, ra, imm, .{}),
+        .sub => if (is_float) encode.fsubImm(rd, ra, imm, .{}) else encode.iadd3Imm(rd, ra, 0 -% imm, .{}),
+        .mul => if (is_float) encode.fmulImm(rd, ra, imm, .{}) else encode.imadImm(rd, ra, imm, encode.RZ, .{}),
+        .bit_and => encode.lop3Imm(rd, ra, imm, encode.LUT_AND, .{}),
+        .bit_or => encode.lop3Imm(rd, ra, imm, encode.LUT_OR, .{}),
+        .bit_xor => encode.lop3Imm(rd, ra, imm, encode.LUT_XOR, .{}),
+        .shl => encode.shfImm(rd, ra, imm, false, false, .{}),
+        .shr => encode.shfImm(rd, ra, imm, true, isSignedRaw(func, lhs), .{}),
+        // The same three `arith` refuses, for the same reasons.
+        .div, .rem, .mulh => error.Unsupported,
+    };
+}
+
 /// The 3-input logic-op LUT (src0=0xF0, src1=0xCC, src2=0xAA truth table)
 /// for a two-input bitwise op, shared by LOP3 (integer) and PLOP3
 /// (predicate). Only the bitwise ops are valid here, since a logical
@@ -3057,17 +3310,99 @@ fn emitJump(allocator: std.mem.Allocator, func: *const Function, loc: *std.AutoH
     try fixups.append(allocator, .{ .at = at, .target = @intFromEnum(jump.target) });
 }
 
-/// Edge moves into the target block's parameters (register copies). Distinct
-/// registers per value mean the moves are independent, except for genuine
-/// swaps. A scratch register breaks any cycle.
+/// One register-to-register copy on a control-flow edge.
+const EdgeMove = struct { dst: u8, src: u8 };
+
+/// Edge moves into the target block's parameters.
+///
+/// These copies are a PARALLEL assignment: every source is read as it was before the edge,
+/// and every destination is written after. Emitting them in argument order does not do
+/// that, and `emitParallelCopy` is what makes the emitted order behave as if they happened
+/// at once.
+///
+/// A 64-BIT ADDRESS MOVES AS A PAIR. `assignLocs` gives a global, constant or private
+/// pointer an aligned register pair, so a single copy of the low half left the high half of
+/// the target parameter holding whatever the allocator last put there, and every access
+/// through that parameter addressed another place.
+///
+/// A BOOLEAN LIVES IN A PREDICATE, not a GPR. There is no spare predicate to break a cycle
+/// with: the allocator hands out P0..P5 and P6 is the carry scratch. An edge that passes
+/// one is refused, which is what `gprOf` would otherwise reach an `unreachable` on.
 fn emitMoves(allocator: std.mem.Allocator, func: *const Function, loc: *std.AutoHashMapUnmanaged(Value, Loc), code: *std.ArrayList(Inst), jump: ir.function.Jump) Error!void {
     const args = func.blockArgs(jump);
     const params = func.blockParams(jump.target);
     if (args.len != params.len) return error.Unsupported;
+
+    var moves: std.ArrayList(EdgeMove) = .empty;
+    defer moves.deinit(allocator);
     for (args, params) |arg, param| {
+        if (isBool(func, param) or isBool(func, arg)) return error.Unsupported;
         const dst = gprOf(loc.*, param);
         const src = gprOf(loc.*, arg);
-        if (dst != src) try code.append(allocator, encode.movReg(dst, src, .{}));
+        const span: u8 = if (isWidePtr(func, param)) 2 else 1;
+        var i: u8 = 0;
+        while (i < span) : (i += 1) {
+            if (dst + i != src + i) try moves.append(allocator, .{ .dst = dst + i, .src = src + i });
+        }
+    }
+    try emitParallelCopy(allocator, code, &moves);
+}
+
+/// Whether a move OTHER than the one at `skip` still reads `reg`.
+fn readByAnotherMove(moves: []const EdgeMove, skip: usize, reg: u8) bool {
+    for (moves, 0..) |m, i| {
+        if (i == skip) continue;
+        if (m.src == reg) return true;
+    }
+    return false;
+}
+
+/// Emit a set of register copies so that the result is the PARALLEL assignment they
+/// describe, whatever order the hardware runs them in.
+///
+/// Emitted in the order they were built, a copy can overwrite a register a later copy still
+/// reads. A CYCLE has no safe order at all. The old code emitted a five-way block-parameter
+/// permutation as five plain MOVs:
+///
+///     MOV R4, R9 ; MOV R5, R7 ; MOV R7, R4 ; MOV R8, R5 ; MOV R9, R8
+///
+/// The first MOV destroyed R4, so the third copied the NEW R4 into R7 and the value R4 held
+/// never arrived. R7 came out zero. Every block argument on an edge whose permutation
+/// contains a cycle was silently lost.
+///
+/// The rule is the standard one. Emit any move whose DESTINATION no other remaining move
+/// reads: nothing else needs the register it overwrites, so it is safe now. When no such
+/// move is left, only cycles remain. Park one cycle member's source in the scratch register
+/// and point every reader of that register at the scratch instead, which opens the cycle
+/// into a chain.
+///
+/// THE SCRATCH IS FREE AGAIN BEFORE THE NEXT PARK. Breaking a cycle makes exactly one of its
+/// own moves ready, and no move of any OTHER cycle can be ready, so the broken cycle unwinds
+/// to its end before the loop stalls again. The last move of that chain is the one that
+/// reads the scratch.
+///
+/// `r_scratch` is the parking register. The prologue owns it and `assignLocs` gives it to no
+/// value, so parking there destroys nothing.
+fn emitParallelCopy(allocator: std.mem.Allocator, code: *std.ArrayList(Inst), moves: *std.ArrayList(EdgeMove)) Error!void {
+    // Each turn either emits a move or breaks a cycle, and a broken cycle lets at least one
+    // move go on the next turn, so the whole set drains.
+    while (moves.items.len > 0) {
+        var ready: ?usize = null;
+        for (moves.items, 0..) |m, i| {
+            if (readByAnotherMove(moves.items, i, m.dst)) continue;
+            ready = i;
+            break;
+        }
+        if (ready) |i| {
+            const m = moves.orderedRemove(i);
+            try code.append(allocator, encode.movReg(m.dst, m.src, .{}));
+            continue;
+        }
+        const parked = moves.items[0].src;
+        try code.append(allocator, encode.movReg(r_scratch, parked, .{}));
+        for (moves.items) |*m| {
+            if (m.src == parked) m.src = r_scratch;
+        }
     }
 }
 
@@ -3315,6 +3650,10 @@ test "compiles a vertex shader: attribute load, compute, attribute store, exit" 
     defer kernel.deinit(allocator);
 
     // The sequence is: ALD (attribute fetch), FADD, AST (write position), EXIT.
+    //
+    // The FADD is the IMMEDIATE form (0x421), not the register form (0x221): the 1.0 is a
+    // constant, so `foldConstantsToImm` moves it into the instruction and no MOV
+    // materializes it. `encode.faddImm` explains why an immediate FADD carries form 2.
     var has_ald = false;
     var has_fadd = false;
     var has_ast = false;
@@ -3323,7 +3662,7 @@ test "compiles a vertex shader: attribute load, compute, attribute store, exit" 
     while (i < kernel.code.len) : (i += 4) {
         switch (kernel.code[i] & 0xfff) {
             0x321 => has_ald = true,
-            0x221 => has_fadd = true,
+            0x421 => has_fadd = true,
             0x322 => has_ast = true,
             0x94d => has_exit = true,
             else => {},
@@ -3359,9 +3698,9 @@ test "graphics: a UBO pointer param loads its address from constant bank (LDC), 
     var kernel = try compileShader(allocator, &func, .vertex, nvidia_abi);
     defer kernel.deinit(allocator);
 
-    // The prologue must source the UBO pointer from the constant bank (two
-    // LDCs for the 64-bit address pair), and the body must LDG through it,
-    // plus do an ALD for the input.
+    // The prologue must source the UBO pointer from the constant bank (ONE LDC.64 for the
+    // whole 64-bit address), and the body must LDG through it, plus do an ALD for the
+    // input.
     var ldc_count: usize = 0;
     var has_ldg = false;
     var has_ald = false;
@@ -3374,10 +3713,10 @@ test "graphics: a UBO pointer param loads its address from constant bank (LDC), 
             else => {},
         }
     }
-    try testing.expectEqual(@as(usize, 2), ldc_count); // address lo + hi
+    try testing.expectEqual(@as(usize, 1), ldc_count); // one LDC.64 for the whole address
     try testing.expect(has_ldg);
     try testing.expect(has_ald);
-    // The LDC offset of the first (address-lo) load is graphics_ubo_cb_base.
+    // The LDC reads the whole address at graphics_ubo_cb_base.
     i = 0;
     var first_ldc_off: ?u16 = null;
     while (i < kernel.code.len) : (i += 4) {
@@ -3422,7 +3761,7 @@ test "graphics: gl_VertexIndex sources from S2R and pulls a vec from a UBO array
 
     // This must source gl_VertexIndex through ALD a[ATTR_VERTEX_ID] (the
     // DA-delivered vertex-ID attribute), scale it (IMAD index*stride), load
-    // the UBO pointer (LDC x2), and LDG through base+offset. The only ALD
+    // the UBO pointer (one LDC.64), and LDG through base+offset. The only ALD
     // is the vertex-ID read. There is no vertex attribute, since the vertex
     // shader pulls from the UBO, not a vertex buffer.
     var has_ald_vid = false;
@@ -3437,7 +3776,7 @@ test "graphics: gl_VertexIndex sources from S2R and pulls a vec from a UBO array
                 ald_count += 1;
                 if ((kernel.code[i + 1] >> 8) & 0x3ff == encode.ATTR_VERTEX_ID) has_ald_vid = true;
             },
-            0x224 => has_imad = true, // IMAD (base 0x024 | reg form)
+            0x824 => has_imad = true, // IMAD with an immediate scale (base 0x024 | imm form)
             0xb82 => ldc_count += 1,
             0x981 => has_ldg = true,
             else => {},
@@ -3445,7 +3784,8 @@ test "graphics: gl_VertexIndex sources from S2R and pulls a vec from a UBO array
     }
     try testing.expect(has_ald_vid);
     try testing.expect(has_imad);
-    try testing.expectEqual(@as(usize, 2), ldc_count); // UBO address lo + hi
+    // ONE LDC.64 reads the whole UBO address. It was two 32-bit LDCs before.
+    try testing.expectEqual(@as(usize, 1), ldc_count);
     try testing.expect(has_ldg);
     try testing.expectEqual(@as(usize, 1), ald_count); // only the vertex-id ALD, no attribute fetch
 }
@@ -3465,27 +3805,28 @@ test "compiles a kernel: load params, multiply-add, store, exit" {
     var kernel = try compileKernel(allocator, &func, nvidia_abi);
     defer kernel.deinit(allocator);
 
-    // Prologue: LDC outptr lo/hi plus two inputs equals 4 instructions,
-    // then IMAD, IADD3, STG, EXIT equals 8 instructions total (32 dwords).
-    try testing.expectEqual(@as(usize, 8 * 4), kernel.code.len);
+    // Prologue: ONE LDC.64 for the output pointer plus two scalar LDCs equals 3
+    // instructions, then IMAD, IADD3, STG, EXIT equals 7 instructions total (28 dwords).
+    // The output pointer took two LDCs of its own before.
+    try testing.expectEqual(@as(usize, 7 * 4), kernel.code.len);
     try testing.expectEqual(@as(u32, 0xb82), kernel.code[0] & 0xfff); // first LDC
-    // The first LDC reads the output pointer low word at the ABI's parameter base.
+    // The first LDC reads the whole output pointer at the ABI's parameter base.
     try testing.expectEqual(
         @as(u32, nvidia_abi.param_base),
         @as(u32, @as(u16, @truncate(kernel.code[1] >> 6)) & 0xffff),
     );
 
-    // The instruction words: LDC x4, IMAD, IADD3, STG, EXIT.
+    // The instruction words: LDC.64, LDC, LDC, IMAD, IADD3, STG, EXIT.
     const op = struct {
         fn at(code: []const u32, i: usize) u32 {
             return code[i * 4] & 0xfff;
         }
     }.at;
-    try testing.expectEqual(@as(u32, 0xb82), op(kernel.code, 3)); // last param LDC
-    try testing.expectEqual(@as(u32, 0x224), op(kernel.code, 4)); // IMAD (base 0x024 | reg form)
-    try testing.expectEqual(@as(u32, 0x210), op(kernel.code, 5)); // IADD3
-    try testing.expectEqual(@as(u32, 0x986), op(kernel.code, 6)); // STG
-    try testing.expectEqual(@as(u32, 0x94d), op(kernel.code, 7)); // EXIT
+    try testing.expectEqual(@as(u32, 0xb82), op(kernel.code, 2)); // last param LDC
+    try testing.expectEqual(@as(u32, 0x224), op(kernel.code, 3)); // IMAD (base 0x024 | reg form)
+    try testing.expectEqual(@as(u32, 0x210), op(kernel.code, 4)); // IADD3
+    try testing.expectEqual(@as(u32, 0x986), op(kernel.code, 5)); // STG
+    try testing.expectEqual(@as(u32, 0x94d), op(kernel.code, 6)); // EXIT
 }
 
 test "the emitted LDC offsets match the offsets LaunchInfo reports" {
@@ -3518,14 +3859,14 @@ test "the emitted LDC offsets match the offsets LaunchInfo reports" {
         try offsets.append(allocator, @as(u16, @truncate(kernel.code[i + 1] >> 6)) & 0xffff);
     }
 
-    // The output pointer is a pair, then the buffer pointer is a pair, then the scalar.
-    try testing.expectEqual(@as(usize, 5), offsets.items.len);
+    // The output pointer is ONE LDC.64, then the buffer pointer is ONE LDC.64, then the
+    // scalar. Each pointer took two LDCs before, so this was five.
+    try testing.expectEqual(@as(usize, 3), offsets.items.len);
     try testing.expectEqual(@as(usize, 2), kernel.launch.params.len);
 
     const base = nvidia_abi.param_base;
-    try testing.expectEqual(base + kernel.launch.params[0].offset, offsets.items[2]);
-    try testing.expectEqual(base + kernel.launch.params[0].offset + 4, offsets.items[3]);
-    try testing.expectEqual(base + kernel.launch.params[1].offset, offsets.items[4]);
+    try testing.expectEqual(base + kernel.launch.params[0].offset, offsets.items[1]);
+    try testing.expectEqual(base + kernel.launch.params[1].offset, offsets.items[2]);
 
     // The reported block size is the declared default, and the pointer is global in M1.
     try testing.expectEqual([3]u32{ 1, 1, 1 }, kernel.launch.block);
@@ -4169,35 +4510,40 @@ test "a shared pointer parameter is 32 bits: ONE LDC, and its accesses are LDS a
     var kernel = try compileKernel(allocator, &func, nvidia_abi);
     defer kernel.deinit(allocator);
 
-    // LDC outptr lo, LDC outptr hi, LDC tile, LDC n, LDS, IADD3, STS, STG, EXIT.
-    // The tile pointer contributes ONE LDC. A 64-bit pointer would add a tenth.
-    try testing.expectEqual(@as(usize, 9 * 4), kernel.code.len);
-    try testing.expectEqual(@as(u32, 0xb82), opAt(kernel.code, 0)); // outptr lo
-    try testing.expectEqual(@as(u32, 0xb82), opAt(kernel.code, 1)); // outptr hi
-    try testing.expectEqual(@as(u32, 0xb82), opAt(kernel.code, 2)); // tile, the ONLY one
-    try testing.expectEqual(@as(u32, 0xb82), opAt(kernel.code, 3)); // n
-    try testing.expectEqual(@as(u32, 0x984), opAt(kernel.code, 4)); // LDS, not LDG (0x981)
-    try testing.expectEqual(@as(u32, 0x210), opAt(kernel.code, 5)); // IADD3
-    try testing.expectEqual(@as(u32, 0x988), opAt(kernel.code, 6)); // STS, not STG (0x986)
-    try testing.expectEqual(@as(u32, 0x986), opAt(kernel.code, 7)); // STG: the return, still global
-    try testing.expectEqual(@as(u32, 0x94d), opAt(kernel.code, 8)); // EXIT
+    // LDC.64 outptr, LDC tile, LDC n, LDS, IADD3, STS, STG, EXIT.
+    // The tile pointer contributes ONE LDC. A 64-bit pointer would read a PAIR, which is
+    // what the outptr LDC.64 does in one instruction.
+    try testing.expectEqual(@as(usize, 8 * 4), kernel.code.len);
+    try testing.expectEqual(@as(u32, 0xb82), opAt(kernel.code, 0)); // outptr, one LDC.64
+    try testing.expectEqual(@as(u32, 0xb82), opAt(kernel.code, 1)); // tile, the ONLY one
+    try testing.expectEqual(@as(u32, 0xb82), opAt(kernel.code, 2)); // n
+    try testing.expectEqual(@as(u32, 0x984), opAt(kernel.code, 3)); // LDS, not LDG (0x981)
+    try testing.expectEqual(@as(u32, 0x210), opAt(kernel.code, 4)); // IADD3
+    try testing.expectEqual(@as(u32, 0x988), opAt(kernel.code, 5)); // STS, not STG (0x986)
+    try testing.expectEqual(@as(u32, 0x986), opAt(kernel.code, 6)); // STG: the return, still global
+    try testing.expectEqual(@as(u32, 0x94d), opAt(kernel.code, 7)); // EXIT
+
+    // The outptr LDC.64 fills a PAIR and the tile LDC fills ONE register, so a b64 width
+    // field on the first and a b32 on the second is what keeps the two apart.
+    try testing.expectEqual(@as(u32, @intFromEnum(encode.MemType.b64)), (kernel.code[2] >> (73 - 64)) & 0x7);
+    try testing.expectEqual(@as(u32, @intFromEnum(encode.MemType.b32)), (kernel.code[6] >> (73 - 64)) & 0x7);
 
     // The tile parameter occupies exactly ONE register: the next parameter takes the very
     // next register. A pair would have pushed `n` one further along.
-    const r_tile = regAt(kernel.code, 2, 16); // LDC dst
-    const r_n = regAt(kernel.code, 3, 16);
+    const r_tile = regAt(kernel.code, 1, 16); // LDC dst
+    const r_n = regAt(kernel.code, 2, 16);
     try testing.expectEqual(r_tile + 1, r_n);
     try testing.expectEqual(@as(u8, value_reg_base), r_tile);
 
     // LDS reads the shared window offset out of that one register at bit 24, and writes the
     // loaded value into the register the STG then returns.
-    const r_v = regAt(kernel.code, 4, 16); // LDS dst
-    try testing.expectEqual(r_tile, regAt(kernel.code, 4, 24)); // LDS address
-    try testing.expectEqual(@as(u8, encode.URZ), regAt(kernel.code, 4, 32)); // no uniform base
+    const r_v = regAt(kernel.code, 3, 16); // LDS dst
+    try testing.expectEqual(r_tile, regAt(kernel.code, 3, 24)); // LDS address
+    try testing.expectEqual(@as(u8, encode.URZ), regAt(kernel.code, 3, 32)); // no uniform base
     // STS addresses the same register and stores the IADD3 result at bit 32.
-    try testing.expectEqual(r_tile, regAt(kernel.code, 6, 24)); // STS address
-    try testing.expectEqual(regAt(kernel.code, 5, 16), regAt(kernel.code, 6, 32)); // STS data
-    try testing.expectEqual(r_v, regAt(kernel.code, 7, 32)); // STG stores the loaded value
+    try testing.expectEqual(r_tile, regAt(kernel.code, 5, 24)); // STS address
+    try testing.expectEqual(regAt(kernel.code, 4, 16), regAt(kernel.code, 5, 32)); // STS data
+    try testing.expectEqual(r_v, regAt(kernel.code, 6, 32)); // STG stores the loaded value
 
     // The runtime is told the space, so it binds shared memory rather than a buffer.
     try testing.expectEqual(@as(usize, 2), kernel.launch.params.len);
@@ -4242,21 +4588,24 @@ test "shared address arithmetic is one 32-bit IADD3, where a global address is a
         }
     }.of;
 
-    // Shared: LDC outptr lo/hi, LDC tile, LDC i, IADD3, LDS, STG, EXIT.
-    try testing.expectEqual(@as(usize, 8 * 4), shared_k.code.len);
+    // Shared: LDC.64 outptr, LDC tile, LDC i, IADD3, LDS, STG, EXIT.
+    try testing.expectEqual(@as(usize, 7 * 4), shared_k.code.len);
     try testing.expectEqual(@as(usize, 1), count(shared_k.code, 0x210)); // ONE IADD3
     try testing.expectEqual(@as(usize, 1), count(shared_k.code, 0x984)); // LDS
     try testing.expectEqual(@as(usize, 0), count(shared_k.code, 0x981)); // no LDG
     // The LDS reads the register the single IADD3 wrote.
-    try testing.expectEqual(@as(u32, 0x210), opAt(shared_k.code, 4));
-    try testing.expectEqual(@as(u32, 0x984), opAt(shared_k.code, 5));
-    try testing.expectEqual(regAt(shared_k.code, 4, 16), regAt(shared_k.code, 5, 24));
+    try testing.expectEqual(@as(u32, 0x210), opAt(shared_k.code, 3));
+    try testing.expectEqual(@as(u32, 0x984), opAt(shared_k.code, 4));
+    try testing.expectEqual(regAt(shared_k.code, 3, 16), regAt(shared_k.code, 4, 24));
 
-    // Global: the pointer is a pair, so it is two LDCs and a two-instruction carry chain.
-    try testing.expectEqual(@as(usize, 2), count(global_k.code, 0x210)); // carry-out plus carry-in
+    // Global: the pointer is a PAIR, so it is one LDC.64 and one IMAD.WIDE. The wide
+    // multiply-add replaced the IADD3 carry-out plus IADD3.X pair, and it keeps the carry
+    // inside one instruction, so no plain IADD3 forms the address at all.
+    try testing.expectEqual(@as(usize, 0), count(global_k.code, 0x210)); // no 32-bit address add
+    try testing.expectEqual(@as(usize, 1), count(global_k.code, encode.IMAD_WIDE_IMM_OPCODE));
     try testing.expectEqual(@as(usize, 1), count(global_k.code, 0x981)); // LDG
     try testing.expectEqual(@as(usize, 0), count(global_k.code, 0x984)); // no LDS
-    try testing.expectEqual(@as(usize, 5), count(global_k.code, 0xb82)); // outptr pair, base pair, i
+    try testing.expectEqual(@as(usize, 3), count(global_k.code, 0xb82)); // outptr, base, i
 }
 
 test "a graphics stage rejects a shared pointer parameter instead of interpolating it" {
@@ -5299,4 +5648,84 @@ test "a PRIVATE alloca is still refused, and takes no room in the shared window"
     func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
 
     try testing.expectError(error.Unsupported, compileKernel(allocator, &func, nvidia_abi));
+}
+
+/// Run a list of edge moves through `emitParallelCopy` and simulate the MOVs it emits over a
+/// register file, so a test can compare the result against the parallel assignment the moves
+/// describe. `initial[r]` is what register r holds before the edge.
+fn simulateParallelCopy(allocator: std.mem.Allocator, moves: []const EdgeMove, initial: [256]u32) ![256]u32 {
+    var list: std.ArrayList(EdgeMove) = .empty;
+    defer list.deinit(allocator);
+    try list.appendSlice(allocator, moves);
+    var code: std.ArrayList(Inst) = .empty;
+    defer code.deinit(allocator);
+    try emitParallelCopy(allocator, &code, &list);
+
+    var regs = initial;
+    for (code.items) |inst| {
+        try testing.expectEqual(@as(u32, 0x202), inst[0] & 0xfff); // MOV, register form
+        const dst: u8 = @truncate(inst[0] >> 16);
+        const src: u8 = @truncate(inst[1]);
+        regs[dst] = regs[src];
+    }
+    return regs;
+}
+
+test "a CYCLE of edge moves still delivers every value" {
+    // The five-way block-argument permutation that came out wrong. Emitted in order, the
+    // first MOV destroys R4 and the value it held never reaches R7, which read back zero.
+    // A parallel assignment must deliver all five.
+    const allocator = testing.allocator;
+    const moves = [_]EdgeMove{
+        .{ .dst = 4, .src = 9 },
+        .{ .dst = 5, .src = 7 },
+        .{ .dst = 7, .src = 4 },
+        .{ .dst = 8, .src = 5 },
+        .{ .dst = 9, .src = 8 },
+    };
+    var initial = [_]u32{0} ** 256;
+    for (4..10) |r| initial[r] = @intCast(0x100 + r);
+
+    const regs = try simulateParallelCopy(allocator, &moves, initial);
+    for (moves) |m| {
+        try testing.expectEqual(initial[m.src], regs[m.dst]);
+    }
+}
+
+test "a SWAP of two edge moves still delivers both values" {
+    // The smallest cycle. Two plain MOVs give both registers the same value.
+    const allocator = testing.allocator;
+    const moves = [_]EdgeMove{
+        .{ .dst = 4, .src = 5 },
+        .{ .dst = 5, .src = 4 },
+    };
+    var initial = [_]u32{0} ** 256;
+    initial[4] = 0xaaaa;
+    initial[5] = 0xbbbb;
+
+    const regs = try simulateParallelCopy(allocator, &moves, initial);
+    try testing.expectEqual(@as(u32, 0xbbbb), regs[4]);
+    try testing.expectEqual(@as(u32, 0xaaaa), regs[5]);
+}
+
+test "a CHAIN of edge moves needs no scratch register" {
+    // The negative control. `R4 <- R5 <- R6` has a safe order, so the ordering must find it
+    // and emit exactly one MOV per move, with none through the scratch register. A copy
+    // that always parked through the scratch would pass the two tests above and double the
+    // instruction count of every ordinary edge.
+    const allocator = testing.allocator;
+    var list: std.ArrayList(EdgeMove) = .empty;
+    defer list.deinit(allocator);
+    try list.appendSlice(allocator, &.{
+        .{ .dst = 4, .src = 5 },
+        .{ .dst = 5, .src = 6 },
+    });
+    var code: std.ArrayList(Inst) = .empty;
+    defer code.deinit(allocator);
+    try emitParallelCopy(allocator, &code, &list);
+
+    try testing.expectEqual(@as(usize, 2), code.items.len);
+    for (code.items) |inst| {
+        try testing.expect(@as(u8, @truncate(inst[0] >> 16)) != r_scratch);
+    }
 }

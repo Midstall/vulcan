@@ -414,39 +414,47 @@ test "live: a boolean in P0 survives a global load" {
     try testing.expectEqual(@as(i32, 14), dst.read(i32, 0));
 }
 
-test "a compiled pointer add emits IADD3 then IADD3.X, and the .X reads the carry" {
-    // The structural half of the proof, which needs no GPU. `compileKernel` must
-    // put bit 74 on the SECOND add of the pair and nowhere else, and the
-    // predicate the first add writes at 81..83 must be the one the second reads
-    // at 87..89.
+test "a compiled pointer add is ONE IMAD.WIDE, and it names no carry predicate" {
+    // The structural half of the proof, which needs no GPU.
+    //
+    // A 64-bit pointer add is now a single `IMAD.WIDE.U32 dst, off, 0x1, base`: the wide
+    // multiply-add widens the 32-bit byte offset and adds the 64-bit base in one
+    // instruction. It replaced an IADD3 that wrote a carry-out predicate plus an IADD3.X
+    // that read it, and the three live tests above prove on silicon that the carry still
+    // reaches the high half.
+    //
+    // THE POINT OF THE OLD TEST SURVIVES, INVERTED. It watched a carry that travelled
+    // between two instructions through a predicate register, which is where a carry can be
+    // dropped. The hardware never splits this sum, so the check is that NO carry predicate
+    // is named at all: no `.X` bit anywhere, and no IADD3 writing a carry-out.
     const allocator = testing.allocator;
     var func = try buildOffsetStore(allocator);
     defer func.deinit();
     var kernel = try isel.compileKernel(allocator, &func, runner_abi);
     defer kernel.deinit(allocator);
 
-    var carry_out: ?u32 = null;
-    var carry_in: ?u32 = null;
+    var wide: u32 = 0;
     var extended: u32 = 0;
+    var carry_out: u32 = 0;
     var i: usize = 0;
     while (i < kernel.code.len) : (i += 4) {
-        if (kernel.code[i] & 0xfff != 0x210) continue; // IADD3, register form
+        const op = kernel.code[i] & 0xfff;
         const hi = kernel.code[i + 2];
-        const cout = (hi >> (81 - 64)) & 0x7;
-        if ((hi >> (74 - 64)) & 0x1 == 1) {
-            extended += 1;
-            carry_in = (hi >> (87 - 64)) & 0x7;
-            // The extended add must not also negate the carry it reads.
-            try testing.expectEqual(@as(u32, 0), (hi >> (90 - 64)) & 0x1);
-        } else if (cout != encode.PT) {
-            carry_out = cout;
+        if (op == encode.IMAD_WIDE_IMM_OPCODE) {
+            wide += 1;
+            // The scale is 1, so the sum is exactly `base + zext(offset)`. See the isel.
+            try testing.expectEqual(@as(u32, 1), kernel.code[i + 1]);
+            // Unsigned: bit 73 clear, so the offset is zero-extended and not sign-extended.
+            try testing.expectEqual(@as(u32, 0), (hi >> (73 - 64)) & 0x1);
+            // The destination pair is aligned, as a 64-bit result must be.
+            try testing.expectEqual(@as(u32, 0), ((kernel.code[i] >> 16) & 0xff) % 2);
         }
+        if (op != 0x210) continue; // IADD3, register form
+        if ((hi >> (74 - 64)) & 0x1 == 1) extended += 1;
+        if ((hi >> (81 - 64)) & 0x7 != encode.PT) carry_out += 1;
     }
 
-    try testing.expectEqual(@as(u32, 1), extended);
-    try testing.expect(carry_out != null);
-    try testing.expectEqual(carry_out.?, carry_in.?);
-    // The carry predicate must stay clear of P0..P5, which the allocator gives
-    // to booleans.
-    try testing.expect(carry_out.? >= 6);
+    try testing.expectEqual(@as(u32, 1), wide);
+    try testing.expectEqual(@as(u32, 0), extended);
+    try testing.expectEqual(@as(u32, 0), carry_out);
 }

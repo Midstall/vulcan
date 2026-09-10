@@ -34,6 +34,21 @@ pub const Control = struct {
     pred_neg: bool = false, // guard on !pred
 };
 
+/// The two's-complement low `width` bits of a signed value, for a signed
+/// immediate field such as the address displacement of LDG, STG, LDS and STS.
+fn signedBits(val: i32, width: usize) u64 {
+    const mask: u64 = (@as(u64, 1) << @intCast(width)) - 1;
+    return @as(u64, @bitCast(@as(i64, val))) & mask;
+}
+
+/// Whether `offset` fits the 24-BIT SIGNED address displacement that LDG, STG,
+/// LDS and STS carry at bits 40..63. The instruction selector asks before it
+/// folds a constant byte offset into a memory access, because a displacement
+/// that does not fit would wrap and address the wrong memory.
+pub fn fitsAddrOffset(offset: i64) bool {
+    return offset >= -(1 << 23) and offset < (1 << 23);
+}
+
 /// Set `width` bits at bit offset `lo` within the instruction.
 fn setBits(inst: *Inst, lo: usize, width: usize, val: u64) void {
     var i: usize = 0;
@@ -263,10 +278,33 @@ pub fn sel(dst: u8, a: u8, b: u8, pred: u8, c: Control) Inst {
     return w;
 }
 
-/// `SHF.L/R dst, value, shift, RZ`: shift left or right. Regular SHF 0x019,
-/// integer type (S32 for an arithmetic right shift) at 73..74, wrap at 75,
-/// right at 76. A right shift puts the value in the high (srcC) operand, as
-/// the funnel form requires.
+/// Set the three shift-form fields SHF shares between its register and its
+/// immediate operand form.
+///
+/// THIS HARDWARE HAS ONLY A FUNNEL SHIFT: it shifts the 64-bit pair
+/// (high:low) and gives back one 32-bit half. A left shift puts the value in
+/// the LOW operand, RZ in the high one, and takes the LOW half. A right shift
+/// is the mirror: the value goes in the HIGH operand, RZ in the low one, and
+/// the answer comes out of the HIGH half. `dst_high` at bit 80 is what selects
+/// that half, and a right shift without it returns the low half of the funnel,
+/// which is `value << (32 - count)`. A live GPU run of `0x1234 >> 3` returned
+/// 0x80000000, which is exactly that.
+///
+/// Bits 73..74 name the DATA TYPE, and NAK's table is I64 = 0, U64 = 1,
+/// I32 = 2, U32 = 3 (`OpShf::encode`). These are 32-bit shifts, so the field is
+/// 2 or 3 and never 0 or 1. A 64-bit type there gives the same answer for a
+/// left shift, because the high operand is RZ, and the wrong answer for a
+/// right shift.
+fn setShiftForm(w: *Inst, right: bool, arithmetic: bool) void {
+    setBits(w, 73, 2, if (arithmetic) 2 else 3); // I32 vs U32
+    setBits(w, 75, 1, 1); // wrap the shift count
+    setBits(w, 76, 1, @intFromBool(right));
+    setBits(w, 80, 1, @intFromBool(right)); // take the HIGH half for a right shift
+}
+
+/// `SHF.L/R dst, value, shift, RZ`: shift left or right. Regular SHF 0x019.
+/// A right shift puts the value in the high (srcC) operand and takes the high
+/// half of the funnel. See `setShiftForm`.
 pub fn shf(dst: u8, value: u8, shift: u8, right: bool, arithmetic: bool, c: Control) Inst {
     var w = base(c);
     setBits(&w, 0, 9, 0x019);
@@ -275,31 +313,43 @@ pub fn shf(dst: u8, value: u8, shift: u8, right: bool, arithmetic: bool, c: Cont
     setBits(&w, 24, 8, if (right) RZ else value);
     setBits(&w, 32, 8, shift);
     setBits(&w, 64, 8, if (right) value else RZ);
-    setBits(&w, 73, 2, if (arithmetic) 1 else 0); // S32 vs U32
-    setBits(&w, 75, 1, 1); // wrap the shift count
-    if (right) setBits(&w, 76, 1, 1);
+    setShiftForm(&w, right, arithmetic);
     return w;
 }
 
-/// The Volta floating-point ALU ops (FADD, FMUL, FFMA) carry three
-/// predicate source/result fields that must all be PT, the always-true
-/// predicate. Unlike the integer IMAD, which tolerates the 0 (P0) default
-/// in the upper two, the FP ops are rejected as an "illegal instruction
-/// encoding" (Xid 13, SM warp exception) on Blackwell sm_120 unless 81..83,
-/// 84..86, and 87..89 are all PT. Proven live: a UBO vec4 multiply faulted
-/// with only 81..83 set, and drew cleanly once all three were PT.
-fn setFpPreds(w: *Inst) void {
-    setBits(w, 81, 3, PT);
-    setBits(w, 84, 3, PT);
-    setBits(w, 87, 3, PT);
-}
+// BITS 81..90 OF A FLOAT ALU OP ARE NOT PREDICATE FIELDS, AND THEY MUST BE ZERO.
+//
+// This backend used to write PT (7) into 81..83, 84..86 and 87..89 of FADD, FMUL and
+// FFMA, on the theory that they were the same predicate source and result fields the
+// integer ops carry. THAT WAS WRONG, and on FADD it silently changed the arithmetic:
+// `nvdisasm` read the result as `FHADD.BF16 Rd, Ra.H1, Rb`, a HALF-PRECISION add that
+// truncates source A to bfloat16. A live GPU run of `x + x` with
+// x = 0x3EFF_FFFC returned 0x3F7F_7FFE where the correct answer is 0x3F7F_FFFC, which is
+// exactly what truncating A to bf16 predicts. `fsub` is built on `fadd`, so float
+// subtract carried the same defect, and a naive matmul returned 4486 for 12276.
+//
+// Nothing caught it because every earlier float test used operands whose low 16 mantissa
+// bits are zero (0.5, 1.0, 2.0), and for those the truncation changes nothing.
+//
+// GROUND TRUTH, read out of a ptxas cubin for sm_120 with
+// `nvdisasm -b SM120 -c -hex` and the raw section bytes:
+//
+//     FADD R5, R6, R7      06057221 00000007 00000000 140fe200
+//     FADD R7, R6, -R7     06077221 80000007 00000000 000fc400
+//     FMUL R9, R6, R7      06097220 00000007 00400000 041fe200
+//     FFMA R5, R4, R5, R7  04057223 00000005 00000007 001fca00
+//
+// Word 2 holds bits 64..95. FADD and FFMA leave EVERY bit of 72..95 clear. FMUL sets one
+// field, bits 84..86 = 4, which is NAK's PDIV; the rest are clear. NAK's `OpFAdd::encode`,
+// `OpFMul::encode` and `OpFFma::encode` agree: none of them touches 81..90.
+//
+// The old comment claimed a UBO vec4 multiply faulted unless all three were PT. The field
+// that actually fixed that multiply is FMUL's PDIV at 84..86, which `fmul` still writes.
 
-/// `FADD dst, a, b`: 32-bit float add. NAK base 0x021. Needs the FP predicate fields
-/// (see setFpPreds).
+/// `FADD dst, a, b`: 32-bit float add. NAK base 0x021. Bits 81..90 stay CLEAR: see the
+/// note above.
 pub fn fadd(dst: u8, a: u8, b: u8, c: Control) Inst {
-    var w = alu(0x021, dst, a, b, RZ, c);
-    setFpPreds(&w);
-    return w;
+    return alu(0x021, dst, a, b, RZ, c);
 }
 
 /// `FADD dst, a, -b`: float subtract (dst = a - b), via the srcB negate modifier.
@@ -309,37 +359,39 @@ pub fn fsub(dst: u8, a: u8, b: u8, c: Control) Inst {
     return w;
 }
 
-/// `FMUL dst, a, b`: 32-bit float multiply. NAK base 0x020. Needs the FP
-/// predicate fields (see setFpPreds) and the PDIV field at bits 84..86 set
-/// to 4.
+/// `FMUL dst, a, b`: 32-bit float multiply. NAK base 0x020, plus the PDIV field at bits
+/// 84..86, which must be 4.
 ///
-/// NAK's `OpFMul::encode` (sm70_encode.rs) does `set_field(84..87, 0x4)`
-/// after the generic ALU encode, the "PDIV" field. FADD and FFMA do not set
-/// it. Leaving bits 84..86 at the PT default (7) that `setFpPreds` writes
-/// corrupts the multiply: a bare `FMUL 0.5, 0.5` reads back saturated
-/// (about 1.0) instead of 0.25 on Blackwell sm_120. Proven by a frame
-/// oracle: a fragment that outputs `0.5*0.5` saturates, while `0.5+0.0`
-/// through FADD reads 0.5 correctly. So this overrides bits 84..86 to 4.
-/// This is the field behind every "FMUL on the GPU saturates", "cube is
-/// white", and "derivative 22x too large" symptom: any shader doing an FP
-/// multiply mis-computed.
+/// NAK's `OpFMul::encode` (sm70_encode.rs) does `set_field(84..87, 0x4)` after the generic
+/// ALU encode, and ptxas emits the same. FADD and FFMA do not set it. Left at 7, the
+/// multiply is corrupted: a bare `FMUL 0.5, 0.5` reads back saturated (about 1.0) instead
+/// of 0.25 on Blackwell sm_120. Proven by a frame oracle: a fragment that outputs
+/// `0.5*0.5` saturated, while `0.5+0.0` through FADD read 0.5 correctly. This is the field
+/// behind every "FMUL on the GPU saturates", "cube is white", and "derivative 22x too
+/// large" symptom: any shader doing an FP multiply mis-computed.
 pub fn fmul(dst: u8, a: u8, b: u8, c: Control) Inst {
     var w = alu(0x020, dst, a, b, RZ, c);
-    setFpPreds(&w);
-    setBits(&w, 84, 3, 4); // PDIV field = 4 (NAK OpFMul, NOT the PT default)
+    setBits(&w, 84, 3, 4); // PDIV field = 4 (NAK OpFMul)
     return w;
 }
 
-/// `FFMA dst, a, b, c_in`: fused multiply-add (dst = a*b + c_in). NAK base 0x023.
-/// Needs the FP predicate fields (see setFpPreds).
+/// `FFMA dst, a, b, c_in`: fused multiply-add (dst = a*b + c_in). NAK base 0x023. Bits
+/// 81..90 stay CLEAR, as they do for FADD.
 pub fn ffma(dst: u8, a: u8, b: u8, c_in: u8, c: Control) Inst {
-    var w = alu(0x023, dst, a, b, c_in, c);
-    setFpPreds(&w);
-    return w;
+    return alu(0x023, dst, a, b, c_in, c);
 }
 
 // 32-bit int-to-float and float-to-int. NAK encodes the operand sizes as
 // log2(bytes): 4 bytes maps to 2.
+
+/// I2F opcode as it appears in the encoded instruction's low 12 bits: `alu()`
+/// ORs the NAK base 0x106 with the register-srcB form bit (1 << 9 = 0x200),
+/// so the scheduler sees 0x306. Variable-latency (decoupled) on sm120, so the
+/// scheduler scoreboards it (schedule.isVariableLatency).
+pub const I2F_OPCODE: u32 = 0x306;
+/// F2I opcode in the same low 12 bits: NAK base 0x105 with the register-srcB
+/// form bit. Decoupled on sm120, exactly as I2F is.
+pub const F2I_OPCODE: u32 = 0x305;
 
 /// `I2F.F32 dst, src`: convert a 32-bit integer to f32. NAK base 0x106, src
 /// signedness at bit 74, dst-size-log2 at 75, src-size-log2 at 84.
@@ -391,19 +443,267 @@ pub fn mufu(dst: u8, src: u8, mfop: MuFuOp, c: Control) Inst {
     return w;
 }
 
+// ---------------------------------------------------------------------------
+// Immediate-operand ALU forms.
+//
+// The three ALU operand slots are srcA at bits 24..31 (a register only), srcB
+// at 32..63, and srcC at 64..71 (a register only). The 3-bit FORM field at
+// bits 9..11 tells the hardware what the 32..63 slot holds. NAK's `encode_alu`
+// (Mesa `sm70_encode.rs`) picks it:
+//
+//   form 1: srcB is a REGISTER at 32..39, srcC is a register at 64..71.
+//   form 4: srcB is a 32-BIT IMMEDIATE at 32..63, srcC is a register at 64..71.
+//
+// So an immediate operand costs no MOV and no register. Before these forms the
+// instruction selector materialized every constant with `movImm` into a scratch
+// register and then read that register, which is two instructions where the
+// hardware needs one.
+//
+// The IMMEDIATE OCCUPIES THE WHOLE 32..63 RANGE, so bits 62 and 63 are value
+// bits and not the srcB abs/negate modifiers the register form puts there.
+// `isub` and `fsub` negate their register operand with bit 63; the immediate
+// forms below must negate the VALUE instead. See `iaddImm` and `fsubImm`.
+//
+// The scheduler reads the same form field: `schedule.readsSrc` treats bits
+// 32..39 as a register source only when the form is 1, so an immediate in that
+// slot is not mistaken for a GPR number. That is what makes these forms safe to
+// emit without a scheduler change.
+
+/// A fixed-latency ALU op whose second source is a 32-bit immediate: the 9-bit
+/// base opcode in bits 0..8, form 4 in bits 9..11, `dst` at 16, srcA at 24, the
+/// immediate at 32..63, and srcC at 64.
+fn aluImm(op: u9, dst: u8, a: u8, imm: u32, c_in: u8, c: Control) Inst {
+    var w = base(c);
+    setBits(&w, 0, 9, op);
+    setBits(&w, 9, 3, 4); // form: 32-bit immediate srcB
+    setBits(&w, 16, 8, dst);
+    setBits(&w, 24, 8, a);
+    setBits(&w, 32, 32, imm);
+    setBits(&w, 64, 8, c_in);
+    return w;
+}
+
+/// `IADD3 dst, a, imm, RZ`: add a 32-bit immediate. The carry fields are the
+/// constant false, exactly as `iadd3` writes them, because a zero there names
+/// P0 and P0 is a predicate this backend gives to booleans.
+///
+/// TO SUBTRACT AN IMMEDIATE, negate the value and add it. The register form's
+/// negate modifier is bit 63, which this form uses as an immediate value bit.
+pub fn iadd3Imm(dst: u8, a: u8, imm: u32, c: Control) Inst {
+    var w = aluImm(0x010, dst, a, imm, RZ, c);
+    setBits(&w, 81, 3, PT); // carry-out predicate = none
+    setBits(&w, 84, 3, PT);
+    setCarryIn(&w, 87, 90, PT, true); // carry-in 0 = !PT
+    setCarryIn(&w, 77, 80, PT, true); // carry-in 1 = !PT
+    return w;
+}
+
+/// `IADD3 dst, a, imm, RZ` writing a carry-out to predicate `cout`: the low half
+/// of a 64-bit add against a constant, such as a global pointer plus a constant
+/// byte offset. The high half is the same `iadd3CarryIn` the register form uses.
+pub fn iadd3CarryOutImm(dst: u8, a: u8, imm: u32, cout: u8, c: Control) Inst {
+    var w = iadd3Imm(dst, a, imm, c);
+    setBits(&w, 81, 3, cout); // carry-out predicate
+    return w;
+}
+
+/// `IADD3.X dst, a, imm, RZ, cin, !PT`: the HIGH half of a 64-bit add against a
+/// constant. `imm` is the high word of the constant, which is 0 for a positive
+/// value and 0xFFFFFFFF for a negative one, so the low half's constant is sign
+/// extended and not zero extended.
+///
+/// BIT 74 IS THE `.X` FLAG. See `iadd3CarryIn` for why it and nothing else makes
+/// the hardware read the carry.
+pub fn iadd3CarryInImm(dst: u8, a: u8, imm: u32, cin: u8, c: Control) Inst {
+    var w = iadd3Imm(dst, a, imm, c);
+    setBits(&w, 74, 1, 1); // .X: read the carry-in
+    setCarryIn(&w, 87, 90, cin, false); // carry-in 0 = cin
+    return w;
+}
+
+/// `IMAD dst, a, imm, c_in`: multiply by a 32-bit immediate and add `c_in`.
+/// A plain multiply passes `RZ` for `c_in`. The result-predicate field must be
+/// PT: leaving it 0 (P0) is rejected on Blackwell.
+pub fn imadImm(dst: u8, a: u8, imm: u32, c_in: u8, c: Control) Inst {
+    var w = aluImm(0x024, dst, a, imm, c_in, c);
+    setBits(&w, 81, 3, PT); // result predicate = none
+    return w;
+}
+
+/// `LOP3.LUT dst, a, imm, RZ, lut`: a bitwise op against a 32-bit immediate.
+pub fn lop3Imm(dst: u8, a: u8, imm: u32, lut: u8, c: Control) Inst {
+    var w = aluImm(0x012, dst, a, imm, RZ, c);
+    setBits(&w, 72, 8, lut);
+    setBits(&w, 81, 3, PT); // predicate dst = none
+    return w;
+}
+
+/// `SHF.L/R dst, value, imm, RZ`: shift by a constant count. The field layout
+/// matches `shf`: a right shift puts the value in the srcC slot, because the
+/// hardware has only the funnel shift.
+pub fn shfImm(dst: u8, value: u8, shift: u32, right: bool, arithmetic: bool, c: Control) Inst {
+    var w = aluImm(0x019, dst, if (right) RZ else value, shift, if (right) value else RZ, c);
+    setShiftForm(&w, right, arithmetic);
+    return w;
+}
+
+/// A fixed-latency ALU op whose THIRD source is a 32-bit immediate: form 2. The
+/// immediate still occupies bits 32..63, and the operand that form 4 would put
+/// there moves to the srcC slot at 64..71.
+///
+/// FADD is the one op here that needs this. NAK's `OpFAdd::encode` passes an
+/// immediate second operand as `encode_alu(0x021, dst, srcs[0], Src::ZERO,
+/// srcs[1])`, which is src1 = a register and src2 = the immediate, and
+/// `encode_alu` answers form 2 for that pair. Encoded as form 4 instead, the
+/// hardware reads the operand from somewhere else: a live GPU run of
+/// `x + 0.25` returned 0.
+fn aluImm2(op: u9, dst: u8, a: u8, imm: u32, b: u8, c: Control) Inst {
+    var w = base(c);
+    setBits(&w, 0, 9, op);
+    setBits(&w, 9, 3, 2); // form: 32-bit immediate srcC, register srcB at 64
+    setBits(&w, 16, 8, dst);
+    setBits(&w, 24, 8, a);
+    setBits(&w, 32, 32, imm);
+    setBits(&w, 64, 8, b);
+    return w;
+}
+
+/// `FADD dst, a, imm`: add a 32-bit float immediate, given as its IEEE-754
+/// binary32 bit pattern.
+///
+/// TWO THINGS DIFFER FROM THE REGISTER FORM, and each of them returned 0 from a
+/// live GPU run of `2.0 + 0.25` when it was wrong.
+///
+/// It is FORM 2, not form 4. See `aluImm2`.
+///
+/// It leaves bits 81..90 CLEAR, exactly as the register form does. Writing PT
+/// into them returned 0 here, and turned the register form into a bfloat16 add:
+/// see the note above `fadd`.
+pub fn faddImm(dst: u8, a: u8, imm: u32, c: Control) Inst {
+    return aluImm2(0x021, dst, a, imm, RZ, c);
+}
+
+/// `FADD dst, a, -imm`: subtract a float immediate. The register form negates
+/// srcB with bit 63, which this form uses as the sign bit of the immediate, so
+/// the SIGN BIT OF THE VALUE is flipped instead. That gives the same result for
+/// every finite value and for an infinity, and it keeps a NaN a NaN.
+pub fn fsubImm(dst: u8, a: u8, imm: u32, c: Control) Inst {
+    return faddImm(dst, a, imm ^ 0x8000_0000, c);
+}
+
+/// `FMUL dst, a, imm`: multiply by a 32-bit float immediate, given as its
+/// IEEE-754 binary32 bit pattern. Bits 84..86 hold NAK's PDIV field, which must
+/// be 4: see `fmul`. Every other bit of 81..90 stays clear.
+pub fn fmulImm(dst: u8, a: u8, imm: u32, c: Control) Inst {
+    var w = aluImm(0x020, dst, a, imm, RZ, c);
+    setBits(&w, 84, 3, 4); // PDIV field = 4 (NAK OpFMul)
+    return w;
+}
+
+/// `IMAD.WIDE dst:dst+1, a, b, c:c+1`: a 32 by 32 multiply added to a 64-bit
+/// value, giving a 64-bit result. NAK opcode 0x025, the same encoding as `imad`
+/// with the wide opcode. `signed` selects IMAD.WIDE over IMAD.WIDE.U32, and it
+/// sign-extends the 32-bit product into the 64-bit sum.
+///
+/// THIS IS ONE INSTRUCTION WHERE A GLOBAL ARRAY INDEX OTHERWISE TAKES FOUR.
+/// `base + index * scale` with a 64-bit base needs a shift, a carry-out add and
+/// a carry-in add, plus a MOV for the scale. IMAD.WIDE scales, sign-extends and
+/// adds the 64-bit base together, and its carry cannot be dropped because the
+/// hardware never splits it.
+///
+/// `dst` and a register `c` must each be an even register, because both name a
+/// 64-bit pair. The caller owns both registers of each pair.
+pub fn imadWide(dst: u8, a: u8, b: u8, c_in: u8, signed: bool, c: Control) Inst {
+    var w = alu(0x025, dst, a, b, c_in, c);
+    setBits(&w, 73, 1, @intFromBool(signed));
+    setBits(&w, 81, 3, PT); // result predicate = none
+    return w;
+}
+
+/// `IMAD.WIDE dst:dst+1, a, imm, c:c+1`: the immediate-scale form of
+/// `imadWide`, which is what an array index uses: the scale is the element size
+/// and it is a compile-time constant.
+pub fn imadWideImm(dst: u8, a: u8, imm: u32, c_in: u8, signed: bool, c: Control) Inst {
+    var w = aluImm(0x025, dst, a, imm, c_in, c);
+    setBits(&w, 73, 1, @intFromBool(signed));
+    setBits(&w, 81, 3, PT); // result predicate = none
+    return w;
+}
+
+/// `LEA dst, a, b, shift`: `dst = (a << shift) + b`, all 32 bits. ONE
+/// instruction where a shift and an add take two, which is what an array index
+/// into a 32-bit address space costs.
+///
+/// Source: NAK `sm70_encode.rs`, `impl SM70Op for OpLea`. Opcode 0x011 through
+/// the generic ALU encode, so `a` is srcA at 24..31 and `b` is srcB at 32..39.
+/// The shift count is a 5-bit field at 75..80. Bit 80 selects the HIGH half of
+/// a 64-bit shift-and-add and stays clear here. Bit 74 is the `.X` carry-in
+/// form and stays clear. Bits 81..84 hold the OVERFLOW predicate destination,
+/// which must be PT and not the zero default, because P0 is a register the
+/// boolean allocator hands out. Bit 72 negates the shifted value and stays
+/// clear.
+///
+/// `ir.rs` `impl Foldable for OpLea` states the arithmetic: shift `a` left,
+/// then add `b`. The shift is a 32-bit shift, so a count above 31 is refused
+/// by the caller and never encoded.
+pub fn lea(dst: u8, a: u8, b: u8, shift: u5, c: Control) Inst {
+    var w = alu(0x011, dst, a, b, RZ, c);
+    setBits(&w, 72, 1, 0); // do not negate the shifted value
+    setBits(&w, 74, 1, 0); // not the .X carry-in form
+    setBits(&w, 75, 5, shift);
+    setBits(&w, 80, 1, 0); // the LOW half, not LEA.HI
+    setBits(&w, 81, 3, PT); // overflow predicate = none
+    return w;
+}
+
+/// The LEA opcode as it appears in the encoded instruction's low 12 bits: `alu`
+/// ORs the NAK base 0x011 with the register-srcB form bit (1 << 9).
+pub const LEA_OPCODE: u32 = 0x211;
+
+/// The IMAD.WIDE opcode as it appears in the encoded instruction's low 12 bits,
+/// in both operand forms. `alu` ORs the NAK base 0x025 with the register-srcB
+/// form bit (1 << 9), and `aluImm` with the immediate form bit (4 << 9).
+///
+/// The scheduler needs both: IMAD.WIDE writes a REGISTER PAIR and reads one at
+/// its srcC, and no other ALU op does either, so `schedule.dstSpan` and
+/// `schedule.srcSpan` name these opcodes to give it a span of 2.
+pub const IMAD_WIDE_OPCODE: u32 = 0x225;
+/// The immediate-scale form of `IMAD_WIDE_OPCODE`.
+pub const IMAD_WIDE_IMM_OPCODE: u32 = 0x825;
+
 /// `LDC dst, c[bank][offset]`: load a 32-bit value from a constant bank
 /// (the kernel-parameter ABI loads inputs this way). NAK opcode 0xb82: dst
 /// at bit 16, dynamic offset register at 24 (RZ = static), 16-bit immediate
 /// offset at 38, bank index at 54, mem type B32 at 73. Fixed latency on the
 /// constant cache.
 pub fn ldc(dst: u8, bank: u5, offset: u16, c: Control) Inst {
+    return ldcSized(dst, bank, offset, .b32, c);
+}
+
+/// `LDC.64 dst, c[bank][offset]`: read EIGHT bytes of a constant bank into the
+/// register pair (dst, dst+1). A 64-bit pointer parameter is one of these, and
+/// so is any pair of adjacent 32-bit scalars.
+///
+/// One instruction where two LDCs were emitted before, and the parameter
+/// prologue of every kernel with a pointer paid that. `dst` must be EVEN, and
+/// `offset` must be 8-ALIGNED, because both name a 64-bit quantity.
+pub fn ldcWide(dst: u8, bank: u5, offset: u16, c: Control) Inst {
+    std.debug.assert(dst % 2 == 0);
+    std.debug.assert(offset % 8 == 0);
+    return ldcSized(dst, bank, offset, .b64, c);
+}
+
+/// `LDC dst, c[bank][offset]` at an explicit access width. The width field is
+/// the same `MemType` at bits 73..75 that LDG, STG, LDS and STS use, and it
+/// decides how many consecutive registers the load fills.
+pub fn ldcSized(dst: u8, bank: u5, offset: u16, ty: MemType, c: Control) Inst {
     var w = base(c);
     setBits(&w, 0, 12, 0xb82);
     setBits(&w, 16, 8, dst);
     setBits(&w, 24, 8, RZ); // no dynamic offset
     setBits(&w, 38, 16, offset);
     setBits(&w, 54, 5, bank);
-    setBits(&w, 73, 3, 4); // B32
+    setBits(&w, 73, 3, @intFromEnum(ty));
     return w;
 }
 
@@ -473,7 +773,8 @@ pub const MemOrder = enum(u4) {
 /// register pair (addr, addr+1). Volta LDG 0x981.
 ///
 /// Source: NAK `sm70_encode.rs`, `impl SM70Op for OpLd`, the `MemSpace::Global`
-/// arm. `set_reg_addr(24..32, addr, 90)` for the address pair;
+/// arm. The 24-BIT SIGNED BYTE DISPLACEMENT at bits 40..63 is added to that address by
+/// the hardware. `set_reg_addr(24..32, addr, 90)` for the address pair;
 /// `set_ureg_addr(32, uniform, 72)` for the uniform base, URZ here, which also
 /// sets bit 72; `set_rev_pred_src(64..67, 67, pred)` for the guard;
 /// `set_pred_dst(81..84, None)` for the fault predicate; and `set_mem_access`,
@@ -492,11 +793,12 @@ pub const MemOrder = enum(u4) {
 /// access: the field is REVERSED (NAK writes `7 - index`), so PT encodes as 0.
 /// The fault-predicate destination is PT and not the zero default, because P0
 /// is a register the boolean allocator hands out.
-pub fn ldgOrdered(dst: u8, addr: u8, ty: MemType, order: MemOrder, c: Control) Inst {
+pub fn ldgOrdered(dst: u8, addr: u8, offset: i32, ty: MemType, order: MemOrder, c: Control) Inst {
     var w = base(c);
     setBits(&w, 0, 12, 0x981);
     setBits(&w, 16, 8, dst);
     setBits(&w, 24, 8, addr);
+    setBits(&w, 40, 24, signedBits(offset, 24)); // signed byte displacement
     setBits(&w, 32, 8, URZ); // uniform base, at 32 for a LOAD
     setBits(&w, 64, 4, 0); // guard = PT, reversed, no negate
     setBits(&w, 72, 1, 1); // 64-bit uniform
@@ -513,7 +815,15 @@ pub fn ldgOrdered(dst: u8, addr: u8, ty: MemType, order: MemOrder, c: Control) I
 /// form the instruction selector emits; a kernel that needs a stronger order
 /// asks for it through `ldgOrdered`.
 pub fn ldg(dst: u8, addr: u8, ty: MemType, c: Control) Inst {
-    return ldgOrdered(dst, addr, ty, .weak, c);
+    return ldgAt(dst, addr, 0, ty, c);
+}
+
+/// `LDG.E dst, [addr:addr+1 + offset]`: the weak-order load with a CONSTANT
+/// BYTE DISPLACEMENT in the instruction. A constant array index or a struct
+/// field offset goes here, so it costs no address arithmetic and no register.
+/// `fitsAddrOffset` is the range the field holds.
+pub fn ldgAt(dst: u8, addr: u8, offset: i32, ty: MemType, c: Control) Inst {
+    return ldgOrdered(dst, addr, offset, ty, .weak, c);
 }
 
 /// `LDG.E.32 dst, [addr:addr+1]`: the single-word shorthand for `ldg`.
@@ -530,10 +840,11 @@ pub fn ldgU32(dst: u8, addr: u8, c: Control) Inst {
 /// the uniform base, which for a STORE sits at bit 64; `set_reg_src(32..40)`
 /// for the data; and `set_mem_access` as for `ldg`. A `b64` store reads
 /// (data, data+1) and a `b128` store reads (data .. data+3).
-pub fn stgOrdered(addr: u8, data: u8, ty: MemType, order: MemOrder, c: Control) Inst {
+pub fn stgOrdered(addr: u8, data: u8, offset: i32, ty: MemType, order: MemOrder, c: Control) Inst {
     var w = base(c);
     setBits(&w, 0, 12, 0x986);
     setBits(&w, 24, 8, addr);
+    setBits(&w, 40, 24, signedBits(offset, 24)); // signed byte displacement
     setBits(&w, 90, 1, 1); // 64-bit GPR address
     setBits(&w, 64, 8, URZ); // uniform base, at 64 for a STORE
     setBits(&w, 72, 1, 1); // 64-bit uniform
@@ -549,7 +860,13 @@ pub fn stgOrdered(addr: u8, data: u8, ty: MemType, order: MemOrder, c: Control) 
 /// form the instruction selector emits; a kernel that needs a stronger order
 /// asks for it through `stgOrdered`.
 pub fn stg(addr: u8, data: u8, ty: MemType, c: Control) Inst {
-    return stgOrdered(addr, data, ty, .weak, c);
+    return stgAt(addr, data, 0, ty, c);
+}
+
+/// `STG.E [addr:addr+1 + offset], data`: the weak-order store with a CONSTANT
+/// BYTE DISPLACEMENT in the instruction. See `ldgAt`.
+pub fn stgAt(addr: u8, data: u8, offset: i32, ty: MemType, c: Control) Inst {
+    return stgOrdered(addr, data, offset, ty, .weak, c);
 }
 
 /// `STG.E.32 [addr:addr+1], data`: the single-word shorthand for `stg`.
@@ -584,12 +901,20 @@ pub fn stgU32(addr: u8, data: u8, c: Control) Inst {
 /// 81..87 at zero, unlike the global LDG/STG path above. Variable latency: the
 /// scoreboard scheduler assigns the write barrier and the consumer waits.
 pub fn lds(dst: u8, addr: u8, ty: MemType, c: Control) Inst {
+    return ldsAt(dst, addr, 0, ty, c);
+}
+
+/// `LDS dst, [addr + offset]`: the shared load with a CONSTANT BYTE
+/// DISPLACEMENT in the instruction, at bits 40..63. A fixed slot of a shared
+/// tile goes here, so it costs no address arithmetic and no register.
+/// `fitsAddrOffset` is the range the field holds.
+pub fn ldsAt(dst: u8, addr: u8, offset: i32, ty: MemType, c: Control) Inst {
     var w = base(c);
     setBits(&w, 0, 12, 0x984);
     setBits(&w, 16, 8, dst);
     setBits(&w, 24, 8, addr); // 32-bit shared-window offset, ONE register
     setBits(&w, 32, 8, URZ); // no uniform base
-    setBits(&w, 40, 24, 0); // immediate offset
+    setBits(&w, 40, 24, signedBits(offset, 24)); // signed byte displacement
     setBits(&w, 73, 3, @intFromEnum(ty));
     setBits(&w, 78, 2, 0); // offset stride X1
     setBits(&w, 87, 3, PT); // UPT: unconditional
@@ -608,7 +933,7 @@ pub fn ldsU32(dst: u8, addr: u8, c: Control) Inst {
 /// Source: NAK `sm70_encode.rs`, `impl SM70Op for OpSt`, the `MemSpace::Shared`
 /// arm plus the common tail of that `encode`. Opcode 0x988 (bits 0..12);
 /// `set_reg_src(24..32)` for the address; `set_reg_src(32..40)` for the data;
-/// `set_field(40..64)` for the 24-bit immediate offset, 0 here;
+/// `set_field(40..64)` for the 24-bit SIGNED byte displacement, which `stsAt` fills;
 /// `set_ureg_src(64)` for the uniform base, URZ here (8 bits on sm>=100);
 /// `set_mem_type(73..76)` for the width; `set_field(78..80)` = 0
 /// (`OffsetStride::X1`); and `set_bit(91, has_ugpr)`, true for this target.
@@ -617,11 +942,17 @@ pub fn ldsU32(dst: u8, addr: u8, c: Control) Inst {
 /// is not a transcription slip: NAK uses the two different starts, because a
 /// store needs bits 32..40 for its data register.
 pub fn sts(addr: u8, data: u8, ty: MemType, c: Control) Inst {
+    return stsAt(addr, data, 0, ty, c);
+}
+
+/// `STS [addr + offset], data`: the shared store with a CONSTANT BYTE
+/// DISPLACEMENT in the instruction. See `ldsAt`.
+pub fn stsAt(addr: u8, data: u8, offset: i32, ty: MemType, c: Control) Inst {
     var w = base(c);
     setBits(&w, 0, 12, 0x988);
     setBits(&w, 24, 8, addr); // 32-bit shared-window offset, ONE register
     setBits(&w, 32, 8, data);
-    setBits(&w, 40, 24, 0); // immediate offset
+    setBits(&w, 40, 24, signedBits(offset, 24)); // signed byte displacement
     setBits(&w, 64, 8, URZ); // no uniform base
     setBits(&w, 73, 3, @intFromEnum(ty));
     setBits(&w, 78, 2, 0); // offset stride X1
@@ -1743,7 +2074,7 @@ test "STG matches the hardware-verified bits (prism, live on Blackwell)" {
     try std.testing.expectEqual(@as(u32, 0x00007986), w[0]);
     try std.testing.expectEqual(@as(u32, 0x00000002), w[1]);
     try std.testing.expectEqual(@as(u32, 0x0c1009ff), w[2]);
-    try std.testing.expectEqual(@as(u32, 0x0c1149ff), stgOrdered(0, 2, .b32, .strong_sys, .{})[2]);
+    try std.testing.expectEqual(@as(u32, 0x0c1149ff), stgOrdered(0, 2, 0, .b32, .strong_sys, .{})[2]);
 }
 
 test "EXIT matches the hardware-verified opcode" {
@@ -1867,20 +2198,30 @@ test "FSETP encodes the float ordered compare (vs ISETP integer)" {
     try std.testing.expect((w[0] & 0xfff) != (isetp(0, 6, 7, .gt, false, .{})[0] & 0xfff));
 }
 
-test "FMUL sets the PDIV field (bits 84..86 = 4), FADD/FFMA do not" {
-    // NAK OpFMul::encode does `set_field(84..87, 0x4)`, the PDIV field,
-    // after the generic ALU encode. FADD/FFMA never touch it. Leaving it at
-    // the PT default (7) that setFpPreds writes corrupts the multiply on
-    // Blackwell sm_120: a bare `FMUL 0.5,0.5` saturates to about 1.0
-    // instead of 0.25, proven by a frame oracle.
+test "FMUL sets the PDIV field, and every other bit of 81..90 stays clear" {
+    // The bit-for-bit shape of a ptxas sm_120 cubin. Word 2 holds bits 64..95:
+    //
+    //     FADD R5, R6, R7      06057221 00000007 00000000 140fe200
+    //     FMUL R9, R6, R7      06097220 00000007 00400000 041fe200
+    //     FFMA R5, R4, R5, R7  04057223 00000005 00000007 001fca00
+    //
+    // FMUL sets ONE field above bit 71: PDIV at 84..86 = 4. FADD and FFMA set nothing
+    // there, and a PT written into 81..90 makes FADD a bfloat16 add. See the note above
+    // `fadd`. Bits 64..71 are the srcC REGISTER slot, which these encoders fill with RZ
+    // where ptxas leaves 0; a two-source float op ignores that slot, and FMUL with RZ in it
+    // is proven on hardware, so the check starts above it.
     const m = fmul(8, 4, 6, .{});
     try std.testing.expectEqual(@as(u32, 0x220), m[0] & 0xfff); // FMUL base 0x020 | reg form
     try std.testing.expectEqual(@as(u32, 4), (m[2] >> (84 - 64)) & 0x7); // PDIV field = 4
-    // FADD/FFMA leave bits 84..86 at the setFpPreds PT default (7), NOT 4.
+    try std.testing.expectEqual(@as(u32, 0x4000), m[2] >> 8); // PDIV, and NOTHING else
+
     const a = fadd(8, 4, 6, .{});
-    try std.testing.expectEqual(@as(u32, 7), (a[2] >> (84 - 64)) & 0x7);
+    try std.testing.expectEqual(@as(u32, 0), a[2] >> 8);
+    const s = fsub(8, 4, 6, .{});
+    try std.testing.expectEqual(@as(u32, 0), s[2] >> 8);
     const f = ffma(8, 4, 6, 5, .{});
-    try std.testing.expectEqual(@as(u32, 7), (f[2] >> (84 - 64)) & 0x7);
+    try std.testing.expectEqual(@as(u32, 5), f[2] & 0xff); // srcC R5 at bits 64..71
+    try std.testing.expectEqual(@as(u32, 0), f[2] >> 8); // and nothing above it
 }
 
 test "SHFL.BFLY quad shuffle encodes the NAK fddx/fddy form" {
@@ -2065,8 +2406,8 @@ test "every memory order selector matches NAK set_mem_order for sm >= 80" {
         .{ .order = .strong_sys, .code = 0xa },
     };
     for (cases) |c| {
-        try std.testing.expectEqual(c.code, (ldgOrdered(6, 4, .b32, c.order, .{})[2] >> (77 - 64)) & 0xf);
-        try std.testing.expectEqual(c.code, (stgOrdered(4, 6, .b32, c.order, .{})[2] >> (77 - 64)) & 0xf);
+        try std.testing.expectEqual(c.code, (ldgOrdered(6, 4, 0, .b32, c.order, .{})[2] >> (77 - 64)) & 0xf);
+        try std.testing.expectEqual(c.code, (stgOrdered(4, 6, 0, .b32, c.order, .{})[2] >> (77 - 64)) & 0xf);
     }
     // The selector the instruction selector gets is the weak one.
     try std.testing.expectEqual(@as(u32, 0), (ldgU32(6, 4, .{})[2] >> (77 - 64)) & 0xf);
@@ -2409,4 +2750,26 @@ test "a tensor op under a guard predicate keeps the predicate field" {
     try std.testing.expectEqual(@as(u32, LDSM_OPCODE), l[0] & 0xfff);
     try std.testing.expectEqual(@as(u32, 5), (l[0] >> 12) & 0x7);
     try std.testing.expectEqual(@as(u32, 0), (l[0] >> 15) & 0x1);
+}
+
+test "LEA encodes (a << shift) + b in one instruction" {
+    // `nvdisasm -b SM120 -c` reads this word back as `LEA R9, R7, R6, 0x2`, which is
+    // `(R7 << 2) + R6`. The shift is a 5-bit field, and 0x1f decodes too.
+    //
+    // NOTHING IN THE INSTRUCTION SELECTOR EMITS LEA YET. It is here, and checked against
+    // NAK field by field plus the disassembler, so the selection side is the only work
+    // left. `atomg` and the tensor ops were added the same way.
+    const w = lea(9, 7, 6, 2, .{});
+    try std.testing.expectEqual(LEA_OPCODE, w[0] & 0xfff); // base 0x011 | register form
+    try std.testing.expectEqual(@as(u32, 9), (w[0] >> 16) & 0xff); // dst R9
+    try std.testing.expectEqual(@as(u32, 7), (w[0] >> 24) & 0xff); // srcA R7, the shifted value
+    try std.testing.expectEqual(@as(u32, 6), w[1] & 0xff); // srcB R6, the addend, at bit 32
+    try std.testing.expectEqual(@as(u32, 2), (w[2] >> (75 - 64)) & 0x1f); // shift count at 75..80
+    try std.testing.expectEqual(@as(u32, 0), (w[2] >> (80 - 64)) & 0x1); // the LOW half, not LEA.HI
+    try std.testing.expectEqual(@as(u32, 0), (w[2] >> (74 - 64)) & 0x1); // not the .X carry-in form
+    // The overflow predicate destination must be PT. A zero there names P0, which the
+    // boolean allocator hands out. See the zero-field note at the top of this file.
+    try std.testing.expectEqual(@as(u32, PT), (w[2] >> (81 - 64)) & 0x7);
+    // The widest shift the 5-bit field holds.
+    try std.testing.expectEqual(@as(u32, 31), (lea(9, 7, 6, 31, .{})[2] >> (75 - 64)) & 0x1f);
 }

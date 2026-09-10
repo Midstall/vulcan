@@ -330,6 +330,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "vulcan-ir", .module = vulcan_ir },
+            .{ .name = "vulcan-opt", .module = vulcan_opt },
             .{ .name = "vulcan-target", .module = vulcan_target },
         },
     }) });
@@ -667,6 +668,24 @@ pub fn build(b: *std.Build) void {
         },
     }) });
     test_step.dependOn(&b.addRunArtifact(nvidia_carry).step);
+
+    // Address forming and immediate operands. A constant goes in the instruction that
+    // reads it: an ALU operand in the 32-bit immediate field, a byte offset in the
+    // address displacement of LDG/STG/LDS/STS. Both remove a MOV and a register, and the
+    // address fold removes a whole IADD3 carry chain, so a wrong field silently reads or
+    // writes the wrong place. Every test here runs on the GPU and checks the numbers.
+    const nvidia_addressing = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("libs/vulcan-target/nvidia/tests/addressing.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "vulcan-ir", .module = vulcan_ir },
+            .{ .name = "vulcan-gpu", .module = vulcan_gpu },
+            .{ .name = "vulcan-target", .module = vulcan_target },
+            .{ .name = "nvidia", .module = nvidia_dep.module("nvidia") },
+        },
+    }) });
+    test_step.dependOn(&b.addRunArtifact(nvidia_addressing).step);
 
     // GLSL frontend tests: parsing/lowering (IR only), plus execution (GLSL -> IR ->
     // host JIT -> run) for scalar functions.
