@@ -29,6 +29,152 @@ pub const BlockMap = std.AutoHashMapUnmanaged(Block, Block);
 
 pub const Error = std.mem.Allocator.Error;
 
+/// The clone of `v` under `map`, or `v` itself when it is defined outside the region.
+fn remapValue(map: *const ValueMap, v: Value) Value {
+    return map.get(v) orelse v;
+}
+
+/// The clone of `b` under `map`, or `b` itself when it is outside the region.
+fn remapBlock(map: *const BlockMap, b: Block) Block {
+    return map.get(b) orelse b;
+}
+
+/// Rebuild `op` with every Value operand mapped through `value_map` and every Block target
+/// mapped through `block_map`. `args_buf` is scratch for the variadic operands, so one buffer
+/// serves a whole clone. The switch is exhaustive over `Opcode` with NO `else`: a new opcode
+/// stops the build here instead of reaching a run-time `unreachable`.
+fn rebuildOpcode(
+    func: *Function,
+    op: Opcode,
+    value_map: *const ValueMap,
+    block_map: *const BlockMap,
+    args_buf: *std.ArrayList(Value),
+    allocator: std.mem.Allocator,
+) Error!Opcode {
+    return switch (op) {
+        .iconst => |v| .{ .iconst = v },
+        .fconst => |v| .{ .fconst = v },
+        .fconst128 => |v| .{ .fconst128 = v },
+        .arith => |a| .{ .arith = .{
+            .op = a.op,
+            .lhs = remapValue(value_map, a.lhs),
+            .rhs = remapValue(value_map, a.rhs),
+        } },
+        .arith_imm => |a| .{ .arith_imm = .{
+            .op = a.op,
+            .lhs = remapValue(value_map, a.lhs),
+            .imm = a.imm,
+        } },
+        .icmp => |c| .{ .icmp = .{
+            .op = c.op,
+            .lhs = remapValue(value_map, c.lhs),
+            .rhs = remapValue(value_map, c.rhs),
+        } },
+        .select => |s| .{ .select = .{
+            .cond = remapValue(value_map, s.cond),
+            .then = remapValue(value_map, s.then),
+            .@"else" = remapValue(value_map, s.@"else"),
+        } },
+        .struct_new => |sn| blk: {
+            args_buf.clearRetainingCapacity();
+            for (func.valueList(sn.fields)) |v| {
+                try args_buf.append(allocator, remapValue(value_map, v));
+            }
+            break :blk .{ .struct_new = .{ .fields = try func.internValues(args_buf.items) } };
+        },
+        .extract => |e| .{ .extract = .{
+            .aggregate = remapValue(value_map, e.aggregate),
+            .index = e.index,
+        } },
+        .convert => |cv| .{ .convert = .{ .value = remapValue(value_map, cv.value) } },
+        .unary => |u| .{ .unary = .{ .op = u.op, .value = remapValue(value_map, u.value) } },
+        .alloca => |a| .{ .alloca = .{ .elem = a.elem } },
+        // Only `args` (and `target`/`ret_dest`) are Values. `is_variadic`/`num_fixed` and
+        // the `ret_dest`/`ret_regs`/`ret_pieces`/`sret` struct-return description are
+        // call-site metadata that each unrolled copy must keep, so start from the source
+        // op and overwrite only the Values.
+        .call => |c| blk: {
+            args_buf.clearRetainingCapacity();
+            for (func.valueList(c.args)) |v| {
+                try args_buf.append(allocator, remapValue(value_map, v));
+            }
+            var out = c;
+            out.args = try func.internValues(args_buf.items);
+            if (c.ret_dest) |rd| out.ret_dest = remapValue(value_map, rd);
+            break :blk .{ .call = out };
+        },
+        .call_indirect => |c| blk: {
+            args_buf.clearRetainingCapacity();
+            for (func.valueList(c.args)) |v| {
+                try args_buf.append(allocator, remapValue(value_map, v));
+            }
+            var out = c;
+            out.target = remapValue(value_map, c.target);
+            out.args = try func.internValues(args_buf.items);
+            if (c.ret_dest) |rd| out.ret_dest = remapValue(value_map, rd);
+            break :blk .{ .call_indirect = out };
+        },
+        .global_addr => |g| .{ .global_addr = .{ .symbol = g.symbol, .via_got = g.via_got } },
+        .load => |l| .{ .load = .{ .ptr = remapValue(value_map, l.ptr), .@"volatile" = l.@"volatile" } },
+        .store => |st| .{ .store = .{
+            .value = remapValue(value_map, st.value),
+            .ptr = remapValue(value_map, st.ptr),
+            .@"volatile" = st.@"volatile",
+        } },
+        .prefetch => |pf| .{ .prefetch = .{
+            .ptr = remapValue(value_map, pf.ptr),
+        } },
+        .va_start => |vs| .{ .va_start = .{ .list = remapValue(value_map, vs.list) } },
+        .va_arg => |va| .{ .va_arg = .{ .list = remapValue(value_map, va.list), .ty = va.ty } },
+        .va_end => |ve| .{ .va_end = .{ .list = remapValue(value_map, ve.list) } },
+        // A barrier has no Value to remap. Each unrolled copy of the body keeps its
+        // own barrier, so the number of times a thread meets is unchanged.
+        .barrier => |bar| .{ .barrier = bar },
+        .dot => |d| .{ .dot = .{
+            .acc = remapValue(value_map, d.acc),
+            .a = remapValue(value_map, d.a),
+            .b = remapValue(value_map, d.b),
+        } },
+        // Only a/b/c are Values. Everything else (m/n/k, dtype, accumulate, embedded,
+        // quant, input_signs) is compile-time metadata, so start from the source op and
+        // overwrite only the Values. A named-field rebuild silently defaulted `embedded`
+        // back to false, which told the backend a matmul inside a live-value region was a
+        // standalone kernel free to clobber registers.
+        // The `quant` handle copies verbatim, including a `per_column` scale's ScaleList:
+        // unrolling clones within the SAME function, so the handle stays relative to the
+        // same `scale_pool` and needs no re-interning (unlike inline.zig's cross-function
+        // clone).
+        .matmul => |mmv| blk: {
+            var out = mmv;
+            out.a = remapValue(value_map, mmv.a);
+            out.b = remapValue(value_map, mmv.b);
+            out.c = remapValue(value_map, mmv.c);
+            break :blk .{ .matmul = out };
+        },
+        .@"if" => |cf| blk: {
+            args_buf.clearRetainingCapacity();
+            for (func.valueList(cf.then.args)) |v| {
+                try args_buf.append(allocator, remapValue(value_map, v));
+            }
+            const then_args = try func.internValues(args_buf.items);
+            const then_jump: Jump = .{ .target = remapBlock(block_map, cf.then.target), .args = then_args };
+
+            args_buf.clearRetainingCapacity();
+            for (func.valueList(cf.@"else".args)) |v| {
+                try args_buf.append(allocator, remapValue(value_map, v));
+            }
+            const else_args = try func.internValues(args_buf.items);
+            const else_jump: Jump = .{ .target = remapBlock(block_map, cf.@"else".target), .args = else_args };
+
+            break :blk .{ .@"if" = .{
+                .cond = remapValue(value_map, cf.cond),
+                .then = then_jump,
+                .@"else" = else_jump,
+            } };
+        },
+    };
+}
+
 /// Deep-copies `blocks` into `func`, remapping every Value operand through
 /// `value_map` and every Block target through `block_map`. Two passes: the
 /// first creates every cloned block and its params (so forward branches and
@@ -44,16 +190,13 @@ pub fn cloneBlocks(
     value_map: *ValueMap,
     block_map: *BlockMap,
 ) Error![]Block {
-    const remapValue = struct {
-        fn call(map: *const ValueMap, v: Value) Value {
-            return map.get(v) orelse v;
-        }
-    }.call;
-    const remapBlock = struct {
-        fn call(map: *const BlockMap, b: Block) Block {
-            return map.get(b) orelse b;
-        }
-    }.call;
+    // The `original -> clone` record the attribute copy needs. It holds ONLY what this call
+    // creates, never a caller's pre-seeded substitution, so an attribute cannot land on a
+    // value the clone does not own.
+    var value_pairs: std.ArrayList(ir.function.Function.ValuePair) = .empty;
+    defer value_pairs.deinit(allocator);
+    var inst_pairs: std.ArrayList(ir.function.Function.InstPair) = .empty;
+    defer inst_pairs.deinit(allocator);
 
     // Pass 1: create the cloned blocks and their params, so any forward branch
     // target or cross-block value use resolves in pass 2.
@@ -66,6 +209,7 @@ pub fn cloneBlocks(
         for (func.blockParams(b)) |p| {
             const cloned_p = try func.appendBlockParam(cloned, func.valueType(p));
             try value_map.put(allocator, p, cloned_p);
+            try value_pairs.append(allocator, .{ .old = p, .new = cloned_p });
         }
     }
 
@@ -78,129 +222,7 @@ pub fn cloneBlocks(
     for (blocks, 0..) |b, i| {
         const cloned = clones[i];
         for (func.blockInsts(b)) |inst| {
-            const op = func.opcode(inst);
-            const rebuilt: Opcode = switch (op) {
-                .iconst => |v| .{ .iconst = v },
-                .fconst => |v| .{ .fconst = v },
-                .fconst128 => |v| .{ .fconst128 = v },
-                .arith => |a| .{ .arith = .{
-                    .op = a.op,
-                    .lhs = remapValue(value_map, a.lhs),
-                    .rhs = remapValue(value_map, a.rhs),
-                } },
-                .arith_imm => |a| .{ .arith_imm = .{
-                    .op = a.op,
-                    .lhs = remapValue(value_map, a.lhs),
-                    .imm = a.imm,
-                } },
-                .icmp => |c| .{ .icmp = .{
-                    .op = c.op,
-                    .lhs = remapValue(value_map, c.lhs),
-                    .rhs = remapValue(value_map, c.rhs),
-                } },
-                .select => |s| .{ .select = .{
-                    .cond = remapValue(value_map, s.cond),
-                    .then = remapValue(value_map, s.then),
-                    .@"else" = remapValue(value_map, s.@"else"),
-                } },
-                .struct_new => |sn| blk: {
-                    args_buf.clearRetainingCapacity();
-                    for (func.valueList(sn.fields)) |v| {
-                        try args_buf.append(allocator, remapValue(value_map, v));
-                    }
-                    break :blk .{ .struct_new = .{ .fields = try func.internValues(args_buf.items) } };
-                },
-                .extract => |e| .{ .extract = .{
-                    .aggregate = remapValue(value_map, e.aggregate),
-                    .index = e.index,
-                } },
-                .convert => |cv| .{ .convert = .{ .value = remapValue(value_map, cv.value) } },
-                .unary => |u| .{ .unary = .{ .op = u.op, .value = remapValue(value_map, u.value) } },
-                .alloca => |a| .{ .alloca = .{ .elem = a.elem } },
-                // Only `args` (and `target`/`ret_dest`) are Values. `is_variadic`/`num_fixed` and
-                // the `ret_dest`/`ret_regs`/`ret_pieces`/`sret` struct-return description are
-                // call-site metadata that each unrolled copy must keep, so start from the source
-                // op and overwrite only the Values.
-                .call => |c| blk: {
-                    args_buf.clearRetainingCapacity();
-                    for (func.valueList(c.args)) |v| {
-                        try args_buf.append(allocator, remapValue(value_map, v));
-                    }
-                    var out = c;
-                    out.args = try func.internValues(args_buf.items);
-                    if (c.ret_dest) |rd| out.ret_dest = remapValue(value_map, rd);
-                    break :blk .{ .call = out };
-                },
-                .call_indirect => |c| blk: {
-                    args_buf.clearRetainingCapacity();
-                    for (func.valueList(c.args)) |v| {
-                        try args_buf.append(allocator, remapValue(value_map, v));
-                    }
-                    var out = c;
-                    out.target = remapValue(value_map, c.target);
-                    out.args = try func.internValues(args_buf.items);
-                    if (c.ret_dest) |rd| out.ret_dest = remapValue(value_map, rd);
-                    break :blk .{ .call_indirect = out };
-                },
-                .global_addr => |g| .{ .global_addr = .{ .symbol = g.symbol, .via_got = g.via_got } },
-                .load => |l| .{ .load = .{ .ptr = remapValue(value_map, l.ptr), .@"volatile" = l.@"volatile" } },
-                .store => |st| .{ .store = .{
-                    .value = remapValue(value_map, st.value),
-                    .ptr = remapValue(value_map, st.ptr),
-                    .@"volatile" = st.@"volatile",
-                } },
-                .prefetch => |pf| .{ .prefetch = .{
-                    .ptr = remapValue(value_map, pf.ptr),
-                } },
-                .va_start => |vs| .{ .va_start = .{ .list = remapValue(value_map, vs.list) } },
-                .va_arg => |va| .{ .va_arg = .{ .list = remapValue(value_map, va.list), .ty = va.ty } },
-                .va_end => |ve| .{ .va_end = .{ .list = remapValue(value_map, ve.list) } },
-                // A barrier has no Value to remap. Each unrolled copy of the body keeps its
-                // own barrier, so the number of times a thread meets is unchanged.
-                .barrier => |bar| .{ .barrier = bar },
-                .dot => |d| .{ .dot = .{
-                    .acc = remapValue(value_map, d.acc),
-                    .a = remapValue(value_map, d.a),
-                    .b = remapValue(value_map, d.b),
-                } },
-                // Only a/b/c are Values. Everything else (m/n/k, dtype, accumulate, embedded,
-                // quant, input_signs) is compile-time metadata, so start from the source op and
-                // overwrite only the Values. A named-field rebuild silently defaulted `embedded`
-                // back to false, which told the backend a matmul inside a live-value region was a
-                // standalone kernel free to clobber registers.
-                // The `quant` handle copies verbatim, including a `per_column` scale's ScaleList:
-                // unrolling clones within the SAME function, so the handle stays relative to the
-                // same `scale_pool` and needs no re-interning (unlike inline.zig's cross-function
-                // clone).
-                .matmul => |mmv| blk: {
-                    var out = mmv;
-                    out.a = remapValue(value_map, mmv.a);
-                    out.b = remapValue(value_map, mmv.b);
-                    out.c = remapValue(value_map, mmv.c);
-                    break :blk .{ .matmul = out };
-                },
-                .@"if" => |cf| blk: {
-                    args_buf.clearRetainingCapacity();
-                    for (func.valueList(cf.then.args)) |v| {
-                        try args_buf.append(allocator, remapValue(value_map, v));
-                    }
-                    const then_args = try func.internValues(args_buf.items);
-                    const then_jump: Jump = .{ .target = remapBlock(block_map, cf.then.target), .args = then_args };
-
-                    args_buf.clearRetainingCapacity();
-                    for (func.valueList(cf.@"else".args)) |v| {
-                        try args_buf.append(allocator, remapValue(value_map, v));
-                    }
-                    const else_args = try func.internValues(args_buf.items);
-                    const else_jump: Jump = .{ .target = remapBlock(block_map, cf.@"else".target), .args = else_args };
-
-                    break :blk .{ .@"if" = .{
-                        .cond = remapValue(value_map, cf.cond),
-                        .then = then_jump,
-                        .@"else" = else_jump,
-                    } };
-                },
-            };
+            const rebuilt = try rebuildOpcode(func, func.opcode(inst), value_map, block_map, &args_buf, allocator);
 
             // Ask the INSTRUCTION whether it defines a result, rather than naming the
             // result-less opcodes in a list. A hand-kept list has to be updated for every new
@@ -210,8 +232,11 @@ pub fn cloneBlocks(
             if (func.instResult(inst)) |result| {
                 const cloned_result = try func.appendInst(cloned, func.valueType(result), rebuilt);
                 try value_map.put(allocator, result, cloned_result);
+                try value_pairs.append(allocator, .{ .old = result, .new = cloned_result });
+                try inst_pairs.append(allocator, .{ .old = inst, .new = func.definingInst(cloned_result).? });
             } else {
-                _ = try func.appendStmtRaw(cloned, rebuilt);
+                const cloned_inst = try func.appendStmtRaw(cloned, rebuilt);
+                try inst_pairs.append(allocator, .{ .old = inst, .new = cloned_inst });
             }
         }
 
@@ -236,6 +261,11 @@ pub fn cloneBlocks(
             func.setTerminator(cloned, rebuilt_term);
         }
     }
+
+    // Carry every attribute of a cloned parameter, instruction or result onto its copy. An
+    // unrolled body copy runs the SAME operations as the original, so it must keep the same
+    // annotations: an `endian` a copy loses is a byte order the backend stops applying.
+    try func.cloneAttrs(value_pairs.items, inst_pairs.items);
 
     return clones;
 }
@@ -636,31 +666,44 @@ fn remapArgs(map: *const ValueMap, src: []const Value, a: std.mem.Allocator) Err
     return out;
 }
 
-/// Clone one pure (value-producing) instruction into `dest`, remapping operands
-/// through `vmap` and recording result -> clone. Only the pure opcodes a vetted
-/// header can hold are handled; anything else is unreachable by eligibility.
+/// Clone one instruction of the loop test header into `dest`, remapping operands through `vmap`
+/// and recording result -> clone.
+///
+/// It shares `rebuildOpcode` with `cloneBlocks` instead of listing the pure opcodes again. The
+/// old private list ended in `else => unreachable`, so a header opcode eligibility accepted but
+/// this list had missed reached undefined behaviour in a release build. `fconst128` was already
+/// such an opcode. `rebuildOpcode` is exhaustive over `Opcode` with no `else`, so a new opcode
+/// stops the BUILD instead.
+///
+/// The instruction's attributes travel with the copy: the guard re-runs the same test, so it
+/// must keep the same annotations.
 fn cloneInstInto(func: *Function, dest: Block, inst: Inst, vmap: *ValueMap, a: std.mem.Allocator) Error!void {
-    const rebuilt: Opcode = switch (func.opcode(inst)) {
-        .iconst => |v| .{ .iconst = v },
-        .fconst => |v| .{ .fconst = v },
-        .arith => |x| .{ .arith = .{ .op = x.op, .lhs = rv(vmap, x.lhs), .rhs = rv(vmap, x.rhs) } },
-        .arith_imm => |x| .{ .arith_imm = .{ .op = x.op, .lhs = rv(vmap, x.lhs), .imm = x.imm } },
-        .icmp => |x| .{ .icmp = .{ .op = x.op, .lhs = rv(vmap, x.lhs), .rhs = rv(vmap, x.rhs) } },
-        .select => |x| .{ .select = .{ .cond = rv(vmap, x.cond), .then = rv(vmap, x.then), .@"else" = rv(vmap, x.@"else") } },
-        .convert => |x| .{ .convert = .{ .value = rv(vmap, x.value) } },
-        .unary => |x| .{ .unary = .{ .op = x.op, .value = rv(vmap, x.value) } },
-        .extract => |x| .{ .extract = .{ .aggregate = rv(vmap, x.aggregate), .index = x.index } },
-        .struct_new => |x| blk: {
-            var fields: std.ArrayList(Value) = .empty;
-            for (func.valueList(x.fields)) |v| try fields.append(a, rv(vmap, v));
-            break :blk .{ .struct_new = .{ .fields = try func.internValues(fields.items) } };
-        },
-        .dot => |x| .{ .dot = .{ .acc = rv(vmap, x.acc), .a = rv(vmap, x.a), .b = rv(vmap, x.b) } },
-        else => unreachable, // eligibility guarantees a pure test header
-    };
-    const result = func.instResult(inst).?;
-    const cloned = try func.appendInst(dest, func.valueType(result), rebuilt);
-    try vmap.put(a, result, cloned);
+    // Scratch for the variadic operands, released whatever happens. The old `struct_new` arm
+    // built this list and never released it, so unrolling a header holding a `struct_new`
+    // leaked one allocation per guard.
+    var args_buf: std.ArrayList(Value) = .empty;
+    defer args_buf.deinit(a);
+
+    // The header holds no branch, so no block target can need remapping. An empty map leaves
+    // every target as it is.
+    var block_map: BlockMap = .empty;
+    defer block_map.deinit(a);
+
+    const rebuilt = try rebuildOpcode(func, func.opcode(inst), vmap, &block_map, &args_buf, a);
+
+    // Ask the INSTRUCTION whether it defines a result, rather than assuming one. The old
+    // `func.instResult(inst).?` was an unchecked assumption about the header's shape.
+    if (func.instResult(inst)) |result| {
+        const cloned = try func.appendInst(dest, func.valueType(result), rebuilt);
+        try vmap.put(a, result, cloned);
+        try func.cloneAttrs(
+            &.{.{ .old = result, .new = cloned }},
+            &.{.{ .old = inst, .new = func.definingInst(cloned).? }},
+        );
+    } else {
+        const cloned = try func.appendStmtRaw(dest, rebuilt);
+        try func.cloneAttrs(&.{}, &.{.{ .old = inst, .new = cloned }});
+    }
 }
 
 /// Add every value operand used by `block` (instructions, `if` edges, and the
@@ -1054,4 +1097,173 @@ test "cloneBlocks keeps volatile on a cloned load and store (loop-unroll body co
     try std.testing.expectEqual(@as(usize, 1), vol_stores);
     try std.testing.expectEqual(@as(usize, 1), plain_loads);
     try std.testing.expectEqual(@as(usize, 1), plain_stores);
+}
+
+/// The int payload of the first `namespace.key` attribute on `target`, or null when absent.
+fn testCustomInt(func: *const Function, target: ir.function.AttrTarget, namespace: []const u8, key: []const u8) ?i64 {
+    var it = func.attributesOf(target);
+    while (it.next()) |attr| switch (attr) {
+        .custom => |c| {
+            if (!std.mem.eql(u8, c.namespace, namespace)) continue;
+            if (!std.mem.eql(u8, c.key, key)) continue;
+            return switch (c.value) {
+                .int => |n| n,
+                .flag, .string => null,
+            };
+        },
+        .@"inline", .noreturn, .cold, .@"align", .endian => {},
+    };
+    return null;
+}
+
+/// How many attributes sit on `target`.
+fn testAttrCount(func: *const Function, target: ir.function.AttrTarget) usize {
+    var n: usize = 0;
+    var it = func.attributesOf(target);
+    while (it.next()) |_| n += 1;
+    return n;
+}
+
+test "cloneBlocks carries a param, result and instruction attribute onto the body copy" {
+    // An unrolled body copy runs the same operations as the original, so it must keep the same
+    // annotations. A copied load that loses `endian` is one the backend stops byte-swapping.
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const b0 = try func.appendBlock();
+    const p = try func.appendBlockParam(b0, ptr_t);
+    const v = try func.appendInst(b0, i32_t, .{ .load = .{ .ptr = p } });
+    try func.appendStore(b0, v, p);
+    const store_inst = func.blockInsts(b0)[1];
+    func.setTerminator(b0, .{ .ret = ir.function.Ret.none() });
+
+    try func.addAttr(.{ .value = p }, .{ .@"align" = 16 });
+    try func.addAttr(.{ .value = v }, .{ .endian = .big });
+    try func.addAttr(.{ .inst = store_inst }, .{ .custom = .{
+        .namespace = "debug",
+        .key = "line",
+        .value = .{ .int = 9 },
+    } });
+
+    var vmap: ValueMap = .empty;
+    defer vmap.deinit(allocator);
+    var bmap: BlockMap = .empty;
+    defer bmap.deinit(allocator);
+    const clones = try cloneBlocks(allocator, &func, &.{b0}, &vmap, &bmap);
+    defer allocator.free(clones);
+
+    const new_p = func.blockParams(clones[0])[0];
+    var align_it = func.attributesOf(.{ .value = new_p });
+    try std.testing.expectEqual(ir.function.Attribute{ .@"align" = 16 }, align_it.next().?);
+
+    const new_v = vmap.get(v).?;
+    var endian_it = func.attributesOf(.{ .value = new_v });
+    try std.testing.expectEqual(ir.function.Attribute{ .endian = .big }, endian_it.next().?);
+
+    const new_store = func.blockInsts(clones[0])[1];
+    try std.testing.expectEqual(@as(?i64, 9), testCustomInt(&func, .{ .inst = new_store }, "debug", "line"));
+}
+
+test "cloneBlocks does not carry a block attribute onto the copied block" {
+    // Suspicious case, the other direction. A `cf` attribute names the merge block of the
+    // ORIGINAL region; a body copy claiming the same merge point would misdescribe the CFG.
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const exit = try func.appendBlock();
+    const b0 = try func.appendBlock();
+    const p = try func.appendBlockParam(b0, i32_t);
+    _ = try func.appendInst(b0, i32_t, .{ .arith = .{ .op = .add, .lhs = p, .rhs = p } });
+    func.setTerminator(b0, .{ .ret = ir.function.Ret.none() });
+    try func.addAttr(.{ .block = b0 }, .{ .custom = .{
+        .namespace = "cf",
+        .key = "merge",
+        .value = .{ .int = @intFromEnum(exit) },
+    } });
+
+    var vmap: ValueMap = .empty;
+    defer vmap.deinit(allocator);
+    var bmap: BlockMap = .empty;
+    defer bmap.deinit(allocator);
+    const clones = try cloneBlocks(allocator, &func, &.{b0}, &vmap, &bmap);
+    defer allocator.free(clones);
+
+    try std.testing.expectEqual(@as(usize, 0), testAttrCount(&func, .{ .block = clones[0] }));
+    try std.testing.expectEqual(@as(usize, 1), testAttrCount(&func, .{ .block = b0 }));
+}
+
+test "cloneInstInto rebuilds an f128 constant instead of reaching unreachable" {
+    // Regression: `eligible` accepts `fconst128` in a loop test header, but the private opcode
+    // list this function used had no `fconst128` arm and ended in `else => unreachable`. A
+    // header holding an f128 constant reached undefined behaviour in a release build.
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const f128_t = try func.types.intern(.{ .float = .f128 });
+    const b0 = try func.appendBlock();
+    const dest = try func.appendBlock();
+    const k = try func.appendInst(b0, f128_t, .{ .fconst128 = 0x3fff_8000_0000_0000_0000_0000_0000_0000 });
+
+    var vmap: ValueMap = .empty;
+    defer vmap.deinit(allocator);
+    try cloneInstInto(&func, dest, func.definingInst(k).?, &vmap, allocator);
+
+    const cloned = func.blockInsts(dest)[0];
+    try std.testing.expectEqual(@as(u128, 0x3fff_8000_0000_0000_0000_0000_0000_0000), func.opcode(cloned).fconst128);
+}
+
+test "cloneInstInto carries the header instruction's attribute onto the guard copy" {
+    // Each guard re-runs the header test, so its copy must keep the header's annotations.
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const b0 = try func.appendBlock();
+    const dest = try func.appendBlock();
+    const p = try func.appendBlockParam(b0, i32_t);
+    const sum = try func.appendInst(b0, i32_t, .{ .arith = .{ .op = .add, .lhs = p, .rhs = p } });
+    const sum_inst = func.definingInst(sum).?;
+    try func.addAttr(.{ .value = sum }, .{ .@"align" = 8 });
+    try func.addAttr(.{ .inst = sum_inst }, .{ .custom = .{
+        .namespace = "debug",
+        .key = "line",
+        .value = .{ .int = 5 },
+    } });
+
+    var vmap: ValueMap = .empty;
+    defer vmap.deinit(allocator);
+    try cloneInstInto(&func, dest, sum_inst, &vmap, allocator);
+
+    const cloned = func.blockInsts(dest)[0];
+    const cloned_result = func.instResult(cloned).?;
+    var align_it = func.attributesOf(.{ .value = cloned_result });
+    try std.testing.expectEqual(ir.function.Attribute{ .@"align" = 8 }, align_it.next().?);
+    try std.testing.expectEqual(@as(?i64, 5), testCustomInt(&func, .{ .inst = cloned }, "debug", "line"));
+}
+
+test "cloneInstInto releases the scratch list it builds for a struct_new header op" {
+    // Regression: the `struct_new` arm built an ArrayList of remapped fields and never released
+    // it, so every guard of an unrolled loop leaked one allocation. `testing.allocator` fails
+    // this test if the list is not released.
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const vec_t = try func.types.intern(.{ .vector = .{ .len = 2, .elem = i32_t } });
+    const b0 = try func.appendBlock();
+    const dest = try func.appendBlock();
+    const p = try func.appendBlockParam(b0, i32_t);
+    const packed_val = try func.appendInst(b0, vec_t, .{
+        .struct_new = .{ .fields = try func.internValues(&.{ p, p }) },
+    });
+
+    var vmap: ValueMap = .empty;
+    defer vmap.deinit(allocator);
+    try cloneInstInto(&func, dest, func.definingInst(packed_val).?, &vmap, allocator);
+
+    const cloned = func.blockInsts(dest)[0];
+    try std.testing.expectEqualSlices(Value, &.{ p, p }, func.valueList(func.opcode(cloned).struct_new.fields));
 }

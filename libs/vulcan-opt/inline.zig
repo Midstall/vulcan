@@ -137,7 +137,19 @@ fn inlineCall(allocator: std.mem.Allocator, caller: *Function, bi: u32, call_idx
     defer tmap.deinit(allocator);
 
     // Callee parameters map to the call arguments.
+    //
+    // A parameter's attributes deliberately STOP here. The argument is a value the caller
+    // already owns and already uses elsewhere, so stamping the callee's parameter attributes
+    // onto it would change how the caller's own value reads everywhere it appears, not just
+    // inside the inlined body. `inlineCallMulti` gives the callee's parameters fresh caller
+    // parameters, so there the attributes do travel.
     for (callee.blockParams(entry), 0..) |p, k| try vmap.put(allocator, p, args[k]);
+
+    // The `callee entity -> caller clone` record for the attribute copy below.
+    var value_pairs: std.ArrayList(Function.ValuePair) = .empty;
+    defer value_pairs.deinit(allocator);
+    var inst_pairs: std.ArrayList(Function.InstPair) = .empty;
+    defer inst_pairs.deinit(allocator);
 
     // Clone each callee instruction onto the end of the caller's block.
     const old_len = caller.blockInsts(block).len;
@@ -147,7 +159,14 @@ fn inlineCall(allocator: std.mem.Allocator, caller: *Function, bi: u32, call_idx
         const op = try mapOpcode(caller, callee, vmap, &tmap, callee.opcode(cinst));
         const nres = try caller.appendInst(block, rty, op);
         try vmap.put(allocator, cres, nres);
+        try value_pairs.append(allocator, .{ .old = cres, .new = nres });
+        try inst_pairs.append(allocator, .{ .old = cinst, .new = caller.definingInst(nres).? });
     }
+
+    // Carry the callee's instruction and result attributes onto the copies. An inlined
+    // `endian` load that came back plain is a byte order the backend stops applying, the same
+    // class of loss as an inlined `volatile` load that came back ordinary.
+    try caller.cloneAttrsFrom(callee, value_pairs.items, inst_pairs.items);
 
     // The callee's returned value replaces the call's result everywhere.
     if (call_result) |r| {
@@ -424,23 +443,40 @@ fn inlineCallMulti(allocator: std.mem.Allocator, caller: *Function, bi: u32, cal
     const rpo = try reachableRpo(allocator, callee);
     defer allocator.free(rpo);
 
+    // The `callee entity -> caller clone` record for the attribute copy at the end.
+    var value_pairs: std.ArrayList(Function.ValuePair) = .empty;
+    defer value_pairs.deinit(allocator);
+    var inst_pairs: std.ArrayList(Function.InstPair) = .empty;
+    defer inst_pairs.deinit(allocator);
+
     for (rpo) |cb| try bmap.put(allocator, cb, try caller.appendBlock());
-    for (rpo) |cb| { // params of every cloned block (entry params get the call args below)
+    for (rpo) |cb| { // params of every cloned block (the entry's take the call args by jump)
         const nb = bmap.get(cb).?;
         for (callee.blockParams(@enumFromInt(cb))) |p| {
             const np = try caller.appendBlockParam(nb, try mapType(caller, callee, &tmap, callee.valueType(p)));
             try vmap.put(allocator, p, np);
+            // This path gives every callee parameter, the entry's included, a FRESH caller
+            // parameter, so a parameter attribute describes the copy just as well as the
+            // original and travels with it.
+            try value_pairs.append(allocator, .{ .old = p, .new = np });
         }
     }
     for (rpo) |cb| { // instructions, in RPO so operands are already mapped. `if` is handled below
         const nb = bmap.get(cb).?;
         for (callee.blockInsts(@enumFromInt(cb))) |cinst| switch (callee.opcode(cinst)) {
+            // The `if` is rebuilt by the control-flow pass below, which records its own pair.
             .@"if" => {},
             // `appendStoreVol`, not `appendStore`: `appendStore` hardcodes `volatile = false`, which
             // turns an MMIO write in the callee into an ordinary store the next pass can move or
             // delete. Carry the callee op's own flag instead.
-            .store => |st| try caller.appendStoreVol(nb, mapV(vmap, st.value), mapV(vmap, st.ptr), st.@"volatile"),
-            .prefetch => |pf| try caller.appendPrefetch(nb, mapV(vmap, pf.ptr)),
+            .store => |st| {
+                try caller.appendStoreVol(nb, mapV(vmap, st.value), mapV(vmap, st.ptr), st.@"volatile");
+                try inst_pairs.append(allocator, .{ .old = cinst, .new = lastInst(caller, nb) });
+            },
+            .prefetch => |pf| {
+                try caller.appendPrefetch(nb, mapV(vmap, pf.ptr));
+                try inst_pairs.append(allocator, .{ .old = cinst, .new = lastInst(caller, nb) });
+            },
             // A `per_column` scale's ScaleList handle (and a bias's BiasList handle) is relative to
             // the CALLEE's pools, which is meaningless in the caller (a different function, different
             // pools). Re-intern both through the spec builder so each handle is re-resolved via the
@@ -471,20 +507,20 @@ fn inlineCallMulti(allocator: std.mem.Allocator, caller: *Function, bi: u32, cal
                 // The builders above default `embedded` to false; carry the callee op's flag onto the
                 // just-appended matmul (the last inst in nb) so a self-contained matmul stays
                 // self-contained after inlining into a caller that has live values around it.
-                if (mm.embedded) {
-                    const appended = caller.blockInsts(nb);
-                    const last = appended[appended.len - 1];
-                    // The matmul builders each append exactly one statement, so the last inst in nb is
-                    // that matmul; assert it rather than silently flag-flip an unrelated opcode.
-                    std.debug.assert(caller.opcode(last) == .matmul);
-                    caller.opcodeMut(last).matmul.embedded = true;
-                }
+                const last = lastInst(caller, nb);
+                // The matmul builders each append exactly one statement, so the last inst in nb is
+                // that matmul; assert it rather than silently flag-flip an unrelated opcode.
+                std.debug.assert(caller.opcode(last) == .matmul);
+                if (mm.embedded) caller.opcodeMut(last).matmul.embedded = true;
+                try inst_pairs.append(allocator, .{ .old = cinst, .new = last });
             },
             else => |op| {
                 const cres = callee.instResult(cinst).?;
                 const rty = try mapType(caller, callee, &tmap, callee.valueType(cres));
                 const nres = try caller.appendInst(nb, rty, try mapOpcode(caller, callee, vmap, &tmap, op));
                 try vmap.put(allocator, cres, nres);
+                try value_pairs.append(allocator, .{ .old = cres, .new = nres });
+                try inst_pairs.append(allocator, .{ .old = cinst, .new = caller.definingInst(nres).? });
             },
         };
     }
@@ -492,9 +528,11 @@ fn inlineCallMulti(allocator: std.mem.Allocator, caller: *Function, bi: u32, cal
         const nb = bmap.get(cb).?;
         const cblock: Block = @enumFromInt(cb);
         var if_cf: ?ir.function.If = null;
+        var if_src: ?Inst = null;
         for (callee.blockInsts(cblock)) |cinst| {
             if (callee.opcode(cinst) == .@"if") {
                 if_cf = callee.opcode(cinst).@"if";
+                if_src = cinst;
                 break;
             }
         }
@@ -504,6 +542,7 @@ fn inlineCallMulti(allocator: std.mem.Allocator, caller: *Function, bi: u32, cal
             const ea = try remapArgs(allocator, callee, vmap, cf.@"else".args);
             defer allocator.free(ea);
             try caller.appendIf(nb, mapV(vmap, cf.cond), .{ .target = bmap.get(@intFromEnum(cf.then.target)).?, .args = ta }, .{ .target = bmap.get(@intFromEnum(cf.@"else".target)).?, .args = ea });
+            try inst_pairs.append(allocator, .{ .old = if_src.?, .new = lastInst(caller, nb) });
             continue;
         }
         if (callee.terminator(cblock)) |t| switch (t) {
@@ -520,8 +559,22 @@ fn inlineCallMulti(allocator: std.mem.Allocator, caller: *Function, bi: u32, cal
         };
     }
 
+    // Carry the callee's parameter, instruction and result attributes onto the copies, now that
+    // every copy exists. An inlined `endian` load that came back plain is a byte order the
+    // backend stops applying, the same class of loss as an inlined `volatile` load that came
+    // back ordinary.
+    try caller.cloneAttrsFrom(callee, value_pairs.items, inst_pairs.items);
+
     // Enter the inlined body from the (now truncated) caller block, passing the call arguments.
     try caller.setJump(b_block, bmap.get(0).?, args);
+}
+
+/// The instruction a statement builder just appended to `block`: the block's last one. Each
+/// builder above appends exactly one instruction and returns nothing, so this recovers its
+/// handle.
+fn lastInst(caller: *const Function, block: Block) Inst {
+    const appended = caller.blockInsts(block);
+    return appended[appended.len - 1];
 }
 
 const TestLookup = struct {
@@ -790,4 +843,181 @@ test "inlining a plain load and store leaves volatile=false (the flag is carried
             else => {},
         };
     }
+}
+
+/// The int payload of the first `namespace.key` attribute on `target`, or null when absent.
+fn testCustomInt(func: *const Function, target: ir.function.AttrTarget, namespace: []const u8, key: []const u8) ?i64 {
+    var it = func.attributesOf(target);
+    while (it.next()) |attr| switch (attr) {
+        .custom => |c| {
+            if (!std.mem.eql(u8, c.namespace, namespace)) continue;
+            if (!std.mem.eql(u8, c.key, key)) continue;
+            return switch (c.value) {
+                .int => |n| n,
+                .flag, .string => null,
+            };
+        },
+        .@"inline", .noreturn, .cold, .@"align", .endian => {},
+    };
+    return null;
+}
+
+/// How many attributes sit on `target`.
+fn testAttrCount(func: *const Function, target: ir.function.AttrTarget) usize {
+    var n: usize = 0;
+    var it = func.attributesOf(target);
+    while (it.next()) |_| n += 1;
+    return n;
+}
+
+test "inlining carries the callee load's endian attribute onto the clone (single-block path)" {
+    // `endian` picks a byte-swapping load in the riscv64 backend. A callee helper that reads a
+    // big-endian field and comes back plain after inlining reads the bytes in the wrong order,
+    // the same class of loss as an inlined `volatile` load that comes back ordinary.
+    const allocator = std.testing.allocator;
+    const i32k = ir.types.TypeKind{ .int = .{ .signedness = .signed, .bits = 32 } };
+
+    // callee read_be(p): return *p, with the result tagged big-endian.
+    var callee = Function.init(allocator);
+    defer callee.deinit();
+    {
+        const t = try callee.types.intern(i32k);
+        const ptr_t = try callee.types.ptrGlobal();
+        const b = try callee.appendBlock();
+        const p = try callee.appendBlockParam(b, ptr_t);
+        const v = try callee.appendInst(b, t, .{ .load = .{ .ptr = p } });
+        try callee.addAttr(.{ .value = v }, .{ .endian = .big });
+        callee.setTerminator(b, .{ .ret = ir.function.Ret.one(v) });
+    }
+
+    var caller = Function.init(allocator);
+    defer caller.deinit();
+    const t = try caller.types.intern(i32k);
+    const ptr_t = try caller.types.ptrGlobal();
+    const b = try caller.appendBlock();
+    const p = try caller.appendBlockParam(b, ptr_t);
+    const call = try caller.appendCall(b, t, "read_be", &.{p});
+    caller.setTerminator(b, .{ .ret = ir.function.Ret.one(call) });
+
+    var lk = TestLookup{ .callee = &callee, .name = "read_be" };
+    try std.testing.expect(try run(allocator, &caller, .{ .context = &lk, .func = TestLookup.get }));
+
+    var tagged: usize = 0;
+    for (caller.blockInsts(b)) |inst| {
+        if (caller.opcode(inst) != .load) continue;
+        const result = caller.instResult(inst).?;
+        var it = caller.attributesOf(.{ .value = result });
+        try std.testing.expectEqual(ir.function.Attribute{ .endian = .big }, it.next().?);
+        tagged += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), tagged);
+}
+
+test "inlining does not stamp a callee parameter's attribute onto the caller's argument (single-block path)" {
+    // Suspicious case, the other direction. On this path a callee parameter maps to a value the
+    // CALLER already owns and uses elsewhere. Copying the parameter's attribute onto it would
+    // change how the caller's own value reads everywhere it appears, not only inside the body.
+    const allocator = std.testing.allocator;
+    const i32k = ir.types.TypeKind{ .int = .{ .signedness = .signed, .bits = 32 } };
+
+    var callee = Function.init(allocator);
+    defer callee.deinit();
+    {
+        const t = try callee.types.intern(i32k);
+        const b = try callee.appendBlock();
+        const a = try callee.appendBlockParam(b, t);
+        try callee.addAttr(.{ .value = a }, .{ .@"align" = 16 });
+        const sum = try callee.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = a, .rhs = a } });
+        callee.setTerminator(b, .{ .ret = ir.function.Ret.one(sum) });
+    }
+
+    var caller = Function.init(allocator);
+    defer caller.deinit();
+    const t = try caller.types.intern(i32k);
+    const b = try caller.appendBlock();
+    const x = try caller.appendBlockParam(b, t);
+    const call = try caller.appendCall(b, t, "twice", &.{x});
+    caller.setTerminator(b, .{ .ret = ir.function.Ret.one(call) });
+
+    var lk = TestLookup{ .callee = &callee, .name = "twice" };
+    try std.testing.expect(try run(allocator, &caller, .{ .context = &lk, .func = TestLookup.get }));
+
+    try std.testing.expectEqual(@as(usize, 0), testAttrCount(&caller, .{ .value = x }));
+    // The whole caller gains nothing: the callee held only that one parameter attribute.
+    try std.testing.expectEqual(@as(usize, 0), caller.attributeEntries().len);
+}
+
+test "inlining carries a parameter and a store attribute onto the clone (multi-block path)" {
+    // This path gives every callee parameter a FRESH caller parameter, so a parameter attribute
+    // describes the copy just as well as the original and must travel with it.
+    const allocator = std.testing.allocator;
+    const i32k = ir.types.TypeKind{ .int = .{ .signedness = .signed, .bits = 32 } };
+
+    // callee rmw(dst, src, v): *dst = v; return *src. The store leaves it result-less, so
+    // `inlinable` refuses it and `inlineCallMulti` takes it.
+    var callee = Function.init(allocator);
+    defer callee.deinit();
+    {
+        const t = try callee.types.intern(i32k);
+        const ptr_t = try callee.types.ptrGlobal();
+        const b = try callee.appendBlock();
+        const dst = try callee.appendBlockParam(b, ptr_t);
+        const src = try callee.appendBlockParam(b, ptr_t);
+        const v = try callee.appendBlockParam(b, t);
+        try callee.appendStoreVol(b, v, dst, false);
+        const store_inst = callee.blockInsts(b)[0];
+        const l = try callee.appendInst(b, t, .{ .load = .{ .ptr = src } });
+        callee.setTerminator(b, .{ .ret = ir.function.Ret.one(l) });
+
+        try callee.addAttr(.{ .value = dst }, .{ .@"align" = 16 });
+        try callee.addAttr(.{ .inst = store_inst }, .{ .custom = .{
+            .namespace = "debug",
+            .key = "line",
+            .value = .{ .int = 77 },
+        } });
+        try callee.addAttr(.{ .value = l }, .{ .endian = .big });
+        try callee.addAttr(.func, .@"inline"); // must NOT travel: it describes the callee
+    }
+
+    var caller = Function.init(allocator);
+    defer caller.deinit();
+    const t = try caller.types.intern(i32k);
+    const ptr_t = try caller.types.ptrGlobal();
+    const b = try caller.appendBlock();
+    const dst = try caller.appendBlockParam(b, ptr_t);
+    const src = try caller.appendBlockParam(b, ptr_t);
+    const v = try caller.appendBlockParam(b, t);
+    const call = try caller.appendCall(b, t, "rmw", &.{ dst, src, v });
+    caller.setTerminator(b, .{ .ret = ir.function.Ret.one(call) });
+
+    var lk = TestLookup{ .callee = &callee, .name = "rmw" };
+    try std.testing.expect(try run(allocator, &caller, .{ .context = &lk, .func = TestLookup.get }));
+
+    // The cloned body block's first parameter is the clone of the callee's `dst`.
+    var aligned: usize = 0;
+    var lines: usize = 0;
+    var big: usize = 0;
+    for (caller.attributeEntries()) |entry| switch (entry.attr) {
+        .@"align" => |n| {
+            try std.testing.expectEqual(@as(u32, 16), n);
+            aligned += 1;
+        },
+        .endian => |e| {
+            try std.testing.expectEqual(ir.function.Attribute{ .endian = .big }, ir.function.Attribute{ .endian = e });
+            big += 1;
+        },
+        .custom => {
+            try std.testing.expectEqual(@as(?i64, 77), testCustomInt(&caller, entry.target, "debug", "line"));
+            lines += 1;
+        },
+        .@"inline", .noreturn, .cold => try std.testing.expect(false), // the callee's, must not travel
+    };
+    try std.testing.expectEqual(@as(usize, 1), aligned);
+    try std.testing.expectEqual(@as(usize, 1), lines);
+    try std.testing.expectEqual(@as(usize, 1), big);
+
+    // Each landed on the clone, not on a value the caller already owned.
+    try std.testing.expectEqual(@as(usize, 0), testAttrCount(&caller, .{ .value = dst }));
+    try std.testing.expectEqual(@as(usize, 0), testAttrCount(&caller, .{ .value = src }));
+    try std.testing.expectEqual(@as(usize, 0), testAttrCount(&caller, .func));
 }

@@ -695,6 +695,90 @@ pub const Function = struct {
         return self.attributes.items;
     }
 
+    /// One `original -> clone` correspondence, for `cloneAttrs`.
+    pub const ValuePair = struct { old: Value, new: Value };
+
+    /// One `original -> clone` correspondence, for `cloneAttrs`.
+    pub const InstPair = struct { old: Inst, new: Inst };
+
+    /// Copy every attribute of a cloned entity onto its clone, inside ONE function.
+    ///
+    /// An attribute is not decoration. `endian` selects a byte-swapping load, and
+    /// `vulcan.gpu.builtin` says a parameter comes from the hardware and takes no room in the
+    /// parameter block. A pass that duplicates instructions without duplicating their
+    /// attributes gives the copy a different meaning from the original, and the backend then
+    /// emits the wrong code with no diagnostic. Every pass that duplicates instructions inside
+    /// a function must call this.
+    ///
+    /// `values` and `insts` hold ONLY what the caller itself cloned. A pass whose value map is
+    /// pre-seeded with an outside substitution must not put that substitution here, or it would
+    /// pull an attribute onto a value the clone does not own.
+    ///
+    /// A `func` attribute is left alone: it already describes the function the clone sits in.
+    /// A `block` attribute is left alone as well, because the structured control-flow
+    /// attributes hold merge and continue block ids that name the ORIGINAL region, and a second
+    /// block must not claim to be that region's merge point.
+    pub fn cloneAttrs(
+        self: *Function,
+        values: []const ValuePair,
+        insts: []const InstPair,
+    ) std.mem.Allocator.Error!void {
+        // Read the end ONCE. `addAttr` appends to this same list, so a copied entry would
+        // otherwise be seen again and copied forever.
+        const end = self.attributes.items.len;
+        if (end == 0) return;
+
+        var i: usize = 0;
+        while (i < end) : (i += 1) {
+            // Re-index each time: the append below can have moved the backing array. The
+            // attribute's own string payloads are function-owned and do not move, so the
+            // copy taken here stays valid across `addAttr`.
+            const entry = self.attributes.items[i];
+            // EVERY matching pair, not the first. One original can have several copies: a
+            // loop unrolled by four gives one instruction four clones, and each needs its own
+            // entry.
+            switch (entry.target) {
+                .value => |v| for (values) |pair| {
+                    if (pair.old == v) try self.addAttr(.{ .value = pair.new }, entry.attr);
+                },
+                .inst => |n| for (insts) |pair| {
+                    if (pair.old == n) try self.addAttr(.{ .inst = pair.new }, entry.attr);
+                },
+                .func, .block => {},
+            }
+        }
+    }
+
+    /// Copy every attribute of a cloned entity from `src` onto its clone in `self`. The
+    /// cross-function form of `cloneAttrs`, for a pass that copies one function's body into
+    /// another one (inlining). `addAttr` re-owns any string payload, so the copy shares no
+    /// memory with `src`.
+    ///
+    /// A `func` attribute does NOT travel: it describes the SOURCE function (`noreturn`,
+    /// `inline`), which says nothing about the function the body is spliced into.
+    pub fn cloneAttrsFrom(
+        self: *Function,
+        src: *const Function,
+        values: []const ValuePair,
+        insts: []const InstPair,
+    ) std.mem.Allocator.Error!void {
+        // Two different functions. Appending to the list being read would move it.
+        std.debug.assert(self != src);
+
+        for (src.attributes.items) |entry| {
+            // EVERY matching pair, for the same reason as `cloneAttrs`.
+            switch (entry.target) {
+                .value => |v| for (values) |pair| {
+                    if (pair.old == v) try self.addAttr(.{ .value = pair.new }, entry.attr);
+                },
+                .inst => |n| for (insts) |pair| {
+                    if (pair.old == n) try self.addAttr(.{ .inst = pair.new }, entry.attr);
+                },
+                .func, .block => {},
+            }
+        }
+    }
+
     /// Copy any string payloads of an attribute into function-owned memory.
     fn ownAttr(self: *Function, attr: Attribute) std.mem.Allocator.Error!Attribute {
         switch (attr) {
@@ -1317,12 +1401,25 @@ pub const Function = struct {
     /// now point at the clone (e.g. rewiring one predecessor's edge onto the fresh copy). Does NOT
     /// modify `src`. Foundation for tail duplication in general jump threading: cloning a shared
     /// block gives one predecessor a private copy it can specialize.
+    ///
+    /// Every attribute on a copied parameter, instruction or instruction result travels with the
+    /// copy (see `cloneAttrs`), so a cloned load keeps its `endian` and a cloned parameter keeps
+    /// its `vulcan.gpu.builtin` tag. An attribute keyed by `src` ITSELF does not travel: see the
+    /// note on `cloneAttrs`.
     pub fn cloneBlock(self: *Function, allocator: std.mem.Allocator, src: Block, map: *std.AutoHashMapUnmanaged(Value, Value)) std.mem.Allocator.Error!Block {
         const dst = try self.appendBlock();
+
+        // The `original -> clone` record the attribute copy needs. It holds only what this call
+        // clones, never anything the caller pre-seeded into `map`.
+        var value_pairs: std.ArrayList(ValuePair) = .empty;
+        defer value_pairs.deinit(allocator);
+        var inst_pairs: std.ArrayList(InstPair) = .empty;
+        defer inst_pairs.deinit(allocator);
 
         for (self.blockParams(src)) |p| {
             const np = try self.appendBlockParam(dst, self.valueType(p));
             try map.put(allocator, p, np);
+            try value_pairs.append(allocator, .{ .old = p, .new = np });
         }
 
         for (self.blockInsts(src)) |inst| {
@@ -1330,11 +1427,16 @@ pub const Function = struct {
             if (self.instResult(inst)) |result| {
                 const nr = try self.appendInst(dst, self.valueType(result), op);
                 try map.put(allocator, result, nr);
+                try value_pairs.append(allocator, .{ .old = result, .new = nr });
+                try inst_pairs.append(allocator, .{ .old = inst, .new = self.definingInst(nr).? });
             } else {
                 // @"if", store, prefetch, matmul: result-less statements.
-                try self.appendStmt(dst, op);
+                const ni = try self.appendStmtRaw(dst, op);
+                try inst_pairs.append(allocator, .{ .old = inst, .new = ni });
             }
         }
+
+        try self.cloneAttrs(value_pairs.items, inst_pairs.items);
 
         if (self.terminator(src)) |term| {
             const new_term: Terminator = switch (term) {
@@ -2809,6 +2911,114 @@ test "cloneBlock produces a block verify accepts once wired into the CFG" {
     var d = try verify.verify(std.testing.allocator, &func, .high);
     defer d.deinit();
     try std.testing.expect(d.ok());
+}
+
+/// The int payload of the first `namespace.key` attribute on `target`, or null when absent. The
+/// GPU layer has its own reader, in a module this one cannot import, so the test repeats it.
+fn customIntAttr(func: *const Function, target: AttrTarget, namespace: []const u8, key: []const u8) ?i64 {
+    var it = func.attributesOf(target);
+    while (it.next()) |attr| switch (attr) {
+        .custom => |c| {
+            if (!std.mem.eql(u8, c.namespace, namespace)) continue;
+            if (!std.mem.eql(u8, c.key, key)) continue;
+            return switch (c.value) {
+                .int => |n| n,
+                .flag, .string => null,
+            };
+        },
+        .@"inline", .noreturn, .cold, .@"align", .endian => {},
+    };
+    return null;
+}
+
+/// How many attributes sit on `target`.
+fn attrCount(func: *const Function, target: AttrTarget) usize {
+    var n: usize = 0;
+    var it = func.attributesOf(target);
+    while (it.next()) |_| n += 1;
+    return n;
+}
+
+test "cloneBlock carries a parameter, result and instruction attribute onto the clone with the payload intact" {
+    // A cloned block that drops its attributes changes meaning: a parameter that loses
+    // `vulcan.gpu.builtin` is laid out in the parameter block instead of read from hardware,
+    // and a load that loses `endian` stops being byte-swapped.
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const src = try func.appendBlock();
+    const p = try func.appendBlockParam(src, ptr_t);
+    const loaded = try func.appendInst(src, i32_t, .{ .load = .{ .ptr = p } });
+    try func.appendStore(src, loaded, p);
+    const store_inst = func.blockInsts(src)[1];
+
+    try func.addAttr(.{ .value = p }, .{ .custom = .{
+        .namespace = "vulcan.gpu",
+        .key = "builtin",
+        .value = .{ .int = 3 },
+    } });
+    try func.addAttr(.{ .value = loaded }, .{ .endian = .big });
+    try func.addAttr(.{ .inst = store_inst }, .{ .custom = .{
+        .namespace = "debug",
+        .key = "line",
+        .value = .{ .int = 42 },
+    } });
+
+    var map: std.AutoHashMapUnmanaged(Value, Value) = .empty;
+    defer map.deinit(allocator);
+    const dst = try func.cloneBlock(allocator, src, &map);
+
+    // The clone's own parameter, result and instruction each carry the SAME payload.
+    const new_p = func.blockParams(dst)[0];
+    try std.testing.expect(new_p != p);
+    try std.testing.expectEqual(@as(?i64, 3), customIntAttr(&func, .{ .value = new_p }, "vulcan.gpu", "builtin"));
+
+    const new_loaded = map.get(loaded).?;
+    var endian_it = func.attributesOf(.{ .value = new_loaded });
+    try std.testing.expectEqual(Attribute{ .endian = .big }, endian_it.next().?);
+
+    const new_store = func.blockInsts(dst)[1];
+    try std.testing.expect(new_store != store_inst);
+    try std.testing.expectEqual(@as(?i64, 42), customIntAttr(&func, .{ .inst = new_store }, "debug", "line"));
+
+    // The originals keep exactly one attribute each: the copy added, it did not move.
+    try std.testing.expectEqual(@as(usize, 1), attrCount(&func, .{ .value = p }));
+    try std.testing.expectEqual(@as(usize, 1), attrCount(&func, .{ .inst = store_inst }));
+}
+
+test "cloneBlock does not carry a block attribute or a function attribute onto the clone" {
+    // Suspicious case, the other direction. A `cf` attribute holds the merge block id of the
+    // ORIGINAL region, so a second block must not claim to be that region's merge point, and a
+    // function attribute already describes the function the clone sits in.
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const merge = try func.appendBlock();
+    const src = try func.appendBlock();
+    const p = try func.appendBlockParam(src, i32_t);
+    _ = try func.appendInst(src, i32_t, .{ .arith = .{ .op = .add, .lhs = p, .rhs = p } });
+
+    try func.addAttr(.{ .block = src }, .{ .custom = .{
+        .namespace = "cf",
+        .key = "merge",
+        .value = .{ .int = @intFromEnum(merge) },
+    } });
+    try func.addAttr(.{ .block = src }, .cold);
+    try func.addAttr(.func, .@"inline");
+
+    var map: std.AutoHashMapUnmanaged(Value, Value) = .empty;
+    defer map.deinit(allocator);
+    const dst = try func.cloneBlock(allocator, src, &map);
+
+    // Nothing lands on the clone's block, and the source keeps both of its own.
+    try std.testing.expectEqual(@as(usize, 0), attrCount(&func, .{ .block = dst }));
+    try std.testing.expectEqual(@as(usize, 2), attrCount(&func, .{ .block = src }));
+    try std.testing.expectEqual(@as(usize, 1), attrCount(&func, .func));
 }
 
 test "clone deep-copies a function and leaves the original untouched" {

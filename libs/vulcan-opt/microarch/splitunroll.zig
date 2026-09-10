@@ -456,19 +456,34 @@ fn buildTree(func: *Function, block: Block, op: BinOp, ty: ir.types.Type, items:
 /// Clone every instruction of `body` (not its terminator) into `dest`, remapping operands through
 /// `vmap` and recording each result -> clone. Straight-line opcodes only (recognition guarantees no
 /// `if`/`matmul`); memory and call ops are cloned as-is (they run once per original iteration, in
-/// order, so their side effects are preserved).
+/// order, so their side effects are preserved). Every attribute of a cloned instruction or
+/// result travels with the copy: a split copy runs the same operation as the original, so an
+/// `endian` the copy loses is a byte order the backend stops applying to that access.
 fn cloneBodyInsts(func: *Function, dest: Block, body: Block, vmap: *std.AutoHashMapUnmanaged(Value, Value), allocator: std.mem.Allocator) Error!void {
     const insts = try allocator.dupe(Inst, func.blockInsts(body));
     defer allocator.free(insts);
+
+    // The `original -> clone` record for the attribute copy. It holds ONLY what this call
+    // creates, never a caller's pre-seeded substitution.
+    var value_pairs: std.ArrayList(ir.function.Function.ValuePair) = .empty;
+    defer value_pairs.deinit(allocator);
+    var inst_pairs: std.ArrayList(ir.function.Function.InstPair) = .empty;
+    defer inst_pairs.deinit(allocator);
+
     for (insts) |inst| {
         const op = try remapOp(func, func.opcode(inst), vmap, allocator);
         if (func.instResult(inst)) |result| {
             const clone = try func.appendInst(dest, func.valueType(result), op);
             try vmap.put(allocator, result, clone);
+            try value_pairs.append(allocator, .{ .old = result, .new = clone });
+            try inst_pairs.append(allocator, .{ .old = inst, .new = func.definingInst(clone).? });
         } else {
-            _ = try func.appendStmtRaw(dest, op);
+            const clone = try func.appendStmtRaw(dest, op);
+            try inst_pairs.append(allocator, .{ .old = inst, .new = clone });
         }
     }
+
+    try func.cloneAttrs(value_pairs.items, inst_pairs.items);
 }
 
 fn rv(vmap: *const std.AutoHashMapUnmanaged(Value, Value), v: Value) Value {
@@ -707,4 +722,86 @@ test "remapOp keeps volatile on a cloned load and store" {
         else => {},
     };
     try std.testing.expectEqual(@as(usize, 2), seen);
+}
+
+/// The int payload of the first `namespace.key` attribute on `target`, or null when absent.
+fn testCustomInt(func: *const Function, target: ir.function.AttrTarget, namespace: []const u8, key: []const u8) ?i64 {
+    var it = func.attributesOf(target);
+    while (it.next()) |attr| switch (attr) {
+        .custom => |c| {
+            if (!std.mem.eql(u8, c.namespace, namespace)) continue;
+            if (!std.mem.eql(u8, c.key, key)) continue;
+            return switch (c.value) {
+                .int => |n| n,
+                .flag, .string => null,
+            };
+        },
+        .@"inline", .noreturn, .cold, .@"align", .endian => {},
+    };
+    return null;
+}
+
+/// How many attributes sit on `target`.
+fn testAttrCount(func: *const Function, target: ir.function.AttrTarget) usize {
+    var n: usize = 0;
+    var it = func.attributesOf(target);
+    while (it.next()) |_| n += 1;
+    return n;
+}
+
+test "cloneBodyInsts carries a result and an instruction attribute onto the split copy" {
+    // A split copy runs the same operation as the original, so it must keep the same
+    // annotations. A copied load that loses `endian` is one the backend stops byte-swapping.
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const body = try func.appendBlock();
+    const dest = try func.appendBlock();
+    const p = try func.appendBlockParam(body, ptr_t);
+    const v = try func.appendInst(body, i32_t, .{ .load = .{ .ptr = p } });
+    try func.appendStore(body, v, p);
+    const store_inst = func.blockInsts(body)[1];
+
+    try func.addAttr(.{ .value = v }, .{ .endian = .big });
+    try func.addAttr(.{ .inst = store_inst }, .{ .custom = .{
+        .namespace = "debug",
+        .key = "line",
+        .value = .{ .int = 11 },
+    } });
+
+    var vmap: std.AutoHashMapUnmanaged(Value, Value) = .empty;
+    defer vmap.deinit(allocator);
+    try cloneBodyInsts(&func, dest, body, &vmap, allocator);
+
+    const cloned_v = vmap.get(v).?;
+    var endian_it = func.attributesOf(.{ .value = cloned_v });
+    try std.testing.expectEqual(ir.function.Attribute{ .endian = .big }, endian_it.next().?);
+
+    const cloned_store = func.blockInsts(dest)[1];
+    try std.testing.expectEqual(@as(?i64, 11), testCustomInt(&func, .{ .inst = cloned_store }, "debug", "line"));
+}
+
+test "cloneBodyInsts does not carry a block or function attribute onto the split copy" {
+    // Suspicious case, the other direction. A block attribute describes the ORIGINAL block and
+    // a function attribute already describes the function both blocks sit in.
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const body = try func.appendBlock();
+    const dest = try func.appendBlock();
+    const p = try func.appendBlockParam(body, i32_t);
+    _ = try func.appendInst(body, i32_t, .{ .arith = .{ .op = .add, .lhs = p, .rhs = p } });
+    try func.addAttr(.{ .block = body }, .cold);
+    try func.addAttr(.func, .@"inline");
+
+    var vmap: std.AutoHashMapUnmanaged(Value, Value) = .empty;
+    defer vmap.deinit(allocator);
+    try cloneBodyInsts(&func, dest, body, &vmap, allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), testAttrCount(&func, .{ .block = dest }));
+    try std.testing.expectEqual(@as(usize, 1), testAttrCount(&func, .{ .block = body }));
+    try std.testing.expectEqual(@as(usize, 1), testAttrCount(&func, .func));
 }

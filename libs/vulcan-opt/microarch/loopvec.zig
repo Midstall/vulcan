@@ -127,8 +127,20 @@ fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error
     }
 
     // Clone the body op-major: for each instruction, emit its V copies (one per value map) adjacently.
+    //
+    // Each copy keeps the SAME type and the same operation as the original, so every attribute of
+    // the original travels with it. This is a scalar unroll by V, not a widening: an `endian` on a
+    // 4-byte load still describes a 4-byte load in every copy. (The reduction path in
+    // `applyReduction` below is the widening one, and it deliberately carries nothing.)
     const body_insts = try allocator.dupe(Inst, func.blockInsts(plan.body));
     defer allocator.free(body_insts);
+
+    // The `original -> clone` record for the attribute copy, one entry per emitted copy.
+    var value_pairs: std.ArrayList(ir.function.Function.ValuePair) = .empty;
+    defer value_pairs.deinit(allocator);
+    var inst_pairs: std.ArrayList(ir.function.Function.InstPair) = .empty;
+    defer inst_pairs.deinit(allocator);
+
     for (body_insts) |inst| {
         if (skip.contains(inst)) continue;
         if (func.instResult(inst)) |result| {
@@ -137,14 +149,19 @@ fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error
                 const op = try remapOp(func, func.opcode(inst), vm, allocator);
                 const clone = try func.appendInst(mainbody, func.valueType(result), op);
                 try vm.put(allocator, result, clone);
+                try value_pairs.append(allocator, .{ .old = result, .new = clone });
+                try inst_pairs.append(allocator, .{ .old = inst, .new = func.definingInst(clone).? });
             }
         } else {
             for (vmaps) |*vm| {
                 const op = try remapOp(func, func.opcode(inst), vm, allocator);
-                _ = try func.appendStmtRaw(mainbody, op);
+                const clone = try func.appendStmtRaw(mainbody, op);
+                try inst_pairs.append(allocator, .{ .old = inst, .new = clone });
             }
         }
     }
+
+    try func.cloneAttrs(value_pairs.items, inst_pairs.items);
     const nmi = try func.appendArithImm(mainbody, ind_ty, .add, bmi, @as(i64, @intCast(V)));
     try func.setJump(mainbody, mainheader, &.{nmi});
 
@@ -996,4 +1013,64 @@ test "volatile: a reduction over a volatile load is not widened" {
     defer info.deinit(allocator);
     try testing.expect(recognizeReduction(&func, model, &info.loops[0], false) == null);
     try testing.expect(func.opcode(func.blockInsts(body)[2]).load.@"volatile");
+}
+
+test "the map path carries a body instruction's endian attribute onto every lane copy" {
+    // The map path is a scalar unroll by V, not a widening: each copy loads the same 4 bytes as
+    // the original, so it keeps the original's `endian`. A copy that lost it would stop being
+    // byte-swapped while the source iteration it stands for still is.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    try buildSaxpy(&func, .none);
+
+    // Tag the `x` load's result. Body block 2 holds off, xaddr, xv, yaddr, yv, mul, add, store.
+    const body: Block = @enumFromInt(2);
+    const xv = func.instResult(func.blockInsts(body)[2]).?;
+    try func.addAttr(.{ .value = xv }, .{ .endian = .big });
+    try testing.expectEqual(@as(usize, 1), countBigEndianValues(&func));
+
+    try testing.expect(try run(allocator, &func, registry.modelFor(.@"ampere-altra")));
+
+    // The original scalar body stays as the remainder loop, so its tag survives too: one
+    // original plus one per lane.
+    try testing.expectEqual(@as(usize, 1 + 4), countBigEndianValues(&func));
+}
+
+test "the map path does not carry a block attribute onto a rewritten block" {
+    // Suspicious case, the other direction. A block attribute names a block of the ORIGINAL
+    // region, and this pass builds new blocks around it.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    try buildSaxpy(&func, .none);
+    const body: Block = @enumFromInt(2);
+    try func.addAttr(.{ .block = body }, .cold);
+
+    try testing.expect(try run(allocator, &func, registry.modelFor(.@"ampere-altra")));
+
+    var block_attrs: usize = 0;
+    for (func.attributeEntries()) |entry| switch (entry.target) {
+        .block => |b| {
+            try testing.expectEqual(body, b);
+            block_attrs += 1;
+        },
+        .func, .inst, .value => {},
+    };
+    try testing.expectEqual(@as(usize, 1), block_attrs);
+}
+
+/// How many values carry a big-endian tag.
+fn countBigEndianValues(func: *const Function) usize {
+    var n: usize = 0;
+    for (func.attributeEntries()) |entry| {
+        if (entry.target != .value) continue;
+        switch (entry.attr) {
+            .endian => |e| if (e == .big) {
+                n += 1;
+            },
+            .@"inline", .noreturn, .cold, .@"align", .custom => {},
+        }
+    }
+    return n;
 }
