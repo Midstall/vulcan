@@ -10,6 +10,7 @@ const std = @import("std");
 const ir = @import("vulcan-ir");
 const attrs = @import("attrs.zig");
 const builtin_mod = @import("builtin.zig");
+const abi = @import("abi.zig");
 
 const Function = ir.function.Function;
 const Block = ir.function.Block;
@@ -90,27 +91,9 @@ fn returnsValue(func: *const Function) bool {
 }
 
 /// Whether any edge branches back to the entry block. The entry becomes the nest's preheader,
-/// so a kernel that jumps back to it would re-enter the preheader once per iteration.
-fn entryIsBranchTarget(func: *const Function) bool {
-    for (0..func.blockCount()) |bi| {
-        const block: Block = @enumFromInt(bi);
-        for (func.blockInsts(block)) |inst| {
-            switch (func.opcode(inst)) {
-                .@"if" => |cf| {
-                    if (cf.then.target == entry_block) return true;
-                    if (cf.@"else".target == entry_block) return true;
-                },
-                else => {},
-            }
-        }
-        const term = func.terminator(block) orelse continue;
-        switch (term) {
-            .jump => |j| if (j.target == entry_block) return true,
-            .ret => {},
-        }
-    }
-    return false;
-}
+/// so a kernel that jumps back to it would re-enter the preheader once per iteration. The
+/// parameter contract refuses the same shape for its own reason, so the test lives in `abi`.
+const entryIsBranchTarget = abi.entryIsBranchTarget;
 
 /// Whether any attribute is keyed by a block. `reorderBlocks` does not remap a block id that
 /// an attribute payload holds, and this pass lays the result out with `reorderBlocks`, so a
@@ -144,8 +127,14 @@ fn hasBlockAttribute(func: *const Function) bool {
 /// ```
 ///
 /// The x axis is the innermost loop of each pair, so the nest visits x fastest and z slowest.
-/// That is the order every GPU numbers its lanes in. `block` is the declared workgroup size,
-/// which the caller reads from `attrs.localSize`.
+/// That is the order every GPU numbers its lanes in, and it is the launch contract's
+/// linearization rule: the position of a thread in this nest is `kernel.linearIndex` of its
+/// index, and a LINEAR-ID backend recovers the three axes from one hardware identifier with
+/// `kernel.axisIndex`. The oracle and such a backend therefore agree by construction rather
+/// than by comment. `nvidia/tests/spirv.zig` executes the nest and checks every trace position
+/// against `kernel.axisIndex` to hold the two together.
+///
+/// `block` is the declared workgroup size, which the caller reads from `attrs.localSize`.
 ///
 /// The blocks come out in an order where every block follows its immediate dominator, which is
 /// what the machine backends' linear-scan liveness needs. See `layOutNest`.

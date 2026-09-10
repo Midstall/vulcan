@@ -96,11 +96,17 @@ pub fn shireScratchpadAddr(shire: u32, offset: u32) u64 {
 /// align to their own size. `gpu.abi.layoutParams` raises each parameter to `max(param_align,
 /// size)`, so a floor of 1 reproduces the LP64D layout exactly and any larger floor would
 /// place the block differently from the C structure a runtime writes.
+///
+/// `linear_thread_id` is true because a hart reads ONE `hartid`, not one identifier per axis.
+/// The prologue splits it with `gpu.kernel.axisIndex`, and the grid half of that split needs
+/// the grid extents, so `layoutParams` reserves the launch-shape region for every workgroup
+/// builtin on this target and not for `grid_dim_*` alone.
 pub const etsoc_abi: gpu.Abi = .{
     .param_base = 0,
     .pointer_bytes = 8,
     .param_align = 1,
     .max_shared_bytes = scratchpad_shire_bytes,
+    .linear_thread_id = true,
 };
 
 /// The register the prologue keeps the parameter block address in. `t0`, a caller-saved
@@ -110,6 +116,9 @@ const r_block: Reg = .x5;
 const r_id: Reg = .x6;
 /// The prologue's second scratch register, `t2`.
 const r_tmp: Reg = .x7;
+/// The prologue's third scratch register, `t3`. The grid split needs two live intermediates
+/// at once, so `r_tmp` alone is not enough.
+const r_tmp2: Reg = .x28;
 
 /// The integer argument registers, a0 through a7. The prologue fills these in declaration
 /// order, which is the order `isel.riscv64RegDescription` pins the entry parameters to.
@@ -156,30 +165,200 @@ fn appendHartId(allocator: std.mem.Allocator, code: *std.ArrayList(u32), read: *
     read.* = true;
 }
 
-/// Append `li dst, value`. Every immediate this file emits is a workgroup extent or the VPU
-/// width, and `checkLaunchShape` has already bounded those by `harts_per_shire`, so the
-/// twelve-bit form is always enough.
+/// Append `li dst, value`. Every immediate this file emits is a workgroup extent, a product
+/// of two workgroup extents, or the VPU width. `checkWorkgroupShape` bounds the product of all
+/// three extents by `harts_per_shire`, so the twelve-bit form is always enough.
 fn appendSmallImm(allocator: std.mem.Allocator, code: *std.ArrayList(u32), dst: Reg, value: u32) Error!void {
     std.debug.assert(value <= harts_per_shire);
     try code.append(allocator, encode.addi(dst, .x0, @intCast(value)));
+}
+
+/// Append `lwu dst, grid[axis](r_block)`: one grid extent from the launch-shape region.
+///
+/// `grid_at` is the displacement of the x extent from the parameter block pointer, with
+/// `Abi.param_base` already added, or null when the layout reserved no region. The load is
+/// unsigned because an extent is a count, and `divu` and `remu` below are 64-bit operations
+/// that a sign-extended word would feed a negative divisor.
+fn appendGridExtent(
+    allocator: std.mem.Allocator,
+    code: *std.ArrayList(u32),
+    dst: Reg,
+    grid_at: ?i12,
+    axis: u2,
+) Error!void {
+    const at = grid_at orelse return error.Unsupported;
+    const disp: i32 = @as(i32, at) + @as(i32, axis) * @as(i32, @intCast(gpu.LaunchShape.axis_bytes));
+    try code.append(allocator, encode.lwu(dst, r_block, @intCast(disp)));
+}
+
+/// Emit the thread index on `axis` into `dst`. Clobbers `r_tmp` and reads `r_id`.
+///
+/// A hart holds ONE linear identifier, so the three axes come out of it by division. The
+/// shire-local hart index is
+///
+///     t = hartid & (harts_per_shire - 1)
+///
+/// which is the vendor's `get_hart_id() % 64`. The launch contract starts exactly
+/// `bx * by * bz` harts in each enabled shire, so `t` is the linear thread index and
+/// `0 <= t < bx * by * bz`. The contract linearizes x fastest (`gpu.kernel.linearIndex`), so
+///
+///     t = (z * by + y) * bx + x
+///
+/// and `gpu.kernel.axisIndex` inverts it:
+///
+///     x = t % bx
+///     y = (t / bx) % by
+///     z = t / (bx * by)
+///
+/// Three foldings drop an instruction where the bound `t < bx * by * bz` makes it a no-op:
+///
+///   - `bx == bx * by * bz` means `t < bx`, so `t % bx` is `t` and the mask is the whole
+///     lowering. This is the flat one-dimensional workgroup every launch used before.
+///   - `by == 1` forces y to 0, and `bz == 1` forces z to 0.
+///   - `bx * by == bx * by * bz` means `t / bx < by`, so the outer `% by` is a no-op.
+fn emitThreadAxis(
+    allocator: std.mem.Allocator,
+    code: *std.ArrayList(u32),
+    block: [3]u32,
+    dst: Reg,
+    axis: u2,
+    read_id: *bool,
+) Error!void {
+    std.debug.assert(dst != r_id and dst != r_tmp and dst != r_block);
+    const threads = block[0] * block[1] * block[2];
+    const mask: i12 = @intCast(harts_per_shire - 1);
+    switch (axis) {
+        0 => {
+            try appendHartId(allocator, code, read_id);
+            if (block[0] == threads) {
+                try code.append(allocator, encode.andi(dst, r_id, mask));
+                return;
+            }
+            try code.append(allocator, encode.andi(r_tmp, r_id, mask));
+            try appendSmallImm(allocator, code, dst, block[0]);
+            try code.append(allocator, encode.remu(dst, r_tmp, dst));
+        },
+        1 => {
+            if (block[1] == 1) {
+                try code.append(allocator, encode.addi(dst, .x0, 0));
+                return;
+            }
+            try appendHartId(allocator, code, read_id);
+            try code.append(allocator, encode.andi(r_tmp, r_id, mask));
+            try appendSmallImm(allocator, code, dst, block[0]);
+            try code.append(allocator, encode.divu(dst, r_tmp, dst));
+            if (block[0] * block[1] == threads) return;
+            try code.append(allocator, encode.addi(r_tmp, dst, 0));
+            try appendSmallImm(allocator, code, dst, block[1]);
+            try code.append(allocator, encode.remu(dst, r_tmp, dst));
+        },
+        2 => {
+            if (block[2] == 1) {
+                try code.append(allocator, encode.addi(dst, .x0, 0));
+                return;
+            }
+            try appendHartId(allocator, code, read_id);
+            try code.append(allocator, encode.andi(r_tmp, r_id, mask));
+            try appendSmallImm(allocator, code, dst, block[0] * block[1]);
+            try code.append(allocator, encode.divu(dst, r_tmp, dst));
+        },
+        // `Builtin.axis` yields 0, 1 or 2, so a fourth value never reaches this switch.
+        3 => unreachable,
+    }
+}
+
+/// Emit the workgroup index on `axis` into `dst`. Clobbers `r_tmp` and `r_tmp2`, and reads
+/// `r_id`.
+///
+/// A workgroup is a SHIRE, so the linear workgroup index is
+///
+///     s = hartid >> 6
+///
+/// which is the vendor's `get_shire_id()`. The runtime enables exactly `gx * gy * gz` shires,
+/// so `0 <= s < gx * gy * gz` and `gpu.kernel.axisIndex` inverts the same linearization the
+/// thread split uses:
+///
+///     x = s % gx
+///     y = (s / gx) % gy
+///     z = s / (gx * gy)
+///
+/// No folding is possible here. The grid extents are LAUNCH-time values read from the
+/// launch-shape region, so nothing at compile time proves `gy` or `gz` is 1. In particular
+/// `x` keeps its `% gx`: a two-dimensional grid numbers shire `gx` as workgroup `(0, 1)`, and
+/// dropping the remainder would report `(gx, 1)` instead.
+fn emitBlockAxis(
+    allocator: std.mem.Allocator,
+    code: *std.ArrayList(u32),
+    dst: Reg,
+    axis: u2,
+    grid_at: ?i12,
+    read_id: *bool,
+) Error!void {
+    std.debug.assert(dst != r_id and dst != r_tmp and dst != r_tmp2 and dst != r_block);
+    try appendHartId(allocator, code, read_id);
+    const shire_shift: u6 = @intCast(std.math.log2_int(u32, harts_per_shire));
+    try code.append(allocator, encode.srli(r_tmp, r_id, shire_shift));
+    switch (axis) {
+        0 => {
+            try appendGridExtent(allocator, code, dst, grid_at, 0);
+            try code.append(allocator, encode.remu(dst, r_tmp, dst));
+        },
+        1 => {
+            try appendGridExtent(allocator, code, dst, grid_at, 0);
+            try code.append(allocator, encode.divu(r_tmp, r_tmp, dst));
+            try appendGridExtent(allocator, code, dst, grid_at, 1);
+            try code.append(allocator, encode.remu(dst, r_tmp, dst));
+        },
+        2 => {
+            try appendGridExtent(allocator, code, dst, grid_at, 0);
+            try appendGridExtent(allocator, code, r_tmp2, grid_at, 1);
+            try code.append(allocator, encode.mul(dst, dst, r_tmp2));
+            try code.append(allocator, encode.divu(dst, r_tmp, dst));
+        },
+        // `Builtin.axis` yields 0, 1 or 2, so a fourth value never reaches this switch.
+        3 => unreachable,
+    }
+}
+
+/// Emit the fused global index on `axis` into `dst`:
+///
+///     global_id[axis] = block_id[axis] * block_dim[axis] + thread_id[axis]
+///
+/// This is the same fusion the NVIDIA backend emits and the same one the host loop nest
+/// computes, with the declared workgroup extent as an immediate. The workgroup index lands in
+/// `dst` first, because `emitBlockAxis` needs both scratch registers; the thread index then
+/// lands in `r_tmp2`, which `emitThreadAxis` does not touch.
+fn emitGlobalAxis(
+    allocator: std.mem.Allocator,
+    code: *std.ArrayList(u32),
+    block: [3]u32,
+    dst: Reg,
+    axis: u2,
+    grid_at: ?i12,
+    read_id: *bool,
+) Error!void {
+    try emitBlockAxis(allocator, code, dst, axis, grid_at, read_id);
+    try appendSmallImm(allocator, code, r_tmp2, block[axis]);
+    try code.append(allocator, encode.mul(dst, dst, r_tmp2));
+    try emitThreadAxis(allocator, code, block, r_tmp2, axis, read_id);
+    try code.append(allocator, encode.add(dst, dst, r_tmp2));
 }
 
 /// Emit the hardware read for one compute builtin into `dst`.
 ///
 /// What lowers, and why:
 ///
-///   - `thread_id_x` is `hartid` masked to the shire. A workgroup is a shire and a shire holds
-///     `harts_per_shire` harts, so the low six bits of the hart identifier are the thread
-///     index inside the workgroup. The vendor's `get_hart_id() % 64` reads the same field.
-///   - `block_id_x` is `hartid >> 6`, which is the vendor's `get_shire_id()` exactly.
-///   - `global_id_x` is `block_id_x * block_dim_x + thread_id_x`, the same fused form the
-///     NVIDIA backend emits, with the declared workgroup width as an immediate.
+///   - `thread_id_*` splits the shire-local hart index with the DECLARED workgroup extents.
+///     See `emitThreadAxis` for the arithmetic.
+///   - `block_id_*` splits the shire identifier with the grid extents the runtime wrote into
+///     the launch-shape region. See `emitBlockAxis`.
+///   - `global_id_*` fuses the two. See `emitGlobalAxis`.
 ///   - `block_dim_*` is the workgroup size the kernel DECLARES. `LaunchInfo.block` carries the
 ///     same number to the runtime, so the kernel and the launch agree by construction.
+///   - `grid_dim_*` is one unsigned word from the launch-shape region, which is the only place
+///     a launch-time value can come from on hardware that has no register for it.
 ///   - `subgroup_size` is the VPU width, 8. The VPU moves 256 bits as eight 32-bit lanes in
 ///     every packed encoder in `encode.zig`.
-///   - `thread_id_y` and `thread_id_z` lower to 0 ONLY when the kernel declares an extent of 1
-///     on that axis, where 0 is the sole possible value. See the refusal below otherwise.
 ///
 /// What refuses, and why. A refusal is deliberate. A builtin that reads the wrong number
 /// produces a kernel that looks right and indexes the wrong element, which no amount of
@@ -191,50 +370,25 @@ fn emitBuiltin(
     dst: Reg,
     b: gpu.Builtin,
     read_id: *bool,
+    grid_at: ?i12,
 ) Error!void {
     const block = gpu.attrs.localSize(func);
     switch (b) {
-        .thread_id_x => {
-            try appendHartId(allocator, code, read_id);
-            try code.append(allocator, encode.andi(dst, r_id, @intCast(harts_per_shire - 1)));
+        .thread_id_x, .thread_id_y, .thread_id_z => {
+            try emitThreadAxis(allocator, code, block, dst, b.axis().?, read_id);
         },
-        // The hart identifier is ONE linear index. A three-dimensional workgroup would need a
-        // rule that maps that index onto three axes, and `vulcan-gpu` defines no such rule:
-        // its host loop nest gives each axis its own induction variable and never linearizes
-        // them. Choosing a rule here would invent a convention a runtime does not share. When
-        // the declared extent is 1 there is nothing to choose, so those cases lower.
-        .thread_id_y, .thread_id_z => {
-            const axis = b.axis().?;
-            if (block[axis] != 1) return error.Unsupported;
-            try code.append(allocator, encode.addi(dst, .x0, 0));
+        .block_id_x, .block_id_y, .block_id_z => {
+            try emitBlockAxis(allocator, code, dst, b.axis().?, grid_at, read_id);
         },
-        .block_id_x => {
-            try appendHartId(allocator, code, read_id);
-            try code.append(allocator, encode.srli(dst, r_id, 6));
-        },
-        // The shire identifier is also one linear index, and the grid extents are launch-time
-        // values the kernel never declares, so not even the extent-of-1 case above can be
-        // proven here.
-        .block_id_y, .block_id_z => return error.Unsupported,
         .block_dim_x, .block_dim_y, .block_dim_z => {
             try appendSmallImm(allocator, code, dst, block[b.axis().?]);
         },
-        // The grid size is chosen at launch. ET-SoC has no register that holds it, and
-        // `layoutParams` reserves no slot for it, so there is nothing to read. This is the
-        // same gap the NVIDIA backend refuses on, and it closes when `vulcan-gpu` gives the
-        // grid size a place in the parameter contract.
-        .grid_dim_x, .grid_dim_y, .grid_dim_z => return error.Unsupported,
-        .global_id_x => {
-            try appendHartId(allocator, code, read_id);
-            try code.append(allocator, encode.srli(r_tmp, r_id, 6)); // the shire, block_id_x
-            try appendSmallImm(allocator, code, dst, block[0]);
-            try code.append(allocator, encode.mul(r_tmp, r_tmp, dst));
-            try code.append(allocator, encode.andi(dst, r_id, @intCast(harts_per_shire - 1)));
-            try code.append(allocator, encode.add(dst, dst, r_tmp));
+        .grid_dim_x, .grid_dim_y, .grid_dim_z => {
+            try appendGridExtent(allocator, code, dst, grid_at, b.axis().?);
         },
-        // A fused global index on y or z needs `block_id_y` or `block_id_z`, which refuse
-        // above.
-        .global_id_y, .global_id_z => return error.Unsupported,
+        .global_id_x, .global_id_y, .global_id_z => {
+            try emitGlobalAxis(allocator, code, block, dst, b.axis().?, grid_at, read_id);
+        },
         // The VPU is not a set of independently sequenced lanes. One hart issues one packed
         // instruction that moves all eight lanes, so no lane has a program counter and there
         // is no hardware lane index to read. A kernel that wants per-lane work uses the packed
@@ -306,9 +460,9 @@ fn emitParamLoad(
     }
 }
 
-/// Refuse a launch shape the hardware cannot run. A workgroup is a shire and a shire holds
+/// Refuse a workgroup the hardware cannot run. A workgroup is a shire and a shire holds
 /// `harts_per_shire` harts, so a declared workgroup larger than that has no launch.
-fn checkLaunchShape(func: *const Function) Error!void {
+fn checkWorkgroupShape(func: *const Function) Error!void {
     const block = gpu.attrs.localSize(func);
     var threads: u64 = 1;
     for (block) |n| {
@@ -333,10 +487,22 @@ pub fn compileKernel(allocator: std.mem.Allocator, func: *const Function, a: gpu
     // convention does not define.
     if (returnsValue(func)) return error.Unsupported;
     if (func.blockCount() == 0) return error.Unsupported;
-    try checkLaunchShape(func);
+    // The prologue walks the entry parameters positionally against the placed layout, so the
+    // two must see the same list. `mem2reg` adds and removes block parameters on any block
+    // that has a predecessor, so an entry a branch reaches has no stable list to walk.
+    if (gpu.abi.entryIsBranchTarget(func)) return error.Unsupported;
+    try checkWorkgroupShape(func);
 
     var layout = try gpu.layoutParams(allocator, func, a, false);
     errdefer layout.deinit(allocator);
+
+    // The prologue addresses the launch-shape region with the same signed twelve-bit
+    // displacement it addresses a parameter with, so the LAST extent has to stay in range.
+    const grid_at: ?i12 = if (layout.launch_shape) |shape| at: {
+        const last = a.param_base + shape.axisOffset(2);
+        if (last > std.math.maxInt(i12)) return error.Unsupported;
+        break :at @intCast(a.param_base + shape.offset);
+    } else null;
 
     var code: std.ArrayList(u32) = .empty;
     defer code.deinit(allocator);
@@ -355,7 +521,7 @@ pub fn compileKernel(allocator: std.mem.Allocator, func: *const Function, a: gpu
             // register. A frontend that typed one as a float has tagged the wrong parameter.
             if (func.types.type_kind(func.valueType(p)) != .int) return error.Unsupported;
             if (int_idx >= int_arg_regs.len) return error.Unsupported;
-            try emitBuiltin(allocator, &code, func, int_arg_regs[int_idx], b, &read_id);
+            try emitBuiltin(allocator, &code, func, int_arg_regs[int_idx], b, &read_id, grid_at);
             int_idx += 1;
             continue;
         }
@@ -380,6 +546,7 @@ pub fn compileKernel(allocator: std.mem.Allocator, func: *const Function, a: gpu
         .launch = .{
             .params = layout.params,
             .param_bytes = layout.bytes,
+            .launch_shape = layout.launch_shape,
             .block = gpu.attrs.localSize(func),
             .shared_bytes = gpu.attrs.sharedBytes(func),
             // ET-SoC has no launch descriptor that declares a register budget. A hart owns its
@@ -446,7 +613,10 @@ test "compileKernel reports a launch a runtime can use" {
     try testing.expectEqual(@as(u32, 0), kernel.launch.params[0].offset);
     try testing.expectEqual(@as(u32, 8), kernel.launch.params[0].size);
     try testing.expectEqual(gpu.AddressSpace.global, kernel.launch.params[0].kind.pointer);
-    try testing.expectEqual(@as(u32, 8), kernel.launch.param_bytes);
+    // `global_id_x` splits the shire identifier, so the launch-shape region follows the
+    // pointer and the runtime writes the grid there.
+    try testing.expectEqual(@as(u32, 8), kernel.launch.launch_shape.?.offset);
+    try testing.expectEqual(@as(u32, 20), kernel.launch.param_bytes);
     try testing.expectEqual([3]u32{ 64, 1, 1 }, kernel.launch.block);
     try testing.expectEqual(@as(u32, 1024), kernel.launch.shared_bytes);
     // ET-SoC declares neither a register budget nor a barrier count.
@@ -492,7 +662,10 @@ test "thread_id_x masks the hart identifier to its shire" {
     try testing.expectEqual(encode.andi(.x11, r_id, 63), kernel.code[3]);
 }
 
-test "block_id_x is the shire identifier" {
+test "block_id_x takes the shire identifier modulo the grid width" {
+    // The shire identifier is the LINEAR workgroup index. On a grid wider than one row the x
+    // axis is that index modulo the grid width, so the remainder is load-bearing and not an
+    // optimization the backend may drop.
     var func = Function.init(testing.allocator);
     defer func.deinit();
     try buildOneBuiltinKernel(&func, .block_id_x);
@@ -500,8 +673,63 @@ test "block_id_x is the shire identifier" {
     var kernel = try compileKernel(testing.allocator, &func, etsoc_abi);
     defer kernel.deinit(testing.allocator);
 
+    const grid_at: i12 = @intCast(kernel.launch.launch_shape.?.offset);
     try testing.expectEqual(encode.csrrs(r_id, csr_hartid, .x0), kernel.code[2]);
-    try testing.expectEqual(encode.srli(.x11, r_id, 6), kernel.code[3]);
+    try testing.expectEqual(encode.srli(r_tmp, r_id, 6), kernel.code[3]);
+    try testing.expectEqual(encode.lwu(.x11, r_block, grid_at), kernel.code[4]);
+    try testing.expectEqual(encode.remu(.x11, r_tmp, .x11), kernel.code[5]);
+}
+
+test "block_id_y divides by the grid width and then wraps on the grid height" {
+    var func = Function.init(testing.allocator);
+    defer func.deinit();
+    try buildOneBuiltinKernel(&func, .block_id_y);
+
+    var kernel = try compileKernel(testing.allocator, &func, etsoc_abi);
+    defer kernel.deinit(testing.allocator);
+
+    const shape = kernel.launch.launch_shape.?;
+    const gx: i12 = @intCast(shape.axisOffset(0));
+    const gy: i12 = @intCast(shape.axisOffset(1));
+    try testing.expectEqual(encode.srli(r_tmp, r_id, 6), kernel.code[3]);
+    try testing.expectEqual(encode.lwu(.x11, r_block, gx), kernel.code[4]);
+    try testing.expectEqual(encode.divu(r_tmp, r_tmp, .x11), kernel.code[5]);
+    try testing.expectEqual(encode.lwu(.x11, r_block, gy), kernel.code[6]);
+    try testing.expectEqual(encode.remu(.x11, r_tmp, .x11), kernel.code[7]);
+}
+
+test "block_id_z divides by the area of one grid layer" {
+    var func = Function.init(testing.allocator);
+    defer func.deinit();
+    try buildOneBuiltinKernel(&func, .block_id_z);
+
+    var kernel = try compileKernel(testing.allocator, &func, etsoc_abi);
+    defer kernel.deinit(testing.allocator);
+
+    const shape = kernel.launch.launch_shape.?;
+    const gx: i12 = @intCast(shape.axisOffset(0));
+    const gy: i12 = @intCast(shape.axisOffset(1));
+    try testing.expectEqual(encode.srli(r_tmp, r_id, 6), kernel.code[3]);
+    try testing.expectEqual(encode.lwu(.x11, r_block, gx), kernel.code[4]);
+    try testing.expectEqual(encode.lwu(r_tmp2, r_block, gy), kernel.code[5]);
+    try testing.expectEqual(encode.mul(.x11, .x11, r_tmp2), kernel.code[6]);
+    try testing.expectEqual(encode.divu(.x11, r_tmp, .x11), kernel.code[7]);
+}
+
+test "grid_dim reads one unsigned word per axis from the launch-shape region" {
+    for ([_]gpu.Builtin{ .grid_dim_x, .grid_dim_y, .grid_dim_z }) |b| {
+        var func = Function.init(testing.allocator);
+        defer func.deinit();
+        try buildOneBuiltinKernel(&func, b);
+
+        var kernel = try compileKernel(testing.allocator, &func, etsoc_abi);
+        defer kernel.deinit(testing.allocator);
+
+        const at: i12 = @intCast(kernel.launch.launch_shape.?.axisOffset(b.axis().?));
+        // One load and nothing else: the grid size needs no hart identifier.
+        try testing.expectEqual(@as(u32, 3), kernel.prologue_words);
+        try testing.expectEqual(encode.lwu(.x11, r_block, at), kernel.code[2]);
+    }
 }
 
 test "block_dim_x lowers to the declared workgroup width" {
@@ -541,15 +769,6 @@ test "one hartid read serves two builtins" {
     try testing.expectEqual(@as(u32, 1), reads);
 }
 
-test "the grid size refuses on every axis" {
-    for ([_]gpu.Builtin{ .grid_dim_x, .grid_dim_y, .grid_dim_z }) |b| {
-        var func = Function.init(testing.allocator);
-        defer func.deinit();
-        try buildOneBuiltinKernel(&func, b);
-        try testing.expectError(error.Unsupported, compileKernel(testing.allocator, &func, etsoc_abi));
-    }
-}
-
 test "the subgroup index and the lane index refuse" {
     for ([_]gpu.Builtin{ .lane_id, .warp_id }) |b| {
         var func = Function.init(testing.allocator);
@@ -566,7 +785,7 @@ test "a graphics builtin refuses in a compute kernel" {
     try testing.expectError(error.Unsupported, compileKernel(testing.allocator, &func, etsoc_abi));
 }
 
-test "thread_id_y is zero on a flat workgroup and refuses on a tall one" {
+test "thread_id_y is zero on a flat workgroup and divides on a tall one" {
     {
         var func = Function.init(testing.allocator);
         defer func.deinit();
@@ -574,6 +793,9 @@ test "thread_id_y is zero on a flat workgroup and refuses on a tall one" {
         try gpu.attrs.setLocalSize(&func, .{ 8, 1, 1 });
         var kernel = try compileKernel(testing.allocator, &func, etsoc_abi);
         defer kernel.deinit(testing.allocator);
+        // A height of one leaves y no other value, so the whole lowering is that constant and
+        // the prologue never reads the hart identifier.
+        try testing.expectEqual(@as(u32, 3), kernel.prologue_words);
         try testing.expectEqual(encode.addi(.x11, .x0, 0), kernel.code[2]);
     }
     {
@@ -581,7 +803,103 @@ test "thread_id_y is zero on a flat workgroup and refuses on a tall one" {
         defer func.deinit();
         try buildOneBuiltinKernel(&func, .thread_id_y);
         try gpu.attrs.setLocalSize(&func, .{ 8, 4, 1 });
-        try testing.expectError(error.Unsupported, compileKernel(testing.allocator, &func, etsoc_abi));
+        var kernel = try compileKernel(testing.allocator, &func, etsoc_abi);
+        defer kernel.deinit(testing.allocator);
+        // `y = (t / 8) % 4`, and `8 * 4` is the whole workgroup, so `t / 8 < 4` and the outer
+        // remainder folds away.
+        try testing.expectEqual(encode.csrrs(r_id, csr_hartid, .x0), kernel.code[2]);
+        try testing.expectEqual(encode.andi(r_tmp, r_id, 63), kernel.code[3]);
+        try testing.expectEqual(encode.addi(.x11, .x0, 8), kernel.code[4]);
+        try testing.expectEqual(encode.divu(.x11, r_tmp, .x11), kernel.code[5]);
+        try testing.expectEqual(@as(u32, 6), kernel.prologue_words);
+    }
+}
+
+test "a three-dimensional workgroup splits the hart identifier on every axis" {
+    // The general case, where no folding applies: `t % 2`, `(t / 2) % 2` and `t / 4`. The
+    // outer remainder on y survives here because `2 * 2` is not the whole workgroup.
+    const cases = [3]struct { b: gpu.Builtin, words: u32 }{
+        .{ .b = .thread_id_x, .words = 6 },
+        .{ .b = .thread_id_y, .words = 9 },
+        .{ .b = .thread_id_z, .words = 6 },
+    };
+    for (cases) |case| {
+        var func = Function.init(testing.allocator);
+        defer func.deinit();
+        try buildOneBuiltinKernel(&func, case.b);
+        try gpu.attrs.setLocalSize(&func, .{ 2, 2, 2 });
+
+        var kernel = try compileKernel(testing.allocator, &func, etsoc_abi);
+        defer kernel.deinit(testing.allocator);
+
+        // A thread index needs no grid, so no kernel here reserves the region.
+        try testing.expectEqual(@as(?gpu.LaunchShape, null), kernel.launch.launch_shape);
+        try testing.expectEqual(case.words, kernel.prologue_words);
+        try testing.expectEqual(encode.andi(r_tmp, r_id, 63), kernel.code[3]);
+    }
+    // x takes the remainder by the width, z divides by the area of one layer.
+    {
+        var func = Function.init(testing.allocator);
+        defer func.deinit();
+        try buildOneBuiltinKernel(&func, .thread_id_x);
+        try gpu.attrs.setLocalSize(&func, .{ 2, 2, 2 });
+        var kernel = try compileKernel(testing.allocator, &func, etsoc_abi);
+        defer kernel.deinit(testing.allocator);
+        try testing.expectEqual(encode.addi(.x11, .x0, 2), kernel.code[4]);
+        try testing.expectEqual(encode.remu(.x11, r_tmp, .x11), kernel.code[5]);
+    }
+    {
+        var func = Function.init(testing.allocator);
+        defer func.deinit();
+        try buildOneBuiltinKernel(&func, .thread_id_z);
+        try gpu.attrs.setLocalSize(&func, .{ 2, 2, 2 });
+        var kernel = try compileKernel(testing.allocator, &func, etsoc_abi);
+        defer kernel.deinit(testing.allocator);
+        try testing.expectEqual(encode.addi(.x11, .x0, 4), kernel.code[4]);
+        try testing.expectEqual(encode.divu(.x11, r_tmp, .x11), kernel.code[5]);
+    }
+}
+
+test "global_id fuses the split workgroup index with the split thread index" {
+    var func = Function.init(testing.allocator);
+    defer func.deinit();
+    try buildOneBuiltinKernel(&func, .global_id_y);
+    try gpu.attrs.setLocalSize(&func, .{ 4, 4, 1 });
+
+    var kernel = try compileKernel(testing.allocator, &func, etsoc_abi);
+    defer kernel.deinit(testing.allocator);
+
+    const shape = kernel.launch.launch_shape.?;
+    const gx: i12 = @intCast(shape.axisOffset(0));
+    const gy: i12 = @intCast(shape.axisOffset(1));
+    // block_id_y into a1, then the declared height, then the product.
+    try testing.expectEqual(encode.csrrs(r_id, csr_hartid, .x0), kernel.code[2]);
+    try testing.expectEqual(encode.srli(r_tmp, r_id, 6), kernel.code[3]);
+    try testing.expectEqual(encode.lwu(.x11, r_block, gx), kernel.code[4]);
+    try testing.expectEqual(encode.divu(r_tmp, r_tmp, .x11), kernel.code[5]);
+    try testing.expectEqual(encode.lwu(.x11, r_block, gy), kernel.code[6]);
+    try testing.expectEqual(encode.remu(.x11, r_tmp, .x11), kernel.code[7]);
+    try testing.expectEqual(encode.addi(r_tmp2, .x0, 4), kernel.code[8]);
+    try testing.expectEqual(encode.mul(.x11, .x11, r_tmp2), kernel.code[9]);
+    // thread_id_y into the scratch, then the sum. `4 * 4` is the whole workgroup, so the
+    // outer remainder folds away here too.
+    try testing.expectEqual(encode.andi(r_tmp, r_id, 63), kernel.code[10]);
+    try testing.expectEqual(encode.addi(r_tmp2, .x0, 4), kernel.code[11]);
+    try testing.expectEqual(encode.divu(r_tmp2, r_tmp, r_tmp2), kernel.code[12]);
+    try testing.expectEqual(encode.add(.x11, .x11, r_tmp2), kernel.code[13]);
+}
+
+test "the split registers stay apart, so no step overwrites its own input" {
+    // Suspicious case: the whole grid split runs in three scratch registers while the answer
+    // lands in an argument register that earlier parameters already use. If any two of them
+    // aliased, a later step would read a value a earlier step had already replaced.
+    try testing.expect(r_block != r_id);
+    try testing.expect(r_block != r_tmp and r_block != r_tmp2);
+    try testing.expect(r_id != r_tmp and r_id != r_tmp2);
+    try testing.expect(r_tmp != r_tmp2);
+    for (int_arg_regs) |arg| {
+        try testing.expect(arg != r_block and arg != r_id);
+        try testing.expect(arg != r_tmp and arg != r_tmp2);
     }
 }
 
@@ -650,4 +968,28 @@ test "a mixed parameter block places a float in its own argument register" {
     try testing.expectEqual(encode.ld(.x10, r_block, 0), kernel.code[1]);
     try testing.expectEqual(encode.lw(.x11, r_block, 8), kernel.code[2]);
     try testing.expectEqual(encode.flw(.f10, r_block, 12), kernel.code[3]);
+}
+
+test "a kernel whose entry a branch reaches refuses, and the same shape without the edge compiles" {
+    // The parameter contract is positional, and `mem2reg` edits the parameter list of any
+    // block that has a predecessor. The negative control is the identical two-block kernel
+    // with the edge pointing forward, which still compiles.
+    {
+        var func = Function.init(testing.allocator);
+        defer func.deinit();
+        try buildOneBuiltinKernel(&func, .thread_id_x);
+        const back = try func.appendBlock();
+        try func.setJump(back, @enumFromInt(0), &.{});
+        try testing.expectError(error.Unsupported, compileKernel(testing.allocator, &func, etsoc_abi));
+    }
+    {
+        var func = Function.init(testing.allocator);
+        defer func.deinit();
+        try buildOneBuiltinKernel(&func, .thread_id_x);
+        const tail = try func.appendBlock();
+        try func.setJump(@enumFromInt(0), tail, &.{});
+        func.setTerminator(tail, .{ .ret = ir.function.Ret.none() });
+        var kernel = try compileKernel(testing.allocator, &func, etsoc_abi);
+        kernel.deinit(testing.allocator);
+    }
 }

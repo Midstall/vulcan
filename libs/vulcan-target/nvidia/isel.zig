@@ -45,6 +45,10 @@ pub const nvidia_abi: gpu.Abi = .{
     .pointer_bytes = 8,
     .param_align = 4,
     .max_shared_bytes = 48 * 1024,
+    // The hardware holds a thread index and a workgroup index per AXIS, in SR_TID_X/Y/Z and
+    // SR_CTAID_X/Y/Z, so this backend never splits a linear identifier. Only the grid size
+    // comes out of the parameter block.
+    .linear_thread_id = false,
 };
 const bank0: u5 = 0;
 
@@ -505,6 +509,11 @@ pub fn compileShader(allocator: std.mem.Allocator, func: *Function, stage: Stage
 
     const nblocks = func.blockCount();
     if (nblocks == 0) return error.Unsupported;
+    // The compute prologue walks the entry parameters positionally against the placed layout,
+    // and `layoutParams` reads the same list to decide whether the launch-shape region is
+    // present. `mem2reg` adds and removes block parameters on any block that has a
+    // predecessor, so an entry a branch reaches has no stable list for the two to share.
+    if (stage == .compute and gpu.abi.entryIsBranchTarget(func)) return error.Unsupported;
 
     // Fold constant arith operands into immediates before register allocation.
     // This stops each constant from pinning a GPR for its whole live range.
@@ -570,7 +579,7 @@ pub fn compileShader(allocator: std.mem.Allocator, func: *Function, stage: Stage
     var layout: gpu.kernel.Layout = if (stage == .compute)
         try gpu.layoutParams(allocator, func, a, returnsValue(func))
     else
-        .{ .params = try allocator.alloc(gpu.Param, 0), .bytes = 0, .out_pointer = null };
+        .{ .params = try allocator.alloc(gpu.Param, 0), .bytes = 0, .out_pointer = null, .launch_shape = null };
     errdefer layout.deinit(allocator);
 
     if (stage == .compute) {
@@ -585,7 +594,7 @@ pub fn compileShader(allocator: std.mem.Allocator, func: *Function, stage: Stage
         var placed: usize = 0;
         for (eparams) |p| {
             if (gpu.attrs.builtinOf(func, p)) |bi| {
-                try emitComputeBuiltin(allocator, &code, func, loc, p, bi);
+                try emitComputeBuiltin(allocator, &code, func, loc, p, bi, a, layout.launch_shape);
                 continue;
             }
             const slot = layout.params[placed];
@@ -936,6 +945,7 @@ pub fn compileShader(allocator: std.mem.Allocator, func: *Function, stage: Stage
         .launch = .{
             .params = layout.params,
             .param_bytes = layout.bytes,
+            .launch_shape = layout.launch_shape,
             .block = gpu.attrs.localSize(func),
             .shared_bytes = gpu.attrs.sharedBytes(func),
             .reg_count = reg_count,
@@ -1464,11 +1474,13 @@ fn isSharedPtr(func: *const Function, v: Value) bool {
 /// The thread index, the block index and the fused global index lower on all three axes. Each
 /// index reads its own special register, whose number comes from NAK (see the `SR_*` block in
 /// `encode.zig`). The workgroup size lowers to an immediate, because the kernel declares it.
+/// The grid size loads from the launch-shape region of the parameter block, exactly as a
+/// 32-bit scalar parameter loads.
 ///
-/// The grid size and the subgroup builtins have no correct lowering here yet and return
-/// `error.Unsupported`. Each refusal says why below. A refusal is deliberate: a builtin that
-/// reads the wrong register produces a kernel that looks right and computes garbage, and no
-/// test in this repository can execute SASS to catch that.
+/// The subgroup builtins have no correct lowering here yet and return `error.Unsupported`.
+/// Each refusal says why below. A refusal is deliberate: a builtin that reads the wrong
+/// register produces a kernel that looks right and computes garbage, and no test in this
+/// repository can execute SASS to catch that.
 fn emitComputeBuiltin(
     allocator: std.mem.Allocator,
     code: *std.ArrayList(Inst),
@@ -1476,6 +1488,8 @@ fn emitComputeBuiltin(
     loc: std.AutoHashMapUnmanaged(Value, Loc),
     p: Value,
     bi: gpu.Builtin,
+    a: gpu.Abi,
+    shape: ?gpu.kernel.LaunchShape,
 ) Error!void {
     if (!bi.isCompute()) return error.Unsupported;
     const dst = gprOf(loc, p);
@@ -1499,16 +1513,24 @@ fn emitComputeBuiltin(
         .block_dim_y => try code.append(allocator, encode.movImm(dst, gpu.attrs.localSize(func)[1], .{})),
         .block_dim_z => try code.append(allocator, encode.movImm(dst, gpu.attrs.localSize(func)[2], .{})),
         // The grid size is a launch-time value, not a compile-time one, and NVIDIA has no
-        // special register for it. The CUDA driver puts it in its own reserved area of
-        // constant bank 0, but that offset belongs to a driver convention this ABI does not
-        // define: `gpu.Abi` describes where the PARAMETER block starts and nothing else, and
-        // `layoutParams` reserves no slot for the grid size. Picking an offset here would
-        // invent a delivery mechanism the runtime does not implement. This lowers once
-        // `vulcan-gpu` gives the grid size a place in the contract.
+        // special register for it. It comes from the launch-shape region that `layoutParams`
+        // reserves at the end of the parameter block, and it loads exactly as a 32-bit scalar
+        // parameter loads: one LDC from constant bank 0 at the ABI's parameter base plus the
+        // region's offset for this axis. The CUDA driver puts the same three numbers in its
+        // own reserved area of the bank, but that offset is a driver convention this ABI does
+        // not define, so the region is where a vulcan runtime writes them.
+        //
+        // `layoutParams` reserves the region for exactly these three builtins, so `shape` is
+        // never null on this path. It stays a checked refusal rather than an assert, because
+        // the two decisions live in different modules.
         .grid_dim_x,
         .grid_dim_y,
         .grid_dim_z,
-        => return error.Unsupported,
+        => {
+            const region = shape orelse return error.Unsupported;
+            const at: u16 = @intCast(a.param_base + region.axisOffset(bi.axis().?));
+            try code.append(allocator, encode.ldc(dst, bank0, at, .{}));
+        },
         // The warp index inside a workgroup has no special register of its own. It is
         // derivable from the combined thread index and the warp width, but that derivation
         // needs the full workgroup shape and has no oracle to check it against, because the
@@ -4781,4 +4803,43 @@ test "an atomic inside a divergent arm compiles, unlike a barrier" {
     var kernel = try compileKernel(allocator, &func, nvidia_abi);
     defer kernel.deinit(allocator);
     _ = try onlyOpAt(kernel.code, encode.RED_OPCODE);
+}
+
+test "a compute kernel whose entry a branch reaches refuses, and the forward edge compiles" {
+    // `layoutParams` reads the entry parameter list to place every slot and to decide whether
+    // the launch-shape region is present, and the prologue walks the same list. `mem2reg`
+    // adds and removes block parameters on any block with a predecessor, so the two would
+    // stop agreeing. The negative control is the same two blocks with the edge forward.
+    const allocator = testing.allocator;
+    {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+        const ptr_t = try func.types.ptrGlobal();
+        const b0 = try func.appendBlock();
+        const out = try func.appendBlockParam(b0, ptr_t);
+        const v = try func.appendBlockParam(b0, t);
+        try gpu.attrs.setBuiltin(&func, v, .grid_dim_x);
+        try func.appendStore(b0, v, out);
+        const back = try func.appendBlock();
+        try func.setJump(b0, back, &.{});
+        try func.setJump(back, b0, &.{});
+        try testing.expectError(error.Unsupported, compileKernel(allocator, &func, nvidia_abi));
+    }
+    {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+        const ptr_t = try func.types.ptrGlobal();
+        const b0 = try func.appendBlock();
+        const out = try func.appendBlockParam(b0, ptr_t);
+        const v = try func.appendBlockParam(b0, t);
+        try gpu.attrs.setBuiltin(&func, v, .grid_dim_x);
+        try func.appendStore(b0, v, out);
+        const tail = try func.appendBlock();
+        try func.setJump(b0, tail, &.{});
+        func.setTerminator(tail, .{ .ret = ir.function.Ret.none() });
+        var kernel = try compileKernel(allocator, &func, nvidia_abi);
+        kernel.deinit(allocator);
+    }
 }

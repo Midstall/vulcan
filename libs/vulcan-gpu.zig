@@ -27,6 +27,8 @@ pub const Abi = abi.Abi;
 pub const LaunchInfo = kernel.LaunchInfo;
 /// A placed parameter. See `kernel.Param`.
 pub const Param = kernel.Param;
+/// Where a runtime writes the grid size inside the parameter block. See `kernel.LaunchShape`.
+pub const LaunchShape = kernel.LaunchShape;
 /// Where a pointer points. See `kernel.AddressSpace`.
 pub const AddressSpace = kernel.AddressSpace;
 /// Place a kernel's parameter block. See `abi.layoutParams`.

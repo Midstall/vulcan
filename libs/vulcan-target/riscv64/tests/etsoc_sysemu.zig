@@ -3814,6 +3814,7 @@ fn buildKernelImage(
     code: []const u32,
     launch: gpu.LaunchInfo,
     slots: []const ParamSlot,
+    grid: [3]u32,
     in_words: []const u32,
     out_size: usize,
 ) std.mem.Allocator.Error!KernelImage {
@@ -3870,6 +3871,17 @@ fn buildKernelImage(
             .in_ptr => std.mem.writeInt(u64, bytes[at..][0..8], load_base + in_off, .little),
             .u32_value => |v| std.mem.writeInt(u32, bytes[at..][0..4], v, .little),
             .i64_value => |v| std.mem.writeInt(i64, bytes[at..][0..8], v, .little),
+        }
+    }
+
+    // The launch-shape region, when the kernel reserved one. This is the runtime's half of
+    // the grid contract: the kernel reads its workgroup index out of these three words, so a
+    // harness that skipped them would leave every workgroup builtin reading whatever the
+    // image happened to hold there.
+    if (launch.launch_shape) |shape| {
+        for (grid, 0..) |extent, axis| {
+            const at = params_off + shape.axisOffset(@intCast(axis));
+            std.mem.writeInt(u32, bytes[at..][0..4], extent, .little);
         }
     }
 
@@ -3934,24 +3946,26 @@ fn runKernelImage(
     return dump;
 }
 
-/// Compile a kernel, launch it on the given minions, and return the output words.
+/// Compile a kernel, launch it on the given minions and shires, and return the output words.
 fn runKernel(
     io: std.Io,
     allocator: std.mem.Allocator,
     func: *const Function,
     slots: []const ParamSlot,
+    grid: [3]u32,
     in_words: []const u32,
     out_words: usize,
     minion_mask: u32,
     single_thread: bool,
+    shire_mask: u32,
 ) ![]u32 {
     var compiled = try kernel_mod.compileKernel(allocator, func, kernel_mod.etsoc_abi);
     defer compiled.deinit(allocator);
 
-    const image = try buildKernelImage(allocator, compiled.code, compiled.launch, slots, in_words, out_words * 4);
+    const image = try buildKernelImage(allocator, compiled.code, compiled.launch, slots, grid, in_words, out_words * 4);
     defer image.deinit(allocator);
 
-    const dump = try runKernelImage(io, allocator, image, minion_mask, single_thread, 0x1);
+    const dump = try runKernelImage(io, allocator, image, minion_mask, single_thread, shire_mask);
     defer allocator.free(dump);
 
     const out = try allocator.alloc(u32, out_words);
@@ -3997,7 +4011,10 @@ test "et-soc kernel: sw-sysemu reads the parameter block at the offsets LaunchIn
     // LP64D: the pointer at 0, the two i32 at 8 and 12, the i64 at 16. The builtins take no
     // space in the block.
     try std.testing.expectEqual(@as(usize, 4), compiled.launch.params.len);
-    try std.testing.expectEqual(@as(u32, 24), compiled.launch.param_bytes);
+    // `global_id_x` splits the shire identifier, so the launch-shape region follows the four
+    // explicit parameters and the block grows by twelve bytes. None of the four moved.
+    try std.testing.expectEqual(@as(u32, 24), compiled.launch.launch_shape.?.offset);
+    try std.testing.expectEqual(@as(u32, 36), compiled.launch.param_bytes);
     compiled.deinit(allocator);
 
     const slots = [_]ParamSlot{
@@ -4006,7 +4023,7 @@ test "et-soc kernel: sw-sysemu reads the parameter block at the offsets LaunchIn
         .{ .u32_value = 0x5566_7788 },
         .{ .i64_value = 0x0123_4567_89ab_cdef },
     };
-    const out = runKernel(std.testing.io, allocator, &func, &slots, &.{}, 6, 0x1, true) catch |e| switch (e) {
+    const out = runKernel(std.testing.io, allocator, &func, &slots, .{ 1, 1, 1 }, &.{}, 6, 0x1, true, 0x1) catch |e| switch (e) {
         error.SkipZigTest => return error.SkipZigTest,
         else => return e,
     };
@@ -4051,7 +4068,7 @@ test "et-soc kernel: eight minions each find their own thread_id_x" {
     try buildThreadIdKernel(&func);
 
     const slots = [_]ParamSlot{.out_ptr};
-    const out = runKernel(std.testing.io, allocator, &func, &slots, &.{}, 16, 0xff, true) catch |e| switch (e) {
+    const out = runKernel(std.testing.io, allocator, &func, &slots, .{ 1, 1, 1 }, &.{}, 16, 0xff, true, 0x1) catch |e| switch (e) {
         error.SkipZigTest => return error.SkipZigTest,
         else => return e,
     };
@@ -4076,7 +4093,7 @@ test "et-soc kernel: two harts of one minion get two different thread_id_x" {
     try buildThreadIdKernel(&func);
 
     const slots = [_]ParamSlot{.out_ptr};
-    const out = runKernel(std.testing.io, allocator, &func, &slots, &.{}, 4, 0x1, false) catch |e| switch (e) {
+    const out = runKernel(std.testing.io, allocator, &func, &slots, .{ 1, 1, 1 }, &.{}, 4, 0x1, false, 0x1) catch |e| switch (e) {
         error.SkipZigTest => return error.SkipZigTest,
         else => return e,
     };
@@ -4121,7 +4138,7 @@ test "et-soc kernel: a data-parallel kernel over two buffers runs on eight minio
     // The output pointer is the first parameter and the input pointer is the second, which is
     // the order the block places them.
     const slots = [_]ParamSlot{ .out_ptr, .in_ptr };
-    const out = runKernel(std.testing.io, allocator, &func, &slots, &input, 16, 0xff, true) catch |e| switch (e) {
+    const out = runKernel(std.testing.io, allocator, &func, &slots, .{ 1, 1, 1 }, &input, 16, 0xff, true, 0x1) catch |e| switch (e) {
         error.SkipZigTest => return error.SkipZigTest,
         else => return e,
     };
@@ -4171,7 +4188,7 @@ test "et-soc kernel: two shires give two workgroups with different block_id_x" {
     try buildGlobalIdKernel(&func);
 
     var compiled = try kernel_mod.compileKernel(allocator, &func, kernel_mod.etsoc_abi);
-    const image = try buildKernelImage(allocator, compiled.code, compiled.launch, &.{.out_ptr}, &.{}, 68 * 4);
+    const image = try buildKernelImage(allocator, compiled.code, compiled.launch, &.{.out_ptr}, .{ 2, 1, 1 }, &.{}, 68 * 4);
     compiled.deinit(allocator);
     defer image.deinit(allocator);
 
@@ -4191,4 +4208,200 @@ test "et-soc kernel: two shires give two workgroups with different block_id_x" {
     try std.testing.expectEqual(@as(u32, 201), out[65]); // block_id_x 1
     // Nothing else ran, so nothing else was written.
     for (2..64) |i| try std.testing.expectEqual(@as(u32, 0), out[i]);
+}
+
+/// `void k(u32 *out, i32 tx, i32 ty, i32 tz)` where the three are `thread_id_x/y/z`. It
+/// recomposes its own linear index with the contract's rule, `(z * by + y) * bx + x`, and
+/// writes its three axes and that index four words apart:
+///
+///     out[slot * 4 + 0] = x + 10
+///     out[slot * 4 + 1] = y + 20
+///     out[slot * 4 + 2] = z + 30
+///     out[slot * 4 + 3] = slot + 40
+///
+/// The recomposition is the point. Every hart writes to the slot its OWN split says it owns,
+/// so a split that put two harts on one point would leave another slot untouched, and a split
+/// that shifted an axis would land the whole trace somewhere else.
+fn buildThreadSplitKernel(func: *Function, block: [3]u32) !void {
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const blk = try func.appendBlock();
+    const out = try func.appendBlockParam(blk, ptr_t);
+    const tx = try func.appendBlockParam(blk, i32_t);
+    const ty = try func.appendBlockParam(blk, i32_t);
+    const tz = try func.appendBlockParam(blk, i32_t);
+    try gpu.attrs.setBuiltin(func, tx, .thread_id_x);
+    try gpu.attrs.setBuiltin(func, ty, .thread_id_y);
+    try gpu.attrs.setBuiltin(func, tz, .thread_id_z);
+    try gpu.attrs.setLocalSize(func, block);
+
+    try appendSplitTrace(func, blk, i32_t, ptr_t, out, .{ tx, ty, tz }, block);
+    func.setTerminator(blk, .{ .ret = ir.function.Ret.none() });
+}
+
+/// Emit the shared tail of the two split kernels: recompose the linear index from the three
+/// axes and `extent`, then write the axes and the index into `out` four words apart.
+fn appendSplitTrace(
+    func: *Function,
+    blk: ir.function.Block,
+    i32_t: ir.types.Type,
+    ptr_t: ir.types.Type,
+    out: ir.function.Value,
+    axis: [3]ir.function.Value,
+    extent: [3]u32,
+) !void {
+    // slot = (z * extent[1] + y) * extent[0] + x, which is `gpu.kernel.linearIndex`. The
+    // riscv64 selector has no immediate multiply, so each extent becomes a constant first.
+    const ey = try func.appendInst(blk, i32_t, .{ .iconst = @intCast(extent[1]) });
+    const ex = try func.appendInst(blk, i32_t, .{ .iconst = @intCast(extent[0]) });
+    const za = try func.appendInst(blk, i32_t, .{ .arith = .{ .op = .mul, .lhs = axis[2], .rhs = ey } });
+    const zy = try func.appendInst(blk, i32_t, .{ .arith = .{ .op = .add, .lhs = za, .rhs = axis[1] } });
+    const zyb = try func.appendInst(blk, i32_t, .{ .arith = .{ .op = .mul, .lhs = zy, .rhs = ex } });
+    const slot = try func.appendInst(blk, i32_t, .{ .arith = .{ .op = .add, .lhs = zyb, .rhs = axis[0] } });
+
+    const off = try func.appendArithImm(blk, i32_t, .shl, slot, 4);
+    const base = try func.appendInst(blk, ptr_t, .{ .arith = .{ .op = .add, .lhs = out, .rhs = off } });
+    for (axis, 0..) |v, i| {
+        const tagged = try func.appendArithImm(blk, i32_t, .add, v, @intCast(10 + i * 10));
+        const at = try func.appendArithImm(blk, ptr_t, .add, base, @intCast(i * 4));
+        try func.appendStore(blk, tagged, at);
+    }
+    const tagged_slot = try func.appendArithImm(blk, i32_t, .add, slot, 40);
+    try func.appendStore(blk, tagged_slot, try func.appendArithImm(blk, ptr_t, .add, base, 12));
+}
+
+/// `void k(u32 *out, i32 bx, i32 by, i32 bz, i32 gx, i32 gy)` where the first three are
+/// `block_id_x/y/z` and the last two are `grid_dim_x/y`. It recomposes its own linear
+/// workgroup index from the grid extents the RUNTIME wrote, `(z * gy + y) * gx + x`, and
+/// writes the same four-word record `buildThreadSplitKernel` writes.
+///
+/// This is the grid half of the same proof, and it needs the launch-shape region twice over:
+/// once to split the shire identifier, once to read the extents back for the recomposition.
+fn buildBlockSplitKernel(func: *Function) !void {
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const blk = try func.appendBlock();
+    const out = try func.appendBlockParam(blk, ptr_t);
+    const bx = try func.appendBlockParam(blk, i32_t);
+    const by = try func.appendBlockParam(blk, i32_t);
+    const bz = try func.appendBlockParam(blk, i32_t);
+    const gx = try func.appendBlockParam(blk, i32_t);
+    const gy = try func.appendBlockParam(blk, i32_t);
+    try gpu.attrs.setBuiltin(func, bx, .block_id_x);
+    try gpu.attrs.setBuiltin(func, by, .block_id_y);
+    try gpu.attrs.setBuiltin(func, bz, .block_id_z);
+    try gpu.attrs.setBuiltin(func, gx, .grid_dim_x);
+    try gpu.attrs.setBuiltin(func, gy, .grid_dim_y);
+    try gpu.attrs.setLocalSize(func, .{ 1, 1, 1 });
+
+    // slot = (bz * gy + by) * gx + bx, with both extents read at run time.
+    const za = try func.appendInst(blk, i32_t, .{ .arith = .{ .op = .mul, .lhs = bz, .rhs = gy } });
+    const zy = try func.appendInst(blk, i32_t, .{ .arith = .{ .op = .add, .lhs = za, .rhs = by } });
+    const zyg = try func.appendInst(blk, i32_t, .{ .arith = .{ .op = .mul, .lhs = zy, .rhs = gx } });
+    const slot = try func.appendInst(blk, i32_t, .{ .arith = .{ .op = .add, .lhs = zyg, .rhs = bx } });
+
+    const off = try func.appendArithImm(blk, i32_t, .shl, slot, 4);
+    const base = try func.appendInst(blk, ptr_t, .{ .arith = .{ .op = .add, .lhs = out, .rhs = off } });
+    for ([3]ir.function.Value{ bx, by, bz }, 0..) |v, i| {
+        const tagged = try func.appendArithImm(blk, i32_t, .add, v, @intCast(10 + i * 10));
+        try func.appendStore(blk, tagged, try func.appendArithImm(blk, ptr_t, .add, base, @intCast(i * 4)));
+    }
+    const tagged_slot = try func.appendArithImm(blk, i32_t, .add, slot, 40);
+    try func.appendStore(blk, tagged_slot, try func.appendArithImm(blk, ptr_t, .add, base, 12));
+    func.setTerminator(blk, .{ .ret = ir.function.Ret.none() });
+}
+
+/// Check a four-word record per point of `extent` against `gpu.kernel.axisIndex`.
+///
+/// This is where the three sides meet. The expected numbers come from the CONTRACT helper,
+/// the actual numbers come from HARDWARE, and the same helper is what the CPU oracle is
+/// checked against in `nvidia/tests/spirv.zig`. So a rule change in any one of the three
+/// breaks this.
+fn expectSplitTrace(out: []const u32, extent: [3]u32) !void {
+    const points = extent[0] * extent[1] * extent[2];
+    var linear: u32 = 0;
+    while (linear < points) : (linear += 1) {
+        const want = gpu.kernel.axisIndex(linear, extent);
+        // The record sits at the slot the point RECOMPOSES to, which must be `linear` again.
+        const at = linear * 4;
+        for (want, 0..) |v, i| {
+            const expected: u32 = v + @as(u32, @intCast(10 + i * 10));
+            std.testing.expectEqual(expected, out[at + i]) catch |e| {
+                std.debug.print("linear {d} axis {d}: expected {d}, got {d}\n", .{ linear, i, expected, out[at + i] });
+                return e;
+            };
+        }
+        try std.testing.expectEqual(linear + 40, out[at + 3]);
+    }
+    // Nothing outside the launch ran, so nothing outside the launch was written.
+    for (out[points * 4 ..]) |w| try std.testing.expectEqual(@as(u32, 0), w);
+}
+
+test "et-soc kernel: twelve harts split one linear identifier into a 2x3x2 workgroup" {
+    // The thread half of the linearization contract, executed. Six minions run both harts, so
+    // the hart identifiers are 0 through 11 with no gaps, which is exactly the launch
+    // contract: the runtime starts `bx * by * bz` harts in the shire and their shire-local
+    // indices are the linear thread indices 0..11.
+    //
+    // A single-AXIS workgroup cannot test this. With {64, 1, 1} the split is the identity and
+    // every wrong rule still passes. The three extents differ, and the height is not a power
+    // of two, so a split that used the wrong extent or folded a division into a mask lands in
+    // the wrong slot instead of staying accidentally right.
+    const allocator = std.testing.allocator;
+    const block = [3]u32{ 2, 3, 2 };
+    var func = Function.init(allocator);
+    defer func.deinit();
+    try buildThreadSplitKernel(&func, block);
+
+    // Compiling runs unconditionally, so a broken split fails this test with no emulator on
+    // PATH. A thread split needs no grid, so this kernel reserves no launch-shape region.
+    var compiled = try kernel_mod.compileKernel(allocator, &func, kernel_mod.etsoc_abi);
+    try std.testing.expectEqual(@as(?gpu.LaunchShape, null), compiled.launch.launch_shape);
+    compiled.deinit(allocator);
+
+    const out = runKernel(std.testing.io, allocator, &func, &.{.out_ptr}, .{ 1, 1, 1 }, &.{}, 56, 0x3f, false, 0x1) catch |e| switch (e) {
+        error.SkipZigTest => return error.SkipZigTest,
+        else => return e,
+    };
+    defer allocator.free(out);
+
+    try expectSplitTrace(out, block);
+}
+
+test "et-soc kernel: eight shires split one shire identifier into a 2x4 grid" {
+    // The grid half, executed. Eight shires each run one hart, so the shire identifiers are 0
+    // through 7, and the grid the harness wrote is two wide by four tall.
+    //
+    // `block_id_x` is the case a one-dimensional grid can never catch. Shire 2 is workgroup
+    // (0, 1), so x must WRAP back to 0 there. A backend that returned the raw shire
+    // identifier would report (2, 0) instead, and every existing single-row test would still
+    // pass. The width and the height differ, so a split that read the wrong extent lands in
+    // the wrong slot instead of staying accidentally right.
+    const allocator = std.testing.allocator;
+    const grid = [3]u32{ 2, 4, 1 };
+    var func = Function.init(allocator);
+    defer func.deinit();
+    try buildBlockSplitKernel(&func);
+
+    var compiled = try kernel_mod.compileKernel(allocator, &func, kernel_mod.etsoc_abi);
+    // One explicit parameter, the output pointer, then the launch-shape region right after it.
+    try std.testing.expectEqual(@as(usize, 1), compiled.launch.params.len);
+    try std.testing.expectEqual(@as(u32, 0), compiled.launch.params[0].offset);
+    try std.testing.expectEqual(@as(u32, 8), compiled.launch.launch_shape.?.offset);
+    try std.testing.expectEqual(@as(u32, 20), compiled.launch.param_bytes);
+
+    const image = try buildKernelImage(allocator, compiled.code, compiled.launch, &.{.out_ptr}, grid, &.{}, 40 * 4);
+    compiled.deinit(allocator);
+    defer image.deinit(allocator);
+
+    // Shires 0 through 7, minion 0 of each, one hart per minion.
+    const dump = runKernelImage(std.testing.io, allocator, image, 0x1, true, 0xff) catch |e| switch (e) {
+        error.SkipZigTest => return error.SkipZigTest,
+        else => return e,
+    };
+    defer allocator.free(dump);
+
+    var out: [40]u32 = undefined;
+    for (&out, 0..) |*w, i| w.* = std.mem.readInt(u32, dump[i * 4 ..][0..4], .little);
+    try expectSplitTrace(&out, grid);
 }

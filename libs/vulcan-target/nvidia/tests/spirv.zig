@@ -270,6 +270,7 @@ const host_builtin = @import("builtin");
 const s2r_opcode: u32 = 0x919;
 const mov_imm_opcode: u32 = 0x802;
 const imad_opcode: u32 = 0x224;
+const ldc_opcode: u32 = 0xb82;
 
 /// The workgroup size every probe kernel declares. The three axes differ, so a lowering that
 /// reads the wrong axis writes different numbers instead of the same ones.
@@ -381,6 +382,14 @@ const MovImm = struct { dst: u8, imm: u32 };
 
 fn decodeMovImm(w: []const u32) MovImm {
     return .{ .dst = @truncate(w[0] >> 16), .imm = w[1] };
+}
+
+/// One decoded `LDC dst, c[0][offset]`: the GPR it writes and the static byte offset it reads
+/// from, which lives in bits 38..53 (word 1 bits 6..21).
+const LdcRead = struct { dst: u8, offset: u32 };
+
+fn decodeLdc(w: []const u32) LdcRead {
+    return .{ .dst = @truncate(w[0] >> 16), .offset = @as(u16, @truncate(w[1] >> 6)) & 0xffff };
 }
 
 /// One decoded ALU `IMAD dst, a, b, c`: `dst = a * b + c`. The operand fields are the shared
@@ -598,22 +607,102 @@ test "grid builtins: block_dim on each axis is the declared size, with no hardwa
     }
 }
 
-test "grid builtins: the grid size and the subgroup builtins still refuse to lower" {
-    // These have no correct lowering on this backend yet. The grid size is a launch-time
-    // value with no special register and no slot in the parameter-block contract, and the
-    // subgroup builtins have no oracle to check them against. A refusal is the honest answer:
-    // a kernel that read the wrong register would look right and compute garbage.
+test "grid builtins: grid_dim on each axis loads its own launch-shape slot and traces it" {
     const allocator = std.testing.allocator;
 
-    const refused = [5]gpu.Builtin{
-        .grid_dim_x, .grid_dim_y, .grid_dim_z, .warp_id, .subgroup_size,
+    const cases = [3]struct { tag: gpu.Builtin, axis: u2 }{
+        .{ .tag = .grid_dim_x, .axis = 0 },
+        .{ .tag = .grid_dim_y, .axis = 1 },
+        .{ .tag = .grid_dim_z, .axis = 2 },
     };
-    for (refused) |tag| {
+
+    const trace = try allocator.alloc(i32, probe_threads);
+    defer allocator.free(trace);
+
+    for (cases) |case| {
+        // The SASS path. The grid size has no special register, so the lowering is one LDC
+        // from the launch-shape region and no hardware read at all. The offset comes back out
+        // of the instruction and has to be the one `LaunchInfo` tells the runtime to write.
+        var kernel = try probeSass(allocator, case.tag);
+        defer kernel.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 0), countOpcode(kernel.code, s2r_opcode));
+        try std.testing.expectEqual(ldc_opcode, kernel.code[0] & 0xfff);
+
+        const shape = kernel.launch.launch_shape.?;
+        const want = isel.nvidia_abi.param_base + shape.axisOffset(case.axis);
+        try std.testing.expectEqual(want, decodeLdc(kernel.code[0..4]).offset);
+        // The region sits after both explicit pointers, which keep the offsets they would
+        // have had with no grid builtin at all.
+        try std.testing.expectEqual(@as(usize, 2), kernel.launch.params.len);
+        try std.testing.expectEqual(@as(u32, 0), kernel.launch.params[0].offset);
+        try std.testing.expectEqual(@as(u32, 8), kernel.launch.params[1].offset);
+        try std.testing.expectEqual(@as(u32, 16), shape.offset);
+        try std.testing.expectEqual(@as(u32, 28), kernel.launch.param_bytes);
+
+        // The oracle. The grid size is uniform over the launch, so every thread reads the
+        // same value, and that value is the grid the host nest ran.
+        if (!hasJit()) continue;
+        try oracleTrace(allocator, case.tag, trace);
+        for (trace) |got| try std.testing.expectEqual(probe_grid[case.axis], got);
+    }
+}
+
+test "grid builtins: the subgroup builtins still refuse to lower" {
+    // These have no correct lowering on this backend yet: the subgroup builtins have no
+    // oracle to check them against, because the host nest runs one thread at a time and has
+    // no subgroup. A refusal is the honest answer: a kernel that read the wrong register
+    // would look right and compute garbage.
+    const allocator = std.testing.allocator;
+
+    for ([2]gpu.Builtin{ .warp_id, .subgroup_size }) |tag| {
         var kernel = try probeKernel(allocator, tag, probe_block);
         defer kernel.deinit();
         try std.testing.expectError(
             error.Unsupported,
             isel.compileKernel(allocator, &kernel, isel.nvidia_abi),
         );
+    }
+}
+
+test "grid builtins: the oracle's nest order is the contract's linearization" {
+    // The cross-target check. `gpu.kernel.axisIndex` is the rule a LINEAR-ID backend follows
+    // to split one identifier into three axes, and the CPU oracle is the reference every
+    // target is diffed against. If the two disagreed, the ET-SoC prologue would put a hart in
+    // a slot the oracle never visits, and each side would still look self-consistent.
+    //
+    // The oracle writes one value per thread in nest order, so the nest position IS the
+    // linear index: the thread part counts inside a workgroup and the workgroup part counts
+    // outside it.
+    const allocator = std.testing.allocator;
+    if (!hasJit()) return error.SkipZigTest;
+
+    const threads_per_block: usize = @as(usize, probe_block[0]) * probe_block[1] * probe_block[2];
+    const grid: [3]u32 = .{
+        @intCast(probe_grid[0]),
+        @intCast(probe_grid[1]),
+        @intCast(probe_grid[2]),
+    };
+
+    const trace = try allocator.alloc(i32, probe_threads);
+    defer allocator.free(trace);
+
+    const thread_tags = [3]gpu.Builtin{ .thread_id_x, .thread_id_y, .thread_id_z };
+    for (thread_tags, 0..) |tag, axis| {
+        try oracleTrace(allocator, tag, trace);
+        for (trace, 0..) |got, i| {
+            const local: u32 = @intCast(i % threads_per_block);
+            const want = gpu.kernel.axisIndex(local, probe_block)[axis];
+            try std.testing.expectEqual(@as(i32, @intCast(want)), got);
+        }
+    }
+
+    const block_tags = [3]gpu.Builtin{ .block_id_x, .block_id_y, .block_id_z };
+    for (block_tags, 0..) |tag, axis| {
+        try oracleTrace(allocator, tag, trace);
+        for (trace, 0..) |got, i| {
+            const workgroup: u32 = @intCast(i / threads_per_block);
+            const want = gpu.kernel.axisIndex(workgroup, grid)[axis];
+            try std.testing.expectEqual(@as(i32, @intCast(want)), got);
+        }
     }
 }
