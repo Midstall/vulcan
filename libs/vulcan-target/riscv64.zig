@@ -12,6 +12,7 @@ pub const link = @import("riscv64/link.zig");
 pub const object = @import("riscv64/object.zig");
 pub const jit = @import("riscv64/jit.zig");
 pub const compress = @import("riscv64/compress.zig");
+pub const kernel = @import("riscv64/kernel.zig");
 
 /// Enabled RISC-V ISA extensions for a codegen target. Codegen consults this to
 /// decide optional output transforms; today the only one wired is `c` (RVC), which

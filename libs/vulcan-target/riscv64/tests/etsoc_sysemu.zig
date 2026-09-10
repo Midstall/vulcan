@@ -21,6 +21,8 @@ const ir = @import("vulcan-ir");
 const mm = @import("vulcan-opt").microarch;
 const encode = @import("../encode.zig");
 const isel = @import("../isel.zig");
+const kernel_mod = @import("../kernel.zig");
+const gpu = @import("vulcan-gpu");
 
 const Function = ir.function.Function;
 
@@ -3757,4 +3759,436 @@ test "wimmer-vpu: a vpu vector carried across a cross-block edge matches (class-
             try std.testing.expectEqual(@as(u32, @bitCast(expected)), @as(u32, @bitCast(got[i])));
         }
     }
+}
+
+// --- ET-SoC kernel launch execution ---------------------------------------------------
+//
+// The tests above execute a plain function under the ordinary calling convention. The ones
+// below execute a `vulcan-gpu` KERNEL: `kernel.compileKernel` builds an entry prologue that
+// reads the parameter block and the hardware identifiers, and this harness supplies the block
+// the `LaunchInfo` describes and launches the kernel on more than one minion at once.
+//
+// The multi-minion runs are the point. ET-SoC-1 is MIMD: every hart fetches its own
+// instructions, so the harness starts N harts at the same address and each one must find its
+// OWN identity. A kernel that read a wrong identifier would write the wrong slot, and the
+// output buffer shows it.
+
+/// Stack bytes each hart gets in a kernel image. A test kernel's frame is a few words.
+const kernel_stack_bytes: u64 = 1024;
+/// The base-two logarithm of `kernel_stack_bytes`, for the stub's shift.
+const kernel_stack_shift: u6 = 10;
+/// Harts a kernel image reserves stack for: one whole shire.
+const kernel_max_harts: u64 = 64;
+
+/// One value the harness writes into a kernel's parameter block. The harness places each at
+/// the offset the kernel's own `LaunchInfo` reports, so a disagreement between the emitted
+/// loads and the reported metadata makes the kernel read the wrong bytes.
+const ParamSlot = union(enum) {
+    /// The address of the image's output buffer.
+    out_ptr,
+    /// The address of the image's input buffer.
+    in_ptr,
+    u32_value: u32,
+    i64_value: i64,
+};
+
+/// A kernel image: the assembled bytes, and where its buffers sit inside them.
+const KernelImage = struct {
+    bytes: []u8,
+    out_off: u64,
+    out_size: usize,
+
+    fn deinit(self: KernelImage, allocator: std.mem.Allocator) void {
+        allocator.free(self.bytes);
+    }
+};
+
+/// Assemble a baremetal image that launches `code` once per enabled hart.
+///
+/// The entry stub enables the FP unit, gives each hart its OWN stack slice (indexed by the
+/// hart identifier, the same thing the vendor's own `boot.S` does with `mhartid`), points `a0`
+/// at the parameter block, calls the kernel, and halts with `wfi`. Every hart runs the same
+/// stub, so the only thing that separates them is the identifier they read.
+fn buildKernelImage(
+    allocator: std.mem.Allocator,
+    code: []const u32,
+    launch: gpu.LaunchInfo,
+    slots: []const ParamSlot,
+    in_words: []const u32,
+    out_size: usize,
+) std.mem.Allocator.Error!KernelImage {
+    // Fixed 13-word entry stub. The indices are load-bearing: the PC-relative pairs and the
+    // call are patched against them.
+    //   0     lui   x6, 0x6            (mstatus.FS = Dirty)
+    //   1     csrrs x0, mstatus, x6    (enable the FP/VPU unit)
+    //   2     csrrs x7, hartid, x0     (t2 = this hart's identifier)
+    //   3-4   auipc/addi sp            (the base of the stack region)
+    //   5     addi  x6, x7, 1          (this hart's slice index, one past its own)
+    //   6     slli  x6, x6, 10         (times the slice size)
+    //   7     add   sp, sp, x6         (the top of this hart's slice)
+    //   8-9   auipc/addi a0            (&params)
+    //   10    jal   x1, <kernel>
+    //   11    wfi                      (halt this hart)
+    //   12    jal   x0, 0              (safety self-loop, never reached)
+    const stub_len: usize = 13;
+    const total_code_words = stub_len + code.len;
+
+    const params_off = roundUp(@as(u64, total_code_words) * 4, 16);
+    const in_off = roundUp(params_off + launch.param_bytes, 64);
+    const out_off = roundUp(in_off + in_words.len * 4, 64);
+    const stack_base_off = roundUp(out_off + out_size, 16);
+    const total = stack_base_off + kernel_max_harts * kernel_stack_bytes;
+
+    var w: std.ArrayList(u32) = .empty;
+    defer w.deinit(allocator);
+    try w.append(allocator, encode.lui(.x6, 6)); // 0x6000
+    try w.append(allocator, encode.csrrs(.x0, 0x300, .x6)); // mstatus.FS = Dirty
+    try w.append(allocator, encode.csrrs(.x7, kernel_mod.csr_hartid, .x0));
+    try appendPcRel(allocator, &w, .x2, 3, stack_base_off);
+    try w.append(allocator, encode.addi(.x6, .x7, 1));
+    try w.append(allocator, encode.slli(.x6, .x6, kernel_stack_shift));
+    try w.append(allocator, encode.add(.x2, .x2, .x6));
+    try appendPcRel(allocator, &w, .x10, 8, params_off);
+    const fn_off: i21 = @intCast((stub_len - w.items.len) * 4);
+    try w.append(allocator, encode.jal(.x1, fn_off));
+    try w.append(allocator, wfi_word);
+    try w.append(allocator, encode.jal(.x0, 0));
+    std.debug.assert(w.items.len == stub_len);
+    try w.appendSlice(allocator, code);
+
+    const bytes = try allocator.alloc(u8, total);
+    @memset(bytes, 0);
+    for (w.items, 0..) |word, i| std.mem.writeInt(u32, bytes[i * 4 ..][0..4], word, .little);
+    for (in_words, 0..) |v, i| std.mem.writeInt(u32, bytes[in_off + i * 4 ..][0..4], v, .little);
+
+    // The parameter block, written at the offsets the kernel's own LaunchInfo reports.
+    std.debug.assert(slots.len == launch.params.len);
+    for (slots, launch.params) |slot, p| {
+        const at = params_off + p.offset;
+        switch (slot) {
+            .out_ptr => std.mem.writeInt(u64, bytes[at..][0..8], load_base + out_off, .little),
+            .in_ptr => std.mem.writeInt(u64, bytes[at..][0..8], load_base + in_off, .little),
+            .u32_value => |v| std.mem.writeInt(u32, bytes[at..][0..4], v, .little),
+            .i64_value => |v| std.mem.writeInt(i64, bytes[at..][0..8], v, .little),
+        }
+    }
+
+    return .{ .bytes = bytes, .out_off = out_off, .out_size = out_size };
+}
+
+/// Run a kernel image under sw-sysemu with `minion_mask` minions of shire 0 enabled, and
+/// return the bytes they wrote to the output buffer. `single_thread` disables the second hart
+/// of every minion, so a minion runs one hart instead of two. Returns `error.SkipZigTest` when
+/// the sw-sysemu binary is not on PATH, exactly like the runners above.
+fn runKernelImage(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    image: KernelImage,
+    minion_mask: u32,
+    single_thread: bool,
+    shire_mask: u32,
+) ![]u8 {
+    const elf = try writeSysemuElf(allocator, image.bytes, load_base);
+    defer allocator.free(elf);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "kernel.elf", .data = elf });
+
+    const out_addr = try std.fmt.allocPrint(allocator, "0x{x}", .{load_base + image.out_off});
+    defer allocator.free(out_addr);
+    const dump_size = try std.fmt.allocPrint(allocator, "{d}", .{image.out_size});
+    defer allocator.free(dump_size);
+    const reset_pc = try std.fmt.allocPrint(allocator, "0x{x}", .{load_base});
+    defer allocator.free(reset_pc);
+    const minions = try std.fmt.allocPrint(allocator, "0x{x}", .{minion_mask});
+    defer allocator.free(minions);
+    const shires = try std.fmt.allocPrint(allocator, "0x{x}", .{shire_mask});
+    defer allocator.free(shires);
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    try argv.appendSlice(allocator, &.{ "sys_emu", "-reset_pc", reset_pc });
+    if (single_thread) try argv.append(allocator, "-single_thread");
+    try argv.appendSlice(allocator, &.{ "-minions", minions, "-shires", shires });
+    try argv.appendSlice(allocator, &.{
+        "-elf_load",  "kernel.elf",
+        "-dump_addr", out_addr,
+        "-dump_size", dump_size,
+        "-dump_file", "out.bin",
+    });
+
+    const result = std.process.run(allocator, io, .{ .argv = argv.items, .cwd = .{ .dir = tmp.dir } }) catch |e| switch (e) {
+        error.FileNotFound => return error.SkipZigTest, // sw-sysemu not installed: skip
+        else => return e,
+    };
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    const dump = tmp.dir.readFileAlloc(io, "out.bin", allocator, .limited(4 << 20)) catch {
+        std.debug.print("sw-sysemu produced no dump. term={any}\nstdout:\n{s}\nstderr:\n{s}\n", .{ result.term, result.stdout, result.stderr });
+        return error.BackendFailed;
+    };
+    errdefer allocator.free(dump);
+    if (dump.len < image.out_size) return error.BackendFailed;
+    return dump;
+}
+
+/// Compile a kernel, launch it on the given minions, and return the output words.
+fn runKernel(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    func: *const Function,
+    slots: []const ParamSlot,
+    in_words: []const u32,
+    out_words: usize,
+    minion_mask: u32,
+    single_thread: bool,
+) ![]u32 {
+    var compiled = try kernel_mod.compileKernel(allocator, func, kernel_mod.etsoc_abi);
+    defer compiled.deinit(allocator);
+
+    const image = try buildKernelImage(allocator, compiled.code, compiled.launch, slots, in_words, out_words * 4);
+    defer image.deinit(allocator);
+
+    const dump = try runKernelImage(io, allocator, image, minion_mask, single_thread, 0x1);
+    defer allocator.free(dump);
+
+    const out = try allocator.alloc(u32, out_words);
+    for (0..out_words) |i| out[i] = std.mem.readInt(u32, dump[i * 4 ..][0..4], .little);
+    return out;
+}
+
+/// `void k(u32 *out, i32 a, i32 b, i64 c, i32 gid, i32 sg)` where `gid` is `global_id_x` and
+/// `sg` is `subgroup_size`. It writes `a`, `b`, `c`, `gid` and `sg` into `out`, so a wrong
+/// parameter-block offset or a wrong builtin shows up as a wrong word.
+fn buildParamBlockKernel(func: *Function) !void {
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const i64_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const blk = try func.appendBlock();
+    const out = try func.appendBlockParam(blk, ptr_t);
+    const a = try func.appendBlockParam(blk, i32_t);
+    const b = try func.appendBlockParam(blk, i32_t);
+    const c = try func.appendBlockParam(blk, i64_t);
+    const gid = try func.appendBlockParam(blk, i32_t);
+    const sg = try func.appendBlockParam(blk, i32_t);
+    try gpu.attrs.setBuiltin(func, gid, .global_id_x);
+    try gpu.attrs.setBuiltin(func, sg, .subgroup_size);
+    try gpu.attrs.setLocalSize(func, .{ 64, 1, 1 });
+
+    try func.appendStore(blk, a, out);
+    try func.appendStore(blk, b, try func.appendArithImm(blk, ptr_t, .add, out, 4));
+    try func.appendStore(blk, c, try func.appendArithImm(blk, ptr_t, .add, out, 8));
+    try func.appendStore(blk, gid, try func.appendArithImm(blk, ptr_t, .add, out, 16));
+    try func.appendStore(blk, sg, try func.appendArithImm(blk, ptr_t, .add, out, 20));
+    func.setTerminator(blk, .{ .ret = ir.function.Ret.none() });
+}
+
+test "et-soc kernel: sw-sysemu reads the parameter block at the offsets LaunchInfo reports" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    try buildParamBlockKernel(&func);
+
+    // Compiling runs unconditionally, so a broken prologue fails this test even with no
+    // emulator on PATH.
+    var compiled = try kernel_mod.compileKernel(allocator, &func, kernel_mod.etsoc_abi);
+    // LP64D: the pointer at 0, the two i32 at 8 and 12, the i64 at 16. The builtins take no
+    // space in the block.
+    try std.testing.expectEqual(@as(usize, 4), compiled.launch.params.len);
+    try std.testing.expectEqual(@as(u32, 24), compiled.launch.param_bytes);
+    compiled.deinit(allocator);
+
+    const slots = [_]ParamSlot{
+        .out_ptr,
+        .{ .u32_value = 0x1122_3344 },
+        .{ .u32_value = 0x5566_7788 },
+        .{ .i64_value = 0x0123_4567_89ab_cdef },
+    };
+    const out = runKernel(std.testing.io, allocator, &func, &slots, &.{}, 6, 0x1, true) catch |e| switch (e) {
+        error.SkipZigTest => return error.SkipZigTest,
+        else => return e,
+    };
+    defer allocator.free(out);
+
+    try std.testing.expectEqual(@as(u32, 0x1122_3344), out[0]);
+    try std.testing.expectEqual(@as(u32, 0x5566_7788), out[1]);
+    try std.testing.expectEqual(@as(u32, 0x89ab_cdef), out[2]);
+    try std.testing.expectEqual(@as(u32, 0x0123_4567), out[3]);
+    // Minion 0, hart 0 of shire 0: hartid 0, so global_id_x is 0.
+    try std.testing.expectEqual(@as(u32, 0), out[4]);
+    // The VPU is eight lanes wide.
+    try std.testing.expectEqual(@as(u32, 8), out[5]);
+}
+
+/// `void k(u32 *out, i32 tid)` where `tid` is `thread_id_x`: `out[tid] = tid + 100`. Every
+/// hart runs the same code, so the buffer records exactly which identifiers actually ran.
+fn buildThreadIdKernel(func: *Function) !void {
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const blk = try func.appendBlock();
+    const out = try func.appendBlockParam(blk, ptr_t);
+    const tid = try func.appendBlockParam(blk, i32_t);
+    try gpu.attrs.setBuiltin(func, tid, .thread_id_x);
+    try gpu.attrs.setLocalSize(func, .{ 64, 1, 1 });
+
+    const off = try func.appendArithImm(blk, i32_t, .shl, tid, 2);
+    const slot = try func.appendInst(blk, ptr_t, .{ .arith = .{ .op = .add, .lhs = out, .rhs = off } });
+    const v = try func.appendArithImm(blk, i32_t, .add, tid, 100);
+    try func.appendStore(blk, v, slot);
+    func.setTerminator(blk, .{ .ret = ir.function.Ret.none() });
+}
+
+test "et-soc kernel: eight minions each find their own thread_id_x" {
+    // The MIMD proof. Eight minions start at the same address with the same code, and each one
+    // must write a DIFFERENT slot. With one hart per minion the hart identifiers are the even
+    // numbers 0, 2, .. 14, so the odd slots must stay untouched: that gap is what separates a
+    // real per-hart identifier from a counter this harness could have supplied.
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    try buildThreadIdKernel(&func);
+
+    const slots = [_]ParamSlot{.out_ptr};
+    const out = runKernel(std.testing.io, allocator, &func, &slots, &.{}, 16, 0xff, true) catch |e| switch (e) {
+        error.SkipZigTest => return error.SkipZigTest,
+        else => return e,
+    };
+    defer allocator.free(out);
+
+    for (0..16) |i| {
+        const expected: u32 = if (i % 2 == 0 and i < 16) @intCast(i + 100) else 0;
+        std.testing.expectEqual(expected, out[i]) catch |e| {
+            std.debug.print("slot {d}: expected {d}, got {d}\n", .{ i, expected, out[i] });
+            return e;
+        };
+    }
+}
+
+test "et-soc kernel: two harts of one minion get two different thread_id_x" {
+    // A thread is a HART, not a minion. One minion runs two harts, and this launch enables
+    // both. If a thread were a minion, the two would collide on one slot and the second would
+    // stay zero.
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    try buildThreadIdKernel(&func);
+
+    const slots = [_]ParamSlot{.out_ptr};
+    const out = runKernel(std.testing.io, allocator, &func, &slots, &.{}, 4, 0x1, false) catch |e| switch (e) {
+        error.SkipZigTest => return error.SkipZigTest,
+        else => return e,
+    };
+    defer allocator.free(out);
+
+    try std.testing.expectEqual(@as(u32, 100), out[0]);
+    try std.testing.expectEqual(@as(u32, 101), out[1]);
+    try std.testing.expectEqual(@as(u32, 0), out[2]);
+    try std.testing.expectEqual(@as(u32, 0), out[3]);
+}
+
+/// `void k(u32 *out, u32 *in, i32 gid)` where `gid` is `global_id_x`: `out[gid] = in[gid] * 2`.
+/// The shape a real data-parallel kernel has, with two pointer parameters in the block.
+fn buildDoubleKernel(func: *Function) !void {
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const blk = try func.appendBlock();
+    const out = try func.appendBlockParam(blk, ptr_t);
+    const in = try func.appendBlockParam(blk, ptr_t);
+    const gid = try func.appendBlockParam(blk, i32_t);
+    try gpu.attrs.setBuiltin(func, gid, .global_id_x);
+    try gpu.attrs.setLocalSize(func, .{ 64, 1, 1 });
+
+    const off = try func.appendArithImm(blk, i32_t, .shl, gid, 2);
+    const src = try func.appendInst(blk, ptr_t, .{ .arith = .{ .op = .add, .lhs = in, .rhs = off } });
+    const dst = try func.appendInst(blk, ptr_t, .{ .arith = .{ .op = .add, .lhs = out, .rhs = off } });
+    const v = try func.appendInst(blk, i32_t, .{ .load = .{ .ptr = src } });
+    const doubled = try func.appendArithImm(blk, i32_t, .shl, v, 1);
+    try func.appendStore(blk, doubled, dst);
+    func.setTerminator(blk, .{ .ret = ir.function.Ret.none() });
+}
+
+test "et-soc kernel: a data-parallel kernel over two buffers runs on eight minions" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    try buildDoubleKernel(&func);
+
+    var input: [16]u32 = undefined;
+    for (&input, 0..) |*v, i| v.* = @intCast(i * 7 + 1);
+
+    // The output pointer is the first parameter and the input pointer is the second, which is
+    // the order the block places them.
+    const slots = [_]ParamSlot{ .out_ptr, .in_ptr };
+    const out = runKernel(std.testing.io, allocator, &func, &slots, &input, 16, 0xff, true) catch |e| switch (e) {
+        error.SkipZigTest => return error.SkipZigTest,
+        else => return e,
+    };
+    defer allocator.free(out);
+
+    // Shire 0 gives block_id_x = 0, so global_id_x is the hart identifier. One hart per minion
+    // means the even elements are doubled and the odd ones are never visited.
+    for (0..16) |i| {
+        const expected: u32 = if (i % 2 == 0) input[i] * 2 else 0;
+        std.testing.expectEqual(expected, out[i]) catch |e| {
+            std.debug.print("slot {d}: expected {d}, got {d}\n", .{ i, expected, out[i] });
+            return e;
+        };
+    }
+}
+
+/// `void k(u32 *out, i32 gid, i32 bid)` where `gid` is `global_id_x` and `bid` is
+/// `block_id_x`: `out[gid] = 100 + gid` and `out[gid + 1] = 200 + bid`. Two workgroups run it,
+/// so both the shire identifier and the fused global index have to be right.
+fn buildGlobalIdKernel(func: *Function) !void {
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const blk = try func.appendBlock();
+    const out = try func.appendBlockParam(blk, ptr_t);
+    const gid = try func.appendBlockParam(blk, i32_t);
+    const bid = try func.appendBlockParam(blk, i32_t);
+    try gpu.attrs.setBuiltin(func, gid, .global_id_x);
+    try gpu.attrs.setBuiltin(func, bid, .block_id_x);
+    try gpu.attrs.setLocalSize(func, .{ 64, 1, 1 });
+
+    const off = try func.appendArithImm(blk, i32_t, .shl, gid, 2);
+    const slot = try func.appendInst(blk, ptr_t, .{ .arith = .{ .op = .add, .lhs = out, .rhs = off } });
+    try func.appendStore(blk, try func.appendArithImm(blk, i32_t, .add, gid, 100), slot);
+    const next = try func.appendArithImm(blk, ptr_t, .add, slot, 4);
+    try func.appendStore(blk, try func.appendArithImm(blk, i32_t, .add, bid, 200), next);
+    func.setTerminator(blk, .{ .ret = ir.function.Ret.none() });
+}
+
+test "et-soc kernel: two shires give two workgroups with different block_id_x" {
+    // A workgroup is a SHIRE. This launch enables shire 0 and shire 1, one hart in each, so
+    // the hart identifiers are 0 and 64. `block_id_x` must read 0 and 1, and `global_id_x`
+    // must fuse the shire with the declared 64-wide workgroup to give 0 and 64. A single-shire
+    // run cannot see either, because the shire term is zero there.
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    try buildGlobalIdKernel(&func);
+
+    var compiled = try kernel_mod.compileKernel(allocator, &func, kernel_mod.etsoc_abi);
+    const image = try buildKernelImage(allocator, compiled.code, compiled.launch, &.{.out_ptr}, &.{}, 68 * 4);
+    compiled.deinit(allocator);
+    defer image.deinit(allocator);
+
+    // Shires 0 and 1, minion 0 of each, one hart per minion.
+    const dump = runKernelImage(std.testing.io, allocator, image, 0x1, true, 0x3) catch |e| switch (e) {
+        error.SkipZigTest => return error.SkipZigTest,
+        else => return e,
+    };
+    defer allocator.free(dump);
+
+    var out: [68]u32 = undefined;
+    for (0..68) |i| out[i] = std.mem.readInt(u32, dump[i * 4 ..][0..4], .little);
+
+    try std.testing.expectEqual(@as(u32, 100), out[0]); // global_id_x 0
+    try std.testing.expectEqual(@as(u32, 200), out[1]); // block_id_x 0
+    try std.testing.expectEqual(@as(u32, 164), out[64]); // global_id_x 64
+    try std.testing.expectEqual(@as(u32, 201), out[65]); // block_id_x 1
+    // Nothing else ran, so nothing else was written.
+    for (2..64) |i| try std.testing.expectEqual(@as(u32, 0), out[i]);
 }
