@@ -341,6 +341,10 @@ fn unhandledStatement(op_code: ir.function.Opcode) Error {
         // These are lowered before the unwrap, so they do not reach here. Refusing them keeps
         // the answer correct if an early handler is ever removed.
         .store,
+        // An atomic read-modify-write. This backend compiles one thread of a scalar loop
+        // nest and emits no LOCK-prefixed form, so there is no lowering. The RESULT-LESS
+        // form arrives here; the reading form is refused by the lowering switch below.
+        .atomic_rmw,
         .barrier,
         .va_start,
         .va_end,
@@ -1511,6 +1515,11 @@ fn emitFromAllocation(allocator: std.mem.Allocator, ctx: *Ctx, func: *const Func
 /// the exact way the fold rewrite repoints operands.
 fn forEachOperand(func: *const Function, inst: ir.function.Inst, fold: *const addrfold.Analysis, ctx: anytype, comptime f: fn (@TypeOf(ctx), Value, bool) void) void {
     switch (func.opcode(inst)) {
+        .atomic_rmw => |a| {
+            f(ctx, a.ptr, false);
+            f(ctx, a.value, false);
+            if (a.compare) |c| f(ctx, c, false);
+        },
         // A barrier reads no Value operand.
         .iconst, .fconst, .fconst128, .alloca, .global_addr, .barrier => {},
         .arith => |a| {
@@ -1896,6 +1905,32 @@ test "matmul, prefetch and a void call are refused, not a panic on the result un
             .matmul => try func.appendMatmul(e, p, p, p, 4, 4, 4, .int8, false),
             .prefetch => try func.appendPrefetch(e, p),
             .void_call => try func.appendVoidCall(e, "sink", &.{x}),
+        }
+        func.setTerminator(e, .{ .ret = ir.function.Ret.one(x) });
+
+        try std.testing.expectError(error.Unsupported, selectFunction(allocator, &func));
+    }
+}
+
+test "an atomic is rejected, not dropped like a prefetch" {
+    // This backend emits no LOCK-prefixed form, so there is no honest lowering. The
+    // RESULT-LESS form is the one that matters: it reaches the result unwrap in `lowerInst`,
+    // which used to be a bare `.?` that PANICS on a statement instead of failing closed.
+    // `unhandledStatement` names it, so the refusal is an error and not a trap.
+    const allocator = std.testing.allocator;
+    for ([_]bool{ false, true }) |reading| {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+        const ptr_t = try func.types.ptrGlobal();
+        const e = try func.appendBlock();
+        const p = try func.appendBlockParam(e, ptr_t);
+        const x = try func.appendBlockParam(e, i32_t);
+        const rmw: ir.function.AtomicRmw = .{ .op = .add, .ptr = p, .value = x, .ordering = .relaxed, .scope = .device };
+        if (reading) {
+            _ = try func.appendAtomicRmw(e, rmw);
+        } else {
+            try func.appendAtomicRmwStmt(e, rmw);
         }
         func.setTerminator(e, .{ .ret = ir.function.Ret.one(x) });
 

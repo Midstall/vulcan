@@ -973,3 +973,47 @@ test "endian: a dot loop over a byte-order-tagged element load is left scalar" {
         try std.testing.expectEqual(tag == .b, func.isByteOrderTagged(body_insts[1]));
     }
 }
+
+test "a dot loop whose body also holds an atomic is not recognized" {
+    // The recognizer requires the body to be the EXACT nine-instruction dot shape, so an
+    // atomic beside it makes the body ten instructions and the loop is skipped. That is a
+    // STRUCTURAL refusal, not an opcode arm: this test pins it, because a later change that
+    // loosened the body check would absorb the atomic into the `dot` op and delete it.
+    //
+    // NEGATIVE CONTROL: the identical loop without the atomic IS recognized.
+    const allocator = std.testing.allocator;
+
+    var plain = Function.init(allocator);
+    defer plain.deinit();
+    try buildDotLoop(&plain, .{ .sign = .signed });
+    try std.testing.expect(try run(allocator, &plain, registry.modelFor(.@"ampere-altra")));
+    try std.testing.expectEqual(@as(usize, 1), countDots(&plain));
+
+    var func = Function.init(allocator);
+    defer func.deinit();
+    try buildDotLoop(&func, .{ .sign = .signed });
+    // The body is the block holding the loads. Add a fire-and-forget counter increment
+    // built from its own operands, so nothing about dominance changes.
+    const ptr_t = try func.types.ptrGlobal();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    var body: ?ir.function.Block = null;
+    for (0..func.blockCount()) |bi| {
+        for (func.blockInsts(@enumFromInt(bi))) |inst| {
+            if (func.opcode(inst) == .load) body = @enumFromInt(bi);
+        }
+    }
+    const b = body.?;
+    const counter = try func.appendInst(b, ptr_t, .{ .global_addr = .{ .symbol = try func.internSymbol("counter") } });
+    const one = try func.appendInst(b, i32_t, .{ .iconst = 1 });
+    try func.appendAtomicRmwStmt(b, .{ .op = .add, .ptr = counter, .value = one, .ordering = .relaxed, .scope = .device });
+
+    try std.testing.expect(!try run(allocator, &func, registry.modelFor(.@"ampere-altra")));
+    try std.testing.expectEqual(@as(usize, 0), countDots(&func));
+    var atomics: usize = 0;
+    for (0..func.blockCount()) |bi| {
+        for (func.blockInsts(@enumFromInt(bi))) |inst| {
+            if (func.opcode(inst) == .atomic_rmw) atomics += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), atomics);
+}

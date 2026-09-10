@@ -93,6 +93,12 @@ const op_va_arg: u8 = 21;
 const op_va_end: u8 = 22;
 const op_fconst128: u8 = 23;
 const op_barrier: u8 = 24;
+const op_atomic_rmw: u8 = 25;
+
+// An `atomic_rmw` record flag bit: the compare operand follows the two ordinary operand
+// slots. Written from the field and read back into it, so a record round-trips whatever the
+// opcode holds, rather than depending on the op/compare agreement `verify` enforces.
+const atomic_flag_compare: u8 = 1 << 0;
 
 const Writer = struct {
     bytes: std.ArrayList(u8) = .empty,
@@ -471,6 +477,38 @@ fn writeInst(w: *Writer, func: *const Function, inst: Inst, serial: []const u32,
                 std.debug.assert(@intFromEnum(function.BarrierScope.subgroup) == 1);
             }
             try w.u8v(@intFromEnum(bar.scope));
+        },
+        .atomic_rmw => |a| {
+            try w.u8v(op_atomic_rmw);
+            // The decoder maps these three bytes back with `std.enums.fromInt`, so pin the
+            // tag values here. A future reorder of any of the three enums would otherwise
+            // desync the two sides and silently turn one atomic into another, instead of
+            // failing to build. This follows the `barrier` arm above.
+            comptime {
+                std.debug.assert(@intFromEnum(function.AtomicOp.add) == 0);
+                std.debug.assert(@intFromEnum(function.AtomicOp.min) == 1);
+                std.debug.assert(@intFromEnum(function.AtomicOp.max) == 2);
+                std.debug.assert(@intFromEnum(function.AtomicOp.bit_and) == 3);
+                std.debug.assert(@intFromEnum(function.AtomicOp.bit_or) == 4);
+                std.debug.assert(@intFromEnum(function.AtomicOp.bit_xor) == 5);
+                std.debug.assert(@intFromEnum(function.AtomicOp.exchange) == 6);
+                std.debug.assert(@intFromEnum(function.AtomicOp.compare_exchange) == 7);
+                std.debug.assert(@intFromEnum(function.AtomicOrdering.relaxed) == 0);
+                std.debug.assert(@intFromEnum(function.AtomicOrdering.acquire) == 1);
+                std.debug.assert(@intFromEnum(function.AtomicOrdering.release) == 2);
+                std.debug.assert(@intFromEnum(function.AtomicOrdering.acq_rel) == 3);
+                std.debug.assert(@intFromEnum(function.AtomicOrdering.seq_cst) == 4);
+                std.debug.assert(@intFromEnum(function.AtomicScope.workgroup) == 0);
+                std.debug.assert(@intFromEnum(function.AtomicScope.device) == 1);
+                std.debug.assert(@intFromEnum(function.AtomicScope.system) == 2);
+            }
+            try w.u8v(@intFromEnum(a.op));
+            try w.u8v(@intFromEnum(a.ordering));
+            try w.u8v(@intFromEnum(a.scope));
+            try w.u8v(if (a.compare != null) atomic_flag_compare else 0);
+            try w.u32v(sv(serial, a.ptr));
+            try w.u32v(sv(serial, a.value));
+            if (a.compare) |c| try w.u32v(sv(serial, c));
         },
         .dot => |d| {
             try w.u8v(op_dot);
@@ -863,6 +901,13 @@ const Fixup = struct {
                         st.value = next(&i, self.slots, serial);
                         st.ptr = next(&i, self.slots, serial);
                     },
+                    // Slot order matches the write order above: address, operand, then the
+                    // compare operand when the record carried one.
+                    .atomic_rmw => |*a| {
+                        a.ptr = next(&i, self.slots, serial);
+                        a.value = next(&i, self.slots, serial);
+                        if (a.compare) |*c| c.* = next(&i, self.slots, serial);
+                    },
                     .prefetch => |*pf| pf.ptr = next(&i, self.slots, serial),
                     .va_start => |*vs| vs.list = next(&i, self.slots, serial),
                     .va_arg => |*va| va.list = next(&i, self.slots, serial),
@@ -1057,6 +1102,42 @@ fn readInst(r: *Reader, func: *Function, block: Block, type_map: []const Type, b
             const scope = std.enums.fromInt(function.BarrierScope, raw) orelse
                 return error.MalformedBitcode;
             break :blk try appendStmtOp(func, block, .{ .barrier = .{ .scope = scope } });
+        },
+        op_atomic_rmw => blk: {
+            // The stream is UNTRUSTED, so each of the three selector bytes maps back with
+            // `std.enums.fromInt` and an unknown value is malformed bitcode, never an
+            // out-of-range tag every later exhaustive switch reads as undefined behavior.
+            const op = std.enums.fromInt(function.AtomicOp, try r.take(u8)) orelse
+                return error.MalformedBitcode;
+            const ordering = std.enums.fromInt(function.AtomicOrdering, try r.take(u8)) orelse
+                return error.MalformedBitcode;
+            const scope = std.enums.fromInt(function.AtomicScope, try r.take(u8)) orelse
+                return error.MalformedBitcode;
+            // An unknown flag bit is a stream this build cannot read: the record's operand
+            // count would be wrong and every later record would decode from the wrong
+            // offset. Mirrors the whole-function flag check in `decode`.
+            const flags = try r.take(u8);
+            if (flags & ~atomic_flag_compare != 0) return error.MalformedBitcode;
+            const has_compare = flags & atomic_flag_compare != 0;
+            try slots.append(allocator, try r.take(u32));
+            try slots.append(allocator, try r.take(u32));
+            if (has_compare) try slots.append(allocator, try r.take(u32));
+            const op_val: Opcode = .{ .atomic_rmw = .{
+                .op = op,
+                .ptr = dummy,
+                .value = dummy,
+                .compare = if (has_compare) dummy else null,
+                .ordering = ordering,
+                .scope = scope,
+            } };
+            // The result is OPTIONAL, so the record's own `has_result` byte decides which
+            // form is rebuilt, exactly as it does for a `call`. Rebuilding the reading form
+            // for a reduction would cost the backend a scoreboard it never asked for.
+            if (has_result) {
+                break :blk try appendRes(func, block, serial, rty, op_val);
+            } else {
+                break :blk try appendStmtOp(func, block, op_val);
+            }
         },
         op_dot => blk: {
             try slots.append(allocator, try r.take(u32));
@@ -2221,4 +2302,160 @@ test "an unknown barrier scope byte is rejected as malformed bitcode" {
     try std.testing.expect(patched);
 
     try std.testing.expectError(error.MalformedBitcode, decode(allocator, mutable));
+}
+
+test "round-trips an atomic read-modify-write field by field" {
+    // FIELD BY FIELD, not by comparing printed text: a printed comparison hides a field the
+    // printer never prints, which is how an earlier field loss stayed hidden.
+    const allocator = std.testing.allocator;
+
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const entry = try func.appendBlock();
+    const p = try func.appendBlockParam(entry, ptr_t);
+    const v = try func.appendBlockParam(entry, i32_t);
+    const old = try func.appendAtomicRmw(entry, .{
+        .op = .min,
+        .ptr = p,
+        .value = v,
+        .ordering = .acq_rel,
+        .scope = .device,
+    });
+    try func.appendAtomicRmwStmt(entry, .{
+        .op = .bit_xor,
+        .ptr = p,
+        .value = v,
+        .ordering = .relaxed,
+        .scope = .system,
+    });
+    func.setTerminator(entry, .{ .ret = function.Ret.one(old) });
+
+    const bytes = try encode(allocator, &func);
+    defer allocator.free(bytes);
+    var decoded = try decode(allocator, bytes);
+    defer decoded.deinit();
+
+    const insts = decoded.blockInsts(entry);
+    try std.testing.expectEqual(@as(usize, 2), insts.len);
+
+    const reading = decoded.opcode(insts[0]).atomic_rmw;
+    try std.testing.expectEqual(function.AtomicOp.min, reading.op);
+    try std.testing.expectEqual(function.AtomicOrdering.acq_rel, reading.ordering);
+    try std.testing.expectEqual(function.AtomicScope.device, reading.scope);
+    try std.testing.expectEqual(@as(?Value, null), reading.compare);
+    // The two operands are the block's two parameters, in order.
+    const params = decoded.blockParams(entry);
+    try std.testing.expectEqual(params[0], reading.ptr);
+    try std.testing.expectEqual(params[1], reading.value);
+    // The reading form keeps its result, and the result type is the operand's type.
+    const result = decoded.instResult(insts[0]).?;
+    try std.testing.expectEqual(decoded.valueType(params[1]), decoded.valueType(result));
+
+    const reduction = decoded.opcode(insts[1]).atomic_rmw;
+    try std.testing.expectEqual(function.AtomicOp.bit_xor, reduction.op);
+    try std.testing.expectEqual(function.AtomicOrdering.relaxed, reduction.ordering);
+    try std.testing.expectEqual(function.AtomicScope.system, reduction.scope);
+    try std.testing.expectEqual(params[0], reduction.ptr);
+    try std.testing.expectEqual(params[1], reduction.value);
+    // The reduction form comes back RESULT-LESS. Rebuilding it with a result would cost the
+    // backend a scoreboard on every fire-and-forget counter increment.
+    try std.testing.expectEqual(@as(?Value, null), decoded.instResult(insts[1]));
+}
+
+test "round-trips a compare-exchange and its compare operand" {
+    const allocator = std.testing.allocator;
+
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const entry = try func.appendBlock();
+    const p = try func.appendBlockParam(entry, ptr_t);
+    const desired = try func.appendBlockParam(entry, i32_t);
+    const expected = try func.appendBlockParam(entry, i32_t);
+    const old = try func.appendAtomicRmw(entry, .{
+        .op = .compare_exchange,
+        .ptr = p,
+        .value = desired,
+        .compare = expected,
+        .ordering = .seq_cst,
+        .scope = .workgroup,
+    });
+    func.setTerminator(entry, .{ .ret = function.Ret.one(old) });
+
+    const bytes = try encode(allocator, &func);
+    defer allocator.free(bytes);
+    var decoded = try decode(allocator, bytes);
+    defer decoded.deinit();
+
+    const params = decoded.blockParams(entry);
+    const cas = decoded.opcode(decoded.blockInsts(entry)[0]).atomic_rmw;
+    try std.testing.expectEqual(function.AtomicOp.compare_exchange, cas.op);
+    try std.testing.expectEqual(params[0], cas.ptr);
+    try std.testing.expectEqual(params[1], cas.value);
+    // The compare operand is the field a two-slot record would have dropped.
+    try std.testing.expectEqual(params[2], cas.compare.?);
+    try std.testing.expectEqual(function.AtomicOrdering.seq_cst, cas.ordering);
+    try std.testing.expectEqual(function.AtomicScope.workgroup, cas.scope);
+}
+
+test "an unknown atomic selector byte is rejected as malformed bitcode" {
+    // Suspicious case: the stream is untrusted. Each of the three selector bytes and the
+    // flag byte must be refused when it names nothing, rather than becoming an
+    // out-of-range tag that every later exhaustive switch reads as undefined behavior.
+    const allocator = std.testing.allocator;
+
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const entry = try func.appendBlock();
+    const p = try func.appendBlockParam(entry, ptr_t);
+    const v = try func.appendBlockParam(entry, i32_t);
+    try func.appendAtomicRmwStmt(entry, .{ .op = .add, .ptr = p, .value = v, .ordering = .relaxed, .scope = .workgroup });
+    func.setTerminator(entry, .{ .ret = function.Ret.one(v) });
+
+    const bytes = try encode(allocator, &func);
+    defer allocator.free(bytes);
+
+    // The record is the tag byte followed by op, ordering, scope and the flag byte, all
+    // four of them zero for the operation built above. This function holds exactly one
+    // instruction, so the first `op_atomic_rmw` byte followed by four zeros is that record.
+    var at: ?usize = null;
+    var i: usize = 0;
+    while (i + 4 < bytes.len) : (i += 1) {
+        if (bytes[i] == op_atomic_rmw and bytes[i + 1] == 0 and bytes[i + 2] == 0 and
+            bytes[i + 3] == 0 and bytes[i + 4] == 0)
+        {
+            at = i;
+            break;
+        }
+    }
+    try std.testing.expect(at != null);
+
+    // The unpatched stream decodes: the control that proves each refusal below comes from
+    // the byte it patched and not from some unrelated damage.
+    {
+        var ok = try decode(allocator, bytes);
+        ok.deinit();
+    }
+
+    // Byte 4 is the flag byte, and it gets a value with ONLY an UNKNOWN bit set. 0xff would
+    // also set the compare bit, which makes the record grow by a slot and the rest of the
+    // stream decode at a wrong offset, so the refusal would come from that and not from the
+    // flag check. 0x02 leaves the record's length alone, so only the check can refuse it.
+    const patches = [_]struct { field: usize, byte: u8 }{
+        .{ .field = 1, .byte = 0xff }, // operation
+        .{ .field = 2, .byte = 0xff }, // ordering
+        .{ .field = 3, .byte = 0xff }, // scope
+        .{ .field = 4, .byte = 0x02 }, // an unknown flag bit
+    };
+    for (patches) |patch| {
+        const mutable = try allocator.dupe(u8, bytes);
+        defer allocator.free(mutable);
+        mutable[at.? + patch.field] = patch.byte;
+        try std.testing.expectError(error.MalformedBitcode, decode(allocator, mutable));
+    }
 }

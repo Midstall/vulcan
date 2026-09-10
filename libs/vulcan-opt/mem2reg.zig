@@ -514,6 +514,15 @@ fn markEscapes(func: *const Function, promotable: []bool) void {
                 esc(promotable, st.value);
                 if (st.@"volatile" or func.isByteOrderTagged(inst)) esc(promotable, st.ptr);
             },
+            // An atomic pins its slot. `ptr` escapes because a read-modify-write is not the
+            // sanctioned load-or-store use this pass promotes: turning the slot into an SSA
+            // value would turn the atomic into ordinary arithmetic, which is not atomic at
+            // all. `value` and `compare` escape because both are written into memory.
+            .atomic_rmw => |a| {
+                esc(promotable, a.ptr);
+                esc(promotable, a.value);
+                if (a.compare) |c| esc(promotable, c);
+            },
             // A barrier names no address, so it lets nothing escape. An alloca this pass
             // promotes is one whose address never escapes, so it is private to the thread
             // and no other thread can write it. A barrier therefore cannot make its
@@ -1101,5 +1110,49 @@ test "endian: a slot with a tagged load or store is left in memory" {
         try testing.expect(try runOnce(allocator, &func));
         try testing.expectEqual(s.stored, func.terminator(s.block).?.ret.values[0]);
         try expectNoMemoryInsts(&func, s.block);
+    }
+}
+
+test "a slot an atomic touches is left in memory" {
+    // Promoting the slot would turn the read-modify-write into ordinary arithmetic on an
+    // SSA value, which is not atomic at all. The plain load/store control proves the same
+    // slot IS promoted when nothing but a load and a store names it.
+    const allocator = testing.allocator;
+    const build = struct {
+        fn f(func: *Function, atomic: bool) !ir.function.Block {
+            const t = try intTy(func, 32, .signed);
+            const ptr_t = try func.types.ptrGlobal();
+            const b = try func.appendBlock();
+            const x = try func.appendBlockParam(b, t);
+            const slot = try func.appendInst(b, ptr_t, .{ .alloca = .{ .elem = t } });
+            try func.appendStore(b, x, slot);
+            if (atomic) {
+                try func.appendAtomicRmwStmt(b, .{ .op = .add, .ptr = slot, .value = x, .ordering = .relaxed, .scope = .device });
+            }
+            const y = try func.appendInst(b, t, .{ .load = .{ .ptr = slot } });
+            func.setTerminator(b, .{ .ret = ir.function.Ret.one(y) });
+            return b;
+        }
+    }.f;
+
+    {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const b = try build(&func, true);
+        try testing.expect(!try runOnce(allocator, &func)); // not promotable
+        var loads: usize = 0;
+        for (func.blockInsts(b)) |inst| {
+            if (func.opcode(inst) == .load) loads += 1;
+        }
+        try testing.expectEqual(@as(usize, 1), loads); // the load still reads memory
+    }
+    {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const b = try build(&func, false);
+        try testing.expect(try runOnce(allocator, &func)); // the control promotes
+        for (func.blockInsts(b)) |inst| {
+            try testing.expect(func.opcode(inst) != .load);
+        }
     }
 }

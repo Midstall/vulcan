@@ -354,12 +354,14 @@ fn emitArm(func: *Function, out: *std.ArrayListUnmanaged(Inst), visited: []bool,
             .prefetch => return error.NotWidenable, // conservative: no prefetch reaches this shader path
             // Hoisting these out of the arm makes them run for BOTH sides of the diamond.
             // A `matmul` would write its `c` tile unconditionally, the `va_*` family would
-            // advance a `va_list` unconditionally, and a `barrier` moved out of a predicated
+            // advance a `va_list` unconditionally, an `atomic_rmw` would apply its
+            // read-modify-write unconditionally, and a `barrier` moved out of a predicated
             // arm changes which threads reach it. A trailing `else` hoisted all of them.
             //
             // Step B (`widenHeavy`'s per-instruction switch) also refuses each of these, so
             // today they cannot reach the emitted function either way. These arms are the
             // FIRST refusal, not the only one. Do not read them as the guard.
+            .atomic_rmw,
             .matmul,
             .va_start,
             .va_arg,
@@ -540,6 +542,11 @@ fn widenFlattened(func: *Function) Error!void {
             // synchronizes real threads, and 4 lanes of one thread cannot meet each other,
             // so there is no correct lane-widened form of it. Refuse, and let the caller
             // keep the scalar path.
+            // Widening runs 4 fragment invocations in the lanes of one vector. An atomic
+            // of a vector of 4 addresses is 4 separate read-modify-writes, which this pass
+            // has no way to build, and a lane-wise one would apply the operation 4 times to
+            // whichever address lane 0 named. Refuse, and let the caller keep the scalar path.
+            .atomic_rmw => return error.NotWidenable,
             .barrier => return error.NotWidenable,
             .convert, .call, .global_addr, .@"if" => return error.NotWidenable,
         }
@@ -1100,6 +1107,62 @@ test "widen heavy: a broadcast load keeps its endian tag, and an untagged one ga
         try testing.expectEqual(@as(usize, 1), countOp(&func, entry, .load));
         for (func.blockInsts(entry)) |inst| {
             if (func.opcode(inst) == .load) try testing.expectEqual(tag, func.isByteOrderTagged(inst));
+        }
+    }
+}
+
+test "widen heavy: an atomic inside a diamond arm refuses the widen" {
+    // Widening runs 4 fragment invocations in the lanes of one vector, and flattening a
+    // diamond runs BOTH arms unconditionally. An atomic in an arm would apply its
+    // read-modify-write for both sides, and there is no lane-wise form of one anyway.
+    //
+    // The plain-arith arm at the end is the NEGATIVE CONTROL: the same diamond with only
+    // pure work in the arm DOES widen, so the refusals come from the atomic and not from
+    // the shape.
+    const gpa = testing.allocator;
+    const Case = enum { atomic_read, atomic_reduce, pure };
+    for ([_]Case{ .atomic_read, .atomic_reduce, .pure }) |case| {
+        var func = Function.init(gpa);
+        defer func.deinit();
+        const f32_t = try func.types.intern(.{ .float = .f32 });
+        const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+        const bool_t = try func.types.intern(.bool);
+        const ptr_t = try func.types.ptrGlobal();
+
+        const entry = try func.appendBlock();
+        const then_b = try func.appendBlock();
+        const else_b = try func.appendBlock();
+        const merge = try func.appendBlock();
+
+        const x = try func.appendBlockParam(entry, f32_t);
+        const p = try func.appendBlockParam(entry, ptr_t);
+        const n = try func.appendBlockParam(entry, i32_t);
+        const half = try func.appendInst(entry, f32_t, .{ .fconst = 0.5 });
+        const cond = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .gt, .lhs = x, .rhs = half } });
+        try func.appendIf(entry, cond, .{ .target = then_b }, .{ .target = else_b });
+
+        const two = try func.appendInst(then_b, f32_t, .{ .fconst = 2.0 });
+        const tval = try func.appendInst(then_b, f32_t, .{ .arith = .{ .op = .mul, .lhs = x, .rhs = two } });
+        const rmw: ir.function.AtomicRmw = .{ .op = .add, .ptr = p, .value = n, .ordering = .relaxed, .scope = .device };
+        switch (case) {
+            .atomic_read => _ = try func.appendAtomicRmw(then_b, rmw),
+            .atomic_reduce => try func.appendAtomicRmwStmt(then_b, rmw),
+            .pure => {},
+        }
+        try func.setJump(then_b, merge, &.{tval});
+
+        const three = try func.appendInst(else_b, f32_t, .{ .fconst = 3.0 });
+        const eval = try func.appendInst(else_b, f32_t, .{ .arith = .{ .op = .mul, .lhs = x, .rhs = three } });
+        try func.setJump(else_b, merge, &.{eval});
+
+        const mp = try func.appendBlockParam(merge, f32_t);
+        const slot = try func.appendInst(merge, ptr_t, .{ .iconst = 0 });
+        try func.appendStore(merge, mp, slot);
+
+        if (case == .pure) {
+            try widenGraphics(&func);
+        } else {
+            try testing.expectError(error.NotWidenable, widenGraphics(&func));
         }
     }
 }

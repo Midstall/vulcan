@@ -425,6 +425,8 @@ fn hasWriteBetween(func: *const Function, block: Block, lo: usize, hi: usize) bo
             // writes the `va_list` object it walks, and a `barrier` forbids moving ANY memory
             // operation across it. An `@"if"` is a control-flow split, so a load must not move
             // over one either. A trailing `else` used to call every one of these pure.
+            // An `atomic_rmw` writes the memory at its address, so it belongs here too, in
+            // both of its forms: the reduction form has no result but the write is real.
             .store,
             .call,
             .call_indirect,
@@ -432,6 +434,7 @@ fn hasWriteBetween(func: *const Function, block: Block, lo: usize, hi: usize) bo
             .va_start,
             .va_arg,
             .va_end,
+            .atomic_rmw,
             .barrier,
             .@"if",
             => return true,
@@ -559,7 +562,8 @@ fn resultsAreCoalesceableStores(func: *const Function, block: Block, results: []
                 store_count += 1;
             },
             // Touches memory, or orders it, so the window is not safe to coalesce. See
-            // `hasWriteBetween` for why `matmul`, the `va_*` family and `barrier` belong here.
+            // `hasWriteBetween` for why `matmul`, the `va_*` family, `barrier` and
+            // `atomic_rmw` belong here.
             .load,
             .call,
             .call_indirect,
@@ -567,6 +571,7 @@ fn resultsAreCoalesceableStores(func: *const Function, block: Block, results: []
             .va_start,
             .va_arg,
             .va_end,
+            .atomic_rmw,
             .barrier,
             .@"if",
             => return false,
@@ -606,6 +611,13 @@ fn valueUseCount(func: *const Function, v: Value) usize {
         const block: Block = @enumFromInt(bi);
         for (func.blockInsts(block)) |inst| {
             switch (func.opcode(inst)) {
+                .atomic_rmw => |x| {
+                    if (x.ptr == v) n += 1;
+                    if (x.value == v) n += 1;
+                    if (x.compare) |c| {
+                        if (c == v) n += 1;
+                    }
+                },
                 // A barrier uses no Value, so it never counts as a consumer.
                 .iconst, .fconst, .fconst128, .alloca, .global_addr, .barrier => {},
                 .arith => |x| {
@@ -806,7 +818,7 @@ fn coalesceStoreRun(allocator: std.mem.Allocator, func: *Function, block: Block,
                     cnt += 1;
                 },
                 // Touches memory, or orders it, so it ends the window. See `hasWriteBetween`
-                // for why `matmul`, the `va_*` family and `barrier` belong here.
+                // for why `matmul`, the `va_*` family, `barrier` and `atomic_rmw` belong here.
                 .load,
                 .call,
                 .call_indirect,
@@ -815,6 +827,7 @@ fn coalesceStoreRun(allocator: std.mem.Allocator, func: *Function, block: Block,
                 .va_start,
                 .va_arg,
                 .va_end,
+                .atomic_rmw,
                 .barrier,
                 => {
                     broke = true;
@@ -937,6 +950,9 @@ fn isPure(op: ir.function.Opcode) bool {
         .load, .store, .prefetch, .matmul, .@"if", .call, .call_indirect => false,
         // SM12 T3: mutate/read the `va_list` object at `list`, like `load`/`store` above.
         .va_start, .va_arg, .va_end => false,
+        // An atomic is a STORE as well as a load, and its result is optional. Mirrors
+        // dce.zig: deleting the reduction form loses the write.
+        .atomic_rmw => false,
         // A barrier has no result, so a purity rule keyed on an unused result would drop
         // every one of them. Mirrors dce.zig.
         .barrier => false,
@@ -952,6 +968,11 @@ fn countUses(func: *const Function, uses: []u32) void {
         const block: Block = @enumFromInt(bi);
         for (func.blockInsts(block)) |inst| {
             switch (func.opcode(inst)) {
+                .atomic_rmw => |x| {
+                    uses[@intFromEnum(x.ptr)] += 1;
+                    uses[@intFromEnum(x.value)] += 1;
+                    if (x.compare) |c| uses[@intFromEnum(c)] += 1;
+                },
                 // A barrier uses no Value, so it adds no use count.
                 .iconst, .fconst, .fconst128, .alloca, .global_addr, .barrier => {},
                 .arith => |x| {
@@ -1635,6 +1656,102 @@ test "endian: four byte-order-tagged stores never merge into one wide store" {
     try std.testing.expect(!hasVectorStore(&func));
     // The loads are untagged, so operand coalescing still fires: the refusal is store-side only.
     try std.testing.expect(hasVectorLoad(&func));
+
+    var diags = try ir.verify.verify(allocator, &func, .low);
+    defer diags.deinit();
+    try std.testing.expect(diags.ok());
+}
+
+test "an atomic between two positions counts as a write, in both forms" {
+    // An atomic writes the memory at its address, so fusing loads across one would observe
+    // memory the scalar loads did not. Both forms count: the reduction form has no result,
+    // and a rule keyed on an unused result would have called it pure.
+    //
+    // The prefetch control proves this is a real answer and not "everything is a write":
+    // a prefetch sits in the same slot and is NOT one.
+    const allocator = std.testing.allocator;
+    const Case = enum { atomic_read, atomic_reduce, prefetch };
+    for ([_]Case{ .atomic_read, .atomic_reduce, .prefetch }) |case| {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+        const ptr_t = try func.types.ptrGlobal();
+        const block = try func.appendBlock();
+        const p = try func.appendBlockParam(block, ptr_t);
+        const v = try func.appendBlockParam(block, i32_t);
+        _ = try func.appendInst(block, i32_t, .{ .load = .{ .ptr = p } });
+        switch (case) {
+            .atomic_read => _ = try func.appendAtomicRmw(block, .{ .op = .add, .ptr = p, .value = v, .ordering = .relaxed, .scope = .device }),
+            .atomic_reduce => try func.appendAtomicRmwStmt(block, .{ .op = .add, .ptr = p, .value = v, .ordering = .relaxed, .scope = .device }),
+            .prefetch => try func.appendPrefetch(block, p),
+        }
+        _ = try func.appendInst(block, i32_t, .{ .load = .{ .ptr = p } });
+        func.setTerminator(block, .{ .ret = ir.function.Ret.none() });
+
+        try std.testing.expectEqual(case != .prefetch, hasWriteBetween(&func, block, 0, 3));
+    }
+}
+
+/// `buildMemElementwiseVol`'s atomic sibling: the same scalar `out[i] = a[i] * b[i]` kernel
+/// over 4 f32 elements. When `atomic` is set, an atomic increment of a separate counter sits
+/// between the lane-1 and the lane-2 store, mid store window.
+fn buildMemElementwiseAtomic(atomic: bool) !Function {
+    var func = Function.init(std.testing.allocator);
+    errdefer func.deinit();
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const block = try func.appendBlock();
+    const ptr_a = try func.appendBlockParam(block, ptr_t);
+    const ptr_b = try func.appendBlockParam(block, ptr_t);
+    const ptr_out = try func.appendBlockParam(block, ptr_t);
+    const counter = try func.appendBlockParam(block, ptr_t);
+    const bump = try func.appendBlockParam(block, i32_t);
+
+    var av: [4]Value = undefined;
+    for (0..4) |i| {
+        const addr = try func.appendArithImm(block, ptr_t, .add, ptr_a, @intCast(i * 4));
+        av[i] = try func.appendInst(block, f32_t, .{ .load = .{ .ptr = addr } });
+    }
+    var bv: [4]Value = undefined;
+    for (0..4) |i| {
+        const addr = try func.appendArithImm(block, ptr_t, .add, ptr_b, @intCast(i * 4));
+        bv[i] = try func.appendInst(block, f32_t, .{ .load = .{ .ptr = addr } });
+    }
+    var cv: [4]Value = undefined;
+    for (0..4) |i| cv[i] = try func.appendInst(block, f32_t, .{ .arith = .{ .op = .mul, .lhs = av[i], .rhs = bv[i] } });
+    for (0..4) |i| {
+        const addr = try func.appendArithImm(block, ptr_t, .add, ptr_out, @intCast(i * 4));
+        try func.appendStore(block, cv[i], addr);
+        if (atomic and i == 1) {
+            try func.appendAtomicRmwStmt(block, .{ .op = .add, .ptr = counter, .value = bump, .ordering = .relaxed, .scope = .device });
+        }
+    }
+    func.setTerminator(block, .{ .ret = ir.function.Ret.none() });
+    return func;
+}
+
+test "an atomic inside a store window stops the wide store" {
+    // A wide store moves the later lanes' writes EARLIER, past anything between them. An
+    // atomic there is a read-modify-write of memory that the reordering would cross.
+    //
+    // NEGATIVE CONTROL first: the identical kernel without the atomic DOES merge its four
+    // stores into one wide store, so the refusal below is the guard and not a dead pass.
+    const allocator = std.testing.allocator;
+
+    var control = try buildMemElementwiseAtomic(false);
+    defer control.deinit();
+    try std.testing.expect(try runLanes(allocator, &control, 4));
+    try std.testing.expectEqual(@as(usize, 1), countOpcode(&control, .store));
+    try std.testing.expect(hasVectorStore(&control));
+
+    var func = try buildMemElementwiseAtomic(true);
+    defer func.deinit();
+    _ = try runLanes(allocator, &func, 4);
+    try std.testing.expectEqual(@as(usize, 4), countOpcode(&func, .store));
+    try std.testing.expect(!hasVectorStore(&func));
+    // The atomic itself survived: nothing deleted it on the way through.
+    try std.testing.expectEqual(@as(usize, 1), countOpcode(&func, .atomic_rmw));
 
     var diags = try ir.verify.verify(allocator, &func, .low);
     defer diags.deinit();

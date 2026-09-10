@@ -166,6 +166,11 @@ fn rewriteUses(func: *Function, subst: std.AutoHashMapUnmanaged(Value, Value)) v
     }.f;
     for (0..func.instCount()) |i| {
         switch (func.opcodeMut(@enumFromInt(i)).*) {
+            .atomic_rmw => |*a| {
+                a.ptr = sub(subst, a.ptr);
+                a.value = sub(subst, a.value);
+                if (a.compare) |*c| c.* = sub(subst, c.*);
+            },
             // A barrier carries no Value operand to substitute.
             .iconst, .fconst, .fconst128, .alloca, .global_addr, .barrier => {},
             .arith => |*a| {

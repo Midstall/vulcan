@@ -35,6 +35,11 @@ fn hoistable(opcode: ir.function.Opcode) bool {
         .alloca, .struct_new, .load, .store, .prefetch, .matmul, .call, .call_indirect, .@"if" => false,
         // SM12 T3: mutate/read the `va_list` object at `list`, like `load`/`store` above.
         .va_start, .va_arg, .va_end => false,
+        // An atomic must run once per iteration, exactly like the store it contains.
+        // Hoisting one to the preheader turns N read-modify-writes into one, which is a
+        // different program, and the invariant address that makes it look hoistable is
+        // precisely the case where the count matters most.
+        .atomic_rmw => false,
         // A barrier must stay where the frontend put it. Hoisting one to the preheader
         // makes the threads meet once before the loop instead of once per iteration,
         // which is a different program.
@@ -59,7 +64,30 @@ fn operandsInvariant(func: *const Function, inst: Inst, invariant: []const bool)
         .unary => |u| inv(invariant, u.value),
         .extract => |e| inv(invariant, e.aggregate),
         .dot => |d| inv(invariant, d.acc) and inv(invariant, d.a) and inv(invariant, d.b),
-        else => false,
+        // An atomic's three operands are really checked here, so `hoistable` above is the
+        // ONE thing that refuses one. A blanket false would turn that entry into
+        // documentation, and a later change to `hoistable` would then hoist an atomic with
+        // no test noticing.
+        .atomic_rmw => |a| inv(invariant, a.ptr) and inv(invariant, a.value) and
+            (a.compare == null or inv(invariant, a.compare.?)),
+        // `hoistable` refuses every one of these, so this function is never asked about
+        // them. The switch is exhaustive with no `else` prong for the reason above: an
+        // `else` answers "not invariant" for a newly added opcode and silently disarms that
+        // opcode's own `hoistable` entry.
+        .struct_new,
+        .alloca,
+        .call,
+        .call_indirect,
+        .load,
+        .store,
+        .prefetch,
+        .va_start,
+        .va_arg,
+        .va_end,
+        .matmul,
+        .barrier,
+        .@"if",
+        => false,
     };
 }
 
@@ -298,4 +326,52 @@ test "does not hoist a load or a store out of a loop that holds a barrier" {
     try std.testing.expect(func.opcode(insts[0]) == .store);
     try std.testing.expect(func.opcode(insts[1]) == .barrier);
     try std.testing.expect(func.opcode(insts[2]) == .load);
+}
+
+test "does not hoist an atomic out of a loop, but still hoists beside it" {
+    // An atomic on a loop-invariant address looks invariant, and that is exactly the case
+    // where the COUNT matters: hoisting turns N read-modify-writes into one. The invariant
+    // multiply beside it is the control, and it does leave the body.
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const ptr_t = try func.types.ptrGlobal();
+    const entry = try func.appendBlock();
+    const loop = try func.appendBlock();
+    const body = try func.appendBlock();
+    const done = try func.appendBlock();
+    const p = try func.appendBlockParam(entry, ptr_t); // invariant address
+    const x = try func.appendBlockParam(entry, i32_t);
+    const y = try func.appendBlockParam(entry, i32_t);
+    const n = try func.appendBlockParam(entry, i32_t);
+    const i = try func.appendBlockParam(loop, i32_t);
+
+    const zero = try func.appendInst(entry, i32_t, .{ .iconst = 0 });
+    try func.setJump(entry, loop, &.{zero});
+    const cmp = try func.appendInst(loop, bool_t, .{ .icmp = .{ .op = .lt, .lhs = i, .rhs = n } });
+    try func.appendIf(loop, cmp, .{ .target = body, .args = &.{i} }, .{ .target = done });
+    const bi = try func.appendBlockParam(body, i32_t);
+    // The READING form, on purpose. `hoistable` sits behind an `instResult orelse continue`,
+    // so the reduction form never reaches it and would not exercise the guard at all.
+    _ = try func.appendAtomicRmw(body, .{ .op = .add, .ptr = p, .value = x, .ordering = .relaxed, .scope = .device });
+    _ = try func.appendInst(body, i32_t, .{ .arith = .{ .op = .mul, .lhs = x, .rhs = y } });
+    const next = try func.appendArithImm(body, i32_t, .add, bi, 1);
+    try func.setJump(body, loop, &.{next});
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(n) });
+
+    var analyses = pass.Analyses{ .allocator = allocator, .func = &func };
+    defer analyses.deinit();
+    try std.testing.expect(try run(allocator, &func, &analyses)); // the multiply was hoisted
+
+    var in_body: usize = 0;
+    for (func.blockInsts(body)) |inst| {
+        if (func.opcode(inst) == .atomic_rmw) in_body += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), in_body);
+    for (func.blockInsts(entry)) |inst| {
+        try std.testing.expect(func.opcode(inst) != .atomic_rmw);
+    }
 }

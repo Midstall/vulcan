@@ -138,6 +138,15 @@ fn checkOperandTypes(func: *const Function, diags: *Diagnostics) std.mem.Allocat
                 .va_arg => |va| if (!isPtrValue(func, va.list)) {
                     if (func.instResult(inst)) |result| try diags.add(.{ .operand_type_mismatch = result });
                 },
+                // An atomic's four rules, all of them checkable without a target: the
+                // address is a `ptr`, the operand is an integer, a result (when there is
+                // one) has the operand's type, and the compare operand is present exactly
+                // for `compare_exchange` and has the operand's type there. The reduction
+                // form has no result, so, like `matmul` above, a mismatch is reported
+                // against an operand: the pointer, which every form has.
+                .atomic_rmw => |a| if (atomicOperandsMismatch(func, inst, a)) {
+                    try diags.add(.{ .operand_type_mismatch = func.instResult(inst) orelse a.ptr });
+                },
                 .va_end => |ve| if (!isPtrValue(func, ve.list)) {
                     try diags.add(.{ .operand_type_mismatch = ve.list });
                 },
@@ -178,6 +187,10 @@ fn endianTargetOk(func: *const Function, target: AttrTarget) bool {
 
 fn isMemoryOp(op: Opcode) bool {
     return switch (op) {
+        // `atomic_rmw` is deliberately absent. An `endian` tag asks the backend to byte-swap
+        // the access, and no backend byte-swaps a read-modify-write: the arithmetic happens in
+        // the device byte order, inside the memory system, where a swap cannot be inserted. So
+        // an `endian` tag on an atomic is misplaced, and this reports it.
         .load, .store, .prefetch, .matmul => true,
         else => false,
     };
@@ -187,6 +200,29 @@ fn isMemoryOp(op: Opcode) bool {
 /// which must always be the address of a `va_list` object.
 fn isPtrValue(func: *const Function, v: Value) bool {
     return func.types.type_kind(func.valueType(v)) == .ptr;
+}
+
+/// Whether an `atomic_rmw`'s operands break one of the four rules `AtomicRmw` states.
+///
+/// The width limits are NOT checked here. A backend accepts the widths its atomic
+/// instructions have (32 and 64 bits on NVIDIA) and refuses the rest, the same way it
+/// refuses a scalar access it cannot size. This function is target-independent.
+fn atomicOperandsMismatch(func: *const Function, inst: function.Inst, a: function.AtomicRmw) bool {
+    if (!isPtrValue(func, a.ptr)) return true;
+    const value_ty = func.valueType(a.value);
+    if (func.types.type_kind(value_ty) != .int) return true;
+    if (func.instResult(inst)) |result| {
+        if (func.valueType(result) != value_ty) return true;
+    }
+    // The compare operand belongs to exactly one operation. A non-null compare on an
+    // `add` is a field the backend would silently ignore; a null one on a
+    // `compare_exchange` is an operand the backend would have to invent.
+    const wants_compare = a.op == .compare_exchange;
+    if (wants_compare != (a.compare != null)) return true;
+    if (a.compare) |c| {
+        if (func.valueType(c) != value_ty) return true;
+    }
+    return false;
 }
 
 /// `dot`'s accumulator (and result) must be `<4 x i32>`; `a` and `b` must be
@@ -429,6 +465,13 @@ fn checkDominance(func: *const Function, diags: *Diagnostics) std.mem.Allocator.
                 .store => |st| {
                     try checkUse(&dominance, def_block, diags, st.value, bi);
                     try checkUse(&dominance, def_block, diags, st.ptr, bi);
+                },
+                // An atomic reads three Values at most: the address, the operand, and the
+                // expected value of the compare-exchange form.
+                .atomic_rmw => |a| {
+                    try checkUse(&dominance, def_block, diags, a.ptr, bi);
+                    try checkUse(&dominance, def_block, diags, a.value, bi);
+                    if (a.compare) |c| try checkUse(&dominance, def_block, diags, c, bi);
                 },
                 .prefetch => |pf| try checkUse(&dominance, def_block, diags, pf.ptr, bi),
                 .va_start => |vs| try checkUse(&dominance, def_block, diags, vs.list, bi),
@@ -1099,4 +1142,99 @@ test "an int plus a shared pointer keeps the shared space, in either operand ord
     try std.testing.expect(!d.ok());
     try std.testing.expectEqual(@as(usize, 1), d.count());
     try std.testing.expectEqual(Diagnostic{ .operand_type_mismatch = bad }, d.items()[0]);
+}
+
+test "verify rejects a compare-exchange with no compare operand" {
+    // The text form cannot spell this one: the parser reads the compare operand whenever
+    // the operation is `compare_exchange`. Only a hand-built function reaches it, and the
+    // backend would have to invent the operand, so the verifier reports it.
+    //
+    // The control comes first: the same function with the operand present verifies clean,
+    // so the diagnostic below comes from the missing operand and nothing else.
+    const allocator = std.testing.allocator;
+    const ptr_and_two = struct {
+        fn build(f: *Function, compare: bool) !Value {
+            const i32_t = try f.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+            const ptr_t = try f.types.ptrGlobal();
+            const entry = try f.appendBlock();
+            const p = try f.appendBlockParam(entry, ptr_t);
+            const v = try f.appendBlockParam(entry, i32_t);
+            const c = try f.appendBlockParam(entry, i32_t);
+            const old = try f.appendAtomicRmw(entry, .{
+                .op = .compare_exchange,
+                .ptr = p,
+                .value = v,
+                .compare = if (compare) c else null,
+                .ordering = .seq_cst,
+                .scope = .device,
+            });
+            f.setTerminator(entry, .{ .ret = function.Ret.one(old) });
+            return old;
+        }
+    }.build;
+
+    {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        _ = try ptr_and_two(&func, true);
+        var d = try verify(allocator, &func, .high);
+        defer d.deinit();
+        try std.testing.expect(d.ok());
+    }
+    {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const old = try ptr_and_two(&func, false);
+        var d = try verify(allocator, &func, .high);
+        defer d.deinit();
+        try std.testing.expect(!d.ok());
+        try std.testing.expectEqual(Diagnostic{ .operand_type_mismatch = old }, d.items()[0]);
+    }
+}
+
+test "verify reports a broken reduction-form atomic against its pointer" {
+    // The reduction form has NO result to report against, so the diagnostic names the
+    // pointer, the one operand every form has. Without this the report would have to
+    // unwrap a result that is not there.
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const ptr_t = try func.types.ptrGlobal();
+    const entry = try func.appendBlock();
+    const p = try func.appendBlockParam(entry, ptr_t);
+    const v = try func.appendBlockParam(entry, f32_t); // not an integer
+    try func.appendAtomicRmwStmt(entry, .{ .op = .add, .ptr = p, .value = v, .ordering = .relaxed, .scope = .device });
+    func.setTerminator(entry, .{ .ret = function.Ret.none() });
+
+    var d = try verify(allocator, &func, .high);
+    defer d.deinit();
+    try std.testing.expect(!d.ok());
+    try std.testing.expectEqual(Diagnostic{ .operand_type_mismatch = p }, d.items()[0]);
+}
+
+test "an endian tag on an atomic is reported as misplaced" {
+    // No backend byte-swaps a read-modify-write, so `atomic_rmw` is deliberately out of
+    // `isMemoryOp`. The store control proves the check itself accepts a memory operation.
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const entry = try func.appendBlock();
+    const p = try func.appendBlockParam(entry, ptr_t);
+    const v = try func.appendBlockParam(entry, i32_t);
+    try func.appendStore(entry, v, p);
+    const store_inst = func.blockInsts(entry)[0];
+    try func.addAttr(.{ .inst = store_inst }, .{ .endian = .big });
+    try func.appendAtomicRmwStmt(entry, .{ .op = .add, .ptr = p, .value = v, .ordering = .relaxed, .scope = .device });
+    const atomic_inst = func.blockInsts(entry)[1];
+    try func.addAttr(.{ .inst = atomic_inst }, .{ .endian = .big });
+    func.setTerminator(entry, .{ .ret = function.Ret.none() });
+
+    var d = try verify(allocator, &func, .high);
+    defer d.deinit();
+    try std.testing.expect(!d.ok());
+    try std.testing.expectEqual(@as(usize, 1), d.count()); // the store's tag is fine
+    try std.testing.expectEqual(Diagnostic{ .misplaced_endian = .{ .inst = atomic_inst } }, d.items()[0]);
 }

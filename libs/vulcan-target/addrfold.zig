@@ -151,6 +151,17 @@ fn countUses(func: *const Function, uses: []u32) void {
         const block: Block = @enumFromInt(bi);
         for (func.blockInsts(block)) |inst| {
             switch (func.opcode(inst)) {
+                // An atomic reads three Values at most. It is counted here so the fold
+                // never sees an atomic's address operand as having one use and rewrites it;
+                // the fold itself only ever names a `load` or a `store`, so an atomic's
+                // address is never folded into an addressing mode. That refusal is
+                // deliberate: the NVIDIA atomic encoders leave their immediate offset field
+                // at zero, so a folded offset would be silently dropped.
+                .atomic_rmw => |a| {
+                    uses[@intFromEnum(a.ptr)] += 1;
+                    uses[@intFromEnum(a.value)] += 1;
+                    if (a.compare) |c| uses[@intFromEnum(c)] += 1;
+                },
                 // A barrier uses no Value, so it adds no use count.
                 .iconst, .fconst, .fconst128, .alloca, .global_addr, .barrier => {},
                 .arith => |a| {
@@ -435,4 +446,44 @@ test "cross-block: an add in the entry block feeding a load in a successor folds
 
     try std.testing.expect(analysis.folds.contains(load_inst));
     try std.testing.expect(analysis.isDeadAdd(add_inst));
+}
+
+test "an offset is never folded into an atomic's address" {
+    // The fold rewrites an access to `[base + imm]` and drops the add. Every NVIDIA atomic
+    // encoder leaves its immediate address-offset field at ZERO, so a folded offset would be
+    // silently dropped and the read-modify-write would hit the base address instead.
+    //
+    // NEGATIVE CONTROL: the identical `base + 8` feeding a LOAD does fold, and the add is
+    // dead. So the refusal comes from the opcode and not from the offset being unfoldable.
+    const allocator = std.testing.allocator;
+    for ([_]bool{ false, true }) |atomic| {
+        var func = Function.init(allocator);
+        defer func.deinit();
+
+        const ptr_t = try func.types.ptrGlobal();
+        const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+        const b = try func.appendBlock();
+        const base = try func.appendBlockParam(b, ptr_t);
+        const v = try func.appendBlockParam(b, i32_t);
+        const p = try func.appendArithImm(b, ptr_t, .add, base, 8);
+        if (atomic) {
+            try func.appendAtomicRmwStmt(b, .{ .op = .add, .ptr = p, .value = v, .ordering = .relaxed, .scope = .device });
+        } else {
+            _ = try func.appendInst(b, i32_t, .{ .load = .{ .ptr = p } });
+        }
+        func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
+        const add_inst = func.definingInst(p).?;
+        const access = func.blockInsts(b)[1];
+
+        var analysis = try analyze(allocator, &func, TestCtx{}, testFoldOffset);
+        defer analysis.deinit(allocator);
+
+        try std.testing.expectEqual(@as(usize, if (atomic) 0 else 1), analysis.folds.count());
+        // No fold entry names the atomic, so no backend can read one for it. `baseOf` is
+        // deliberately NOT called here: `rawPtr` asserts on any opcode but load and store,
+        // and every caller reaches it only through a `folds` entry or a load/store scan.
+        if (atomic) try std.testing.expect(analysis.folds.get(access) == null);
+        // The add stays live for the atomic, so its result really is the address used.
+        try std.testing.expectEqual(!atomic, analysis.isDeadAdd(add_inst));
+    }
 }

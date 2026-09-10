@@ -1342,6 +1342,113 @@ fn memTypeOf(func: *const Function, v: Value) Error!encode.MemType {
     }
 }
 
+/// The atomic access type for `v`. It sets the WIDTH of the read-modify-write and, for `min`
+/// and `max`, whether the comparison is signed.
+///
+/// The hardware field holds one of four values, so only a 32-bit and a 64-bit access exist.
+/// There is no byte or half-word atomic, so an i8 or an i16 is REFUSED and never widened: a
+/// widened access reads and writes the bytes beside it, which is a data race this backend
+/// would have created on its own.
+///
+/// 64 bits is refused for the reason `memTypeOf` refuses a 64-bit scalar: the old value comes
+/// back in a register PAIR, and this backend has no pair allocation for a scalar value. The
+/// encoders accept `u64`/`i64` and are tested for them, so the refusal is here and not there.
+fn atomTypeOf(func: *const Function, v: Value) Error!encode.AtomType {
+    switch (func.types.type_kind(func.valueType(v))) {
+        .int => |i| {
+            if (i.bits != 32) return error.Unsupported;
+            return if (i.signedness == .signed) .i32 else .u32;
+        },
+        // `verify` rejects a non-integer operand, so none of these reaches a verified
+        // function. The refusal keeps an unverified one from picking an integer atomic of
+        // the same width and computing integer arithmetic on a float bit pattern.
+        .bool, .float, .ptr, .vector, .@"struct", .array, .slice => return error.Unsupported,
+    }
+}
+
+/// The hardware operation selector for an IR atomic operation.
+fn atomOpOf(op: ir.function.AtomicOp) Error!encode.AtomOp {
+    return switch (op) {
+        .add => .add,
+        .min => .min,
+        .max => .max,
+        .bit_and => .bit_and,
+        .bit_or => .bit_or,
+        .bit_xor => .bit_xor,
+        .exchange => .exch,
+        // Compare-exchange is a SEPARATE opcode with a second data operand, so it has no
+        // value in this field. `lowerAtomicRmw` routes it to ATOMG.CAS or ATOMS.CAS before
+        // it reaches here.
+        .compare_exchange => error.Unsupported,
+    };
+}
+
+/// Lower an atomic read-modify-write. Four instructions, picked by two independent facts.
+///
+/// The ADDRESS SPACE comes from the pointer type, exactly as it does for `load` and `store`:
+/// a shared pointer takes ATOMS, whose address is a 32-bit window offset in ONE register, and
+/// anything else takes the global form, whose address is a 64-bit pair at (addr, addr+1).
+///
+/// WHETHER THE OLD VALUE IS READ picks between the two global forms, and this is the whole
+/// reason the IR result is optional. A read old value takes ATOMG, which writes a destination
+/// register and so claims one of the SIX scoreboards this GPU has. An old value nobody reads
+/// takes RED, which writes no register at all and claims none. A fire-and-forget counter
+/// increment therefore costs no scoreboard.
+///
+/// A `compare_exchange` is its own opcode in both spaces, because it needs a second data
+/// operand.
+///
+/// Nothing here refuses a divergent placement, unlike `checkBarrierConvergence`. An atomic
+/// inside a divergent arm is well defined: the threads that take the arm apply it, and the
+/// hardware serialises them.
+fn lowerAtomicRmw(
+    allocator: std.mem.Allocator,
+    func: *const Function,
+    loc: std.AutoHashMapUnmanaged(Value, Loc),
+    code: *std.ArrayList(Inst),
+    inst: ir.function.Inst,
+    a: ir.function.AtomicRmw,
+) Error!void {
+    const ty = try atomTypeOf(func, a.value);
+    const addr = gprOf(loc, a.ptr);
+    const data = gprOf(loc, a.value);
+    // RZ discards the value written to it, and the scheduler skips an RZ destination when it
+    // hands out scoreboards, so this is how a form that must name a destination register
+    // gives back nothing.
+    const dst: u8 = if (func.instResult(inst)) |r| gprOf(loc, r) else encode.RZ;
+
+    if (isSharedPtr(func, a.ptr)) {
+        // ATOMS is Strong(CTA) in the hardware: NAK asserts it, and the encoder writes no
+        // memory-order field at all. Shared memory is private to the CTA, so workgroup scope
+        // is the whole of it and a wider scope is a promise ATOMS cannot keep. Refuse rather
+        // than emit an instruction that orders less than the program asked for.
+        if (a.scope != .workgroup) return error.Unsupported;
+        if (a.op == .compare_exchange) {
+            try code.append(allocator, encode.atomsCas(dst, addr, gprOf(loc, a.compare.?), data, ty, .{}));
+            return;
+        }
+        try code.append(allocator, encode.atoms(dst, addr, data, try atomOpOf(a.op), ty, .{}));
+        return;
+    }
+
+    // Every global form the encoders build sets memory order STRONG / SYS, the strongest one
+    // there is, so it satisfies every ordering and every scope the IR can ask for. A backend
+    // may lower a weak order with a stronger instruction; the reverse is what is forbidden.
+    if (a.op == .compare_exchange) {
+        try code.append(allocator, encode.atomgCas(dst, addr, gprOf(loc, a.compare.?), data, ty, .{}));
+        return;
+    }
+    if (func.instResult(inst) == null and a.op != .exchange) {
+        try code.append(allocator, encode.redg(addr, data, try atomOpOf(a.op), ty, .{}));
+        return;
+    }
+    // ATOMG, either because the old value is read or because the operation is an exchange.
+    // RED's operation field is only 3 bits wide, so `exch` (8) does not fit it and
+    // `encode.redg` asserts on one. An unread exchange therefore takes ATOMG with an RZ
+    // destination, which discards the old value and still claims no scoreboard.
+    try code.append(allocator, encode.atomg(dst, addr, data, try atomOpOf(a.op), ty, .{}));
+}
+
 /// True when a value is a workgroup-shared address: a 32-bit window offset in ONE register,
 /// which a load or a store reaches with LDS or STS instead of LDG or STG.
 fn isSharedPtr(func: *const Function, v: Value) bool {
@@ -2743,6 +2850,7 @@ fn lowerInst(allocator: std.mem.Allocator, func: *const Function, loc: *std.Auto
             // deadlocks a kernel whose other warps never reach the barrier. Refuse instead.
             .subgroup => return error.Unsupported,
         },
+        .atomic_rmw => |a| try lowerAtomicRmw(allocator, func, loc.*, code, inst, a),
         .@"if" => {}, // handled by the caller (it terminates the block)
         else => return error.Unsupported,
     }
@@ -2872,6 +2980,11 @@ fn markUse(last_use: []u32, v: Value, pos: u32) void {
 
 fn forEachUse(func: *const Function, inst: ir.function.Inst, last_use: []u32, pos: u32) void {
     switch (func.opcode(inst)) {
+        .atomic_rmw => |a| {
+            markUse(last_use, a.ptr, pos);
+            markUse(last_use, a.value, pos);
+            if (a.compare) |c| markUse(last_use, c, pos);
+        },
         // A barrier reads no Value operand.
         .iconst, .fconst, .fconst128, .alloca, .global_addr, .barrier => {},
         .arith => |a| {
@@ -2937,6 +3050,11 @@ fn setUsed(row: []bool, v: Value) void {
 
 fn markUsedBitset(func: *const Function, inst: ir.function.Inst, row: []bool) void {
     switch (func.opcode(inst)) {
+        .atomic_rmw => |a| {
+            setUsed(row, a.ptr);
+            setUsed(row, a.value);
+            if (a.compare) |c| setUsed(row, c);
+        },
         // A barrier reads no Value operand.
         .iconst, .fconst, .fconst128, .alloca, .global_addr, .barrier => {},
         .arith => |a| {
@@ -4374,4 +4492,293 @@ test "a barrier in a LOOP body is refused, because a thread that exits early ski
     func.setTerminator(done, .{ .ret = ir.function.Ret.one(n) });
 
     try testing.expectError(error.Unsupported, compileKernel(allocator, &func, nvidia_abi));
+}
+
+/// The 4-bit field at bit `lo` of the instruction at index `i` in a compiled kernel's dword
+/// stream. The atomic operation selector and the atomic type both live in such a field.
+fn nibbleAt(code: []const u32, i: usize, comptime lo: usize) u32 {
+    return (code[i * 4 + lo / 32] >> (lo % 32)) & 0xf;
+}
+
+/// Find the single instruction with opcode `want` in a compiled kernel, and fail if there is
+/// not exactly one. Every atomic test below wants exactly one.
+fn onlyOpAt(code: []const u32, want: u32) !usize {
+    var found: ?usize = null;
+    var i: usize = 0;
+    while (i * 4 < code.len) : (i += 1) {
+        if (opAt(code, i) == want) {
+            try testing.expect(found == null); // exactly one, never two
+            found = i;
+        }
+    }
+    return found orelse error.NotFound;
+}
+
+test "a global atomic whose result is READ lowers to ATOMG with the right operation" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const b = try func.appendBlock();
+    const p = try func.appendBlockParam(b, ptr_t);
+    const v = try func.appendBlockParam(b, i32_t);
+    const old = try func.appendAtomicRmw(b, .{ .op = .min, .ptr = p, .value = v, .ordering = .seq_cst, .scope = .device });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(old) });
+
+    var kernel = try compileKernel(allocator, &func, nvidia_abi);
+    defer kernel.deinit(allocator);
+
+    const at = try onlyOpAt(kernel.code, encode.ATOMG_OPCODE);
+    // The operation selector is the 4-bit field at bit 87, and `min` is 1.
+    try testing.expectEqual(@intFromEnum(encode.AtomOp.min), nibbleAt(kernel.code, at, 87));
+    // The atomic TYPE is the 4-bit field at bit 73, and a signed 32-bit operand is `i32`.
+    // Signedness comes from the operand type alone, and it is what makes `min` a signed
+    // comparison.
+    try testing.expectEqual(@intFromEnum(encode.AtomType.i32), nibbleAt(kernel.code, at, 73));
+    // No RED was emitted: the reading form is the ATOMG one.
+    try testing.expectError(error.NotFound, onlyOpAt(kernel.code, encode.RED_OPCODE));
+}
+
+test "a global atomic whose result is UNREAD lowers to RED, which claims no scoreboard" {
+    // This is the whole reason the IR result is optional. RED writes no register, so the
+    // scheduler hands it no write barrier, and a fire-and-forget counter increment costs
+    // none of the six scoreboards. The test above is the control: the same operation with
+    // its result read produces ATOMG instead.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const b = try func.appendBlock();
+    const p = try func.appendBlockParam(b, ptr_t);
+    const v = try func.appendBlockParam(b, u32_t);
+    try func.appendAtomicRmwStmt(b, .{ .op = .add, .ptr = p, .value = v, .ordering = .relaxed, .scope = .device });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(v) });
+
+    var kernel = try compileKernel(allocator, &func, nvidia_abi);
+    defer kernel.deinit(allocator);
+
+    const at = try onlyOpAt(kernel.code, encode.RED_OPCODE);
+    // RED's operation selector is only 3 bits wide, and `add` is 0.
+    try testing.expectEqual(@as(u32, @intFromEnum(encode.AtomOp.add)), (kernel.code[at * 4 + 2] >> (87 - 64)) & 0x7);
+    // An unsigned operand selects the unsigned atomic type.
+    try testing.expectEqual(@intFromEnum(encode.AtomType.u32), nibbleAt(kernel.code, at, 73));
+    // The destination field reads RZ, so no consumer can wait on it and the scheduler
+    // records no write.
+    try testing.expectEqual(encode.RZ, regAt(kernel.code, at, 16));
+    // No ATOMG was emitted.
+    try testing.expectError(error.NotFound, onlyOpAt(kernel.code, encode.ATOMG_OPCODE));
+}
+
+test "an unread global EXCHANGE lowers to ATOMG with an RZ destination, not RED" {
+    // RED's operation field is 3 bits, so `exch` (8) does not fit it. An unread exchange
+    // takes ATOMG with RZ instead, which discards the old value and still claims no
+    // scoreboard, rather than truncating the selector to `add`.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const u32_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 32 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const b = try func.appendBlock();
+    const p = try func.appendBlockParam(b, ptr_t);
+    const v = try func.appendBlockParam(b, u32_t);
+    try func.appendAtomicRmwStmt(b, .{ .op = .exchange, .ptr = p, .value = v, .ordering = .relaxed, .scope = .device });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(v) });
+
+    var kernel = try compileKernel(allocator, &func, nvidia_abi);
+    defer kernel.deinit(allocator);
+
+    const at = try onlyOpAt(kernel.code, encode.ATOMG_OPCODE);
+    try testing.expectEqual(@intFromEnum(encode.AtomOp.exch), nibbleAt(kernel.code, at, 87));
+    try testing.expectEqual(encode.RZ, regAt(kernel.code, at, 16));
+    try testing.expectError(error.NotFound, onlyOpAt(kernel.code, encode.RED_OPCODE));
+}
+
+test "a SHARED-pointer atomic lowers to ATOMS, from the pointer type alone" {
+    // The address space rides in the pointer type, exactly as it does for LDS and STS, so
+    // no new attribute is needed. The global tests above are the control: the same
+    // operation through a global pointer produces ATOMG or RED.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const shared_t = try func.types.intern(.{ .ptr = .shared });
+    const b = try func.appendBlock();
+    const tile = try func.appendBlockParam(b, shared_t);
+    const v = try func.appendBlockParam(b, i32_t);
+    const old = try func.appendAtomicRmw(b, .{ .op = .bit_xor, .ptr = tile, .value = v, .ordering = .relaxed, .scope = .workgroup });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(old) });
+
+    var kernel = try compileKernel(allocator, &func, nvidia_abi);
+    defer kernel.deinit(allocator);
+
+    const at = try onlyOpAt(kernel.code, encode.ATOMS_OPCODE);
+    try testing.expectEqual(@intFromEnum(encode.AtomOp.bit_xor), nibbleAt(kernel.code, at, 87));
+    try testing.expectEqual(@intFromEnum(encode.AtomType.i32), nibbleAt(kernel.code, at, 73));
+    try testing.expectError(error.NotFound, onlyOpAt(kernel.code, encode.ATOMG_OPCODE));
+    try testing.expectError(error.NotFound, onlyOpAt(kernel.code, encode.RED_OPCODE));
+}
+
+test "an unread SHARED atomic still uses ATOMS, with RZ as its destination" {
+    // The encoders have no shared reduction form, so ATOMS is the only shared instruction.
+    // NAK writes RZ into the destination field for a `Dst::None` atomic and this matches:
+    // the scheduler skips an RZ destination, so this claims no scoreboard either.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const shared_t = try func.types.intern(.{ .ptr = .shared });
+    const b = try func.appendBlock();
+    const tile = try func.appendBlockParam(b, shared_t);
+    const v = try func.appendBlockParam(b, i32_t);
+    try func.appendAtomicRmwStmt(b, .{ .op = .add, .ptr = tile, .value = v, .ordering = .relaxed, .scope = .workgroup });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(v) });
+
+    var kernel = try compileKernel(allocator, &func, nvidia_abi);
+    defer kernel.deinit(allocator);
+
+    const at = try onlyOpAt(kernel.code, encode.ATOMS_OPCODE);
+    try testing.expectEqual(encode.RZ, regAt(kernel.code, at, 16));
+}
+
+test "a compare-exchange lowers to the CAS opcode of its address space" {
+    const allocator = testing.allocator;
+    const spaces = [_]struct { space: ir.types.AddressSpace, want: u32 }{
+        .{ .space = .global, .want = encode.ATOMG_CAS_OPCODE },
+        .{ .space = .shared, .want = encode.ATOMS_CAS_OPCODE },
+    };
+    for (spaces) |s| {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+        const ptr_t = try func.types.intern(.{ .ptr = s.space });
+        const b = try func.appendBlock();
+        const p = try func.appendBlockParam(b, ptr_t);
+        const desired = try func.appendBlockParam(b, i32_t);
+        const expected = try func.appendBlockParam(b, i32_t);
+        const old = try func.appendAtomicRmw(b, .{
+            .op = .compare_exchange,
+            .ptr = p,
+            .value = desired,
+            .compare = expected,
+            .ordering = .seq_cst,
+            .scope = .workgroup,
+        });
+        func.setTerminator(b, .{ .ret = ir.function.Ret.one(old) });
+
+        var kernel = try compileKernel(allocator, &func, nvidia_abi);
+        defer kernel.deinit(allocator);
+
+        const at = try onlyOpAt(kernel.code, s.want);
+        try testing.expectEqual(@intFromEnum(encode.AtomType.i32), nibbleAt(kernel.code, at, 73));
+        // The compare operand goes in the bit-32 register field and the swap data in the
+        // bit-64 one. Swapping the two silently inverts what the instruction does.
+        try testing.expectEqual(gprOfTest(&func, expected), regAt(kernel.code, at, 32));
+        try testing.expectEqual(gprOfTest(&func, desired), regAt(kernel.code, at, 64));
+        // The plain forms were NOT emitted for a compare-exchange.
+        try testing.expectError(error.NotFound, onlyOpAt(kernel.code, encode.ATOMG_OPCODE));
+        try testing.expectError(error.NotFound, onlyOpAt(kernel.code, encode.ATOMS_OPCODE));
+    }
+}
+
+/// The register a kernel parameter lands in, recomputed the way `assignLocs` does, so the CAS
+/// test can name the operand registers without reaching into the isel's private map.
+fn gprOfTest(func: *const Function, v: Value) u8 {
+    var locs: std.AutoHashMapUnmanaged(Value, Loc) = .empty;
+    defer locs.deinit(std.testing.allocator);
+    var max_reg: u8 = 0;
+    assignLocs(std.testing.allocator, func, &locs, &max_reg) catch unreachable;
+    return gprOf(locs, v);
+}
+
+test "a shared atomic wider than workgroup scope is refused, not silently narrowed" {
+    // ATOMS is Strong(CTA) in the hardware. Emitting it for a device- or system-scope
+    // request would order less than the program asked for, so it is refused. The
+    // workgroup control proves the refusal comes from the scope and nothing else.
+    const allocator = testing.allocator;
+    const scopes = [_]struct { scope: ir.function.AtomicScope, ok: bool }{
+        .{ .scope = .workgroup, .ok = true },
+        .{ .scope = .device, .ok = false },
+        .{ .scope = .system, .ok = false },
+    };
+    for (scopes) |s| {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+        const shared_t = try func.types.intern(.{ .ptr = .shared });
+        const b = try func.appendBlock();
+        const tile = try func.appendBlockParam(b, shared_t);
+        const v = try func.appendBlockParam(b, i32_t);
+        try func.appendAtomicRmwStmt(b, .{ .op = .add, .ptr = tile, .value = v, .ordering = .relaxed, .scope = s.scope });
+        func.setTerminator(b, .{ .ret = ir.function.Ret.one(v) });
+
+        if (s.ok) {
+            var kernel = try compileKernel(allocator, &func, nvidia_abi);
+            defer kernel.deinit(allocator);
+            _ = try onlyOpAt(kernel.code, encode.ATOMS_OPCODE);
+        } else {
+            try testing.expectError(error.Unsupported, compileKernel(allocator, &func, nvidia_abi));
+        }
+    }
+}
+
+test "an atomic on a narrow integer is refused, not widened to 32 bits" {
+    // There is no byte or half-word atomic. Widening the access would read and write the
+    // three bytes beside it, which is a data race this backend would have created itself.
+    // The i32 control proves the refusal comes from the width.
+    const allocator = testing.allocator;
+    const widths = [_]struct { bits: u16, ok: bool }{ .{ .bits = 32, .ok = true }, .{ .bits = 8, .ok = false }, .{ .bits = 16, .ok = false } };
+    for (widths) |w| {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = w.bits } });
+        const ptr_t = try func.types.ptrGlobal();
+        const b = try func.appendBlock();
+        const p = try func.appendBlockParam(b, ptr_t);
+        const v = try func.appendBlockParam(b, t);
+        try func.appendAtomicRmwStmt(b, .{ .op = .add, .ptr = p, .value = v, .ordering = .relaxed, .scope = .device });
+        func.setTerminator(b, .{ .ret = ir.function.Ret.one(v) });
+
+        if (w.ok) {
+            var kernel = try compileKernel(allocator, &func, nvidia_abi);
+            defer kernel.deinit(allocator);
+            _ = try onlyOpAt(kernel.code, encode.RED_OPCODE);
+        } else {
+            try testing.expectError(error.Unsupported, compileKernel(allocator, &func, nvidia_abi));
+        }
+    }
+}
+
+test "an atomic inside a divergent arm compiles, unlike a barrier" {
+    // An atomic in a divergent arm is well defined: the threads that take the arm apply it
+    // and the hardware serialises them. `checkBarrierConvergence` refuses the same CFG with
+    // a barrier in the arm, and this test pins that the atomic is NOT given that treatment.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const ptr_t = try func.types.ptrGlobal();
+
+    const entry = try func.appendBlock();
+    const p = try func.appendBlockParam(entry, ptr_t);
+    const a = try func.appendBlockParam(entry, t);
+    const bv = try func.appendBlockParam(entry, t);
+    const then_b = try func.appendBlock();
+    const else_b = try func.appendBlock();
+    const merge = try func.appendBlock();
+    const r = try func.appendBlockParam(merge, t);
+    const c = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .gt, .lhs = a, .rhs = bv } });
+    try func.appendIf(entry, c, .{ .target = then_b, .args = &.{} }, .{ .target = else_b, .args = &.{} });
+    try func.appendAtomicRmwStmt(then_b, .{ .op = .add, .ptr = p, .value = a, .ordering = .relaxed, .scope = .device });
+    const one = try func.appendInst(then_b, t, .{ .iconst = 1 });
+    func.setTerminator(then_b, .{ .jump = .{ .target = merge, .args = try func.internValues(&.{one}) } });
+    const two = try func.appendInst(else_b, t, .{ .iconst = 2 });
+    func.setTerminator(else_b, .{ .jump = .{ .target = merge, .args = try func.internValues(&.{two}) } });
+    func.setTerminator(merge, .{ .ret = ir.function.Ret.one(r) });
+
+    var kernel = try compileKernel(allocator, &func, nvidia_abi);
+    defer kernel.deinit(allocator);
+    _ = try onlyOpAt(kernel.code, encode.RED_OPCODE);
 }

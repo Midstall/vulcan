@@ -151,6 +151,16 @@ fn rebuildOpcode(
             out.c = remapValue(value_map, mmv.c);
             break :blk .{ .matmul = out };
         },
+        // Each unrolled copy of the body keeps its own atomic, so the number of
+        // read-modify-writes is unchanged. The caller appends the copy with or without a
+        // result by asking `instResult`, so both forms clone correctly.
+        .atomic_rmw => |av| blk: {
+            var out = av;
+            out.ptr = remapValue(value_map, av.ptr);
+            out.value = remapValue(value_map, av.value);
+            if (av.compare) |c| out.compare = remapValue(value_map, c);
+            break :blk .{ .atomic_rmw = out };
+        },
         .@"if" => |cf| blk: {
             args_buf.clearRetainingCapacity();
             for (func.valueList(cf.then.args)) |v| {
@@ -716,6 +726,11 @@ fn collectOperands(
 ) Error!void {
     for (func.blockInsts(block)) |inst| {
         switch (func.opcode(inst)) {
+            .atomic_rmw => |x| {
+                try set.put(a, x.ptr, {});
+                try set.put(a, x.value, {});
+                if (x.compare) |c| try set.put(a, c, {});
+            },
             // A barrier reads no Value operand.
             .iconst, .fconst, .fconst128, .alloca, .global_addr, .barrier => {},
             .arith => |x| {
@@ -784,6 +799,11 @@ fn replaceInBlock(func: *Function, block: Block, from: Value, to: Value) void {
     for (func.blockInsts(block)) |inst| {
         const op = func.opcodeMut(inst);
         switch (op.*) {
+            .atomic_rmw => |*x| {
+                x.ptr = rep(from, to, x.ptr);
+                x.value = rep(from, to, x.value);
+                if (x.compare) |*c| c.* = rep(from, to, c.*);
+            },
             // A barrier reads no Value operand.
             .iconst, .fconst, .fconst128, .alloca, .global_addr, .barrier => {},
             .arith => |*x| {
@@ -1266,4 +1286,58 @@ test "cloneInstInto releases the scratch list it builds for a struct_new header 
 
     const cloned = func.blockInsts(dest)[0];
     try std.testing.expectEqualSlices(Value, &.{ p, p }, func.valueList(func.opcode(cloned).struct_new.fields));
+}
+
+test "cloneBlocks copies BOTH atomic forms, keeping each copy's result state" {
+    // Unrolling duplicates the body once per unrolled iteration, so the number of
+    // read-modify-writes is unchanged and an atomic may be cloned. The two forms are the
+    // point: the reduction one must come back result-less, and the reading one must come
+    // back with a fresh result. A hand-kept result-less opcode list would get one of them
+    // wrong, which is why `cloneBlocks` asks `instResult` instead.
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const b0 = try func.appendBlock();
+    const p = try func.appendBlockParam(b0, ptr_t);
+    const v = try func.appendBlockParam(b0, i32_t);
+    const c = try func.appendBlockParam(b0, i32_t);
+    try func.appendAtomicRmwStmt(b0, .{ .op = .add, .ptr = p, .value = v, .ordering = .relaxed, .scope = .device });
+    _ = try func.appendAtomicRmw(b0, .{
+        .op = .compare_exchange,
+        .ptr = p,
+        .value = v,
+        .compare = c,
+        .ordering = .seq_cst,
+        .scope = .system,
+    });
+    func.setTerminator(b0, .{ .ret = ir.function.Ret.none() });
+
+    var vmap: ValueMap = .empty;
+    defer vmap.deinit(allocator);
+    var bmap: BlockMap = .empty;
+    defer bmap.deinit(allocator);
+    const clones = try cloneBlocks(allocator, &func, &.{b0}, &vmap, &bmap);
+    defer allocator.free(clones);
+
+    const copied = func.blockInsts(clones[0]);
+    try std.testing.expectEqual(@as(usize, 2), copied.len);
+
+    const reduction = func.opcode(copied[0]).atomic_rmw;
+    try std.testing.expectEqual(ir.function.AtomicOp.add, reduction.op);
+    try std.testing.expectEqual(ir.function.AtomicOrdering.relaxed, reduction.ordering);
+    try std.testing.expectEqual(ir.function.AtomicScope.device, reduction.scope);
+    try std.testing.expectEqual(@as(?Value, null), func.instResult(copied[0]));
+
+    const cas = func.opcode(copied[1]).atomic_rmw;
+    try std.testing.expectEqual(ir.function.AtomicOp.compare_exchange, cas.op);
+    try std.testing.expectEqual(ir.function.AtomicScope.system, cas.scope);
+    // The operands were remapped onto the copied block's own parameters, and the compare
+    // operand survived the copy.
+    const new_params = func.blockParams(clones[0]);
+    try std.testing.expectEqual(new_params[0], cas.ptr);
+    try std.testing.expectEqual(new_params[1], cas.value);
+    try std.testing.expectEqual(new_params[2], cas.compare.?);
+    try std.testing.expect(func.instResult(copied[1]) != null);
 }

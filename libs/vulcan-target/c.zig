@@ -417,6 +417,12 @@ const Emitter = struct {
             .dot => return error.Unsupported,
             // matmul is et-soc-only (a later task). The C backend has no lowering for it.
             .matmul => return error.Unsupported,
+            // An atomic read-modify-write. This backend emits plain C, which has no
+            // guaranteed atomic form to lower to: `<stdatomic.h>` needs the object itself
+            // to be `_Atomic`-qualified, and the pointer this receives is not. A plain
+            // read-modify-write would compile and would not be atomic, which is worse than
+            // refusing.
+            .atomic_rmw => return error.Unsupported,
             // A barrier synchronizes threads. This backend emits a single-threaded C
             // function, so there is nothing to synchronize and no honest lowering: a
             // silent no-op would be a lie about what the code does.
@@ -897,4 +903,21 @@ test "a barrier is rejected, not emitted as a silent no-op" {
     func.setTerminator(entry, .{ .ret = ir.function.Ret.one(x) });
 
     try std.testing.expectError(error.Unsupported, emitFunction(std.testing.allocator, &func, "sync"));
+}
+
+test "an atomic is rejected, not emitted as a plain read-modify-write" {
+    // Plain C has no guaranteed atomic for a pointer that is not `_Atomic`-qualified. An
+    // ordinary read-modify-write would compile and would NOT be atomic, which is worse than
+    // refusing.
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const entry = try func.appendBlock();
+    const p = try func.appendBlockParam(entry, ptr_t);
+    const x = try func.appendBlockParam(entry, i32_t);
+    try func.appendAtomicRmwStmt(entry, .{ .op = .add, .ptr = p, .value = x, .ordering = .relaxed, .scope = .device });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(x) });
+
+    try std.testing.expectError(error.Unsupported, emitFunction(std.testing.allocator, &func, "counter"));
 }

@@ -105,6 +105,10 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, model: *const mm.Mod
     if (in_loop_blocks != 2) return null; // exactly header + one body block
     const bodyb = body orelse return null;
     for (func.blockInsts(bodyb)) |inst| switch (func.opcode(inst)) {
+        // An atomic joins them: splitting one loop into two moves half the
+        // read-modify-writes past the other half, and `remapOp` would have to rebuild an
+        // instruction whose result is optional.
+        .atomic_rmw,
         // A barrier joins them: splitting one loop into two reorders the memory operations
         // around each meeting point, which is the one thing a barrier forbids.
         //
@@ -492,6 +496,11 @@ fn rv(vmap: *const std.AutoHashMapUnmanaged(Value, Value), v: Value) Value {
 
 fn remapOp(func: *Function, op: Opcode, vmap: *const std.AutoHashMapUnmanaged(Value, Value), allocator: std.mem.Allocator) Error!Opcode {
     return switch (op) {
+        // `recognize` above refuses a body holding one, so this is never reached. It is
+        // `unreachable` and not a remap for the reason the `@"if"`/`matmul`/`va_*` arms
+        // below are: the caller appends every rebuilt opcode with a result, and an atomic's
+        // result is optional.
+        .atomic_rmw => unreachable,
         // A barrier carries only its scope, which is not a Value, so it copies unchanged.
         .iconst, .fconst, .fconst128, .alloca, .global_addr, .barrier => op,
         .arith => |a| .{ .arith = .{ .op = a.op, .lhs = rv(vmap, a.lhs), .rhs = rv(vmap, a.rhs) } },
@@ -552,6 +561,11 @@ fn useCounts(allocator: std.mem.Allocator, func: *const Function) Error![]u32 {
     }.f;
     for (0..func.instCount()) |i| {
         switch (func.opcode(@enumFromInt(i))) {
+            .atomic_rmw => |x| {
+                bump(counts, x.ptr);
+                bump(counts, x.value);
+                if (x.compare) |c| bump(counts, c);
+            },
             // A barrier reads no Value operand.
             .iconst, .fconst, .fconst128, .alloca, .global_addr, .barrier => {},
             .arith => |x| {
@@ -804,4 +818,53 @@ test "cloneBodyInsts does not carry a block or function attribute onto the split
     try std.testing.expectEqual(@as(usize, 0), testAttrCount(&func, .{ .block = dest }));
     try std.testing.expectEqual(@as(usize, 1), testAttrCount(&func, .{ .block = body }));
     try std.testing.expectEqual(@as(usize, 1), testAttrCount(&func, .func));
+}
+
+test "an atomic in the body is declined, not sent into remapOp's unreachable" {
+    // Splitting one loop into two moves half the read-modify-writes past the other half, and
+    // `remapOp` calls an atomic `unreachable` on the strength of `recognize`'s body filter.
+    // The same loop with a plain `load` in place of the atomic IS recognized, so the filter
+    // declines the atomic and nothing else.
+    const allocator = std.testing.allocator;
+    for ([_]bool{ false, true }) |use_atomic| {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+        const ptr_t = try func.types.ptrGlobal();
+        const bool_t = try func.types.intern(.bool);
+        const entry = try func.appendBlock();
+        const header = try func.appendBlock();
+        const body = try func.appendBlock();
+        const done = try func.appendBlock();
+        const p = try func.appendBlockParam(entry, ptr_t);
+        const n = try func.appendBlockParam(entry, i32_t);
+        const zero = try func.appendInst(entry, i32_t, .{ .iconst = 0 });
+        try func.setJump(entry, header, &.{ zero, zero });
+        const i = try func.appendBlockParam(header, i32_t);
+        const s = try func.appendBlockParam(header, i32_t);
+        const cmp = try func.appendInst(header, bool_t, .{ .icmp = .{ .op = .lt, .lhs = i, .rhs = n } });
+        try func.appendIf(header, cmp, .{ .target = body, .args = &.{ i, s } }, .{ .target = done });
+        const bi = try func.appendBlockParam(body, i32_t);
+        const bs = try func.appendBlockParam(body, i32_t);
+        // The body is the SAME recognizable reduction in both runs. The only difference is
+        // one extra atomic beside it, so a decline can come from nothing else.
+        const v = try func.appendInst(body, i32_t, .{ .load = .{ .ptr = p } });
+        if (use_atomic) {
+            // The operand is the loop-invariant `n`, not the accumulator: using the
+            // accumulator would add a second use of it and `recognize` would decline for
+            // THAT reason instead of the body filter, which would make this test vacuous.
+            try func.appendAtomicRmwStmt(body, .{ .op = .add, .ptr = p, .value = n, .ordering = .relaxed, .scope = .device });
+        }
+        const ns = try func.appendInst(body, i32_t, .{ .arith = .{ .op = .add, .lhs = bs, .rhs = v } });
+        const ni = try func.appendArithImm(body, i32_t, .add, bi, 1);
+        try func.setJump(body, header, &.{ ni, ns });
+        func.setTerminator(done, .{ .ret = ir.function.Ret.none() });
+
+        var info = try loops.analyze(allocator, &func);
+        defer info.deinit(allocator);
+        const model = @import("registry.zig").modelFor(.@"ampere-altra");
+        const plan = try recognize(allocator, &func, model, &info.loops[0], false);
+        if (plan) |p2| allocator.free(p2.reductions);
+        try std.testing.expectEqual(!use_atomic, plan != null);
+    }
 }

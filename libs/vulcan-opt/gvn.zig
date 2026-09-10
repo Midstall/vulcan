@@ -140,6 +140,11 @@ fn keyOf(func: *const Function, canon: []const Value, inst: Inst, result: Value)
         .alloca, .struct_new, .load, .store, .prefetch, .matmul, .call, .call_indirect, .@"if" => null,
         // SM12 T3: mutate/read the `va_list` object at `list`, like `load`/`store` above - not numbered.
         .va_start, .va_arg, .va_end => null,
+        // An atomic is NOT numbered, and this is the guard the barrier did not need: an
+        // atomic HAS a result, so `keyOf` really is reached for one. Two atomics on one
+        // address with one operand are two separate read-modify-writes, and replacing the
+        // second with the first's old value deletes a write and reads a stale value.
+        .atomic_rmw => null,
         // A barrier is not numbered. Two barriers with the same scope are NOT the same
         // value: each one is a separate meeting point, and commoning them deletes one.
         .barrier => null,
@@ -156,6 +161,14 @@ fn rewriteOperands(func: *Function, canon: []const Value) void {
     for (0..func.instCount()) |i| {
         const op = func.opcodeMut(@enumFromInt(i));
         switch (op.*) {
+            // An atomic's three operands are canonicalized like any other. This rewrites
+            // WHICH value each operand names; it never removes the atomic itself, which
+            // `keyOf` refuses to number.
+            .atomic_rmw => |*a| {
+                a.ptr = sub(canon, a.ptr);
+                a.value = sub(canon, a.value);
+                if (a.compare) |*c| c.* = sub(canon, c.*);
+            },
             // A barrier carries no Value operand to canonicalize.
             .iconst, .fconst, .fconst128, .alloca, .global_addr, .barrier => {},
             .arith => |*a| {
@@ -336,4 +349,88 @@ test "gvn does not common two barriers of the same scope" {
     try std.testing.expect(func.opcode(insts[0]) == .barrier);
     try std.testing.expect(func.opcode(insts[1]) == .store);
     try std.testing.expect(func.opcode(insts[2]) == .barrier);
+}
+
+test "gvn does not common two atomics on one address" {
+    // This is the guard the barrier did not need: an atomic HAS a result, so `keyOf` really
+    // is reached for one. Two atomics on one address with one operand are two separate
+    // read-modify-writes, and replacing the second with the first's old value both deletes
+    // a write and hands back a stale value.
+    //
+    // The duplicated `mul` is the control: it IS commoned, so the pass really ran here.
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const b = try func.appendBlock();
+    const p = try func.appendBlockParam(b, ptr_t);
+    const v = try func.appendBlockParam(b, i32_t);
+    const m1 = try func.appendInst(b, i32_t, .{ .arith = .{ .op = .mul, .lhs = v, .rhs = v } });
+    const m2 = try func.appendInst(b, i32_t, .{ .arith = .{ .op = .mul, .lhs = v, .rhs = v } });
+    const a1 = try func.appendAtomicRmw(b, .{ .op = .add, .ptr = p, .value = v, .ordering = .relaxed, .scope = .device });
+    const a2 = try func.appendAtomicRmw(b, .{ .op = .add, .ptr = p, .value = v, .ordering = .relaxed, .scope = .device });
+    const s1 = try func.appendInst(b, i32_t, .{ .arith = .{ .op = .add, .lhs = a1, .rhs = a2 } });
+    const s2 = try func.appendInst(b, i32_t, .{ .arith = .{ .op = .add, .lhs = m1, .rhs = m2 } });
+    const total = try func.appendInst(b, i32_t, .{ .arith = .{ .op = .add, .lhs = s1, .rhs = s2 } });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(total) });
+
+    var analyses = pass.Analyses{ .allocator = allocator, .func = &func };
+    defer analyses.deinit();
+    _ = try run(allocator, &func, &analyses);
+
+    // The two multiplies were commoned: the control proves the pass ran.
+    const mul_sum = func.opcode(func.definingInst(s2).?).arith;
+    try std.testing.expectEqual(mul_sum.lhs, mul_sum.rhs);
+    // The two atomics were NOT.
+    const atomic_sum = func.opcode(func.definingInst(s1).?).arith;
+    try std.testing.expect(atomic_sum.lhs != atomic_sum.rhs);
+    var atomics: usize = 0;
+    for (func.blockInsts(b)) |inst| {
+        if (func.opcode(inst) == .atomic_rmw) atomics += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), atomics);
+}
+
+test "gvn canonicalizes an atomic's three operands onto the leaders" {
+    // `keyOf` refuses to NUMBER an atomic, but `rewriteOperands` must still repoint its
+    // operands at the leaders the pass picked. Leaving one behind keeps a redundant
+    // definition alive only because the atomic still names it, which is a definition a
+    // later cleanup would delete out from under it.
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const b = try func.appendBlock();
+    const base = try func.appendBlockParam(b, ptr_t);
+    const k = try func.appendBlockParam(b, i32_t);
+    // Three pairs of identical pure expressions. gvn commons each pair, and the atomic
+    // below names the SECOND of each pair, so every one of its operands must be repointed.
+    const addr_a = try func.appendInst(b, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = k } });
+    const addr_b = try func.appendInst(b, ptr_t, .{ .arith = .{ .op = .add, .lhs = base, .rhs = k } });
+    const val_a = try func.appendInst(b, i32_t, .{ .arith = .{ .op = .mul, .lhs = k, .rhs = k } });
+    const val_b = try func.appendInst(b, i32_t, .{ .arith = .{ .op = .mul, .lhs = k, .rhs = k } });
+    const cmp_a = try func.appendInst(b, i32_t, .{ .arith = .{ .op = .sub, .lhs = k, .rhs = k } });
+    const cmp_b = try func.appendInst(b, i32_t, .{ .arith = .{ .op = .sub, .lhs = k, .rhs = k } });
+    const old = try func.appendAtomicRmw(b, .{
+        .op = .compare_exchange,
+        .ptr = addr_b,
+        .value = val_b,
+        .compare = cmp_b,
+        .ordering = .seq_cst,
+        .scope = .device,
+    });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(old) });
+
+    var analyses = pass.Analyses{ .allocator = allocator, .func = &func };
+    defer analyses.deinit();
+    try std.testing.expect(try run(allocator, &func, &analyses));
+
+    const a = func.opcode(func.definingInst(old).?).atomic_rmw;
+    try std.testing.expectEqual(addr_a, a.ptr);
+    try std.testing.expectEqual(val_a, a.value);
+    try std.testing.expectEqual(cmp_a, a.compare.?);
 }

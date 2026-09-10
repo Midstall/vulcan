@@ -35,6 +35,10 @@ fn movable(op: ir.function.Opcode) bool {
         // `list` (a later backend expansion turns `va_arg` into a load-then-advance) - a
         // barrier, like `load`/`store`, not freely reordered.
         .va_start, .va_arg, .va_end => false,
+        // An atomic is a memory operation in both directions, so it is pinned like
+        // `load`/`store`. Reordering one against another access to the same address
+        // changes what the other threads observe.
+        .atomic_rmw => false,
         // An IR barrier IS a scheduling barrier. Moving it, or moving anything across it,
         // defeats the whole operation.
         .barrier => false,
@@ -50,6 +54,11 @@ fn collectOperands(
 ) std.mem.Allocator.Error!void {
     buf.clearRetainingCapacity();
     switch (func.opcode(inst)) {
+        .atomic_rmw => |a| {
+            try buf.append(allocator, a.ptr);
+            try buf.append(allocator, a.value);
+            if (a.compare) |c| try buf.append(allocator, c);
+        },
         // A barrier reads no Value operand.
         .iconst, .fconst, .fconst128, .alloca, .global_addr, .barrier => {},
         .arith => |a| {
@@ -378,7 +387,7 @@ fn windowTestLatency(op: ir.function.Opcode) u32 {
             .mul, .mulh => 5,
             .div, .rem, .add, .sub, .bit_and, .bit_or, .bit_xor, .shl, .shr => 1,
         },
-        .arith_imm, .iconst, .fconst, .fconst128, .icmp, .select, .struct_new, .extract, .convert, .unary, .alloca, .global_addr, .load, .store, .prefetch, .dot, .matmul, .@"if", .call, .call_indirect, .va_start, .va_arg, .va_end, .barrier => 1,
+        .arith_imm, .iconst, .fconst, .fconst128, .icmp, .select, .struct_new, .extract, .convert, .unary, .alloca, .global_addr, .load, .store, .prefetch, .dot, .matmul, .@"if", .call, .call_indirect, .va_start, .va_arg, .va_end, .barrier, .atomic_rmw => 1,
     };
 }
 fn windowTestUnit(op: ir.function.Opcode) UnitClass {
@@ -472,4 +481,60 @@ test "a small reorder window bounds how far an independent op can move; a large 
     try std.testing.expect(far_at_large < far_at_small);
     // The small window keeps `far` at or past its own program-order index (5): bounded motion.
     try std.testing.expect(far_at_small >= 5);
+}
+
+test "an atomic is pinned in place, and nothing is hoisted across it" {
+    // An atomic is a memory operation in both directions, so it is pinned like a load or a
+    // store. The two independent multiplies around it prove the scheduler ran: without the
+    // atomic between them the later one hoists ahead of the first add.
+    const allocator = std.testing.allocator;
+    const build = struct {
+        fn f(func: *Function, atomic: bool) !ir.function.Block {
+            const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+            const ptr_t = try func.types.ptrGlobal();
+            const block = try func.appendBlock();
+            const p = try func.appendBlockParam(block, ptr_t);
+            const v0 = try func.appendBlockParam(block, i32_t);
+            const v1 = try func.appendBlockParam(block, i32_t);
+            const m1 = try func.appendInst(block, i32_t, .{ .arith = .{ .op = .mul, .lhs = v0, .rhs = v1 } });
+            const a1 = try func.appendInst(block, i32_t, .{ .arith = .{ .op = .add, .lhs = m1, .rhs = v0 } });
+            if (atomic) {
+                try func.appendAtomicRmwStmt(block, .{ .op = .add, .ptr = p, .value = v0, .ordering = .relaxed, .scope = .device });
+            }
+            const m2 = try func.appendInst(block, i32_t, .{ .arith = .{ .op = .mul, .lhs = v1, .rhs = v1 } });
+            const a2 = try func.appendInst(block, i32_t, .{ .arith = .{ .op = .add, .lhs = m2, .rhs = v1 } });
+            const sum = try func.appendInst(block, i32_t, .{ .arith = .{ .op = .add, .lhs = a1, .rhs = a2 } });
+            func.setTerminator(block, .{ .ret = ir.function.Ret.one(sum) });
+            return block;
+        }
+    }.f;
+
+    // NEGATIVE CONTROL: with nothing between them, the second multiply hoists ahead of the
+    // first add, so the scheduler really does move an op across this distance.
+    {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const block = try build(&func, false);
+        try run(allocator, &func, registry.modelFor(.@"river-rc1.s"));
+        const insts = func.blockInsts(block);
+        try std.testing.expect(func.opcode(insts[0]) == .arith and func.opcode(insts[0]).arith.op == .mul);
+        try std.testing.expect(func.opcode(insts[1]) == .arith and func.opcode(insts[1]).arith.op == .mul);
+    }
+
+    // With the atomic between them the second multiply stays behind it: nothing crosses the
+    // atomic in either direction, and the atomic itself stays where it was.
+    {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const block = try build(&func, true);
+        try run(allocator, &func, registry.modelFor(.@"river-rc1.s"));
+        const insts = func.blockInsts(block);
+        var atomic_at: ?usize = null;
+        for (insts, 0..) |inst, i| {
+            if (func.opcode(inst) == .atomic_rmw) atomic_at = i;
+        }
+        try std.testing.expectEqual(@as(?usize, 2), atomic_at); // mul, add, atomic
+        // Both instructions after it are the second multiply-add pair.
+        try std.testing.expect(func.opcode(insts[3]) == .arith and func.opcode(insts[3]).arith.op == .mul);
+    }
 }

@@ -1231,6 +1231,10 @@ fn emitInst(
         // These IR ops exist for frontend and IR construction only. Wasm has no lowering
         // for them yet, a later task, mirroring `dot` and `matmul` above.
         .va_start, .va_arg, .va_end => return error.Unsupported,
+        // An atomic read-modify-write. The wasm threads proposal spells one
+        // (`i32.atomic.rmw.add` and its family), which this encoder does not build, and
+        // those instructions need a shared memory this module does not declare.
+        .atomic_rmw => return error.Unsupported,
         // A barrier synchronizes threads. This backend emits a single-threaded wasm
         // function, so there is nothing to synchronize and no honest lowering. A silent
         // drop, the way `prefetch` is dropped, would be a lie: a prefetch is only a hint,
@@ -1592,4 +1596,29 @@ test "a barrier is rejected, not dropped like a prefetch" {
     func.setTerminator(e, .{ .ret = ir.function.Ret.one(x) });
 
     try std.testing.expectError(error.Unsupported, selectFunction(a, &func, null));
+}
+
+test "an atomic is rejected, not dropped like a prefetch" {
+    // The wasm threads proposal spells an atomic read-modify-write, but this encoder does
+    // not build one and the module declares no shared memory. Both forms are refused: the
+    // reduction one would otherwise be the easy silent drop.
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |reading| {
+        var func = Function.init(a);
+        defer func.deinit();
+        const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+        const ptr_t = try func.types.ptrGlobal();
+        const e = try func.appendBlock();
+        const p = try func.appendBlockParam(e, ptr_t);
+        const x = try func.appendBlockParam(e, i32_t);
+        const rmw: ir.function.AtomicRmw = .{ .op = .add, .ptr = p, .value = x, .ordering = .relaxed, .scope = .device };
+        if (reading) {
+            _ = try func.appendAtomicRmw(e, rmw);
+        } else {
+            try func.appendAtomicRmwStmt(e, rmw);
+        }
+        func.setTerminator(e, .{ .ret = ir.function.Ret.one(x) });
+
+        try std.testing.expectError(error.Unsupported, selectFunction(a, &func, null));
+    }
 }

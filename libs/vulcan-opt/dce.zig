@@ -19,6 +19,10 @@ fn isPure(op: ir.function.Opcode) bool {
         .load, .store, .prefetch, .matmul, .@"if", .call, .call_indirect => false,
         // SM12 T3: mutate/read the `va_list` object at `list`, like `load`/`store` above.
         .va_start, .va_arg, .va_end => false,
+        // An atomic is a STORE as well as a load. Deleting one whose old value nobody
+        // reads loses the write, so the reduction form is kept as firmly as the reading
+        // form. This is the guard the optional result makes necessary.
+        .atomic_rmw => false,
         // A barrier synchronizes threads and fences memory. It produces no result, so a
         // purity rule keyed on an unused result would delete every one of them.
         .barrier => false,
@@ -32,6 +36,11 @@ pub fn countUses(func: *const Function, uses: []u32) void {
         const block: ir.function.Block = @enumFromInt(bi);
         for (func.blockInsts(block)) |inst| {
             switch (func.opcode(inst)) {
+                .atomic_rmw => |a| {
+                    uses[@intFromEnum(a.ptr)] += 1;
+                    uses[@intFromEnum(a.value)] += 1;
+                    if (a.compare) |c| uses[@intFromEnum(c)] += 1;
+                },
                 // A barrier uses no Value, so it adds no use count.
                 .iconst, .fconst, .fconst128, .alloca, .global_addr, .barrier => {},
                 .arith => |a| {
@@ -207,4 +216,41 @@ test "keeps a barrier even though it has no result to be used" {
     try std.testing.expect(!try run(allocator, &func, &analyses));
     try std.testing.expectEqual(@as(usize, 1), func.blockInsts(b).len);
     try std.testing.expect(func.opcode(func.blockInsts(b)[0]) == .barrier);
+}
+
+test "keeps both forms of an atomic, read result or not" {
+    // An atomic is a STORE as well as a load. The reduction form has no result to be used,
+    // and the reading form's result is deliberately left unread here: a purity rule keyed
+    // on an unused result would delete BOTH and lose two writes.
+    //
+    // The pure `arith` beside them is the control: it is also unused, and it IS deleted, so
+    // the pass really ran on this block.
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const b = try func.appendBlock();
+    const p = try func.appendBlockParam(b, ptr_t);
+    const x = try func.appendBlockParam(b, i32_t);
+    // `used` feeds the atomic and nothing else, so `countUses` must count an atomic's
+    // operands. If it does not, this pure multiply looks dead and its deletion leaves the
+    // atomic naming a value nothing defines.
+    const used = try func.appendInst(b, i32_t, .{ .arith = .{ .op = .mul, .lhs = x, .rhs = x } });
+    try func.appendAtomicRmwStmt(b, .{ .op = .add, .ptr = p, .value = used, .ordering = .relaxed, .scope = .device });
+    _ = try func.appendAtomicRmw(b, .{ .op = .bit_or, .ptr = p, .value = x, .ordering = .relaxed, .scope = .device });
+    _ = try func.appendInst(b, i32_t, .{ .arith = .{ .op = .sub, .lhs = x, .rhs = x } });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(x) });
+
+    var analyses = pass.Analyses{ .allocator = allocator, .func = &func };
+    defer analyses.deinit();
+    try std.testing.expect(try run(allocator, &func, &analyses)); // the dead subtract went
+
+    const insts = func.blockInsts(b);
+    try std.testing.expectEqual(@as(usize, 3), insts.len);
+    try std.testing.expect(func.opcode(insts[0]) == .arith); // the multiply the atomic uses
+    try std.testing.expectEqual(used, func.instResult(insts[0]).?);
+    try std.testing.expect(func.opcode(insts[1]) == .atomic_rmw);
+    try std.testing.expect(func.opcode(insts[2]) == .atomic_rmw);
 }

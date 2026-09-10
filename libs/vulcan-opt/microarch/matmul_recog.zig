@@ -375,6 +375,12 @@ fn recognizeNest(allocator: std.mem.Allocator, func: *const Function, info: *con
             for (func.blockInsts(b)) |inst| switch (func.opcode(inst)) {
                 // (c) a call inside the nest is an arbitrary side effect the tensor lowering cannot absorb.
                 .call, .call_indirect => return null,
+                // An atomic joins it. The rewrite ORPHANS every interior block and puts one
+                // `matmul` in their place, so a read-modify-write in the nest is deleted
+                // outright. Neither form may be absorbed: the reduction form has no result,
+                // so a rule keyed on an unused result would miss exactly the one that looks
+                // most droppable.
+                .atomic_rmw => return null,
                 else => {},
             };
         }
@@ -2650,4 +2656,49 @@ test "endian: a memory-accumulator nest whose init load is byte-order-tagged is 
     try std.testing.expect(!try run(allocator, &func, model));
     try std.testing.expectEqual(@as(usize, 0), countMatmuls(&func));
     try std.testing.expectEqual(@as(usize, 1), countTaggedAccesses(&func));
+}
+
+test "a nest holding an atomic is not raised to a matmul" {
+    // Raising the nest ORPHANS its three loops and puts one `matmul` op in their place, so an
+    // atomic anywhere inside is deleted outright. The reduction form is the one that matters:
+    // a rule keyed on an unused result would call it dead and absorb it.
+    //
+    // NEGATIVE CONTROL: the identical nest without the atomic IS raised, so the refusal comes
+    // from the atomic and not from the three extra instructions around it.
+    const allocator = std.testing.allocator;
+    const model = registry.modelFor(.@"et-soc");
+
+    var plain = Function.init(allocator);
+    defer plain.deinit();
+    try buildMatmulNest(&plain, .{ .m = 2, .n = 4, .k = 3 });
+    try std.testing.expect(try run(allocator, &plain, model));
+    try std.testing.expectEqual(@as(usize, 1), countMatmuls(&plain));
+
+    var func = Function.init(allocator);
+    defer func.deinit();
+    try buildMatmulNest(&func, .{ .m = 2, .n = 4, .k = 3 });
+    // The innermost body is the block that stores the accumulated element. Put a
+    // fire-and-forget counter increment there, built from its own operands so nothing about
+    // dominance changes.
+    const ptr_t = try func.types.ptrGlobal();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    var inner: ?Block = null;
+    for (0..func.blockCount()) |bi| {
+        for (func.blockInsts(@enumFromInt(bi))) |inst| {
+            if (func.opcode(inst) == .store) inner = @enumFromInt(bi);
+        }
+    }
+    const body = inner.?;
+    const counter = try func.appendInst(body, ptr_t, .{ .global_addr = .{ .symbol = try func.internSymbol("counter") } });
+    const one = try func.appendInst(body, i32_t, .{ .iconst = 1 });
+    try func.appendAtomicRmwStmt(body, .{ .op = .add, .ptr = counter, .value = one, .ordering = .relaxed, .scope = .device });
+
+    const blocks_before = func.blockCount();
+    const insts_before = func.instCount();
+    try std.testing.expect((try recognizeIn(allocator, &func)) == null);
+    try std.testing.expect(!try run(allocator, &func, model));
+    try std.testing.expectEqual(@as(usize, 0), countMatmuls(&func));
+    // Nothing was rewritten, so the atomic is still there.
+    try std.testing.expectEqual(blocks_before, func.blockCount());
+    try std.testing.expectEqual(insts_before, func.instCount());
 }

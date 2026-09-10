@@ -405,6 +405,11 @@ const FunctionParser = struct {
             } else if (std.mem.eql(u8, word, "barrier")) {
                 if (pending.items.len != 0) return error.InvalidSyntax;
                 try self.parseBarrier(block);
+            } else if (std.mem.eql(u8, word, "atomic_rmw")) {
+                // The reduction form: an atomic whose old value nobody reads. The reading
+                // form starts with `let`, so `parseLet` handles it instead.
+                if (pending.items.len != 0) return error.InvalidSyntax;
+                try self.func.appendAtomicRmwStmt(block, try self.parseAtomicRmw());
             } else if (std.mem.eql(u8, word, "call")) {
                 if (pending.items.len != 0) return error.InvalidSyntax;
                 try self.parseVoidCall(block);
@@ -600,6 +605,14 @@ const FunctionParser = struct {
             try self.recordValue(result);
             return result;
         }
+        if (std.mem.eql(u8, op, "atomic_rmw")) {
+            // The reading form: the old value is named, so the backend must keep it in a
+            // register. The result type comes from the value operand, which is where the
+            // printer leaves it.
+            const result = try self.func.appendAtomicRmw(block, try self.parseAtomicRmw());
+            try self.recordValue(result);
+            return result;
+        }
         if (std.mem.eql(u8, op, "global_addr")) {
             const via_got = self.tryWord("got");
             self.skipWs();
@@ -775,6 +788,44 @@ const FunctionParser = struct {
         const scope = std.meta.stringToEnum(function.BarrierScope, word) orelse
             return error.InvalidSyntax;
         try self.func.appendBarrier(block, scope);
+    }
+
+    /// Parse the body of an atomic read-modify-write, after the `atomic_rmw` word:
+    /// `<op> <scope> <ordering> vPTR, vVALUE` plus `, vCOMPARE` for the compare-exchange
+    /// form. Shared by the reduction statement and the `let` reading form, so the two
+    /// spellings can never drift apart.
+    ///
+    /// No result type is read, because none is printed: the result type is the value
+    /// operand's type, and the caller of the reading form takes it from there.
+    fn parseAtomicRmw(self: *FunctionParser) Error!function.AtomicRmw {
+        // Each of the three words is UNTRUSTED text, so an unknown one is a parse error
+        // and never an invalid enum.
+        self.skipWs();
+        const op = std.meta.stringToEnum(function.AtomicOp, self.readWord()) orelse
+            return error.InvalidSyntax;
+        self.skipWs();
+        const scope = std.meta.stringToEnum(function.AtomicScope, self.readWord()) orelse
+            return error.InvalidSyntax;
+        self.skipWs();
+        const ordering = std.meta.stringToEnum(function.AtomicOrdering, self.readWord()) orelse
+            return error.InvalidSyntax;
+        self.skipWs();
+        const ptr = try self.parseValueRef();
+        self.skipWs();
+        try self.eat(',');
+        self.skipWs();
+        const value = try self.parseValueRef();
+        // The compare operand is present for exactly one operation, so its presence is
+        // read from the operation and not guessed from the text. A trailing operand on
+        // any other operation is then a syntax error, which is what it should be.
+        var compare: ?Value = null;
+        if (op == .compare_exchange) {
+            self.skipWs();
+            try self.eat(',');
+            self.skipWs();
+            compare = try self.parseValueRef();
+        }
+        return .{ .op = op, .ptr = ptr, .value = value, .compare = compare, .ordering = ordering, .scope = scope };
     }
 
     /// Parse a void call statement: `call @name(args)` with its trailing extras.
@@ -1653,4 +1704,157 @@ test "a barrier verifies clean and keeps its scope through a clone" {
         function.BarrierScope.workgroup,
         copy.opcode(insts[0]).barrier.scope,
     );
+}
+
+test "round-trips the three atomic spellings" {
+    // All three forms in one function, so a printer or parser that handles one and not
+    // another fails here. The reduction form (no `let`) is the one an earlier hand-kept
+    // result-less list would have lost.
+    const text =
+        \\fn {
+        \\  block0(v0: ptr, v1: i32, v2: i32):
+        \\    let v3 = atomic_rmw add device seq_cst v0, v1
+        \\    atomic_rmw bit_or system relaxed v0, v1
+        \\    let v4 = atomic_rmw compare_exchange workgroup acquire v0, v1, v2
+        \\    ret v3
+        \\}
+    ;
+
+    var func = try parse(std.testing.allocator, text);
+    defer func.deinit();
+
+    try std.testing.expectFmt(text, "{f}", .{func});
+}
+
+test "an atomic round-trips FIELD BY FIELD through the text form" {
+    // The printed text is not the oracle here: a field the printer never prints would
+    // round-trip perfectly and still be lost. Each field is read back off the rebuilt IR.
+    const text =
+        \\fn {
+        \\  block0(v0: ptr, v1: i32, v2: i32):
+        \\    let v3 = atomic_rmw compare_exchange device acq_rel v0, v1, v2
+        \\    atomic_rmw max workgroup release v0, v1
+        \\    ret v3
+        \\}
+    ;
+    var func = try parse(std.testing.allocator, text);
+    defer func.deinit();
+
+    const entry: Block = @enumFromInt(0);
+    const params = func.blockParams(entry);
+    const insts = func.blockInsts(entry);
+
+    const cas = func.opcode(insts[0]).atomic_rmw;
+    try std.testing.expectEqual(function.AtomicOp.compare_exchange, cas.op);
+    try std.testing.expectEqual(function.AtomicScope.device, cas.scope);
+    try std.testing.expectEqual(function.AtomicOrdering.acq_rel, cas.ordering);
+    try std.testing.expectEqual(params[0], cas.ptr);
+    try std.testing.expectEqual(params[1], cas.value);
+    try std.testing.expectEqual(params[2], cas.compare.?);
+    // The reading form's result type is the value operand's type, which is where the
+    // printer leaves it.
+    const result = func.instResult(insts[0]).?;
+    try std.testing.expectEqual(func.valueType(params[1]), func.valueType(result));
+
+    const red = func.opcode(insts[1]).atomic_rmw;
+    try std.testing.expectEqual(function.AtomicOp.max, red.op);
+    try std.testing.expectEqual(function.AtomicScope.workgroup, red.scope);
+    try std.testing.expectEqual(function.AtomicOrdering.release, red.ordering);
+    try std.testing.expectEqual(@as(?Value, null), red.compare);
+    try std.testing.expectEqual(@as(?Value, null), func.instResult(insts[1]));
+}
+
+test "an unknown atomic word is a parse error, not an invalid enum" {
+    // Suspicious case: the text is untrusted, so stringToEnum must reject each word rather
+    // than build an out-of-range tag every later exhaustive switch reads as undefined.
+    //
+    // The accepted control below is what makes the three refusals mean anything: every
+    // other token is identical, so each refusal comes from the word it changed.
+    const allocator = std.testing.allocator;
+    var good = try parse(allocator, "fn {\n  block0(v0: ptr, v1: i32):\n    atomic_rmw add device seq_cst v0, v1\n    ret v1\n}");
+    good.deinit();
+
+    const bad_op = "fn {\n  block0(v0: ptr, v1: i32):\n    atomic_rmw nonsense device seq_cst v0, v1\n    ret v1\n}";
+    try std.testing.expectError(error.InvalidSyntax, parse(allocator, bad_op));
+    const bad_scope = "fn {\n  block0(v0: ptr, v1: i32):\n    atomic_rmw add nonsense seq_cst v0, v1\n    ret v1\n}";
+    try std.testing.expectError(error.InvalidSyntax, parse(allocator, bad_scope));
+    const bad_order = "fn {\n  block0(v0: ptr, v1: i32):\n    atomic_rmw add device nonsense v0, v1\n    ret v1\n}";
+    try std.testing.expectError(error.InvalidSyntax, parse(allocator, bad_order));
+    // A compare-exchange without its third operand: the compare operand is required by the
+    // operation, not guessed from the text.
+    const short_cas = "fn {\n  block0(v0: ptr, v1: i32):\n    atomic_rmw compare_exchange device seq_cst v0, v1\n    ret v1\n}";
+    try std.testing.expectError(error.InvalidSyntax, parse(allocator, short_cas));
+}
+
+test "an atomic verifies clean and keeps every field through a clone" {
+    const verify = @import("verify.zig");
+    const text =
+        \\fn {
+        \\  block0(v0: ptr, v1: i32, v2: i32):
+        \\    let v3 = atomic_rmw compare_exchange system acquire v0, v1, v2
+        \\    atomic_rmw add device relaxed v0, v1
+        \\    ret v3
+        \\}
+    ;
+    var func = try parse(std.testing.allocator, text);
+    defer func.deinit();
+
+    var diags = try verify.verify(std.testing.allocator, &func, .high);
+    defer diags.deinit();
+    try std.testing.expect(diags.ok());
+
+    var copy = try func.clone(std.testing.allocator);
+    defer copy.deinit();
+    const insts = copy.blockInsts(@enumFromInt(0));
+    const params = copy.blockParams(@enumFromInt(0));
+    const cas = copy.opcode(insts[0]).atomic_rmw;
+    try std.testing.expectEqual(function.AtomicOp.compare_exchange, cas.op);
+    try std.testing.expectEqual(function.AtomicScope.system, cas.scope);
+    try std.testing.expectEqual(function.AtomicOrdering.acquire, cas.ordering);
+    try std.testing.expectEqual(params[0], cas.ptr);
+    try std.testing.expectEqual(params[1], cas.value);
+    try std.testing.expectEqual(params[2], cas.compare.?);
+    // The clone keeps the reduction form result-less.
+    try std.testing.expectEqual(@as(?Value, null), copy.instResult(insts[1]));
+}
+
+test "verify rejects each broken atomic operand shape" {
+    // The accepted control comes first: every rejected function below differs from it in
+    // exactly one operand, so each diagnostic comes from that operand.
+    const verify = @import("verify.zig");
+    const allocator = std.testing.allocator;
+
+    const cases = [_]struct { text: []const u8, ok: bool }{
+        // Control: a well-formed add and a well-formed compare-exchange.
+        .{ .text = "fn {\n  block0(v0: ptr, v1: i32, v2: i32):\n    let v3 = atomic_rmw add device seq_cst v0, v1\n    let v4 = atomic_rmw compare_exchange device seq_cst v0, v1, v2\n    ret v3\n}", .ok = true },
+        // The address is not a pointer.
+        .{ .text = "fn {\n  block0(v0: i32, v1: i32):\n    let v2 = atomic_rmw add device seq_cst v0, v1\n    ret v2\n}", .ok = false },
+        // The operand is a float, so the operation has no integer type to run on.
+        .{ .text = "fn {\n  block0(v0: ptr, v1: f32):\n    let v2 = atomic_rmw add device seq_cst v0, v1\n    ret v2\n}", .ok = false },
+        // A compare operand on an operation that has none: the backend would ignore it.
+        .{ .text = "fn {\n  block0(v0: ptr, v1: i32, v2: i32):\n    let v3 = atomic_rmw add device seq_cst v0, v1, v2\n    ret v3\n}", .ok = false },
+        // The compare operand's type does not match the value operand's.
+        .{ .text = "fn {\n  block0(v0: ptr, v1: i32, v2: i64):\n    let v3 = atomic_rmw compare_exchange device seq_cst v0, v1, v2\n    ret v3\n}", .ok = false },
+    };
+
+    for (cases, 0..) |c, i| {
+        var func = parse(allocator, c.text) catch |err| {
+            // The `add` with a trailing operand is refused by the parser, which is a
+            // stricter answer than the verifier's and just as correct.
+            try std.testing.expect(!c.ok);
+            try std.testing.expectEqual(error.InvalidSyntax, err);
+            continue;
+        };
+        defer func.deinit();
+        var diags = try verify.verify(allocator, &func, .high);
+        defer diags.deinit();
+        if (c.ok) {
+            try std.testing.expect(diags.ok());
+        } else {
+            std.testing.expect(!diags.ok()) catch |err| {
+                std.debug.print("case {d} verified clean but should not have\n", .{i});
+                return err;
+            };
+        }
+    }
 }

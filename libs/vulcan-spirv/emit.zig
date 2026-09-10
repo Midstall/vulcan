@@ -915,6 +915,10 @@ const Emitter = struct {
             // SPIR-V has no variadic argument model at all.
             .va_start,
             .va_end,
+            // An atomic is `OpAtomicIAdd` and its family, each of which needs a pointer id
+            // this emitter cannot build. The RESULT-LESS form is the one that reaches here,
+            // and it is exactly the one a silent drop would delete without a trace.
+            .atomic_rmw,
             // A barrier is `OpControlBarrier`. Dropping one deletes the synchronization
             // point that the opcode exists to state.
             .barrier,
@@ -1590,4 +1594,23 @@ test "prefetch, matmul and the va_* statements are refused, not silently dropped
 
         try testing.expectError(error.UnsupportedConstruct, emitModule(allocator, &func, "stmt"));
     }
+}
+
+test "an atomic is refused, not silently dropped" {
+    // `emitInst` routes every result-less instruction to `statementError`. Without an arm
+    // for the atomic the switch would not compile; with a silent drop the module would lose
+    // a write with no diagnostic, which is the exact failure a first-class opcode prevents.
+    const allocator = testing.allocator;
+
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const b = try func.appendBlock();
+    const p = try func.appendBlockParam(b, ptr_t);
+    const x = try func.appendBlockParam(b, i32_t);
+    try func.appendAtomicRmwStmt(b, .{ .op = .add, .ptr = p, .value = x, .ordering = .relaxed, .scope = .device });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(x) });
+
+    try testing.expectError(error.UnsupportedConstruct, emitModule(allocator, &func, "counter"));
 }

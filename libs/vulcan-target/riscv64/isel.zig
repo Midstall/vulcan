@@ -1909,6 +1909,13 @@ fn countUses(func: *const Function, v: Value) usize {
 fn usesInInst(func: *const Function, inst: ir.function.Inst, v: Value) usize {
     var c: usize = 0;
     switch (func.opcode(inst)) {
+        .atomic_rmw => |a| {
+            if (a.ptr == v) c += 1;
+            if (a.value == v) c += 1;
+            if (a.compare) |cv| {
+                if (cv == v) c += 1;
+            }
+        },
         // A barrier reads no Value operand.
         .iconst, .fconst, .fconst128, .alloca, .global_addr, .barrier => {},
         .arith => |a| {
@@ -7831,4 +7838,28 @@ test "a barrier is rejected, not dropped like a prefetch" {
     func.setTerminator(e, .{ .ret = ir.function.Ret.one(x) });
 
     try std.testing.expectError(error.Unsupported, selectFunction(allocator, &func));
+}
+
+test "an atomic is rejected, not dropped like a prefetch" {
+    // This backend emits no A-extension instruction, so there is no honest lowering. Both
+    // IR forms are refused, and refusing must not be a panic.
+    const allocator = std.testing.allocator;
+    for ([_]bool{ false, true }) |reading| {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+        const ptr_t = try func.types.ptrGlobal();
+        const e = try func.appendBlock();
+        const p = try func.appendBlockParam(e, ptr_t);
+        const x = try func.appendBlockParam(e, i32_t);
+        const rmw: ir.function.AtomicRmw = .{ .op = .add, .ptr = p, .value = x, .ordering = .relaxed, .scope = .device };
+        if (reading) {
+            _ = try func.appendAtomicRmw(e, rmw);
+        } else {
+            try func.appendAtomicRmwStmt(e, rmw);
+        }
+        func.setTerminator(e, .{ .ret = ir.function.Ret.one(x) });
+
+        try std.testing.expectError(error.Unsupported, selectFunction(allocator, &func));
+    }
 }

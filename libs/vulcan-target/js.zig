@@ -285,6 +285,10 @@ const Emitter = struct {
             .dot => return error.Unsupported,
             // matmul is et-soc-only (a later task). The JS backend has no lowering for it.
             .matmul => return error.Unsupported,
+            // An atomic read-modify-write. This backend emits single-threaded JS over plain
+            // numbers, not a SharedArrayBuffer, so `Atomics.add` has nothing to apply to. A
+            // plain read-modify-write would run and would not be atomic.
+            .atomic_rmw => return error.Unsupported,
             // A barrier synchronizes threads. This backend emits single-threaded JS, so
             // there is nothing to synchronize and no honest lowering: a silent no-op would
             // be a lie about what the code does.
@@ -751,4 +755,21 @@ test "a barrier is rejected, not emitted as a silent no-op" {
     func.setTerminator(entry, .{ .ret = ir.function.Ret.one(x) });
 
     try std.testing.expectError(error.Unsupported, emitFunction(std.testing.allocator, &func, "sync"));
+}
+
+test "an atomic is rejected, not emitted as a plain read-modify-write" {
+    // This backend emits single-threaded JS over plain numbers, not a SharedArrayBuffer, so
+    // `Atomics.add` has nothing to apply to and an ordinary read-modify-write would not be
+    // atomic.
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const entry = try func.appendBlock();
+    const p = try func.appendBlockParam(entry, ptr_t);
+    const x = try func.appendBlockParam(entry, i32_t);
+    try func.appendAtomicRmwStmt(entry, .{ .op = .add, .ptr = p, .value = x, .ordering = .relaxed, .scope = .device });
+    func.setTerminator(entry, .{ .ret = ir.function.Ret.one(x) });
+
+    try std.testing.expectError(error.Unsupported, emitFunction(std.testing.allocator, &func, "counter"));
 }

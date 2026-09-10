@@ -439,6 +439,7 @@ fn usesValue(func: *const Function, inst: Inst, v: Value) bool {
         .unary => |u| u.value == v,
         .load => |l| l.ptr == v,
         .store => |s| s.value == v or s.ptr == v,
+        .atomic_rmw => |a| a.ptr == v or a.value == v or (a.compare != null and a.compare.? == v),
         .prefetch => |p| p.ptr == v,
         .dot => |d| d.acc == v or d.a == v or d.b == v,
         .matmul => |m| m.a == v or m.b == v or m.c == v,
@@ -534,6 +535,10 @@ fn recognizeReduction(func: *const Function, model: *const mm.Model, loop: *cons
     if (in_loop_blocks != 2) return null;
     const bodyb = body orelse return null;
     for (func.blockInsts(bodyb)) |inst| switch (func.opcode(inst)) {
+        // An atomic joins them, for both reasons at once: vectorizing by V would run V
+        // times fewer read-modify-writes, and `applyReduction` does not clone this body at
+        // all, so the write would happen only in the scalar remainder.
+        .atomic_rmw,
         // A barrier joins them: vectorizing by V divides the trip count by V, so the loop
         // would meet V times fewer than the source says.
         //
@@ -1120,4 +1125,37 @@ test "endian: a reduction over a byte-order-tagged load is not widened" {
     defer info.deinit(allocator);
     try testing.expect(recognizeReduction(&func, model, &info.loops[0], false) == null);
     try testing.expect(func.isByteOrderTagged(func.blockInsts(body)[2]));
+}
+
+test "a reduction body holding an atomic is declined" {
+    // `applyReduction` BUILDS a new main body instead of cloning this one, and it divides the
+    // trip count by V. An atomic in the body would then run only in the scalar remainder,
+    // which is V times fewer read-modify-writes than the source asks for.
+    //
+    // NEGATIVE CONTROL: the same loop without the atomic IS recognized, so the filter
+    // declines the atomic and nothing else.
+    const allocator = testing.allocator;
+    const model = registry.modelFor(.@"ampere-altra");
+
+    var plain = Function.init(allocator);
+    defer plain.deinit();
+    try buildIntReduction(&plain, false);
+    var plain_info = try loops.analyze(allocator, &plain);
+    defer plain_info.deinit(allocator);
+    try testing.expect(recognizeReduction(&plain, model, &plain_info.loops[0], false) != null);
+
+    var func = Function.init(allocator);
+    defer func.deinit();
+    try buildIntReduction(&func, false);
+    // The same body plus one atomic increment of the second pointer, changing nothing else.
+    const body: Block = @enumFromInt(2);
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const entry: Block = @enumFromInt(0);
+    const b_ptr = func.blockParams(entry)[1];
+    const one = try func.appendInst(body, i32_t, .{ .iconst = 1 });
+    try func.appendAtomicRmwStmt(body, .{ .op = .add, .ptr = b_ptr, .value = one, .ordering = .relaxed, .scope = .device });
+
+    var info = try loops.analyze(allocator, &func);
+    defer info.deinit(allocator);
+    try testing.expect(recognizeReduction(&func, model, &info.loops[0], false) == null);
 }

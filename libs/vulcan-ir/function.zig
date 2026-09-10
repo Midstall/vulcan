@@ -335,6 +335,106 @@ pub const BarrierScope = enum {
 /// machine code, so a weaker order has no spelling to lower to.
 pub const Barrier = struct { scope: BarrierScope };
 
+/// The read-modify-write an `atomic_rmw` applies to the value already in memory.
+///
+/// Each name maps onto one NVIDIA `encode.AtomOp` with no gaps, so a backend needs no
+/// table of exceptions. `inc` and `dec` (the wrapping counters) are deliberately absent:
+/// no frontend spells them, and an operation the IR cannot build is an operation no
+/// backend must lower.
+///
+/// Signedness and width are NOT part of this enum. They come from the value operand's
+/// type, which is the only place they can stay consistent with the result type.
+///
+/// Encoded as one byte in bitcode, so the tag values are pinned there.
+pub const AtomicOp = enum {
+    /// Add the value operand.
+    add,
+    /// Keep the smaller of the two, compared as the value operand's type.
+    min,
+    /// Keep the larger of the two, compared as the value operand's type.
+    max,
+    bit_and,
+    bit_or,
+    bit_xor,
+    /// Write the value operand and give back the old value.
+    exchange,
+    /// Write the value operand only if memory holds `compare`, and give back the old
+    /// value either way. This is the ONE operation that reads the `compare` operand.
+    compare_exchange,
+};
+
+/// How strongly an `atomic_rmw` orders the memory operations around it.
+///
+/// A backend may lower a weak order with a STRONGER instruction, because more ordering
+/// than the program asked for is always correct. A backend must never lower a strong
+/// order with a weaker instruction.
+///
+/// Encoded as one byte in bitcode, so the tag values are pinned there.
+pub const AtomicOrdering = enum {
+    /// Atomic, and nothing more. No memory operation around it is ordered.
+    relaxed,
+    /// No later memory operation moves before this one.
+    acquire,
+    /// No earlier memory operation moves after this one.
+    release,
+    /// Both of the two above.
+    acq_rel,
+    /// Both of the two above, plus a single total order over every `seq_cst` operation.
+    seq_cst,
+};
+
+/// The set of threads an `atomic_rmw` is atomic with respect to.
+///
+/// The scope is part of the operation from its first version, for the reason
+/// `BarrierScope` states: a scope-less operation needs a breaking change to every layer
+/// the moment a second scope arrives, and a backend that lowers only one of them can
+/// refuse the others only if the operation says which one it is.
+///
+/// Encoded as one byte in bitcode, so the tag values are pinned there.
+pub const AtomicScope = enum {
+    /// The threads of one workgroup (the CUDA block, the NVIDIA CTA).
+    workgroup,
+    /// Every thread on the device.
+    device,
+    /// Every thread on the device, plus the host and the peer devices.
+    system,
+};
+
+/// An atomic read-modify-write of the memory at `ptr`: read the value there, apply `op`
+/// to it with `value` (and `compare`, for `compare_exchange`), write the answer back, and
+/// give back the OLD value. EFFECTFUL, and BOTH a load and a store of `ptr`.
+///
+/// This is a first-class operation and not a recognised call for a stronger reason than
+/// the barrier has. Every pass that could break it reads opcode STRUCTURE, not call
+/// side-effect metadata: `gvn` must not common two atomics on one address, `licm` must
+/// not hoist one out of a loop, `dce` must not delete one whose result nobody reads,
+/// `loadfwd` must not forward a store across one, and `addrfold` must not fold an offset
+/// into one while the encoders leave their immediate offset field at zero.
+///
+/// The RESULT IS OPTIONAL, and this is the design decision the barrier did not have. An
+/// atomic whose old value nobody reads lowers to a reduction (NVIDIA `RED`), which writes
+/// no register and so claims no scoreboard; one whose old value is read lowers to the
+/// full form (`ATOMG`), which claims one. A GPU has six scoreboards, so forcing a result
+/// and trusting `dce` to notice nobody reads it would lose one on every fire-and-forget
+/// counter increment. The optional result needs no new field here: `InstData.result` is
+/// already `?Value`, so `appendAtomicRmw` builds the reading form and
+/// `appendAtomicRmwStmt` the reduction form, and `instResult` tells them apart.
+///
+/// The address space rides in `ptr`'s type, exactly as it does for `load` and `store`, so
+/// a backend picks its shared-memory form from the pointer and needs no new attribute.
+pub const AtomicRmw = struct {
+    op: AtomicOp,
+    /// The address. Must be a `ptr`.
+    ptr: Value,
+    /// The operand the read-modify-write applies. Must be an integer, and the result (when
+    /// there is one) has this same type.
+    value: Value,
+    /// The expected value, for `compare_exchange` ONLY. Null for every other operation,
+    /// and non-null for that one. `verify` enforces both halves.
+    compare: ?Value = null,
+    ordering: AtomicOrdering,
+    scope: AtomicScope,
+};
 /// A run of values in the function's value-list pool, used for variadic operands
 /// like the arguments passed across a control-flow edge.
 pub const ValueList = struct { start: u32, len: u32 };
@@ -491,6 +591,9 @@ pub const Opcode = union(enum) {
     /// An execution and memory barrier over a scope. Produces no result. EFFECTFUL.
     /// See `Barrier` for why this is an opcode and not a call.
     barrier: Barrier,
+    /// An atomic read-modify-write. Produces the OLD value, or no result at all when
+    /// nobody reads it. EFFECTFUL, and both a load and a store of `ptr`. See `AtomicRmw`.
+    atomic_rmw: AtomicRmw,
     /// A non-terminating conditional. Produces no result in its statement form.
     @"if": If,
 };
@@ -982,6 +1085,21 @@ pub const Function = struct {
         try self.appendStmt(block, .{ .barrier = .{ .scope = scope } });
     }
 
+    /// Append an atomic read-modify-write whose OLD value is read, returning that value.
+    /// The result type is the value operand's type, so the two can never disagree.
+    /// EFFECTFUL, and both a load and a store of `rmw.ptr`. See `AtomicRmw`.
+    pub fn appendAtomicRmw(self: *Function, block: Block, rmw: AtomicRmw) std.mem.Allocator.Error!Value {
+        return self.appendInst(block, self.valueType(rmw.value), .{ .atomic_rmw = rmw });
+    }
+
+    /// Append an atomic read-modify-write whose old value NOBODY reads: the reduction
+    /// form. No result. Build this one, and not `appendAtomicRmw` plus a dead result, when
+    /// the frontend knows the old value is unused: a GPU backend lowers it to an
+    /// instruction that writes no register and so claims no scoreboard. See `AtomicRmw`.
+    pub fn appendAtomicRmwStmt(self: *Function, block: Block, rmw: AtomicRmw) std.mem.Allocator.Error!void {
+        try self.appendStmt(block, .{ .atomic_rmw = rmw });
+    }
+
     /// Append an INT8 4-way dot-product accumulate: `result = acc + dot(a, b)`.
     /// Pure, like `arith`. The result type is `acc`'s type.
     pub fn appendDot(self: *Function, block: Block, acc: Value, a: Value, b: Value) std.mem.Allocator.Error!Value {
@@ -1279,6 +1397,13 @@ pub const Function = struct {
                     mm.b = r(from, to, mm.b);
                     mm.c = r(from, to, mm.c);
                 },
+                .atomic_rmw => |*a| {
+                    a.ptr = r(from, to, a.ptr);
+                    a.value = r(from, to, a.value);
+                    // The compare operand exists only in the compare-exchange form, and it is
+                    // a Value like the other two when it does exist.
+                    if (a.compare) |*c| c.* = r(from, to, c.*);
+                },
                 .struct_new => |sn| for (self.valueListMut(sn.fields)) |*f| {
                     f.* = r(from, to, f.*);
                 },
@@ -1545,6 +1670,15 @@ pub const Function = struct {
                 remapped.b = remapValue(map, mm.b);
                 remapped.c = remapValue(map, mm.c);
                 break :blk .{ .matmul = remapped };
+            },
+            .atomic_rmw => |a| blk: {
+                // Only ptr/value/compare are Values. The operation, ordering and scope are
+                // compile-time metadata, copied unchanged, like matmul above.
+                var remapped = a;
+                remapped.ptr = remapValue(map, a.ptr);
+                remapped.value = remapValue(map, a.value);
+                if (a.compare) |c| remapped.compare = remapValue(map, c);
+                break :blk .{ .atomic_rmw = remapped };
             },
             .@"if" => |cond| .{ .@"if" = .{
                 .cond = remapValue(map, cond.cond),
@@ -2004,6 +2138,22 @@ fn printInst(self: *const Function, w: *std.Io.Writer, inst: Inst) std.Io.Writer
             self.valueName(va.list),
         }),
         .va_end => |ve| try w.print("va_end v{d}", .{self.valueName(ve.list)}),
+        // `atomic_rmw <op> <scope> <ordering> vPTR, vVALUE[, vCOMPARE]`, with a leading
+        // `let vN = ` when the old value is read. The result type is NOT printed: it is
+        // always the value operand's type, so printing it would be a second spelling of
+        // one fact, and the two could disagree. The compare operand prints last and only
+        // for the compare-exchange form, which is the only form that has one.
+        .atomic_rmw => |a| {
+            if (data.result) |res| try w.print("let v{d} = ", .{self.valueName(res)});
+            try w.print("atomic_rmw {s} {s} {s} v{d}, v{d}", .{
+                @tagName(a.op),
+                @tagName(a.scope),
+                @tagName(a.ordering),
+                self.valueName(a.ptr),
+                self.valueName(a.value),
+            });
+            if (a.compare) |c| try w.print(", v{d}", .{self.valueName(c)});
+        },
         // A result-less statement, printed the same way as `prefetch` and `va_end`: the
         // mnemonic and its one operand. The operand here is the scope name, not a value.
         .barrier => |bar| try w.print("barrier {s}", .{@tagName(bar.scope)}),

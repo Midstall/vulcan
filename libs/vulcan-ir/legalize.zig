@@ -326,6 +326,10 @@ fn isPure(op: function.Opcode) bool {
         .load, .store, .prefetch, .matmul, .@"if", .call, .call_indirect => false,
         // These mutate or read the `va_list` object at `list`, like `load`/`store` above.
         .va_start, .va_arg, .va_end => false,
+        // An atomic is a STORE as well as a load, so it is never pure. Its result is
+        // optional, and the reduction form must be kept just as firmly as the reading
+        // form: dropping it loses the write, not only the old value.
+        .atomic_rmw => false,
         // A barrier synchronizes threads and fences memory. It has no result, so a purity
         // rule keyed on an unused result would drop it. It is effectful.
         .barrier => false,
@@ -378,6 +382,11 @@ fn applySubst(func: *Function, subst: *const Subst) void {
     for (0..func.instCount()) |i| {
         const op = func.opcodeMut(@enumFromInt(i));
         switch (op.*) {
+            .atomic_rmw => |*a| {
+                a.ptr = sub(subst, a.ptr);
+                a.value = sub(subst, a.value);
+                if (a.compare) |*c| c.* = sub(subst, c.*);
+            },
             // A barrier carries no Value operand, so it joins the constants here.
             .iconst, .fconst, .fconst128, .alloca, .global_addr, .barrier => {},
             .arith => |*a| {
@@ -485,6 +494,11 @@ fn countUses(func: *const Function, uses: []u32) void {
         const block: function.Block = @enumFromInt(bi);
         for (func.blockInsts(block)) |inst| {
             switch (func.opcode(inst)) {
+                .atomic_rmw => |a| {
+                    uses[@intFromEnum(a.ptr)] += 1;
+                    uses[@intFromEnum(a.value)] += 1;
+                    if (a.compare) |c| uses[@intFromEnum(c)] += 1;
+                },
                 // A barrier carries no Value operand, so it joins the constants here.
                 .iconst, .fconst, .fconst128, .alloca, .global_addr, .barrier => {},
                 .arith => |a| {

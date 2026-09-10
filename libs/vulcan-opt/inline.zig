@@ -225,6 +225,18 @@ fn mapOpcode(caller: *Function, callee: *const Function, vmap: std.AutoHashMapUn
         // fail the `scalar` gate today, so this is unreachable in practice, but the
         // remap is here so a future vector-aware inline path needs no new wiring.)
         .dot => |d| .{ .dot = .{ .acc = m(vmap, d.acc), .a = m(vmap, d.a), .b = m(vmap, d.b) } },
+        // Inlining an atomic is a straight code move: the caller runs it exactly as often
+        // as the callee did, so the count of read-modify-writes is unchanged. Only the
+        // three operands need remapping; the operation, ordering and scope copy unchanged.
+        // The reduction form never reaches here (`inlinable` refuses a result-less
+        // instruction); the multi-block path builds that one itself.
+        .atomic_rmw => |a| blk: {
+            var mapped = a;
+            mapped.ptr = m(vmap, a.ptr);
+            mapped.value = m(vmap, a.value);
+            if (a.compare) |c| mapped.compare = m(vmap, c);
+            break :blk .{ .atomic_rmw = mapped };
+        },
         // Excluded by `inlinable`: these never reach here. `va_start`/`va_arg`/`va_end` are
         // excluded by `inlinable`'s `callee.is_variadic` guard (SM12 T3) - a variadic callee
         // is never considered inlinable at all, so these three never reach here either.
@@ -245,6 +257,11 @@ fn substituteValue(func: *Function, from: Value, to: Value) void {
     for (0..func.instCount()) |i| {
         const op = func.opcodeMut(@enumFromInt(i));
         switch (op.*) {
+            .atomic_rmw => |*a| {
+                a.ptr = r(from, to, a.ptr);
+                a.value = r(from, to, a.value);
+                if (a.compare) |*c| c.* = r(from, to, c.*);
+            },
             // A barrier carries no Value operand to substitute.
             .iconst, .fconst, .fconst128, .alloca, .global_addr, .barrier => {},
             .arith => |*a| {
@@ -333,6 +350,9 @@ fn inlinableMulti(callee: *const Function) bool {
             .@"if" => {}, // control flow, cloned in a later pass
             .store => |st| _ = st, // yields no value, cloned in a later pass
             .prefetch => |pf| _ = pf, // yields no value, cloned in a later pass
+            // Either form is fine: the reading one has a result, the reduction one has
+            // none, and the clone loop below builds whichever it finds.
+            .atomic_rmw => |a| _ = a,
             .matmul => |mm| _ = mm, // yields no value, cloned in a later pass
             .alloca => |al| if (!scalar(callee, al.elem)) return false,
             else => {
@@ -476,6 +496,24 @@ fn inlineCallMulti(allocator: std.mem.Allocator, caller: *Function, bi: u32, cal
             .prefetch => |pf| {
                 try caller.appendPrefetch(nb, mapV(vmap, pf.ptr));
                 try inst_pairs.append(allocator, .{ .old = cinst, .new = lastInst(caller, nb) });
+            },
+            // The result is OPTIONAL, so this arm cannot go through the `else` below,
+            // which unwraps a result that a reduction-form atomic does not have. Build
+            // whichever form the callee held.
+            .atomic_rmw => |a| {
+                var mapped = a;
+                mapped.ptr = mapV(vmap, a.ptr);
+                mapped.value = mapV(vmap, a.value);
+                if (a.compare) |c| mapped.compare = mapV(vmap, c);
+                if (callee.instResult(cinst)) |cres| {
+                    const nres = try caller.appendAtomicRmw(nb, mapped);
+                    try vmap.put(allocator, cres, nres);
+                    try value_pairs.append(allocator, .{ .old = cres, .new = nres });
+                    try inst_pairs.append(allocator, .{ .old = cinst, .new = caller.definingInst(nres).? });
+                } else {
+                    try caller.appendAtomicRmwStmt(nb, mapped);
+                    try inst_pairs.append(allocator, .{ .old = cinst, .new = lastInst(caller, nb) });
+                }
             },
             // A `per_column` scale's ScaleList handle (and a bias's BiasList handle) is relative to
             // the CALLEE's pools, which is meaningless in the caller (a different function, different
@@ -1020,4 +1058,135 @@ test "inlining carries a parameter and a store attribute onto the clone (multi-b
     try std.testing.expectEqual(@as(usize, 0), testAttrCount(&caller, .{ .value = dst }));
     try std.testing.expectEqual(@as(usize, 0), testAttrCount(&caller, .{ .value = src }));
     try std.testing.expectEqual(@as(usize, 0), testAttrCount(&caller, .func));
+}
+
+test "inlining an atomic keeps every field, on the single-block path" {
+    // Inlining an atomic is a straight code move: the caller runs it exactly as often as the
+    // callee did. `mapOpcode` must remap all three operands and copy the operation, ordering
+    // and scope, and it must not reach the `unreachable` arm.
+    const allocator = std.testing.allocator;
+    const i32k = ir.types.TypeKind{ .int = .{ .signedness = .signed, .bits = 32 } };
+
+    // callee cas(p, desired, expected): return atomic compare-exchange
+    var callee = Function.init(allocator);
+    defer callee.deinit();
+    {
+        const t = try callee.types.intern(i32k);
+        const ptr_t = try callee.types.ptrGlobal();
+        const b = try callee.appendBlock();
+        const p = try callee.appendBlockParam(b, ptr_t);
+        const desired = try callee.appendBlockParam(b, t);
+        const expected = try callee.appendBlockParam(b, t);
+        const old = try callee.appendAtomicRmw(b, .{
+            .op = .compare_exchange,
+            .ptr = p,
+            .value = desired,
+            .compare = expected,
+            .ordering = .acq_rel,
+            .scope = .system,
+        });
+        callee.setTerminator(b, .{ .ret = ir.function.Ret.one(old) });
+    }
+
+    var caller = Function.init(allocator);
+    defer caller.deinit();
+    const t = try caller.types.intern(i32k);
+    const ptr_t = try caller.types.ptrGlobal();
+    const b = try caller.appendBlock();
+    // The caller's parameters are declared in the REVERSE order of the callee's, so no
+    // callee value number coincides with the caller value it maps to. Without that, a
+    // missing remap would leave the callee's own handle behind and the check below would
+    // still pass by numeric accident.
+    const e = try caller.appendBlockParam(b, t);
+    const d = try caller.appendBlockParam(b, t);
+    const p = try caller.appendBlockParam(b, ptr_t);
+    const call = try caller.appendCall(b, t, "cas", &.{ p, d, e });
+    caller.setTerminator(b, .{ .ret = ir.function.Ret.one(call) });
+
+    var lk = TestLookup{ .callee = &callee, .name = "cas" };
+    try std.testing.expect(try run(allocator, &caller, .{ .context = &lk, .func = TestLookup.get }));
+
+    var found: usize = 0;
+    for (caller.blockInsts(b)) |inst| {
+        if (caller.opcode(inst) != .atomic_rmw) continue;
+        found += 1;
+        const a = caller.opcode(inst).atomic_rmw;
+        try std.testing.expectEqual(ir.function.AtomicOp.compare_exchange, a.op);
+        try std.testing.expectEqual(ir.function.AtomicOrdering.acq_rel, a.ordering);
+        try std.testing.expectEqual(ir.function.AtomicScope.system, a.scope);
+        // The operands are the CALLER's arguments now.
+        try std.testing.expectEqual(p, a.ptr);
+        try std.testing.expectEqual(d, a.value);
+        try std.testing.expectEqual(e, a.compare.?);
+    }
+    try std.testing.expectEqual(@as(usize, 1), found);
+}
+
+test "inlining a RESULT-LESS atomic keeps it result-less, on the multi-block path" {
+    // The single-block path refuses a result-less callee instruction, so only the multi-block
+    // path clones this form. It needs its own arm there: the `else` prong unwraps a result
+    // the reduction form does not have, and would panic.
+    const allocator = std.testing.allocator;
+    const i32k = ir.types.TypeKind{ .int = .{ .signedness = .signed, .bits = 32 } };
+
+    // callee bump(p, v, c): if (c) atomic add; return 0  -- two blocks, so the multi path runs.
+    var callee = Function.init(allocator);
+    defer callee.deinit();
+    {
+        const t = try callee.types.intern(i32k);
+        const bool_t = try callee.types.intern(.bool);
+        const ptr_t = try callee.types.ptrGlobal();
+        const entry = try callee.appendBlock();
+        const then_b = try callee.appendBlock();
+        const done = try callee.appendBlock();
+        const p = try callee.appendBlockParam(entry, ptr_t);
+        const v = try callee.appendBlockParam(entry, t);
+        const c = try callee.appendBlockParam(entry, bool_t);
+        try callee.appendIf(entry, c, .{ .target = then_b, .args = &.{} }, .{ .target = done, .args = &.{} });
+        try callee.appendAtomicRmwStmt(then_b, .{ .op = .add, .ptr = p, .value = v, .ordering = .relaxed, .scope = .device });
+        try callee.setJump(then_b, done, &.{});
+        const zero = try callee.appendInst(done, t, .{ .iconst = 0 });
+        callee.setTerminator(done, .{ .ret = ir.function.Ret.one(zero) });
+    }
+
+    var caller = Function.init(allocator);
+    defer caller.deinit();
+    const t = try caller.types.intern(i32k);
+    const bool_t = try caller.types.intern(.bool);
+    const ptr_t = try caller.types.ptrGlobal();
+    const b = try caller.appendBlock();
+    const p = try caller.appendBlockParam(b, ptr_t);
+    const v = try caller.appendBlockParam(b, t);
+    const c = try caller.appendBlockParam(b, bool_t);
+    const call = try caller.appendCall(b, t, "bump", &.{ p, v, c });
+    caller.setTerminator(b, .{ .ret = ir.function.Ret.one(call) });
+
+    var lk = TestLookup{ .callee = &callee, .name = "bump" };
+    try std.testing.expect(try run(allocator, &caller, .{ .context = &lk, .func = TestLookup.get }));
+
+    var found: usize = 0;
+    for (0..caller.blockCount()) |bi| {
+        for (caller.blockInsts(@enumFromInt(bi))) |inst| {
+            if (caller.opcode(inst) != .atomic_rmw) continue;
+            found += 1;
+            // Still result-less: it did not gain a destination on the way in.
+            try std.testing.expectEqual(@as(?ir.function.Value, null), caller.instResult(inst));
+            const a = caller.opcode(inst).atomic_rmw;
+            try std.testing.expectEqual(ir.function.AtomicOp.add, a.op);
+            try std.testing.expectEqual(ir.function.AtomicOrdering.relaxed, a.ordering);
+            try std.testing.expectEqual(ir.function.AtomicScope.device, a.scope);
+            try std.testing.expectEqual(@as(?ir.function.Value, null), a.compare);
+            // This path gives every callee parameter a FRESH caller parameter and passes
+            // the call arguments in by jump, so the operands name those copies, not `p`
+            // and `v`. What matters is that they were remapped to something the caller
+            // defines, which `verify` below proves by dominance.
+            try std.testing.expect(caller.types.type_kind(caller.valueType(a.ptr)) == .ptr);
+            try std.testing.expect(caller.types.type_kind(caller.valueType(a.value)) == .int);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), found);
+
+    var diags = try ir.verify.verify(allocator, &caller, .high);
+    defer diags.deinit();
+    try std.testing.expect(diags.ok());
 }

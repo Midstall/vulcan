@@ -42,6 +42,10 @@ fn altraLatency(op: ir.function.Opcode) u32 {
         // never actually schedules one today - priced like any other cheap bookkeeping op
         // (`iconst`/`store`/...) so a future backend expansion doesn't silently under-model.
         .va_start, .va_arg, .va_end => 1,
+        // No CPU backend lowers an atomic read-modify-write: every one of them refuses it,
+        // so this model can never price a real one. Priced as cheap bookkeeping beside the
+        // `va_list` ops rather than left to a wrong default, exactly like the barrier below.
+        .atomic_rmw => 1,
         // No CPU backend lowers a barrier: every one of them refuses it. This model can
         // therefore never price a real one, so it is priced as cheap bookkeeping like the
         // `va_list` ops above rather than left to a wrong default.
@@ -90,6 +94,10 @@ fn altraThroughput(op: ir.function.Opcode, elem_float: bool) u32 {
         // never actually schedules one today - priced like any other cheap bookkeeping op
         // (`iconst`/`store`/...) so a future backend expansion doesn't silently under-model.
         .va_start, .va_arg, .va_end => 1,
+        // No CPU backend lowers an atomic read-modify-write: every one of them refuses it,
+        // so this model can never price a real one. Priced as cheap bookkeeping beside the
+        // `va_list` ops rather than left to a wrong default, exactly like the barrier below.
+        .atomic_rmw => 1,
         // No CPU backend lowers a barrier: every one of them refuses it. This model can
         // therefore never price a real one, so it is priced as cheap bookkeeping like the
         // `va_list` ops above rather than left to a wrong default.
@@ -118,6 +126,10 @@ fn cascadelakeLatency(op: ir.function.Opcode) u32 {
         // never actually schedules one today - priced like any other cheap bookkeeping op
         // (`iconst`/`store`/...) so a future backend expansion doesn't silently under-model.
         .va_start, .va_arg, .va_end => 1,
+        // No CPU backend lowers an atomic read-modify-write: every one of them refuses it,
+        // so this model can never price a real one. Priced as cheap bookkeeping beside the
+        // `va_list` ops rather than left to a wrong default, exactly like the barrier below.
+        .atomic_rmw => 1,
         // No CPU backend lowers a barrier: every one of them refuses it. This model can
         // therefore never price a real one, so it is priced as cheap bookkeeping like the
         // `va_list` ops above rather than left to a wrong default.
@@ -151,6 +163,10 @@ fn cascadelakeThroughput(op: ir.function.Opcode, elem_float: bool) u32 {
         // never actually schedules one today - priced like any other cheap bookkeeping op
         // (`iconst`/`store`/...) so a future backend expansion doesn't silently under-model.
         .va_start, .va_arg, .va_end => 1,
+        // No CPU backend lowers an atomic read-modify-write: every one of them refuses it,
+        // so this model can never price a real one. Priced as cheap bookkeeping beside the
+        // `va_list` ops rather than left to a wrong default, exactly like the barrier below.
+        .atomic_rmw => 1,
         // No CPU backend lowers a barrier: every one of them refuses it. This model can
         // therefore never price a real one, so it is priced as cheap bookkeeping like the
         // `va_list` ops above rather than left to a wrong default.
@@ -183,6 +199,10 @@ fn etsocLatency(op: ir.function.Opcode) u32 {
         // never actually schedules one today - priced like any other cheap bookkeeping op
         // (`iconst`/`store`/...) so a future backend expansion doesn't silently under-model.
         .va_start, .va_arg, .va_end => 1,
+        // No CPU backend lowers an atomic read-modify-write: every one of them refuses it,
+        // so this model can never price a real one. Priced as cheap bookkeeping beside the
+        // `va_list` ops rather than left to a wrong default, exactly like the barrier below.
+        .atomic_rmw => 1,
         // No CPU backend lowers a barrier: every one of them refuses it. This model can
         // therefore never price a real one, so it is priced as cheap bookkeeping like the
         // `va_list` ops above rather than left to a wrong default.
@@ -228,6 +248,10 @@ fn etsocThroughput(op: ir.function.Opcode, elem_float: bool) u32 {
         // never actually schedules one today - priced like any other cheap bookkeeping op
         // (`iconst`/`store`/...) so a future backend expansion doesn't silently under-model.
         .va_start, .va_arg, .va_end => 1,
+        // No CPU backend lowers an atomic read-modify-write: every one of them refuses it,
+        // so this model can never price a real one. Priced as cheap bookkeeping beside the
+        // `va_list` ops rather than left to a wrong default, exactly like the barrier below.
+        .atomic_rmw => 1,
         // No CPU backend lowers a barrier: every one of them refuses it. This model can
         // therefore never price a real one, so it is priced as cheap bookkeeping like the
         // `va_list` ops above rather than left to a wrong default.
@@ -261,6 +285,10 @@ fn riverInorderLatency(op: ir.function.Opcode) u32 {
         // never actually schedules one today - priced like any other cheap bookkeeping op
         // (`iconst`/`store`/...) so a future backend expansion doesn't silently under-model.
         .va_start, .va_arg, .va_end => 1,
+        // No CPU backend lowers an atomic read-modify-write: every one of them refuses it,
+        // so this model can never price a real one. Priced as cheap bookkeeping beside the
+        // `va_list` ops rather than left to a wrong default, exactly like the barrier below.
+        .atomic_rmw => 1,
         // No CPU backend lowers a barrier: every one of them refuses it. This model can
         // therefore never price a real one, so it is priced as cheap bookkeeping like the
         // `va_list` ops above rather than left to a wrong default.
@@ -296,6 +324,10 @@ fn riverMacroLatency(op: ir.function.Opcode) u32 {
         // never actually schedules one today - priced like any other cheap bookkeeping op
         // (`iconst`/`store`/...) so a future backend expansion doesn't silently under-model.
         .va_start, .va_arg, .va_end => 1,
+        // No CPU backend lowers an atomic read-modify-write: every one of them refuses it,
+        // so this model can never price a real one. Priced as cheap bookkeeping beside the
+        // `va_list` ops rather than left to a wrong default, exactly like the barrier below.
+        .atomic_rmw => 1,
         // No CPU backend lowers a barrier: every one of them refuses it. This model can
         // therefore never price a real one, so it is priced as cheap bookkeeping like the
         // `va_list` ops above rather than left to a wrong default.
@@ -331,6 +363,10 @@ fn riverInorderThroughput(op: ir.function.Opcode, elem_float: bool) u32 {
         // never actually schedules one today - priced like any other cheap bookkeeping op
         // (`iconst`/`store`/...) so a future backend expansion doesn't silently under-model.
         .va_start, .va_arg, .va_end => 1,
+        // No CPU backend lowers an atomic read-modify-write: every one of them refuses it,
+        // so this model can never price a real one. Priced as cheap bookkeeping beside the
+        // `va_list` ops rather than left to a wrong default, exactly like the barrier below.
+        .atomic_rmw => 1,
         // No CPU backend lowers a barrier: every one of them refuses it. This model can
         // therefore never price a real one, so it is priced as cheap bookkeeping like the
         // `va_list` ops above rather than left to a wrong default.
@@ -367,6 +403,10 @@ fn riverPipelinedThroughput(op: ir.function.Opcode, elem_float: bool) u32 {
         // never actually schedules one today - priced like any other cheap bookkeeping op
         // (`iconst`/`store`/...) so a future backend expansion doesn't silently under-model.
         .va_start, .va_arg, .va_end => 1,
+        // No CPU backend lowers an atomic read-modify-write: every one of them refuses it,
+        // so this model can never price a real one. Priced as cheap bookkeeping beside the
+        // `va_list` ops rather than left to a wrong default, exactly like the barrier below.
+        .atomic_rmw => 1,
         // No CPU backend lowers a barrier: every one of them refuses it. This model can
         // therefore never price a real one, so it is priced as cheap bookkeeping like the
         // `va_list` ops above rather than left to a wrong default.
@@ -405,6 +445,10 @@ fn unitOfShared(op: ir.function.Opcode) UnitClass {
         // `extract` above.
         .va_arg => .mem,
         .va_start, .va_end => .none,
+        // An atomic is a memory access, so it binds the memory unit like `load`/`store`
+        // above. No CPU backend lowers one today, so this is never priced for real, but the
+        // memory class is the honest answer if one ever does.
+        .atomic_rmw => .mem,
         // A barrier binds no execution unit on any CPU this models, because no CPU backend
         // lowers one. See the latency arms above.
         .barrier => .none,

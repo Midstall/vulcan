@@ -5,7 +5,8 @@
 //! incoming pointers). A light alias oracle keeps it cheap and correct: two distinct allocas never
 //! alias, two distinct globals never alias, an alloca and a global never alias, and anything else is
 //! conservatively assumed to alias. A call, a matmul, a `va_list` operation or a barrier may touch
-//! any memory, so each of them clears everything.
+//! any memory, so each of them clears everything. An atomic is a store of its address, and an
+//! atomic ordered above `relaxed` is a barrier as well.
 
 const std = @import("std");
 const ir = @import("vulcan-ir");
@@ -64,6 +65,18 @@ pub fn run(allocator: std.mem.Allocator, func: *Function, analyses: *pass.Analys
                     // the address now holds is not `st.value`.
                     invalidateAliasing(&avail, func, st.ptr);
                     if (!st.@"volatile" and !func.isByteOrderTagged(inst)) try avail.append(allocator, .{ .ptr = st.ptr, .value = st.value });
+                },
+                // An atomic is a STORE of `ptr`, so a relaxed one invalidates every entry
+                // that may alias it, exactly like the `store` arm above. It is NEVER
+                // recorded as an entry, because its result is the OLD value: the address
+                // does not hold that value afterwards.
+                //
+                // Any ordering above `relaxed` also makes memory another thread wrote
+                // before it visible after it, which is what a barrier does, so it drops the
+                // whole set the way the `barrier` arm below does.
+                .atomic_rmw => |a| switch (a.ordering) {
+                    .relaxed => invalidateAliasing(&avail, func, a.ptr),
+                    .acquire, .release, .acq_rel, .seq_cst => avail.clearRetainingCapacity(),
                 },
                 // A call or a matmul may write any memory, so everything recorded is dropped.
                 .call, .call_indirect, .matmul => avail.clearRetainingCapacity(),
@@ -463,4 +476,106 @@ test "endian: a tagged load is not reused for a later plain load of the same add
         try testing.expectEqual(s.first, add.lhs);
         try testing.expectEqual(s.first, add.rhs); // the second load reused the first
     }
+}
+
+test "a store does not forward to a load across an atomic on the same address" {
+    // An atomic is a store of its address, so what the address holds afterwards is not the
+    // value the earlier store put there. The no-atomic control at the end proves the pass
+    // does forward this exact shape when nothing sits between.
+    const allocator = testing.allocator;
+    const build = struct {
+        fn f(a: std.mem.Allocator, func: *Function, with_atomic: bool) !struct { load: ir.function.Value, block: ir.function.Block } {
+            _ = a;
+            const t = try i32Ty(func);
+            const ptr_t = try func.types.ptrGlobal();
+            const b = try func.appendBlock();
+            const p = try func.appendBlockParam(b, ptr_t);
+            const v = try func.appendBlockParam(b, t);
+            try func.appendStore(b, v, p);
+            if (with_atomic) {
+                try func.appendAtomicRmwStmt(b, .{ .op = .add, .ptr = p, .value = v, .ordering = .relaxed, .scope = .device });
+            }
+            const y = try func.appendInst(b, t, .{ .load = .{ .ptr = p } });
+            func.setTerminator(b, .{ .ret = ir.function.Ret.one(y) });
+            return .{ .load = y, .block = b };
+        }
+    }.f;
+
+    {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const built = try build(allocator, &func, true);
+        try testing.expect(!try runOnce(allocator, &func));
+        // The load survives and still feeds the return: nothing was forwarded.
+        try testing.expectEqual(built.load, func.terminator(built.block).?.ret.values[0]);
+    }
+    {
+        // The control: the same shape without the atomic DOES forward, so the refusal above
+        // comes from the atomic and not from the alias oracle giving up.
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const built = try build(allocator, &func, false);
+        try testing.expect(try runOnce(allocator, &func));
+        try testing.expect(func.terminator(built.block).?.ret.values[0] != built.load);
+    }
+}
+
+test "an atomic ordered above relaxed drops availability for an UNRELATED address too" {
+    // A relaxed atomic is only a store of its own address. Anything stronger also makes
+    // memory another thread wrote before it visible after it, which is what a barrier does,
+    // so the whole availability set goes. The relaxed control forwards the same shape.
+    const allocator = testing.allocator;
+    const build = struct {
+        fn f(func: *Function, ordering: ir.function.AtomicOrdering) !struct { load: ir.function.Value, block: ir.function.Block } {
+            const t = try i32Ty(func);
+            const ptr_t = try func.types.ptrGlobal();
+            const b = try func.appendBlock();
+            const v = try func.appendBlockParam(b, t);
+            // Two DISTINCT allocas: the alias oracle knows they never alias, so only the
+            // whole-set drop can stop the forward.
+            const slot = try func.appendInst(b, ptr_t, .{ .alloca = .{ .elem = t } });
+            const counter = try func.appendInst(b, ptr_t, .{ .alloca = .{ .elem = t } });
+            try func.appendStore(b, v, slot);
+            try func.appendAtomicRmwStmt(b, .{ .op = .add, .ptr = counter, .value = v, .ordering = ordering, .scope = .device });
+            const y = try func.appendInst(b, t, .{ .load = .{ .ptr = slot } });
+            func.setTerminator(b, .{ .ret = ir.function.Ret.one(y) });
+            return .{ .load = y, .block = b };
+        }
+    }.f;
+
+    {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const built = try build(&func, .seq_cst);
+        try testing.expect(!try runOnce(allocator, &func));
+        try testing.expectEqual(built.load, func.terminator(built.block).?.ret.values[0]);
+    }
+    {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const built = try build(&func, .relaxed);
+        try testing.expect(try runOnce(allocator, &func));
+        try testing.expect(func.terminator(built.block).?.ret.values[0] != built.load);
+    }
+}
+
+test "a load does not satisfy a later load across an atomic on the same address" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try i32Ty(&func);
+    const ptr_t = try func.types.ptrGlobal();
+    const b = try func.appendBlock();
+    const p = try func.appendBlockParam(b, ptr_t);
+    const v = try func.appendBlockParam(b, t);
+    const y1 = try func.appendInst(b, t, .{ .load = .{ .ptr = p } });
+    try func.appendAtomicRmwStmt(b, .{ .op = .add, .ptr = p, .value = v, .ordering = .relaxed, .scope = .device });
+    const y2 = try func.appendInst(b, t, .{ .load = .{ .ptr = p } });
+    const sum = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = y1, .rhs = y2 } });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(sum) });
+
+    try testing.expect(!try runOnce(allocator, &func));
+    const add = func.opcode(func.definingInst(sum).?).arith;
+    try testing.expectEqual(y1, add.lhs);
+    try testing.expectEqual(y2, add.rhs); // the second load was NOT replaced by the first
 }

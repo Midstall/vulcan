@@ -417,6 +417,8 @@ fn blockUsesValueFromBlock(func: *const Function, block: Block, def_bi: u32, def
     }.f;
     for (func.blockInsts(block)) |inst| {
         switch (func.opcode(inst)) {
+            .atomic_rmw => |a| if (usesB(def_block, a.ptr, def_bi) or usesB(def_block, a.value, def_bi) or
+                (a.compare != null and usesB(def_block, a.compare.?, def_bi))) return true,
             // A barrier uses no Value, so it can never use a value defined in `def_bi`.
             .iconst, .fconst, .fconst128, .alloca, .global_addr, .barrier => {},
             .arith => |a| if (usesB(def_block, a.lhs, def_bi) or usesB(def_block, a.rhs, def_bi)) return true,
@@ -476,6 +478,10 @@ fn hasSideEffect(func: *const Function, block: Block) bool {
             // edge to tail duplication, which copies B (flag and all) and keeps the access. A plain
             // load is pure and may be skipped.
             .load => |ld| if (ld.@"volatile") return true,
+            // An atomic writes memory, so a block holding one has a side effect in both of
+            // its forms. The result-less one is the case that matters: a rule keyed on an
+            // unused result would let the non-dup thread route around the write.
+            .atomic_rmw => return true,
             // A barrier is a synchronization point. A thread that drops it changes the
             // program, so a block holding one is never duplicated away.
             .barrier => return true,
@@ -1146,5 +1152,68 @@ test "volatile: a block holding a volatile load is tail-duplicated, not threaded
         else => {},
     };
     try testing.expectEqual(@as(usize, 1), vol_loads);
+    try verifyClean(allocator, &func);
+}
+
+/// The same threading shape as `buildThreadWithLoad`, with an atomic in B instead of a load.
+/// `atomic` selects between the atomic (the guarded case) and a plain load (the control).
+fn buildThreadWithAtomic(func: *Function, atomic: bool) !struct { entry: Block, b: Block, d: Block } {
+    const t = try i32Ty(func);
+    const bool_t = try func.types.intern(.bool);
+    const ptr_t = try func.types.ptrGlobal();
+    const entry = try func.appendBlock();
+    const b = try func.appendBlock();
+    const d = try func.appendBlock();
+    const e = try func.appendBlock();
+    const x = try func.appendBlockParam(entry, t);
+    const c = try func.appendBlockParam(b, bool_t);
+    const xp = try func.appendBlockParam(b, t);
+    const dp = try func.appendBlockParam(d, t);
+    const slot = try func.appendInst(entry, ptr_t, .{ .alloca = .{ .elem = t } });
+    const c_true = try func.appendInst(entry, bool_t, .{ .iconst = 1 });
+    try func.setJump(entry, b, &.{ c_true, x });
+    if (atomic) {
+        try func.appendAtomicRmwStmt(b, .{ .op = .add, .ptr = slot, .value = xp, .ordering = .relaxed, .scope = .device });
+    } else {
+        _ = try func.appendInst(b, t, .{ .load = .{ .ptr = slot } });
+    }
+    try func.appendIf(b, c, .{ .target = d, .args = &.{xp} }, .{ .target = e, .args = &.{} });
+    func.setTerminator(d, .{ .ret = ir.function.Ret.one(dp) });
+    const em = try func.appendInst(e, t, .{ .iconst = 0 });
+    func.setTerminator(e, .{ .ret = ir.function.Ret.one(em) });
+    return .{ .entry = entry, .b = b, .d = d };
+}
+
+test "a block holding an atomic is tail-duplicated, not threaded past" {
+    const allocator = testing.allocator;
+
+    // NEGATIVE CONTROL: with a plain load, B is pure. Non-dup threading points entry
+    // straight at D and B never runs on that path, which proves the pass still optimizes
+    // this shape.
+    var control = Function.init(allocator);
+    defer control.deinit();
+    const cb = try buildThreadWithAtomic(&control, false);
+    try testing.expect(try runOnce(allocator, &control));
+    try testing.expectEqual(cb.d, control.terminator(cb.entry).?.jump.target);
+    try verifyClean(allocator, &control);
+
+    // An atomic writes memory. Threading entry past B would DROP that write on the threaded
+    // path, so the edge falls to tail duplication and the copy still performs it. This is
+    // the result-less form, the one a rule keyed on an unused result would have missed.
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const h = try buildThreadWithAtomic(&func, true);
+    try testing.expect(try runOnce(allocator, &func));
+
+    const bprime = func.terminator(h.entry).?.jump.target;
+    try testing.expect(bprime != h.d); // NOT threaded straight past B
+    try testing.expect(bprime != h.b); // a duplicate, so B's other predecessors are undisturbed
+    try testing.expectEqual(h.d, func.terminator(bprime).?.jump.target);
+
+    var atomics: usize = 0;
+    for (func.blockInsts(bprime)) |inst| {
+        if (func.opcode(inst) == .atomic_rmw) atomics += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), atomics);
     try verifyClean(allocator, &func);
 }
