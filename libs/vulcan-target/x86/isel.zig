@@ -319,6 +319,54 @@ fn rebindSymbolName(func: *const Function, name: []const u8) []const u8 {
     unreachable;
 }
 
+/// The error for a result-less instruction (a statement) that reaches `lowerInst`'s result
+/// unwrap. That unwrap used to be a bare `.?`, which PANICS on a statement instead of failing
+/// closed: the lowering switch sits below the unwrap, so its `else => return error.Unsupported`
+/// never sees one. The switch here is exhaustive, so a new opcode must make a decision.
+fn unhandledStatement(op_code: ir.function.Opcode) Error {
+    return switch (op_code) {
+        // A tile multiply writes memory at `c`. This backend has no tile-multiply lowering, so
+        // it fails closed rather than dropping the write.
+        .matmul,
+        // A prefetch is only a hint, so a no-op lowering would also be correct. This backend
+        // has no prefetch encoder, and the microarch model has no x86-32 entry, so no pass can
+        // insert one. It is refused until one can.
+        .prefetch,
+        // The `.call` and `.call_indirect` arms of the switch below both write the result into
+        // EAX's destination, so neither can lower a VOID call. cdecl needs no extra work for
+        // one (the caller cleans the stack either way), so a void-call arm is a later addition,
+        // not a redesign.
+        .call,
+        .call_indirect,
+        // These are lowered before the unwrap, so they do not reach here. Refusing them keeps
+        // the answer correct if an early handler is ever removed.
+        .store,
+        .barrier,
+        .va_start,
+        .va_end,
+        // The block emitter calls `emitIf` for an `@"if"` and never calls `lowerInst` with one.
+        .@"if",
+        // These always define a result, so they do not reach this function.
+        .iconst,
+        .fconst,
+        .fconst128,
+        .arith,
+        .arith_imm,
+        .icmp,
+        .select,
+        .struct_new,
+        .extract,
+        .convert,
+        .unary,
+        .alloca,
+        .global_addr,
+        .load,
+        .va_arg,
+        .dot,
+        => error.Unsupported,
+    };
+}
+
 fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Error!void {
     const func = ctx.func;
     // A folded address-add is dead: every use of its result was rerouted to the base by the fold,
@@ -357,8 +405,8 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
         // A barrier synchronizes threads. This backend compiles one thread of a scalar loop
         // nest, so there is nothing to synchronize and no honest lowering. It is refused
         // HERE, beside the other result-less opcodes, and not in the `else` prong of the
-        // switch below: the `.?` result unwrap between here and that switch panics on any
-        // result-less opcode it reaches, so the switch never sees this one.
+        // switch below: the result unwrap between here and that switch sends every statement
+        // to `unhandledStatement`, so the switch never sees this one.
         return error.Unsupported;
     }
     if (func.opcode(inst) == .va_start) {
@@ -371,7 +419,7 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
         // resource, so `va_end` is a no-op.
         return;
     }
-    const result = func.instResult(inst).?;
+    const result = func.instResult(inst) orelse return unhandledStatement(func.opcode(inst));
     switch (func.opcode(inst)) {
         .iconst => |c| {
             const rd = ctx.dst(result, scratch1);
@@ -1825,4 +1873,32 @@ test "a barrier is rejected, not dropped like a prefetch" {
     func.setTerminator(e, .{ .ret = ir.function.Ret.one(x) });
 
     try std.testing.expectError(error.Unsupported, selectFunction(allocator, &func));
+}
+
+test "matmul, prefetch and a void call are refused, not a panic on the result unwrap" {
+    // Each of these has no result. Before `unhandledStatement`, `lowerInst`'s result unwrap
+    // was a bare `.?`, so any of them reaching this backend PANICKED with "attempt to use
+    // null value" instead of failing closed. The lowering switch's
+    // `else => return error.Unsupported` could not catch them, because the switch sits BELOW
+    // the unwrap. A void call is in the same family: the `.call` arm writes EAX into the
+    // result's destination, so it cannot lower a call that defines no result.
+    const allocator = std.testing.allocator;
+    const Case = enum { matmul, prefetch, void_call };
+    for ([_]Case{ .matmul, .prefetch, .void_call }) |case| {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+        const ptr_t = try func.types.intern(.{ .ptr = .global });
+        const e = try func.appendBlock();
+        const x = try func.appendBlockParam(e, i32_t);
+        const p = try func.appendBlockParam(e, ptr_t);
+        switch (case) {
+            .matmul => try func.appendMatmul(e, p, p, p, 4, 4, 4, .int8, false),
+            .prefetch => try func.appendPrefetch(e, p),
+            .void_call => try func.appendVoidCall(e, "sink", &.{x}),
+        }
+        func.setTerminator(e, .{ .ret = ir.function.Ret.one(x) });
+
+        try std.testing.expectError(error.Unsupported, selectFunction(allocator, &func));
+    }
 }

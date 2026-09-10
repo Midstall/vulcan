@@ -107,8 +107,39 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, model: *const mm.Mod
     for (func.blockInsts(bodyb)) |inst| switch (func.opcode(inst)) {
         // A barrier joins them: splitting one loop into two reorders the memory operations
         // around each meeting point, which is the one thing a barrier forbids.
-        .@"if", .matmul, .barrier => return null, // straight-line body only
-        else => {},
+        //
+        // `remapOp` calls `@"if"`, `matmul` and the whole `va_*` family `unreachable` on the
+        // strength of this filter. A trailing `else` let the `va_*` family through, so a body
+        // holding one PANICKED in `remapOp` instead of being skipped here.
+        .@"if",
+        .matmul,
+        .barrier,
+        .va_start,
+        .va_arg,
+        .va_end,
+        => return null, // straight-line body only
+        // Cloned as-is by `cloneBodyInsts`: each copy runs once per original iteration, in
+        // order, so a memory or call side effect is preserved.
+        .load,
+        .store,
+        .prefetch,
+        .call,
+        .call_indirect,
+        .iconst,
+        .fconst,
+        .fconst128,
+        .arith,
+        .arith_imm,
+        .icmp,
+        .select,
+        .struct_new,
+        .extract,
+        .convert,
+        .unary,
+        .alloca,
+        .global_addr,
+        .dot,
+        => {},
     };
 
     // Header: pure test ending in `if cond -> {body} else {exit}` (or the reverse), cond a comparison.
@@ -552,4 +583,46 @@ fn useCounts(allocator: std.mem.Allocator, func: *const Function) Error![]u32 {
         };
     }
     return counts;
+}
+
+test "a va_* statement in the body is declined, not sent into remapOp's unreachable" {
+    // `remapOp` calls `@"if"`, `matmul` and the whole `va_*` family `unreachable` on the
+    // strength of `recognize`'s body filter. That filter's trailing `else => {}` let the
+    // `va_*` family through, so a body holding one PANICKED in `remapOp`. The same loop with
+    // a plain `load` in place of the `va_arg` is still recognized, so the filter declines the
+    // `va_arg` and nothing else.
+    const allocator = std.testing.allocator;
+    for ([_]bool{ false, true }) |use_va| {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+        const ptr_t = try func.types.ptrGlobal();
+        const bool_t = try func.types.intern(.bool);
+        const entry = try func.appendBlock();
+        const header = try func.appendBlock();
+        const body = try func.appendBlock();
+        const done = try func.appendBlock();
+        const list = try func.appendBlockParam(entry, ptr_t);
+        const n = try func.appendBlockParam(entry, i32_t);
+        const zero = try func.appendInst(entry, i32_t, .{ .iconst = 0 });
+        try func.setJump(entry, header, &.{ zero, zero });
+        const i = try func.appendBlockParam(header, i32_t);
+        const s = try func.appendBlockParam(header, i32_t);
+        const cmp = try func.appendInst(header, bool_t, .{ .icmp = .{ .op = .lt, .lhs = i, .rhs = n } });
+        try func.appendIf(header, cmp, .{ .target = body, .args = &.{ i, s } }, .{ .target = done });
+        const bi = try func.appendBlockParam(body, i32_t);
+        const bs = try func.appendBlockParam(body, i32_t);
+        const v = if (use_va) try func.appendVaArg(body, list, i32_t) else try func.appendInst(body, i32_t, .{ .load = .{ .ptr = list } });
+        const ns = try func.appendInst(body, i32_t, .{ .arith = .{ .op = .add, .lhs = bs, .rhs = v } });
+        const ni = try func.appendArithImm(body, i32_t, .add, bi, 1);
+        try func.setJump(body, header, &.{ ni, ns });
+        func.setTerminator(done, .{ .ret = ir.function.Ret.none() });
+
+        var info = try loops.analyze(allocator, &func);
+        defer info.deinit(allocator);
+        const model = @import("registry.zig").modelFor(.@"ampere-altra");
+        const plan = try recognize(allocator, &func, model, &info.loops[0], false);
+        if (plan) |p| allocator.free(p.reductions);
+        try std.testing.expectEqual(!use_va, plan != null);
+    }
 }

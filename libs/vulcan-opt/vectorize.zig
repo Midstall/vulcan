@@ -421,8 +421,39 @@ fn hasWriteBetween(func: *const Function, block: Block, lo: usize, hi: usize) bo
     var i = lo;
     while (i < hi) : (i += 1) {
         switch (func.opcode(insts[i])) {
-            .store, .call, .call_indirect => return true,
-            else => {},
+            // Writes memory, or orders it. `matmul` writes its `c` tile, the `va_*` family
+            // writes the `va_list` object it walks, and a `barrier` forbids moving ANY memory
+            // operation across it. An `@"if"` is a control-flow split, so a load must not move
+            // over one either. A trailing `else` used to call every one of these pure.
+            .store,
+            .call,
+            .call_indirect,
+            .matmul,
+            .va_start,
+            .va_arg,
+            .va_end,
+            .barrier,
+            .@"if",
+            => return true,
+            // Reads memory or nothing at all: a `load` is a pure reader, and a `prefetch` is a
+            // hint with no observable effect.
+            .load,
+            .prefetch,
+            .iconst,
+            .fconst,
+            .fconst128,
+            .arith,
+            .arith_imm,
+            .icmp,
+            .select,
+            .struct_new,
+            .extract,
+            .convert,
+            .unary,
+            .alloca,
+            .global_addr,
+            .dot,
+            => {},
         }
     }
     return false;
@@ -510,8 +541,35 @@ fn resultsAreCoalesceableStores(func: *const Function, block: Block, results: []
     while (i <= hi) : (i += 1) {
         switch (func.opcode(insts[i])) {
             .store => store_count += 1,
-            .load, .call, .call_indirect => return false,
-            else => {},
+            // Touches memory, or orders it, so the window is not safe to coalesce. See
+            // `hasWriteBetween` for why `matmul`, the `va_*` family and `barrier` belong here.
+            .load,
+            .call,
+            .call_indirect,
+            .matmul,
+            .va_start,
+            .va_arg,
+            .va_end,
+            .barrier,
+            .@"if",
+            => return false,
+            // A hint or a pure computation may sit inside the window.
+            .prefetch,
+            .iconst,
+            .fconst,
+            .fconst128,
+            .arith,
+            .arith_imm,
+            .icmp,
+            .select,
+            .struct_new,
+            .extract,
+            .convert,
+            .unary,
+            .alloca,
+            .global_addr,
+            .dot,
+            => {},
         }
     }
     return store_count == lanes;
@@ -718,11 +776,39 @@ fn coalesceStoreRun(allocator: std.mem.Allocator, func: *Function, block: Block,
                     store_positions[cnt] = i;
                     cnt += 1;
                 },
-                .load, .call, .call_indirect, .@"if" => {
+                // Touches memory, or orders it, so it ends the window. See `hasWriteBetween`
+                // for why `matmul`, the `va_*` family and `barrier` belong here.
+                .load,
+                .call,
+                .call_indirect,
+                .@"if",
+                .matmul,
+                .va_start,
+                .va_arg,
+                .va_end,
+                .barrier,
+                => {
                     broke = true;
                     break;
                 },
-                else => {}, // a pure op (e.g. the address arith_imm) may sit between stores
+                // A hint or a pure op (for example the address `arith_imm`) may sit between
+                // the stores.
+                .prefetch,
+                .iconst,
+                .fconst,
+                .fconst128,
+                .arith,
+                .arith_imm,
+                .icmp,
+                .select,
+                .struct_new,
+                .extract,
+                .convert,
+                .unary,
+                .alloca,
+                .global_addr,
+                .dot,
+                => {},
             }
         }
         if (broke or cnt < lanes) continue;
@@ -1271,4 +1357,36 @@ fn buildMemElementwiseInt(op: BinOp, n: usize) !Function {
     }
     func.setTerminator(block, .{ .ret = ir.function.Ret.none() });
     return func;
+}
+
+test "an effectful statement between two positions counts as a write" {
+    // `hasWriteBetween` proves that fusing loads into one wide load at `hi` still observes
+    // the memory each scalar load saw, and the two store-window scans use the same rule. A
+    // trailing `else => {}` called `matmul`, `barrier` and the `va_*` family PURE, so a load
+    // could be fused across the tile write a matmul makes at `c`, or across a barrier.
+    const allocator = std.testing.allocator;
+    const Case = enum { matmul, barrier, va_start, va_arg, va_end, prefetch };
+    for ([_]Case{ .matmul, .barrier, .va_start, .va_arg, .va_end, .prefetch }) |case| {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+        const ptr_t = try func.types.ptrGlobal();
+        const block = try func.appendBlock();
+        const p = try func.appendBlockParam(block, ptr_t);
+        _ = try func.appendInst(block, i32_t, .{ .load = .{ .ptr = p } });
+        switch (case) {
+            .matmul => try func.appendMatmul(block, p, p, p, 4, 4, 4, .int8, false),
+            .barrier => try func.appendBarrier(block, .workgroup),
+            .va_start => try func.appendVaStart(block, p),
+            .va_arg => _ = try func.appendVaArg(block, p, i32_t),
+            .va_end => try func.appendVaEnd(block, p),
+            .prefetch => try func.appendPrefetch(block, p),
+        }
+        _ = try func.appendInst(block, i32_t, .{ .load = .{ .ptr = p } });
+        func.setTerminator(block, .{ .ret = ir.function.Ret.none() });
+
+        // A prefetch is a hint with no observable effect, so it alone is not a write.
+        const expect_write = case != .prefetch;
+        try std.testing.expectEqual(expect_write, hasWriteBetween(&func, block, 0, 3));
+    }
 }

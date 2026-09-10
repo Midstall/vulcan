@@ -196,15 +196,16 @@ pub fn cloneBlocks(
                 },
             };
 
-            switch (rebuilt) {
-                // `va_arg` has a result (like `load`), so it stays out of this result-less
-                // list and falls to the `else` (appendInst) branch below (SM12 T3).
-                .store, .prefetch, .matmul, .@"if", .va_start, .va_end, .barrier => _ = try func.appendStmtRaw(cloned, rebuilt),
-                else => {
-                    const result = func.instResult(inst) orelse unreachable;
-                    const cloned_result = try func.appendInst(cloned, func.valueType(result), rebuilt);
-                    try value_map.put(allocator, result, cloned_result);
-                },
+            // Ask the INSTRUCTION whether it defines a result, rather than naming the
+            // result-less opcodes in a list. A hand-kept list has to be updated for every new
+            // opcode, and it also missed a VOID `call` and a void `call_indirect`, which the
+            // `else` then sent into an `orelse unreachable`. `instResult` is right for every
+            // opcode, now and later.
+            if (func.instResult(inst)) |result| {
+                const cloned_result = try func.appendInst(cloned, func.valueType(result), rebuilt);
+                try value_map.put(allocator, result, cloned_result);
+            } else {
+                _ = try func.appendStmtRaw(cloned, rebuilt);
             }
         }
 

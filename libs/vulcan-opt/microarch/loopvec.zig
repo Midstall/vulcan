@@ -396,6 +396,11 @@ fn inductionOnlyInAddresses(func: *const Function, body: Block, i_alias: Value, 
     return true;
 }
 
+/// Whether `inst` reads `v` in any operand slot. The callers count uses to prove a value is
+/// dead or is read only where they expect, so a missed reader answers "unused" and lets an
+/// unsound rewrite through. The switch is exhaustive for that reason: a trailing `else`
+/// answered "no" for every call, every `matmul`, the whole `va_*` family and the `@"if"` edge
+/// arguments.
 fn usesValue(func: *const Function, inst: Inst, v: Value) bool {
     return switch (func.opcode(inst)) {
         .arith => |a| a.lhs == v or a.rhs == v,
@@ -406,7 +411,34 @@ fn usesValue(func: *const Function, inst: Inst, v: Value) bool {
         .unary => |u| u.value == v,
         .load => |l| l.ptr == v,
         .store => |s| s.value == v or s.ptr == v,
-        else => false,
+        .prefetch => |p| p.ptr == v,
+        .dot => |d| d.acc == v or d.a == v or d.b == v,
+        .matmul => |m| m.a == v or m.b == v or m.c == v,
+        .va_start => |s| s.list == v,
+        .va_arg => |a| a.list == v,
+        .va_end => |e| e.list == v,
+        .extract => |e| e.aggregate == v,
+        .struct_new => |sn| blk: {
+            for (func.valueList(sn.fields)) |f| if (f == v) break :blk true;
+            break :blk false;
+        },
+        .call => |c| blk: {
+            for (func.valueList(c.args)) |a| if (a == v) break :blk true;
+            break :blk false;
+        },
+        .call_indirect => |c| blk: {
+            if (c.target == v) break :blk true;
+            for (func.valueList(c.args)) |a| if (a == v) break :blk true;
+            break :blk false;
+        },
+        .@"if" => |cf| blk: {
+            if (cf.cond == v) break :blk true;
+            for (func.blockArgs(cf.then)) |a| if (a == v) break :blk true;
+            for (func.blockArgs(cf.@"else")) |a| if (a == v) break :blk true;
+            break :blk false;
+        },
+        // Reads no Value operand at all.
+        .iconst, .fconst, .fconst128, .alloca, .global_addr, .barrier => false,
     };
 }
 
@@ -476,8 +508,40 @@ fn recognizeReduction(func: *const Function, model: *const mm.Model, loop: *cons
     for (func.blockInsts(bodyb)) |inst| switch (func.opcode(inst)) {
         // A barrier joins them: vectorizing by V divides the trip count by V, so the loop
         // would meet V times fewer than the source says.
-        .@"if", .matmul, .barrier => return null,
-        else => {},
+        //
+        // `applyReduction` BUILDS a new main body (a wide load plus one vector arith). It does
+        // not clone this one, so any side effect here would run only in the scalar remainder.
+        // A trailing `else` let a `store`, a call and the `va_*` family through, and the
+        // rewrite then executed them for the remainder iterations alone.
+        .@"if",
+        .matmul,
+        .barrier,
+        .store,
+        .call,
+        .call_indirect,
+        .va_start,
+        .va_arg,
+        .va_end,
+        => return null,
+        // Pure, or a hint with no observable effect. `applyReduction` reads the load and the
+        // reduction arith it recognized below and needs nothing else from this body.
+        .load,
+        .prefetch,
+        .iconst,
+        .fconst,
+        .fconst128,
+        .arith,
+        .arith_imm,
+        .icmp,
+        .select,
+        .struct_new,
+        .extract,
+        .convert,
+        .unary,
+        .alloca,
+        .global_addr,
+        .dot,
+        => {},
     };
 
     // Header: pure test, body on then, params passed through.
@@ -753,4 +817,95 @@ test "declines a non-unit-stride access (a[2*i])" {
     var info = try loops.analyze(allocator, &func);
     defer info.deinit(allocator);
     try testing.expect((try recognize(allocator, &func, registry.modelFor(.@"ampere-altra"), &info.loops[0])) == null);
+}
+
+/// `for (i = 0; i < n; i += 1) { s += a[i]; if (extra_store) b[i] = 0; }` over i32 arrays.
+/// The reduction shape `recognizeReduction` looks for, with an optional SECOND memory effect
+/// in the body.
+fn buildIntReduction(func: *Function, extra_store: bool) !void {
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const bool_t = try func.types.intern(.bool);
+    const entry = try func.appendBlock();
+    const loop = try func.appendBlock();
+    const body = try func.appendBlock();
+    const done = try func.appendBlock();
+    const a = try func.appendBlockParam(entry, ptr_t);
+    const b = try func.appendBlockParam(entry, ptr_t);
+    const n = try func.appendBlockParam(entry, i32_t);
+    const zero = try func.appendInst(entry, i32_t, .{ .iconst = 0 });
+    try func.setJump(entry, loop, &.{ zero, zero });
+    const i = try func.appendBlockParam(loop, i32_t);
+    const s = try func.appendBlockParam(loop, i32_t);
+    const cmp = try func.appendInst(loop, bool_t, .{ .icmp = .{ .op = .lt, .lhs = i, .rhs = n } });
+    try func.appendIf(loop, cmp, .{ .target = body, .args = &.{ i, s } }, .{ .target = done });
+    const bi = try func.appendBlockParam(body, i32_t);
+    const bs = try func.appendBlockParam(body, i32_t);
+    const off = try func.appendArithImm(body, i32_t, .mul, bi, 4);
+    const aaddr = try func.appendInst(body, ptr_t, .{ .arith = .{ .op = .add, .lhs = a, .rhs = off } });
+    const av = try func.appendInst(body, i32_t, .{ .load = .{ .ptr = aaddr } });
+    const ns = try func.appendInst(body, i32_t, .{ .arith = .{ .op = .add, .lhs = bs, .rhs = av } });
+    if (extra_store) {
+        const baddr = try func.appendInst(body, ptr_t, .{ .arith = .{ .op = .add, .lhs = b, .rhs = off } });
+        const zero_b = try func.appendInst(body, i32_t, .{ .iconst = 0 });
+        try func.appendStore(body, zero_b, baddr);
+    }
+    const ni = try func.appendArithImm(body, i32_t, .add, bi, 1);
+    try func.setJump(body, loop, &.{ ni, ns });
+    func.setTerminator(done, .{ .ret = ir.function.Ret.none() });
+}
+
+test "a reduction body with a second memory effect is declined" {
+    // `applyReduction` BUILDS a new main body (one wide load plus one vector arith) instead of
+    // cloning this one, and it divides the trip count by V. Any other side effect in the body
+    // would then run only in the scalar remainder, so `s += a[i]; b[i] = 0;` would leave most
+    // of `b` unwritten. A trailing `else => {}` in the body filter let the store through.
+    //
+    // The same loop WITHOUT the store is still recognized, so the filter declines the store
+    // and nothing else.
+    const allocator = testing.allocator;
+
+    var plain = Function.init(allocator);
+    defer plain.deinit();
+    try buildIntReduction(&plain, false);
+    var plain_info = try loops.analyze(allocator, &plain);
+    defer plain_info.deinit(allocator);
+    try testing.expect(recognizeReduction(&plain, registry.modelFor(.@"ampere-altra"), &plain_info.loops[0], false) != null);
+
+    var stored = Function.init(allocator);
+    defer stored.deinit();
+    try buildIntReduction(&stored, true);
+    var stored_info = try loops.analyze(allocator, &stored);
+    defer stored_info.deinit(allocator);
+    try testing.expect(recognizeReduction(&stored, registry.modelFor(.@"ampere-altra"), &stored_info.loops[0], false) == null);
+}
+
+test "usesValue sees every operand slot, not only the arithmetic ones" {
+    // `countUses` and `inductionOnlyInAddresses` call this to prove a value is read only
+    // where they expect. A missed reader answers "unused" and lets an unsound rewrite
+    // through. A trailing `else => false` hid every call argument, both `matmul` operands
+    // and the `va_*` list.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const bool_t = try func.types.intern(.bool);
+    const block = try func.appendBlock();
+    const other = try func.appendBlock();
+    const p = try func.appendBlockParam(block, ptr_t);
+    const c = try func.appendBlockParam(block, bool_t);
+
+    try func.appendMatmul(block, p, p, p, 4, 4, 4, .int8, false);
+    try func.appendPrefetch(block, p);
+    try func.appendVaStart(block, p);
+    _ = try func.appendVaArg(block, p, i32_t);
+    try func.appendVaEnd(block, p);
+    _ = try func.appendCall(block, i32_t, "f", &.{p});
+    _ = try func.appendInst(block, i32_t, .{ .dot = .{ .acc = p, .a = p, .b = p } });
+    try func.appendIf(block, c, .{ .target = other, .args = &.{p} }, .{ .target = other, .args = &.{p} });
+    _ = try func.appendBlockParam(other, ptr_t);
+    func.setTerminator(other, .{ .ret = ir.function.Ret.none() });
+
+    for (func.blockInsts(block)) |inst| try testing.expect(usesValue(&func, inst, p));
 }

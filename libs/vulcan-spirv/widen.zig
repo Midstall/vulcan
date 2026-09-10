@@ -352,7 +352,40 @@ fn emitArm(func: *Function, out: *std.ArrayListUnmanaged(Inst), visited: []bool,
             .@"if" => return error.NotWidenable,
             .store => return error.NotWidenable, // a predicated store needs real masking
             .prefetch => return error.NotWidenable, // conservative: no prefetch reaches this shader path
-            else => try out.append(func.allocator, inst),
+            // Hoisting these out of the arm makes them run for BOTH sides of the diamond.
+            // A `matmul` would write its `c` tile unconditionally, the `va_*` family would
+            // advance a `va_list` unconditionally, and a `barrier` moved out of a predicated
+            // arm changes which threads reach it. A trailing `else` hoisted all of them.
+            //
+            // Step B (`widenHeavy`'s per-instruction switch) also refuses each of these, so
+            // today they cannot reach the emitted function either way. These arms are the
+            // FIRST refusal, not the only one. Do not read them as the guard.
+            .matmul,
+            .va_start,
+            .va_arg,
+            .va_end,
+            .barrier,
+            => return error.NotWidenable,
+            // Pure for the shader functions this path accepts. `call_indirect` is the `pow`
+            // math helper and `call` the sampler helper, both pure transcendentals here.
+            .call,
+            .call_indirect,
+            .load,
+            .iconst,
+            .fconst,
+            .fconst128,
+            .arith,
+            .arith_imm,
+            .icmp,
+            .select,
+            .struct_new,
+            .extract,
+            .convert,
+            .unary,
+            .alloca,
+            .global_addr,
+            .dot,
+            => try out.append(func.allocator, inst),
         }
     }
     const term = func.terminator(arm) orelse return error.NotWidenable;
@@ -904,4 +937,58 @@ test "widen single-block straight-line still works (the original fast path)" {
     try testing.expectEqual(@as(usize, 1), func.blockCount());
     try testing.expect(isF32Vec(&func, func.valueType(a)));
     try testing.expect(isF32Vec(&func, func.valueType(s)));
+}
+
+test "widen heavy: an effectful statement inside a diamond arm refuses the widen" {
+    // Flattening a diamond runs BOTH arms unconditionally, so an arm may hold only
+    // side-effect-free work. `emitArm` named `store` and `prefetch`, then a trailing `else`
+    // hoisted everything else: a `matmul` would write its `c` tile for both sides, the `va_*`
+    // family would advance a `va_list` for both, and a `barrier` moved out of a predicated arm
+    // changes which threads meet.
+    //
+    // This asserts the WIDENER refuses, not which of its two switches does. Step B refuses the
+    // same opcodes, so the test still passes with `emitArm`'s arms removed. It holds the pass
+    // to the answer; `emitArm`'s own arms are documented as the first of two refusals.
+    const gpa = testing.allocator;
+    const Case = enum { matmul, barrier, va_start, va_arg, va_end };
+    for ([_]Case{ .matmul, .barrier, .va_start, .va_arg, .va_end }) |case| {
+        var func = Function.init(gpa);
+        defer func.deinit();
+        const f32_t = try func.types.intern(.{ .float = .f32 });
+        const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+        const bool_t = try func.types.intern(.bool);
+        const ptr_t = try func.types.ptrGlobal();
+
+        const entry = try func.appendBlock();
+        const then_b = try func.appendBlock();
+        const else_b = try func.appendBlock();
+        const merge = try func.appendBlock();
+
+        const x = try func.appendBlockParam(entry, f32_t);
+        const p = try func.appendBlockParam(entry, ptr_t);
+        const half = try func.appendInst(entry, f32_t, .{ .fconst = 0.5 });
+        const cond = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .gt, .lhs = x, .rhs = half } });
+        try func.appendIf(entry, cond, .{ .target = then_b }, .{ .target = else_b });
+
+        const two = try func.appendInst(then_b, f32_t, .{ .fconst = 2.0 });
+        const tval = try func.appendInst(then_b, f32_t, .{ .arith = .{ .op = .mul, .lhs = x, .rhs = two } });
+        switch (case) {
+            .matmul => try func.appendMatmul(then_b, p, p, p, 4, 4, 4, .int8, false),
+            .barrier => try func.appendBarrier(then_b, .workgroup),
+            .va_start => try func.appendVaStart(then_b, p),
+            .va_arg => _ = try func.appendVaArg(then_b, p, i32_t),
+            .va_end => try func.appendVaEnd(then_b, p),
+        }
+        try func.setJump(then_b, merge, &.{tval});
+
+        const three = try func.appendInst(else_b, f32_t, .{ .fconst = 3.0 });
+        const eval = try func.appendInst(else_b, f32_t, .{ .arith = .{ .op = .mul, .lhs = x, .rhs = three } });
+        try func.setJump(else_b, merge, &.{eval});
+
+        const mp = try func.appendBlockParam(merge, f32_t);
+        const slot = try func.appendInst(merge, ptr_t, .{ .iconst = 0 });
+        try func.appendStore(merge, mp, slot);
+
+        try testing.expectError(error.NotWidenable, widenGraphics(&func));
+    }
 }

@@ -1410,6 +1410,48 @@ fn lowerDirectCall(allocator: std.mem.Allocator, ctx: *Ctx, c: ir.function.Call,
     }
 }
 
+/// The error for a result-less instruction (a statement) that reaches `lowerInst`'s result
+/// unwrap. That unwrap used to be a bare `.?`, which PANICS on a statement instead of failing
+/// closed: the lowering switch sits below the unwrap, so its `else => return error.Unsupported`
+/// never sees one. The switch here is exhaustive, so a new opcode must make a decision.
+fn unhandledStatement(op_code: ir.function.Opcode) Error {
+    return switch (op_code) {
+        // A tile multiply writes memory at `c`. This backend has no tile-multiply lowering
+        // (`expand.zig` rewrites a matmul into scalar loops for a target without one), so it
+        // fails closed rather than dropping the write.
+        .matmul,
+        // These are lowered before the unwrap, so they do not reach here. Refusing them keeps
+        // the answer correct if an early handler is ever removed.
+        .store,
+        .prefetch,
+        .barrier,
+        .va_start,
+        .va_end,
+        .call,
+        .call_indirect,
+        // The block emitter calls `emitIf` for an `@"if"` and never calls `lowerInst` with one.
+        .@"if",
+        // These always define a result, so they do not reach this function.
+        .iconst,
+        .fconst,
+        .fconst128,
+        .arith,
+        .arith_imm,
+        .icmp,
+        .select,
+        .struct_new,
+        .extract,
+        .convert,
+        .unary,
+        .alloca,
+        .global_addr,
+        .load,
+        .va_arg,
+        .dot,
+        => error.Unsupported,
+    };
+}
+
 fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Error!void {
     const func = ctx.func;
     // A folded address-add is dead. Every use of its result was rerouted to the
@@ -1470,8 +1512,8 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
         // A barrier synchronizes threads. This backend compiles one thread of a scalar
         // loop nest, so there is nothing to synchronize and no honest lowering. It is
         // refused HERE, beside the other result-less opcodes, and not in the `else` prong
-        // of the switch below: the `.?` result unwrap between here and that switch panics
-        // on any result-less opcode it reaches, so the switch never sees this one.
+        // of the switch below: the result unwrap between here and that switch sends every
+        // statement to `unhandledStatement`, so the switch never sees this one.
         return error.Unsupported;
     }
     if (func.opcode(inst) == .va_start) {
@@ -1652,7 +1694,7 @@ fn lowerInst(allocator: std.mem.Allocator, ctx: *Ctx, inst: ir.function.Inst) Er
         // shared `lowerDirectCall`.
         return lowerDirectCall(allocator, ctx, func.opcode(inst).call, null);
     }
-    const result = func.instResult(inst).?;
+    const result = func.instResult(inst) orelse return unhandledStatement(func.opcode(inst));
     switch (func.opcode(inst)) {
         .iconst => |c| {
             if (isXmm(func, result)) {
@@ -4110,6 +4152,27 @@ test "a barrier is rejected, not dropped like a prefetch" {
     const e = try func.appendBlock();
     const x = try func.appendBlockParam(e, i32_t);
     try func.appendBarrier(e, .workgroup);
+    func.setTerminator(e, .{ .ret = ir.function.Ret.one(x) });
+
+    try std.testing.expectError(error.Unsupported, selectFunction(allocator, &func));
+}
+
+test "a matmul is refused, not a panic on the result unwrap" {
+    // `matmul` has no result. Before `unhandledStatement`, `lowerInst`'s result unwrap was a
+    // bare `.?`, so a matmul reaching this backend PANICKED with "attempt to use null value"
+    // instead of failing closed. The lowering switch's `else => return error.Unsupported`
+    // could not catch it, because the switch sits BELOW the unwrap.
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr_t = try func.types.intern(.{ .ptr = .global });
+    const e = try func.appendBlock();
+    const x = try func.appendBlockParam(e, i32_t);
+    const a = try func.appendBlockParam(e, ptr_t);
+    const b = try func.appendBlockParam(e, ptr_t);
+    const c = try func.appendBlockParam(e, ptr_t);
+    try func.appendMatmul(e, a, b, c, 4, 4, 4, .int8, false);
     func.setTerminator(e, .{ .ret = ir.function.Ret.one(x) });
 
     try std.testing.expectError(error.Unsupported, selectFunction(allocator, &func));

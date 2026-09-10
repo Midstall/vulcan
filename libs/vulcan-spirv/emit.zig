@@ -893,13 +893,65 @@ const Emitter = struct {
         try self.emit(&self.body, op.FunctionEnd, &.{});
     }
 
+    /// The error for a result-less instruction (a statement) that this emitter cannot
+    /// spell. The switch is exhaustive on purpose: a new opcode must make a decision here,
+    /// and the compiler refuses the file until it does.
+    ///
+    /// This emitter builds ONE function over int, float and bool values. `typeId` has no
+    /// `ptr` case, so no pointer value can exist in the module, and there is no second
+    /// `OpFunction` id to call. Every statement below needs one of those two, so all of
+    /// them are refused today.
+    fn statementError(op_code: ir.function.Opcode) Error {
+        return switch (op_code) {
+            // `OpStore` needs a pointer id. A pointer can only come from `load`, `alloca`
+            // or `global_addr`, none of which this emitter lowers.
+            .store,
+            // SPIR-V has no prefetch hint. Dropping one is harmless, but a silent drop is
+            // how the others got lost, so it is refused with them.
+            .prefetch,
+            // A tile multiply is `OpCooperativeMatrixMulAddKHR`, which needs the cooperative
+            // matrix types this emitter does not build.
+            .matmul,
+            // SPIR-V has no variadic argument model at all.
+            .va_start,
+            .va_end,
+            // A barrier is `OpControlBarrier`. Dropping one deletes the synchronization
+            // point that the opcode exists to state.
+            .barrier,
+            // A void call is `OpFunctionCall` and needs the callee's `OpFunction` id.
+            .call,
+            .call_indirect,
+            // `emitBlock` emits the structured `if` as the block exit (`OpBranchConditional`)
+            // and never passes one here.
+            .@"if",
+            // These always define a result, so they do not reach this function. Refusing
+            // them keeps the answer correct if that ever changes.
+            .iconst,
+            .fconst,
+            .fconst128,
+            .arith,
+            .arith_imm,
+            .icmp,
+            .select,
+            .struct_new,
+            .extract,
+            .convert,
+            .unary,
+            .alloca,
+            .global_addr,
+            .load,
+            .va_arg,
+            .dot,
+            => error.UnsupportedConstruct,
+        };
+    }
+
     fn emitInst(self: *Emitter, inst: ir.function.Inst) Error!void {
-        // A barrier has no result. The `orelse return` below drops every result-less
-        // instruction with no diagnostic, which for a barrier means deleting a
-        // synchronization point silently. SPIR-V spells one `OpControlBarrier`, which this
-        // emitter does not build yet, so it is refused here instead of dropped.
-        if (self.func.opcode(inst) == .barrier) return error.UnsupportedConstruct;
-        const result = self.func.instResult(inst) orelse return;
+        // A result-less instruction (a statement) binds no id, so the arms below cannot
+        // name one. Returning here without a diagnostic would DELETE the instruction from
+        // the emitted module, which for a `store` or a `barrier` is a miscompile, not a
+        // missing feature. Each statement is refused by name instead.
+        const result = self.func.instResult(inst) orelse return statementError(self.func.opcode(inst));
         const res_ty = self.func.valueType(result);
         switch (self.func.opcode(inst)) {
             .iconst, .fconst => {}, // already hoisted
@@ -1476,9 +1528,9 @@ test "emits a fragment shader entry point (in -> out)" {
 }
 
 test "a barrier is refused, not silently dropped" {
-    // `emitInst` returns early for any result-less instruction. Without an explicit refusal
-    // a barrier would take that path and vanish from the module with no diagnostic, which
-    // is the exact failure a first-class barrier opcode exists to prevent.
+    // `emitInst` binds no id for a result-less instruction. Without `statementError` a
+    // barrier would return from `emitInst` and vanish from the module with no diagnostic,
+    // which is the exact failure a first-class barrier opcode exists to prevent.
     const allocator = testing.allocator;
 
     var func = Function.init(allocator);
@@ -1490,4 +1542,52 @@ test "a barrier is refused, not silently dropped" {
     func.setTerminator(b, .{ .ret = ir.function.Ret.one(x) });
 
     try testing.expectError(error.UnsupportedConstruct, emitModule(allocator, &func, "sync"));
+}
+
+test "a store is refused, not silently dropped" {
+    // A store that vanishes from the emitted module is a miscompile: the module computes a
+    // value and then writes it nowhere. This emitter cannot spell `OpStore` (see
+    // `statementError`), so it must FAIL instead of dropping the write.
+    //
+    // The address operand is an int, not a `ptr`. A `ptr` parameter has no SPIR-V type id
+    // here, so `typeId` refuses the function signature BEFORE `emitInst` runs, and the test
+    // would then pass even with the store silently dropped. An int address keeps the store
+    // itself the first construct the emitter cannot spell.
+    const allocator = testing.allocator;
+
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const b = try func.appendBlock();
+    const x = try func.appendBlockParam(b, i32_t);
+    const addr = try func.appendBlockParam(b, i32_t);
+    try func.appendStore(b, x, addr);
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(x) });
+
+    try testing.expectError(error.UnsupportedConstruct, emitModule(allocator, &func, "st"));
+}
+
+test "prefetch, matmul and the va_* statements are refused, not silently dropped" {
+    // The rest of the result-less family takes the same path as the store above. Each one
+    // gets its own function, so one refusal cannot mask another. The address operands are
+    // ints for the reason given in that test.
+    const allocator = testing.allocator;
+
+    const Case = enum { prefetch, matmul, va_start, va_end };
+    for ([_]Case{ .prefetch, .matmul, .va_start, .va_end }) |case| {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+        const b = try func.appendBlock();
+        const x = try func.appendBlockParam(b, i32_t);
+        switch (case) {
+            .prefetch => try func.appendPrefetch(b, x),
+            .matmul => try func.appendMatmul(b, x, x, x, 4, 4, 4, .int8, false),
+            .va_start => try func.appendVaStart(b, x),
+            .va_end => try func.appendVaEnd(b, x),
+        }
+        func.setTerminator(b, .{ .ret = ir.function.Ret.one(x) });
+
+        try testing.expectError(error.UnsupportedConstruct, emitModule(allocator, &func, "stmt"));
+    }
 }
