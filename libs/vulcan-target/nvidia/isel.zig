@@ -573,6 +573,16 @@ pub fn compileShader(allocator: std.mem.Allocator, func: *Function, stage: Stage
     // predecessor, so an entry a branch reaches has no stable list for the two to share.
     if (stage == .compute and gpu.abi.entryIsBranchTarget(func)) return error.Unsupported;
 
+    // The workgroup shared frame: one byte offset in the CTA's shared window per shared
+    // `alloca`. `gpu.abi.layoutSharedFrame` OWNS the placement and cross-checks it against the
+    // kernel's declared `vulcan.gpu.shared_bytes`, so a disagreement is an error here and not a
+    // window the runtime sizes wrongly at dispatch. See that function for the rule.
+    var shared = try gpu.abi.layoutSharedFrame(allocator, func, a);
+    defer shared.deinit(allocator);
+    // A graphics stage has no workgroup, so it has no workgroup shared memory. This mirrors the
+    // refusal of a shared POINTER parameter further down.
+    if (stage != .compute and shared.slots.len != 0) return error.Unsupported;
+
     // Fold constant arith operands into immediates before register allocation.
     // This stops each constant from pinning a GPR for its whole live range.
     // Heavy shaders (the noise and terrain shaders) need this to fit the
@@ -912,7 +922,7 @@ pub fn compileShader(allocator: std.mem.Allocator, func: *Function, stage: Stage
         var terminated = false;
 
         for (func.blockInsts(block)) |inst| {
-            try lowerInst(allocator, func, &loc, &code, &tex, &deriv, &math, inst);
+            try lowerInst(allocator, func, &loc, &code, &tex, &deriv, &math, &shared, inst);
             if (func.opcode(inst) == .@"if") {
                 // Set up the convergence barrier just before the divergent
                 // branch. BCLEAR initializes the barrier register, and BSSY
@@ -1005,7 +1015,7 @@ pub fn compileShader(allocator: std.mem.Allocator, func: *Function, stage: Stage
             .param_bytes = layout.bytes,
             .launch_shape = layout.launch_shape,
             .block = gpu.attrs.localSize(func),
-            .shared_bytes = gpu.attrs.sharedBytes(func),
+            .shared_bytes = shared.total,
             .reg_count = reg_count,
             .barrier_count = barrierCount(func),
         },
@@ -2400,7 +2410,7 @@ fn emitCubeAtlasUv(allocator: std.mem.Allocator, code: *std.ArrayList(Inst), loc
     try code.append(allocator, encode.ffma(call.coord + 1, s + 3, s + 1, s + 1, .{})); // v
 }
 
-fn lowerInst(allocator: std.mem.Allocator, func: *const Function, loc: *std.AutoHashMapUnmanaged(Value, Loc), code: *std.ArrayList(Inst), tex: *const TexLowering, deriv: *const DerivLowering, math: *const MathLowering, inst: ir.function.Inst) Error!void {
+fn lowerInst(allocator: std.mem.Allocator, func: *const Function, loc: *std.AutoHashMapUnmanaged(Value, Loc), code: *std.ArrayList(Inst), tex: *const TexLowering, deriv: *const DerivLowering, math: *const MathLowering, shared: *const gpu.abi.SharedFrame, inst: ir.function.Inst) Error!void {
     switch (func.opcode(inst)) {
         .iconst => |c| {
             // A graphics output-attribute store pointer is a tag-carrier
@@ -2667,11 +2677,20 @@ fn lowerInst(allocator: std.mem.Allocator, func: *const Function, loc: *std.Auto
             }
         },
         .alloca => {
-            // The only alloca the NVIDIA backend supports is the
+            const result = func.instResult(inst).?;
+            // A WORKGROUP-SHARED alloca is a slot in the CTA's shared window, and its address
+            // is that slot's byte offset. The offset is a 32-bit constant in ONE register,
+            // which LDS and STS consume directly, so the whole lowering is a MOV of the
+            // immediate the shared frame assigned. There is no pointer pair and no window base
+            // to add, because the hardware addresses the window from zero.
+            if (shared.offsetOf(result)) |off| {
+                try code.append(allocator, encode.movImm(gprOf(loc.*, result), off, .{}));
+                return;
+            }
+            // The only other alloca the NVIDIA backend supports is the
             // host-sampler out-pointer (a vec4 RGBA result slot), which is
             // materialized as a 4-register TEX result block, with no real
             // stack. Any other alloca is unsupported.
-            const result = func.instResult(inst).?;
             if (!tex.out_base.contains(result)) return error.Unsupported;
         },
         .call_indirect => |c| {
@@ -5094,4 +5113,190 @@ test "a compute kernel whose entry a branch reaches refuses, and the forward edg
         var kernel = try compileKernel(allocator, &func, nvidia_abi);
         kernel.deinit(allocator);
     }
+}
+
+/// The 32-bit immediate of the instruction at index `i`. It sits in the second dword, which is
+/// where `encode.movImm` writes it.
+fn immAt(code: []const u32, i: usize) u32 {
+    return code[i * 4 + 1];
+}
+
+test "a shared alloca lowers to a MOV of its frame offset, and two of them do not overlap" {
+    // The whole shared-alloca lowering in one shape. A shared address is a 32-bit byte offset
+    // into the CTA's window, so the address of a slot is the offset the frame assigned and
+    // nothing else: no pointer pair, no base register, no LDC. The two slots must land at
+    // distinct offsets, or a kernel would stage both tiles on top of each other and read one
+    // thread's data as another's.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const shared_t = try func.types.intern(.{ .ptr = .shared });
+    const tile_t = try func.types.intern(.{ .array = .{ .len = 32, .elem = f32_t } });
+    const small_t = try func.types.intern(.{ .array = .{ .len = 16, .elem = i32_t } });
+    const b = try func.appendBlock();
+    const n = try func.appendBlockParam(b, i32_t);
+    const tile = try func.appendInst(b, shared_t, .{ .alloca = .{ .elem = tile_t } });
+    const small = try func.appendInst(b, shared_t, .{ .alloca = .{ .elem = small_t } });
+    try func.appendStore(b, n, tile);
+    try func.appendStore(b, n, small);
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
+
+    var kernel = try compileKernel(allocator, &func, nvidia_abi);
+    defer kernel.deinit(allocator);
+
+    // LDC n, MOV tile, MOV small, STS, STS, EXIT. No LDC for either slot.
+    try testing.expectEqual(@as(usize, 6 * 4), kernel.code.len);
+    try testing.expectEqual(@as(u32, 0xb82), opAt(kernel.code, 0)); // LDC n
+    try testing.expectEqual(@as(u32, 0x802), opAt(kernel.code, 1)); // MOV immediate
+    try testing.expectEqual(@as(u32, 0x802), opAt(kernel.code, 2));
+    try testing.expectEqual(@as(u32, 0x988), opAt(kernel.code, 3)); // STS, not STG (0x986)
+    try testing.expectEqual(@as(u32, 0x988), opAt(kernel.code, 4));
+
+    // The first slot starts the window and the second follows it, 32 floats along.
+    try testing.expectEqual(@as(u32, 0), immAt(kernel.code, 1));
+    try testing.expectEqual(@as(u32, 128), immAt(kernel.code, 2));
+    // Each STS addresses the register its own MOV wrote, so the two stores reach two slots.
+    try testing.expectEqual(regAt(kernel.code, 1, 16), regAt(kernel.code, 3, 24));
+    try testing.expectEqual(regAt(kernel.code, 2, 16), regAt(kernel.code, 4, 24));
+    try testing.expect(regAt(kernel.code, 1, 16) != regAt(kernel.code, 2, 16));
+
+    // The runtime sizes the CTA window from this, and it is the frame the isel placed.
+    try testing.expectEqual(@as(u32, 128 + 64), kernel.launch.shared_bytes);
+}
+
+test "a shared alloca's element address is ONE 32-bit IADD3, with no carry chain" {
+    // The M1.5 address-space rule, checked on an alloca rather than on a parameter:
+    // `tile + i` keeps the shared space, so it stays a plain integer add of the frame offset
+    // and its accesses stay LDS and STS. A carry chain here would mean the allocator had given
+    // the slot a register PAIR and the second register held a meaningless high word.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const shared_t = try func.types.intern(.{ .ptr = .shared });
+    const tile_t = try func.types.intern(.{ .array = .{ .len = 8, .elem = i32_t } });
+    const b = try func.appendBlock();
+    const i = try func.appendBlockParam(b, i32_t);
+    const tile = try func.appendInst(b, shared_t, .{ .alloca = .{ .elem = tile_t } });
+    const elem = try func.appendInst(b, shared_t, .{ .arith = .{ .op = .add, .lhs = tile, .rhs = i } });
+    const v = try func.appendInst(b, i32_t, .{ .load = .{ .ptr = elem } });
+    try func.appendStore(b, v, elem);
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
+
+    var kernel = try compileKernel(allocator, &func, nvidia_abi);
+    defer kernel.deinit(allocator);
+
+    // LDC i, MOV tile, IADD3, LDS, STS, EXIT. A global pointer would need two IADD3s here.
+    try testing.expectEqual(@as(usize, 6 * 4), kernel.code.len);
+    try testing.expectEqual(@as(u32, 0x802), opAt(kernel.code, 1)); // MOV frame offset
+    try testing.expectEqual(@as(u32, 0x210), opAt(kernel.code, 2)); // the ONE IADD3
+    try testing.expectEqual(@as(u32, 0x984), opAt(kernel.code, 3)); // LDS
+    try testing.expectEqual(@as(u32, 0x988), opAt(kernel.code, 4)); // STS
+    // The add reads the MOV's register, and both accesses address the add's result.
+    try testing.expectEqual(regAt(kernel.code, 1, 16), regAt(kernel.code, 2, 24));
+    try testing.expectEqual(regAt(kernel.code, 2, 16), regAt(kernel.code, 3, 24));
+    try testing.expectEqual(regAt(kernel.code, 2, 16), regAt(kernel.code, 4, 24));
+    try testing.expectEqual(@as(u32, 32), kernel.launch.shared_bytes);
+}
+
+test "a shared frame larger than the target window is refused, not truncated" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const shared_t = try func.types.intern(.{ .ptr = .shared });
+    const big_t = try func.types.intern(.{ .array = .{ .len = 64 * 1024, .elem = f32_t } });
+    const b = try func.appendBlock();
+    _ = try func.appendInst(b, shared_t, .{ .alloca = .{ .elem = big_t } });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
+
+    try testing.expectError(error.SharedMemoryTooLarge, compileKernel(allocator, &func, nvidia_abi));
+}
+
+test "a declared shared_bytes that disagrees with the assigned frame is refused" {
+    // The frontend says 64 bytes and the frame places 128. Reporting either number would give
+    // the runtime a window the kernel does not have, and a shared access past the end of a CTA
+    // window is not faulted on this hardware.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const shared_t = try func.types.intern(.{ .ptr = .shared });
+    const tile_t = try func.types.intern(.{ .array = .{ .len = 32, .elem = f32_t } });
+    const b = try func.appendBlock();
+    _ = try func.appendInst(b, shared_t, .{ .alloca = .{ .elem = tile_t } });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
+    try gpu.attrs.setSharedBytes(&func, 64);
+
+    try testing.expectError(error.SharedFrameMismatch, compileKernel(allocator, &func, nvidia_abi));
+}
+
+test "a declared shared_bytes that AGREES with the frame compiles, the negative control" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const shared_t = try func.types.intern(.{ .ptr = .shared });
+    const tile_t = try func.types.intern(.{ .array = .{ .len = 32, .elem = f32_t } });
+    const b = try func.appendBlock();
+    _ = try func.appendInst(b, shared_t, .{ .alloca = .{ .elem = tile_t } });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
+    try gpu.attrs.setSharedBytes(&func, 128);
+
+    var kernel = try compileKernel(allocator, &func, nvidia_abi);
+    defer kernel.deinit(allocator);
+    try testing.expectEqual(@as(u32, 128), kernel.launch.shared_bytes);
+}
+
+test "a shared alloca beside a shared PARAMETER is refused" {
+    // Both claim offset 0 of one window, and nothing in the IR says that they do not overlap.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const shared_t = try func.types.intern(.{ .ptr = .shared });
+    const b = try func.appendBlock();
+    const extern_tile = try func.appendBlockParam(b, shared_t);
+    const own_tile = try func.appendInst(b, shared_t, .{ .alloca = .{ .elem = i32_t } });
+    const v = try func.appendInst(b, i32_t, .{ .load = .{ .ptr = extern_tile } });
+    try func.appendStore(b, v, own_tile);
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
+
+    try testing.expectError(error.SharedFrameAliasesParameter, compileKernel(allocator, &func, nvidia_abi));
+}
+
+test "a graphics stage rejects a shared alloca instead of placing a workgroup frame" {
+    // A graphics stage has no workgroup, so it has no workgroup shared memory. This is the
+    // alloca half of the same refusal a shared POINTER parameter already gets.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const shared_t = try func.types.intern(.{ .ptr = .shared });
+    const b = try func.appendBlock();
+    const uv = try func.appendBlockParam(b, f32_t);
+    const tile = try func.appendInst(b, shared_t, .{ .alloca = .{ .elem = f32_t } });
+    try func.appendStore(b, uv, tile);
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
+
+    try testing.expectError(error.Unsupported, compileShader(allocator, &func, .fragment, nvidia_abi));
+}
+
+test "a PRIVATE alloca is still refused, and takes no room in the shared window" {
+    // The negative control for the whole feature. Only a `ptr(shared)` alloca gets a frame
+    // slot; an ordinary stack slot has no backing on this target and keeps its refusal.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const private_t = try func.types.intern(.{ .ptr = .private });
+    const b = try func.appendBlock();
+    const n = try func.appendBlockParam(b, i32_t);
+    const slot = try func.appendInst(b, private_t, .{ .alloca = .{ .elem = i32_t } });
+    try func.appendStore(b, n, slot);
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
+
+    try testing.expectError(error.Unsupported, compileKernel(allocator, &func, nvidia_abi));
 }

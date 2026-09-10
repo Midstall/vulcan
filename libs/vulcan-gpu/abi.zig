@@ -11,7 +11,18 @@ const Value = ir.function.Value;
 const Param = kernel.Param;
 const Layout = kernel.Layout;
 
-pub const Error = std.mem.Allocator.Error || error{ UnsupportedParamType, SharedMemoryTooLarge };
+pub const Error = std.mem.Allocator.Error || error{
+    UnsupportedParamType,
+    SharedMemoryTooLarge,
+    /// The kernel declares `vulcan.gpu.shared_bytes`, it declares shared `alloca` slots, and
+    /// the two numbers differ. See `layoutSharedFrame`.
+    SharedFrameMismatch,
+    /// The kernel declares BOTH a shared `alloca` and a `ptr(shared)` parameter. Both claim
+    /// offset 0 of the same window. See `layoutSharedFrame`.
+    SharedFrameAliasesParameter,
+    /// A shared `alloca` holds a type the shared frame cannot place. See `sharedShape`.
+    UnsupportedSharedType,
+};
 
 /// How a target lays out and delivers a kernel's parameter block.
 pub const Abi = struct {
@@ -209,6 +220,188 @@ pub fn layoutParams(
         .out_pointer = out_pointer,
         .launch_shape = launch_shape,
     };
+}
+
+/// One workgroup-shared slot: the `alloca` that declares it, and where it sits.
+pub const SharedSlot = struct {
+    /// The `alloca` result. Its type is a `ptr(shared)`.
+    value: Value,
+    /// The byte offset of the slot from the start of the workgroup's shared window.
+    offset: u32,
+    /// The size of the slot in bytes.
+    size: u32,
+};
+
+/// The placed workgroup-shared frame. The caller OWNS `slots` and must release it with
+/// `deinit`.
+pub const SharedFrame = struct {
+    /// One entry per shared `alloca`, in the order the instructions appear.
+    slots: []SharedSlot,
+    /// How many bytes the slots occupy. Zero when the kernel declares no shared `alloca`.
+    bytes: u32,
+    /// The whole workgroup window the runtime must give the kernel, which is what
+    /// `LaunchInfo.shared_bytes` reports. It is `bytes` for a kernel that declares slots, and
+    /// the frontend's `attrs.sharedBytes` for one that declares none (the extern-shared model,
+    /// where a `ptr(shared)` PARAMETER carries a window the host sized and placed).
+    total: u32,
+
+    /// Release the slot slice. `allocator` must be the one that placed the frame.
+    pub fn deinit(self: *SharedFrame, allocator: std.mem.Allocator) void {
+        allocator.free(self.slots);
+    }
+
+    /// The byte offset of the slot `value` declares, or null when `value` is not a shared
+    /// `alloca`. A frame holds a handful of slots, so a scan is the right lookup.
+    pub fn offsetOf(self: *const SharedFrame, value: Value) ?u32 {
+        for (self.slots) |s| {
+            if (s.value == value) return s.offset;
+        }
+        return null;
+    }
+};
+
+/// The size and the alignment of one shared slot in bytes. See `sharedShape`.
+const SharedShape = struct { size: u32, alignment: u32 };
+
+/// The shape of one shared slot, or null when the frame cannot place the type.
+///
+/// A POINTER element is refused. The width of an address in shared memory is a target fact
+/// this descriptor does not carry: a `global` address is `pointer_bytes` wide, while a
+/// `shared` address is a window offset that is narrower on the hardware that has one. A
+/// shared tile OF ADDRESSES has no caller today, so the frame refuses it instead of guessing
+/// a width and writing the wrong number of bytes.
+///
+/// An integer of a width that is not 8, 16, 32 or 64 bits is refused for the same reason: it
+/// has no natural alignment, and rounding one up would place the next slot where the frontend
+/// did not put it.
+fn sharedShape(func: *const Function, ty: ir.types.Type) ?SharedShape {
+    return switch (func.types.type_kind(ty)) {
+        .bool => .{ .size = 1, .alignment = 1 },
+        .int => |i| switch (i.bits) {
+            8 => .{ .size = 1, .alignment = 1 },
+            16 => .{ .size = 2, .alignment = 2 },
+            32 => .{ .size = 4, .alignment = 4 },
+            64 => .{ .size = 8, .alignment = 8 },
+            else => null,
+        },
+        .float => |f| switch (f) {
+            .f16 => .{ .size = 2, .alignment = 2 },
+            .f32 => .{ .size = 4, .alignment = 4 },
+            .f64 => .{ .size = 8, .alignment = 8 },
+            .f128 => .{ .size = 16, .alignment = 16 },
+        },
+        // An array or a vector is `len` elements laid end to end, and it aligns like ONE
+        // element. The element shape recurses, so an array of arrays places correctly.
+        .array => |arr| sharedRun(func, arr.elem, arr.len),
+        .vector => |v| sharedRun(func, v.elem, v.len),
+        .ptr, .@"struct", .slice => null,
+    };
+}
+
+/// `count` elements of `elem` laid end to end. Null when the element has no shared shape or
+/// the run does not fit in 32 bits.
+fn sharedRun(func: *const Function, elem: ir.types.Type, count: u64) ?SharedShape {
+    const e = sharedShape(func, elem) orelse return null;
+    const n = std.math.cast(u32, count) orelse return null;
+    const size = std.math.mul(u32, e.size, n) catch return null;
+    return .{ .size = size, .alignment = e.alignment };
+}
+
+/// Whether the entry block takes a `ptr(shared)` parameter, which is the extern-shared model.
+fn hasSharedParam(func: *const Function) bool {
+    for (func.blockParams(@enumFromInt(0))) |p| {
+        switch (func.types.type_kind(func.valueType(p))) {
+            .ptr => |space| switch (space) {
+                .shared => return true,
+                .global, .constant, .private => {},
+            },
+            .bool, .int, .float, .vector, .array, .slice, .@"struct" => {},
+        }
+    }
+    return false;
+}
+
+/// Place every workgroup-shared `alloca` of `func` into the workgroup's shared window.
+///
+/// ## Who owns the frame
+///
+/// THIS PLACEMENT OWNS IT, and `attrs.sharedBytes` is the frontend's DECLARATION of the total.
+/// The two meet under one rule, stated below, and any disagreement is an error.
+///
+/// The offset of a slot is a code-generation fact: a backend materializes it as an immediate
+/// and feeds it straight to a shared load or store, so it depends on the target's alignment
+/// rules and on how wide an address in that window is. A frontend that wrote per-slot offsets
+/// into the IR would be committing portable IR to one target's layout, and every other backend
+/// would then have to honour a layout that does not fit its hardware or ignore attributes that
+/// look authoritative.
+///
+/// `attrs.sharedBytes` cannot become a derived number, because the EXTERN-SHARED model has no
+/// `alloca` at all: the kernel takes a `ptr(shared)` parameter and the host writes an offset
+/// into it, so only the frontend knows how large that window is. The attribute therefore keeps
+/// its meaning, "the whole workgroup window this kernel needs".
+///
+/// ## The rule
+///
+///   - No shared `alloca`: the frame is empty and `total` is the declared `attrs.sharedBytes`,
+///     exactly as before this placement existed.
+///   - Shared `alloca`s and NO declaration (`shared_bytes` absent, which reads as 0): the frame
+///     is the whole window and `total` is the frame.
+///   - Shared `alloca`s AND a declaration: the two must be equal, or `SharedFrameMismatch`. The
+///     declaration is a checksum, never a budget. A budget would let a frontend over-declare
+///     and lose occupancy with nothing to show for it.
+///   - Shared `alloca`s AND a `ptr(shared)` parameter: `SharedFrameAliasesParameter`. Both
+///     claim offset 0 of one window, and the IR carries no way to say that they do not overlap.
+///     CUDA places its `extern __shared__` region after the static ones; expressing that needs
+///     the parameter to carry an offset, which is a separate decision.
+///
+/// The frame is also checked against `Abi.max_shared_bytes`, exactly as the declared total is,
+/// so a frame that overflows the hardware window is refused here and not at dispatch.
+///
+/// The caller OWNS the result and must release it with `SharedFrame.deinit`.
+pub fn layoutSharedFrame(allocator: std.mem.Allocator, func: *const Function, a: Abi) Error!SharedFrame {
+    var placed: std.ArrayList(SharedSlot) = .empty;
+    errdefer placed.deinit(allocator);
+
+    // A 64-bit cursor cannot overflow, so the window check below is the only bound and it is
+    // the one the hardware actually imposes.
+    var cursor: u64 = 0;
+    for (0..func.blockCount()) |bi| {
+        for (func.blockInsts(@enumFromInt(bi))) |inst| {
+            const al = switch (func.opcode(inst)) {
+                .alloca => |al| al,
+                .iconst, .fconst, .fconst128, .arith, .arith_imm, .icmp, .select => continue,
+                .struct_new, .extract, .convert, .unary, .global_addr => continue,
+                .call, .call_indirect, .load, .store, .prefetch, .@"if" => continue,
+                .va_start, .va_arg, .va_end, .dot, .matmul, .barrier, .atomic_rmw => continue,
+            };
+            const result = func.instResult(inst) orelse continue;
+            switch (func.types.type_kind(func.valueType(result))) {
+                .ptr => |space| switch (space) {
+                    .shared => {},
+                    // A private, global or constant `alloca` is an ordinary storage slot and
+                    // no business of the workgroup window.
+                    .global, .constant, .private => continue,
+                },
+                .bool, .int, .float, .vector, .array, .slice, .@"struct" => continue,
+            }
+            const shape = sharedShape(func, al.elem) orelse return error.UnsupportedSharedType;
+            const alignment: u64 = shape.alignment;
+            const at = (cursor + alignment - 1) & ~(alignment - 1);
+            cursor = at + shape.size;
+            if (cursor > a.max_shared_bytes) return error.SharedMemoryTooLarge;
+            try placed.append(allocator, .{ .value = result, .offset = @intCast(at), .size = shape.size });
+        }
+    }
+
+    const declared = attrs.sharedBytes(func);
+    if (placed.items.len == 0) {
+        placed.deinit(allocator);
+        return .{ .slots = &.{}, .bytes = 0, .total = declared };
+    }
+    if (hasSharedParam(func)) return error.SharedFrameAliasesParameter;
+    const bytes: u32 = @intCast(cursor);
+    if (declared != 0 and declared != bytes) return error.SharedFrameMismatch;
+    return .{ .slots = try placed.toOwnedSlice(allocator), .bytes = bytes, .total = bytes };
 }
 
 const nvidia_test_abi: Abi = .{
@@ -520,4 +713,168 @@ test "entryIsBranchTarget finds an edge back to the entry and clears a straight-
         func.setTerminator(b1, .{ .ret = ir.function.Ret.none() });
         try std.testing.expect(!entryIsBranchTarget(&func));
     }
+}
+
+/// A kernel that declares `slots` shared `alloca`s of the given element types, in order.
+/// Returns the alloca results so a test can ask the frame where each one landed.
+fn sharedKernel(func: *Function, elems: []const ir.types.Type, out: []Value) !void {
+    const shared_t = try func.types.intern(.{ .ptr = .shared });
+    const b = try func.appendBlock();
+    for (elems, 0..) |e, i| {
+        out[i] = try func.appendInst(b, shared_t, .{ .alloca = .{ .elem = e } });
+    }
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
+}
+
+test "a kernel with no shared alloca reports the declared total and an empty frame" {
+    // The extern-shared model, which worked before this placement existed and must keep
+    // working: the window is a `ptr(shared)` PARAMETER the host sizes and places.
+    var func = try testFunc(std.testing.allocator);
+    defer func.deinit();
+    const shared_t = try func.types.intern(.{ .ptr = .shared });
+    const b = try func.appendBlock();
+    _ = try func.appendBlockParam(b, shared_t);
+    try attrs.setSharedBytes(&func, 1024);
+
+    var frame = try layoutSharedFrame(std.testing.allocator, &func, nvidia_test_abi);
+    defer frame.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), frame.slots.len);
+    try std.testing.expectEqual(@as(u32, 0), frame.bytes);
+    try std.testing.expectEqual(@as(u32, 1024), frame.total);
+}
+
+test "two shared allocas get distinct, non-overlapping offsets and the frame is their sum" {
+    var func = try testFunc(std.testing.allocator);
+    defer func.deinit();
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const tile_t = try func.types.intern(.{ .array = .{ .len = 32, .elem = f32_t } });
+    var vals: [2]Value = undefined;
+    try sharedKernel(&func, &.{ tile_t, tile_t }, &vals);
+
+    var frame = try layoutSharedFrame(std.testing.allocator, &func, nvidia_test_abi);
+    defer frame.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), frame.slots.len);
+    try std.testing.expectEqual(@as(?u32, 0), frame.offsetOf(vals[0]));
+    try std.testing.expectEqual(@as(?u32, 128), frame.offsetOf(vals[1]));
+    // The second slot starts where the first one ends, so the two never share a byte.
+    try std.testing.expectEqual(frame.slots[0].offset + frame.slots[0].size, frame.slots[1].offset);
+    try std.testing.expectEqual(@as(u32, 256), frame.bytes);
+    try std.testing.expectEqual(@as(u32, 256), frame.total);
+}
+
+test "a shared slot aligns to its element, so a byte tile does not misalign the tile after it" {
+    // Suspicious case: without the alignment step the f32 tile would start at offset 3 and
+    // every LDS of it would split a word. The padding is what makes the total 4 + 128 and not
+    // 3 + 128.
+    var func = try testFunc(std.testing.allocator);
+    defer func.deinit();
+    const i8_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 8 } });
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const three_t = try func.types.intern(.{ .array = .{ .len = 3, .elem = i8_t } });
+    const tile_t = try func.types.intern(.{ .array = .{ .len = 32, .elem = f32_t } });
+    var vals: [2]Value = undefined;
+    try sharedKernel(&func, &.{ three_t, tile_t }, &vals);
+
+    var frame = try layoutSharedFrame(std.testing.allocator, &func, nvidia_test_abi);
+    defer frame.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?u32, 0), frame.offsetOf(vals[0]));
+    try std.testing.expectEqual(@as(?u32, 4), frame.offsetOf(vals[1]));
+    try std.testing.expectEqual(@as(u32, 132), frame.bytes);
+}
+
+test "a declared shared total that AGREES with the frame is accepted" {
+    var func = try testFunc(std.testing.allocator);
+    defer func.deinit();
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const tile_t = try func.types.intern(.{ .array = .{ .len = 16, .elem = f32_t } });
+    var vals: [1]Value = undefined;
+    try sharedKernel(&func, &.{tile_t}, &vals);
+    try attrs.setSharedBytes(&func, 64);
+
+    var frame = try layoutSharedFrame(std.testing.allocator, &func, nvidia_test_abi);
+    defer frame.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 64), frame.total);
+}
+
+test "a declared shared total that DISAGREES with the frame is refused" {
+    // The whole point of keeping the declaration: a frontend that thinks the tile is 64 bytes
+    // while the frame places 128 must hear about it, never get a window sized from one of the
+    // two numbers with no diagnostic.
+    var func = try testFunc(std.testing.allocator);
+    defer func.deinit();
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const tile_t = try func.types.intern(.{ .array = .{ .len = 32, .elem = f32_t } });
+    var vals: [1]Value = undefined;
+    try sharedKernel(&func, &.{tile_t}, &vals);
+    try attrs.setSharedBytes(&func, 64);
+
+    try std.testing.expectError(
+        error.SharedFrameMismatch,
+        layoutSharedFrame(std.testing.allocator, &func, nvidia_test_abi),
+    );
+}
+
+test "a shared alloca beside a shared PARAMETER is refused, because both claim offset zero" {
+    var func = try testFunc(std.testing.allocator);
+    defer func.deinit();
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const shared_t = try func.types.intern(.{ .ptr = .shared });
+    const b = try func.appendBlock();
+    _ = try func.appendBlockParam(b, shared_t);
+    _ = try func.appendInst(b, shared_t, .{ .alloca = .{ .elem = f32_t } });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
+
+    try std.testing.expectError(
+        error.SharedFrameAliasesParameter,
+        layoutSharedFrame(std.testing.allocator, &func, nvidia_test_abi),
+    );
+}
+
+test "a shared frame larger than the target window is refused" {
+    var func = try testFunc(std.testing.allocator);
+    defer func.deinit();
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const big_t = try func.types.intern(.{ .array = .{ .len = 64 * 1024, .elem = f32_t } });
+    var vals: [1]Value = undefined;
+    try sharedKernel(&func, &.{big_t}, &vals);
+
+    try std.testing.expectError(
+        error.SharedMemoryTooLarge,
+        layoutSharedFrame(std.testing.allocator, &func, nvidia_test_abi),
+    );
+}
+
+test "a shared alloca of a type the frame cannot size is refused, not guessed at" {
+    // A tile OF ADDRESSES. The width of an address in the shared window is a target fact this
+    // descriptor does not carry, so the frame refuses rather than pick one.
+    var func = try testFunc(std.testing.allocator);
+    defer func.deinit();
+    const ptr_t = try func.types.ptrGlobal();
+    var vals: [1]Value = undefined;
+    try sharedKernel(&func, &.{ptr_t}, &vals);
+
+    try std.testing.expectError(
+        error.UnsupportedSharedType,
+        layoutSharedFrame(std.testing.allocator, &func, nvidia_test_abi),
+    );
+}
+
+test "a PRIVATE alloca takes no room in the shared frame" {
+    // The negative control for the address-space test in the placement loop. An ordinary
+    // stack slot is no business of the workgroup window, and counting it would inflate the
+    // window the runtime allocates for every workgroup.
+    var func = try testFunc(std.testing.allocator);
+    defer func.deinit();
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const private_t = try func.types.intern(.{ .ptr = .private });
+    const global_t = try func.types.ptrGlobal();
+    const b = try func.appendBlock();
+    _ = try func.appendInst(b, private_t, .{ .alloca = .{ .elem = f32_t } });
+    _ = try func.appendInst(b, global_t, .{ .alloca = .{ .elem = f32_t } });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
+
+    var frame = try layoutSharedFrame(std.testing.allocator, &func, nvidia_test_abi);
+    defer frame.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), frame.slots.len);
+    try std.testing.expectEqual(@as(u32, 0), frame.total);
 }

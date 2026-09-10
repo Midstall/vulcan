@@ -688,3 +688,155 @@ test "live: the three-dimensional thread and workgroup builtins read the real ha
         }
     }
 }
+
+test "live: a kernel's OWN shared tile carries a value between threads across a barrier" {
+    // The shared ALLOCA, on silicon. The kernel declares its own tile instead of taking a
+    // `ptr(shared)` parameter, so the address of the tile is a frame offset the isel assigned
+    // and the host writes nothing for it. Each thread stages its own value, the barrier makes
+    // every write visible, and each thread then reads the slot of the thread at the other end
+    // of the workgroup. The answer is only right if the staging really crossed threads.
+    const allocator = testing.allocator;
+    const threads = 32;
+
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const shared_t = try func.types.intern(.{ .ptr = .shared });
+    const tile_t = try func.types.intern(.{ .array = .{ .len = threads, .elem = i32_t } });
+    const b = try func.appendBlock();
+    const out = try func.appendBlockParam(b, ptr_t);
+    const tid = try func.appendBlockParam(b, i32_t);
+    try gpu_abi.attrs.setBuiltin(&func, tid, .thread_id_x);
+    try gpu_abi.attrs.setLocalSize(&func, .{ threads, 1, 1 });
+
+    const tile = try func.appendInst(b, shared_t, .{ .alloca = .{ .elem = tile_t } });
+    const byte = try binImm(&func, b, i32_t, .shl, tid, 2);
+    const mine = try binImm(&func, b, i32_t, .add, try binImm(&func, b, i32_t, .mul, tid, 3), 1);
+    try func.appendStore(b, mine, try ptrAddVal(&func, b, shared_t, tile, byte));
+    try func.appendBarrier(b, .workgroup);
+    // The mirror slot: threads - 1 - tid, as (-tid) + (threads - 1).
+    const mirror = try binImm(&func, b, i32_t, .add, try binImm(&func, b, i32_t, .mul, tid, -1), threads - 1);
+    const mbyte = try binImm(&func, b, i32_t, .shl, mirror, 2);
+    const got = try func.appendInst(b, i32_t, .{ .load = .{ .ptr = try ptrAddVal(&func, b, shared_t, tile, mbyte) } });
+    try func.appendStore(b, got, try ptrAddVal(&func, b, ptr_t, out, byte));
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
+
+    var h = try Harness.open();
+    defer h.deinit();
+    var launch = try h.compile(&func, runner_abi);
+    defer launch.deinit();
+    try testing.expectEqual(@as(u32, 1), launch.kernel.launch.barrier_count);
+    // The frontend declared no total, so the frame the isel placed is what the runtime gets.
+    try testing.expectEqual(@as(u32, threads * 4), launch.kernel.launch.shared_bytes);
+    // The tile takes no room in the parameter block: `out` is the only parameter.
+    try testing.expectEqual(@as(usize, 1), launch.kernel.launch.params.len);
+
+    const dst = try h.alloc(0x1000);
+    launch.setPtr(launch.kernel.launch.params[0].offset, dst.va);
+    try launch.run(.{ 1, 1, 1 });
+
+    for (0..threads) |i| {
+        const expected: i32 = @intCast((threads - 1 - i) * 3 + 1);
+        try testing.expectEqual(expected, dst.read(i32, i));
+    }
+}
+
+test "live: the tiled shape runs on hardware, staging a shared tile in a uniform loop" {
+    // The kernel this milestone was built for, end to end on silicon:
+    //
+    //     for (t in 0..tiles) {          // uniform trip count, from a scalar parameter
+    //         tile[tid] = src[t * threads + tid];
+    //         barrier;
+    //         acc += tile[threads - 1 - tid];
+    //         barrier;
+    //     }
+    //     out[tid] = acc;
+    //
+    // Five things have to hold at once: the uniformity analysis has to admit the two barriers
+    // inside the loop, the shared frame has to give the tile an address, the global staging
+    // load has to reach the right element, the staging has to cross threads, and the
+    // loop-carried accumulator has to survive the back edge. Each thread reads the MIRROR
+    // slot, so a run in which the staging never crossed threads gives a different number
+    // rather than the same one, and the second barrier is what stops the next trip from
+    // overwriting a slot another thread still reads.
+    const allocator = testing.allocator;
+    const threads = 32;
+    const tiles = 4;
+
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const ptr_t = try func.types.ptrGlobal();
+    const shared_t = try func.types.intern(.{ .ptr = .shared });
+    const tile_t = try func.types.intern(.{ .array = .{ .len = threads, .elem = i32_t } });
+
+    const entry = try func.appendBlock();
+    const head = try func.appendBlock();
+    const body = try func.appendBlock();
+    const done = try func.appendBlock();
+
+    const out = try func.appendBlockParam(entry, ptr_t);
+    const src = try func.appendBlockParam(entry, ptr_t);
+    const trips = try func.appendBlockParam(entry, i32_t);
+    const tid = try func.appendBlockParam(entry, i32_t);
+    try gpu_abi.attrs.setBuiltin(&func, tid, .thread_id_x);
+    try gpu_abi.attrs.setLocalSize(&func, .{ threads, 1, 1 });
+
+    // The kernel's own tile, plus the two slot addresses every trip reuses.
+    const tile = try func.appendInst(entry, shared_t, .{ .alloca = .{ .elem = tile_t } });
+    const byte = try binImm(&func, entry, i32_t, .shl, tid, 2);
+    const mirror = try binImm(&func, entry, i32_t, .add, try binImm(&func, entry, i32_t, .mul, tid, -1), threads - 1);
+    const mbyte = try binImm(&func, entry, i32_t, .shl, mirror, 2);
+    const mine = try ptrAddVal(&func, entry, shared_t, tile, byte);
+    const theirs = try ptrAddVal(&func, entry, shared_t, tile, mbyte);
+    const zero = try func.appendInst(entry, i32_t, .{ .iconst = 0 });
+    func.setTerminator(entry, .{ .jump = .{ .target = head, .args = try func.internValues(&.{ zero, zero }) } });
+
+    // head(t, acc): the loop test. `trips` is a scalar parameter, so every thread of the
+    // workgroup makes the same number of trips and the body's barriers are legal.
+    const t = try func.appendBlockParam(head, i32_t);
+    const acc = try func.appendBlockParam(head, i32_t);
+    const more = try func.appendInst(head, bool_t, .{ .icmp = .{ .op = .lt, .lhs = t, .rhs = trips } });
+    try func.appendIf(head, more, .{ .target = body }, .{ .target = done, .args = &.{acc} });
+
+    // body: stage this thread's element of tile t, wait, accumulate the MIRROR slot, wait.
+    const row = try binImm(&func, body, i32_t, .mul, t, threads * 4);
+    const at = try bin(&func, body, i32_t, .add, row, byte);
+    const staged = try func.appendInst(body, i32_t, .{ .load = .{ .ptr = try ptrAddVal(&func, body, ptr_t, src, at) } });
+    try func.appendStore(body, staged, mine);
+    try func.appendBarrier(body, .workgroup);
+    const got = try func.appendInst(body, i32_t, .{ .load = .{ .ptr = theirs } });
+    const sum = try bin(&func, body, i32_t, .add, acc, got);
+    try func.appendBarrier(body, .workgroup);
+    const next = try binImm(&func, body, i32_t, .add, t, 1);
+    func.setTerminator(body, .{ .jump = .{ .target = head, .args = try func.internValues(&.{ next, sum }) } });
+
+    const total = try func.appendBlockParam(done, i32_t);
+    try func.appendStore(done, total, try ptrAddVal(&func, done, ptr_t, out, byte));
+    func.setTerminator(done, .{ .ret = ir.function.Ret.none() });
+
+    var h = try Harness.open();
+    defer h.deinit();
+    var launch = try h.compile(&func, runner_abi);
+    defer launch.deinit();
+    try testing.expectEqual(@as(u32, 1), launch.kernel.launch.barrier_count);
+    try testing.expectEqual(@as(u32, threads * 4), launch.kernel.launch.shared_bytes);
+
+    const source = try h.alloc(threads * tiles * 4 + 0x1000);
+    const feed = source.slice(i32);
+    for (0..threads * tiles) |i| feed[i] = @intCast(i + 1); // src[i] = i + 1
+    const dst = try h.alloc(0x1000);
+    launch.setPtr(launch.kernel.launch.params[0].offset, dst.va);
+    launch.setPtr(launch.kernel.launch.params[1].offset, source.va);
+    launch.setU32(launch.kernel.launch.params[2].offset, tiles);
+    try launch.run(.{ 1, 1, 1 });
+
+    for (0..threads) |i| {
+        // acc[tid] = sum over t of src[t * threads + (threads - 1 - tid)], and src[i] = i + 1.
+        var want: i32 = 0;
+        for (0..tiles) |k| want += @intCast(k * threads + (threads - 1 - i) + 1);
+        try testing.expectEqual(want, dst.read(i32, i));
+    }
+}
