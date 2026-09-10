@@ -1210,8 +1210,11 @@ pub fn tex(dst: u8, coord: u8, handle: u8, dim: u8, c: Control) Inst {
 /// (sm>=120): NAK forces deriv_mode = DerivXY (=3, bits 76..77) whenever
 /// lod_mode != Zero. Leaving it Auto, the `tex` default, makes the
 /// explicit LOD flaky or ignored. The hardware takes the LOD from the
-/// coordinate register just past the `dim` spatial coordinates (a 2D
-/// sample reads coord, coord+1 = u,v and coord+2 = f32 LOD).
+/// register just past `handle`, NOT from the coordinate block: NAK reads
+/// src1 as [handle, lod]. The isel passes handle = coord + 2 for a 2D
+/// sample, so the registers are coord, coord+1 = u,v, coord+2 = the
+/// bindless handle, and coord+3 = the f32 LOD. `schedule.srcSpan` models
+/// that src1 as a 2-register run for this reason.
 pub fn texLod(dst: u8, coord: u8, handle: u8, dim: u8, c: Control) Inst {
     var w = tex(dst, coord, handle, dim, c);
     setBits(&w, 59, 1, 1); // lod_mode2 low bit: Lod(3) & 1
