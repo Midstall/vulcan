@@ -57,6 +57,35 @@ pub const Builtin = enum(u16) {
         return @intFromEnum(self) <= @intFromEnum(Builtin.subgroup_size);
     }
 
+    /// Whether every thread of ONE WORKGROUP reads the same value from this builtin.
+    ///
+    /// The scope is the workgroup, because that is the scope a workgroup barrier synchronizes.
+    /// A uniformity analysis asks this question to decide whether a branch can split the threads
+    /// that a barrier waits for, and only the threads of one workgroup wait at that barrier.
+    ///
+    /// `block_id_*` is UNIFORM under this definition, although it changes from one workgroup to
+    /// the next. Every thread of one workgroup reads the same workgroup index, so a branch on it
+    /// sends all of them the same way. Two different workgroups can go different ways, but they
+    /// never wait at the same workgroup barrier, so their disagreement cannot desynchronize one.
+    /// A wider scope, for example a grid-wide barrier, must NOT use this answer.
+    ///
+    /// `subgroup_size` is a hardware constant, and `block_dim_*` and `grid_dim_*` come from the
+    /// launch shape, so all three hold the same value in every thread of the grid.
+    ///
+    /// Every graphics builtin is per-invocation, so all of them are divergent.
+    pub fn isWorkgroupUniform(self: Builtin) bool {
+        return switch (self) {
+            .thread_id_x, .thread_id_y, .thread_id_z => false,
+            .global_id_x, .global_id_y, .global_id_z => false,
+            .lane_id, .warp_id => false,
+            .block_id_x, .block_id_y, .block_id_z => true,
+            .block_dim_x, .block_dim_y, .block_dim_z => true,
+            .grid_dim_x, .grid_dim_y, .grid_dim_z => true,
+            .subgroup_size => true,
+            .vertex_index, .instance_index, .frag_coord, .point_coord, .front_facing => false,
+        };
+    }
+
     /// The axis this builtin selects, or null when it has no axis. A backend uses this to
     /// index a three-element table instead of writing out a 15-arm switch.
     pub fn axis(self: Builtin) ?u2 {
@@ -83,6 +112,34 @@ test "axis reports the component for the three-axis builtins and null otherwise"
     try std.testing.expectEqual(@as(?u2, 2), Builtin.global_id_z.axis());
     try std.testing.expectEqual(@as(?u2, null), Builtin.lane_id.axis());
     try std.testing.expectEqual(@as(?u2, null), Builtin.vertex_index.axis());
+}
+
+test "isWorkgroupUniform splits the per-thread builtins from the per-workgroup ones" {
+    try std.testing.expect(!Builtin.thread_id_x.isWorkgroupUniform());
+    try std.testing.expect(!Builtin.thread_id_z.isWorkgroupUniform());
+    try std.testing.expect(!Builtin.global_id_y.isWorkgroupUniform());
+    try std.testing.expect(!Builtin.lane_id.isWorkgroupUniform());
+    try std.testing.expect(!Builtin.warp_id.isWorkgroupUniform());
+    try std.testing.expect(Builtin.block_dim_x.isWorkgroupUniform());
+    try std.testing.expect(Builtin.grid_dim_z.isWorkgroupUniform());
+    try std.testing.expect(Builtin.subgroup_size.isWorkgroupUniform());
+}
+
+test "block_id is uniform inside a workgroup, which is the scope of a workgroup barrier" {
+    // Suspicious case: the workgroup index changes from one workgroup to the next, so it looks
+    // divergent. It is not, at this scope. Every thread of one workgroup reads the same index,
+    // and only the threads of one workgroup wait at a workgroup barrier.
+    try std.testing.expect(Builtin.block_id_x.isWorkgroupUniform());
+    try std.testing.expect(Builtin.block_id_y.isWorkgroupUniform());
+    try std.testing.expect(Builtin.block_id_z.isWorkgroupUniform());
+}
+
+test "every graphics builtin is divergent" {
+    try std.testing.expect(!Builtin.vertex_index.isWorkgroupUniform());
+    try std.testing.expect(!Builtin.instance_index.isWorkgroupUniform());
+    try std.testing.expect(!Builtin.frag_coord.isWorkgroupUniform());
+    try std.testing.expect(!Builtin.point_coord.isWorkgroupUniform());
+    try std.testing.expect(!Builtin.front_facing.isWorkgroupUniform());
 }
 
 test "the compute group boundary sits where isCompute expects it" {

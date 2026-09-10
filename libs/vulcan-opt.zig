@@ -8,6 +8,7 @@ const ir = @import("vulcan-ir");
 pub const cfg = @import("vulcan-opt/cfg.zig");
 pub const dominators = @import("vulcan-opt/dominators.zig");
 pub const loops = @import("vulcan-opt/loops.zig");
+pub const uniform = @import("vulcan-opt/uniform.zig");
 pub const pass = @import("vulcan-opt/pass.zig");
 pub const mem2reg = @import("vulcan-opt/mem2reg.zig");
 pub const knownbits = @import("vulcan-opt/knownbits.zig");

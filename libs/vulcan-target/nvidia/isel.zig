@@ -24,6 +24,7 @@
 const std = @import("std");
 const ir = @import("vulcan-ir");
 const gpu = @import("vulcan-gpu");
+const opt = @import("vulcan-opt");
 const encode = @import("encode.zig");
 const schedule = @import("schedule.zig");
 
@@ -417,6 +418,44 @@ fn reachesFromSuccessors(
     return false;
 }
 
+/// Whether the branch at block `ai` leaves a loop that holds block `b`, and leaves it on a
+/// UNIFORM condition. Such a branch never splits the workgroup, so a barrier in `b` runs the
+/// same number of times in every thread.
+///
+/// Four things must all hold, and each one closes a way to be wrong:
+///   - `ai` and `b` belong to the same natural loop. An irreducible loop is not a natural loop,
+///     so it finds none here and keeps the refusal.
+///   - The branch is an EXIT of that loop: one edge stays inside, the other leaves. A branch
+///     with both edges inside is an ordinary `if` in the body, and the region check owns it.
+///   - The exit condition is uniform.
+///   - Neither block runs under a divergent branch itself. A uniform condition proves the
+///     threads agree at each visit of `ai`, not that every thread visits it.
+///
+/// The fourth condition is DEFENSE IN DEPTH, not the load-bearing guard. An outer divergent
+/// branch that can reach the barrier already fails the region check on its own pass, because a
+/// block strictly inside a region that the join cannot be reached around WOULD BE the join.
+/// Removing this line therefore breaks no test today. It stays because it makes the exemption
+/// stop where its own reasoning stops, instead of resting on another check to catch it.
+fn isUniformLoopExit(
+    func: *const Function,
+    uni: *const opt.uniform.Uniformity,
+    info: *const opt.loops.LoopInfo,
+    ai: usize,
+    b: usize,
+) bool {
+    if (uni.blockIsSplit(ai) or uni.blockIsSplit(b)) return false;
+    const cf = opt.uniform.twoWayIf(func, ai) orelse return false;
+    if (uni.isDivergent(cf.cond)) return false;
+    const then_i: usize = @intFromEnum(cf.then.target);
+    const else_i: usize = @intFromEnum(cf.@"else".target);
+    for (info.loops) |*l| {
+        if (!l.contains(ai) or !l.contains(b)) continue;
+        if (l.contains(then_i) == l.contains(else_i)) continue; // not an exit branch
+        return true;
+    }
+    return false;
+}
+
 /// Refuse a `barrier` the warp can split around. Returns `error.Unsupported` for one, and
 /// nothing when every barrier in `func` is safely placed.
 ///
@@ -429,15 +468,25 @@ fn reachesFromSuccessors(
 /// The rule: for a divergent `if` at block A whose join is M, a barrier in a block B inside that
 /// region must lie on EVERY path from A to M. Two shapes fail it:
 ///   - A barrier in one arm of a diamond. The other arm reaches M without running it.
-///   - A barrier in a loop body. The loop's exit branch is such a region, and a thread that
-///     leaves the loop skips a barrier the other threads still run. That is safe only when
-///     every thread makes the same number of trips, which the IR cannot state and this backend
-///     will not assume.
+///   - A barrier in a loop body whose trip count the compiler cannot prove uniform. A thread
+///     that leaves such a loop early skips a barrier the other threads still run.
 ///
-/// Both refusals are deliberate. The frontend is not trusted to have predicated the guard: a
-/// wrong answer that varies with scheduling is much worse than a compile error. A guard around
-/// a barrier must be PREDICATED, not branched, and `encode.barSync` takes a full `Control` so a
-/// predicated barrier stays expressible once a lowering builds one.
+/// ONE EXEMPTION, and only one: a loop whose EXIT CONDITION IS UNIFORM. Every thread of the
+/// workgroup then makes the same number of trips, so every thread runs the body's barrier the
+/// same number of times and none of them is left waiting. `opt.uniform` proves that, and it
+/// refuses to prove it wherever it cannot, so an unprovable trip count keeps the refusal. This
+/// admits the tiled-matmul shape, which stages a tile into shared memory, waits, computes from
+/// it, and waits again, once per tile.
+///
+/// The exemption is NOT widened to a plain `if` with a uniform condition, although such a branch
+/// sends the whole workgroup the same way and is therefore also safe. The loop is the shape with
+/// a demonstrated need. Widening the acceptance any further is a separate decision, and every
+/// refusal that stands today keeps standing.
+///
+/// Every remaining refusal is deliberate. The frontend is not trusted to have predicated the
+/// guard: a wrong answer that varies with scheduling is much worse than a compile error. A guard
+/// around a barrier must be PREDICATED, not branched, and `encode.barSync` takes a full `Control`
+/// so a predicated barrier stays expressible once a lowering builds one.
 fn checkBarrierConvergence(allocator: std.mem.Allocator, func: *const Function, conv: *const Convergence) Error!void {
     const n = func.blockCount();
 
@@ -449,6 +498,12 @@ fn checkBarrierConvergence(allocator: std.mem.Allocator, func: *const Function, 
         }
     }
     if (!any) return;
+
+    // Only a function that holds a barrier pays for these two analyses.
+    var uni = try opt.uniform.analyze(allocator, func);
+    defer uni.deinit(allocator);
+    var loop_info = try opt.loops.analyze(allocator, func);
+    defer loop_info.deinit(allocator);
 
     for (0..n) |ai| {
         if (divergentIf(func, ai) == null) continue;
@@ -462,6 +517,9 @@ fn checkBarrierConvergence(allocator: std.mem.Allocator, func: *const Function, 
             // The branch sits at the END of block A, so A's own instructions run with the warp
             // still whole.
             if (b == ai) continue;
+            // The one exemption: A is the exit branch of a loop that holds B, and the exit
+            // condition is uniform, so the whole workgroup makes the same trips.
+            if (isUniformLoopExit(func, &uni, &loop_info, ai, b)) continue;
 
             const m = merge orelse {
                 if (try reachesFromSuccessors(allocator, func, ai, b, null, null)) return error.Unsupported;
@@ -4487,11 +4545,97 @@ test "a barrier BEFORE and AFTER a divergent region is accepted" {
     try testing.expectEqual(@as(u32, 1), kernel.launch.barrier_count);
 }
 
-test "a barrier in a LOOP body is refused, because a thread that exits early skips it" {
-    // The loop's exit branch is a divergent region whose join is the exit block. A thread
-    // that leaves the loop reaches that join without running the last barrier the others
-    // still run. That is safe only when every thread makes the same number of trips, which
-    // the IR cannot state, so the backend refuses rather than assuming it.
+/// Build the tiled-matmul control shape into `func`: a counted loop whose body stages a tile,
+/// waits, computes, and waits again. `trips` is the trip-count value the loop compares against,
+/// which is what decides whether the loop is uniform. The caller owns `entry` and supplies
+/// `trips`, so each test below changes only where the trip count comes from.
+fn buildTileLoop(func: *Function, trips: Value, entry: Block) !void {
+    const t = func.valueType(trips);
+    const bool_t = try func.types.intern(.bool);
+    const head = try func.appendBlock();
+    const body = try func.appendBlock();
+    const done = try func.appendBlock();
+    const i = try func.appendBlockParam(head, t);
+    const zero = try func.appendInst(entry, t, .{ .iconst = 0 });
+    func.setTerminator(entry, .{ .jump = .{ .target = head, .args = try func.internValues(&.{zero}) } });
+    const c = try func.appendInst(head, bool_t, .{ .icmp = .{ .op = .lt, .lhs = i, .rhs = trips } });
+    try func.appendIf(head, c, .{ .target = body, .args = &.{} }, .{ .target = done, .args = &.{} });
+    try func.appendBarrier(body, .workgroup); // the tile is staged, wait for every thread
+    const acc = try func.appendArithImm(body, t, .mul, i, 3); // stands in for the tile compute
+    try func.appendBarrier(body, .workgroup); // the tile is consumed, wait before overwriting it
+    const next = try func.appendArithImm(body, t, .add, acc, 1);
+    func.setTerminator(body, .{ .jump = .{ .target = head, .args = try func.internValues(&.{next}) } });
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(trips) });
+}
+
+/// How many BAR.SYNC instructions a compiled kernel holds.
+fn countBarSync(code: []const u32) usize {
+    var bars: usize = 0;
+    var i: usize = 0;
+    while (i < code.len) : (i += 4) {
+        if (code[i] & 0xfff == 0xb1d) bars += 1;
+    }
+    return bars;
+}
+
+test "a barrier in a LOOP body is accepted when the trip count is a kernel parameter" {
+    // The tiled-matmul shape, and the reason the uniformity analysis exists. The trip count is
+    // a scalar kernel parameter, so every thread of the workgroup reads the same number of
+    // tiles and makes the same number of trips. No thread leaves the loop while another waits,
+    // so both barriers in the body are safe.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const entry = try func.appendBlock();
+    const tiles = try func.appendBlockParam(entry, t);
+    try buildTileLoop(&func, tiles, entry);
+
+    var kernel = try compileKernel(allocator, &func, nvidia_abi);
+    defer kernel.deinit(allocator);
+    try testing.expectEqual(@as(usize, 2), countBarSync(kernel.code));
+    try testing.expectEqual(@as(u32, 1), kernel.launch.barrier_count);
+}
+
+test "a barrier in a LOOP body is refused when the trip count comes from thread_id_x" {
+    // The negative control for the acceptance above: the SAME shape, with the trip count tagged
+    // as the thread index instead of read from the parameter block. Threads then leave the loop
+    // at different trips, and a thread that leaves early skips a barrier the others still wait
+    // at. A check that accepted every loop would pass the test above and fail this one.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const entry = try func.appendBlock();
+    const tid = try func.appendBlockParam(entry, t);
+    try gpu.attrs.setBuiltin(&func, tid, .thread_id_x);
+    try buildTileLoop(&func, tid, entry);
+
+    try testing.expectError(error.Unsupported, compileKernel(allocator, &func, nvidia_abi));
+}
+
+test "a barrier in a LOOP body is refused when the trip count is LOADED from memory" {
+    // The conservative choice in `opt.uniform`, seen from the backend. Nothing proves that no
+    // divergent thread wrote to the address, so the loaded tile count is not uniform and the
+    // loop keeps the refusal. Passing the count as a scalar parameter is the way through.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const entry = try func.appendBlock();
+    const p = try func.appendBlockParam(entry, ptr_t);
+    const tiles = try func.appendInst(entry, t, .{ .load = .{ .ptr = p } });
+    try buildTileLoop(&func, tiles, entry);
+
+    try testing.expectError(error.Unsupported, compileKernel(allocator, &func, nvidia_abi));
+}
+
+test "a barrier in a LOOP body is refused when the trip count arrives as a block parameter" {
+    // The same refusal as the `thread_id_x` case, reached through an EDGE instead of an operand.
+    // The bound is handed to the loop header as a block argument, so nothing inside the header
+    // names the thread index. An analysis that only walks operands would read the bound as
+    // uniform here and admit a barrier that half the workgroup walks away from.
     const allocator = testing.allocator;
     var func = Function.init(allocator);
     defer func.deinit();
@@ -4502,16 +4646,124 @@ test "a barrier in a LOOP body is refused, because a thread that exits early ski
     const head = try func.appendBlock();
     const body = try func.appendBlock();
     const done = try func.appendBlock();
-    const n = try func.appendBlockParam(entry, t);
+    const tid = try func.appendBlockParam(entry, t);
+    try gpu.attrs.setBuiltin(&func, tid, .thread_id_x);
     const i = try func.appendBlockParam(head, t);
+    const bound = try func.appendBlockParam(head, t);
+    const zero = try func.appendInst(entry, t, .{ .iconst = 0 });
+    func.setTerminator(entry, .{ .jump = .{ .target = head, .args = try func.internValues(&.{ zero, tid }) } });
+    const c = try func.appendInst(head, bool_t, .{ .icmp = .{ .op = .lt, .lhs = i, .rhs = bound } });
+    try func.appendIf(head, c, .{ .target = body, .args = &.{} }, .{ .target = done, .args = &.{} });
+    try func.appendBarrier(body, .workgroup);
+    const next = try func.appendArithImm(body, t, .add, i, 1);
+    func.setTerminator(body, .{ .jump = .{ .target = head, .args = try func.internValues(&.{ next, bound }) } });
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(bound) });
+
+    try testing.expectError(error.Unsupported, compileKernel(allocator, &func, nvidia_abi));
+}
+
+test "a UNIFORM if inside a uniform loop is still refused around a barrier" {
+    // The exemption stops at the loop's own exit branch. This `if` sits in the body with both
+    // edges inside the loop, and its condition is a pair of kernel parameters, so the whole
+    // workgroup does take the same arm and the placement is in fact safe. The backend refuses it
+    // all the same, exactly as it refuses the same shape outside a loop. Widening the acceptance
+    // to a plain `if` is a separate decision, and this test pins where the line sits today.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+
+    const entry = try func.appendBlock();
+    const tiles = try func.appendBlockParam(entry, t);
+    const limit = try func.appendBlockParam(entry, t);
+    const head = try func.appendBlock();
+    const body = try func.appendBlock();
+    const guarded = try func.appendBlock();
+    const latch = try func.appendBlock();
+    const done = try func.appendBlock();
     const zero = try func.appendInst(entry, t, .{ .iconst = 0 });
     func.setTerminator(entry, .{ .jump = .{ .target = head, .args = try func.internValues(&.{zero}) } });
-    const c = try func.appendInst(head, bool_t, .{ .icmp = .{ .op = .lt, .lhs = i, .rhs = n } });
+    const i = try func.appendBlockParam(head, t);
+    const c = try func.appendInst(head, bool_t, .{ .icmp = .{ .op = .lt, .lhs = i, .rhs = tiles } });
+    try func.appendIf(head, c, .{ .target = body, .args = &.{} }, .{ .target = done, .args = &.{} });
+    const guard = try func.appendInst(body, bool_t, .{ .icmp = .{ .op = .gt, .lhs = limit, .rhs = i } });
+    try func.appendIf(body, guard, .{ .target = guarded, .args = &.{} }, .{ .target = latch, .args = &.{} });
+    try func.appendBarrier(guarded, .workgroup);
+    try func.setJump(guarded, latch, &.{});
+    const next = try func.appendArithImm(latch, t, .add, i, 1);
+    func.setTerminator(latch, .{ .jump = .{ .target = head, .args = try func.internValues(&.{next}) } });
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(tiles) });
+
+    try testing.expectError(error.Unsupported, compileKernel(allocator, &func, nvidia_abi));
+}
+
+test "a uniform loop nested inside a divergent guard is still refused" {
+    // The exemption covers the loop's own exit branch and nothing else. The guard around the
+    // whole loop is a separate divergent branch, and the threads it turns away reach the join
+    // without running any of the loop's barriers.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+
+    const entry = try func.appendBlock();
+    const tid = try func.appendBlockParam(entry, t);
+    const tiles = try func.appendBlockParam(entry, t);
+    try gpu.attrs.setBuiltin(&func, tid, .thread_id_x);
+    const pre = try func.appendBlock();
+    const head = try func.appendBlock();
+    const body = try func.appendBlock();
+    const done = try func.appendBlock();
+    const four = try func.appendInst(entry, t, .{ .iconst = 4 });
+    const guard = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = tid, .rhs = four } });
+    try func.appendIf(entry, guard, .{ .target = pre, .args = &.{} }, .{ .target = done, .args = &.{} });
+    const zero = try func.appendInst(pre, t, .{ .iconst = 0 });
+    func.setTerminator(pre, .{ .jump = .{ .target = head, .args = try func.internValues(&.{zero}) } });
+    const i = try func.appendBlockParam(head, t);
+    const c = try func.appendInst(head, bool_t, .{ .icmp = .{ .op = .lt, .lhs = i, .rhs = tiles } });
     try func.appendIf(head, c, .{ .target = body, .args = &.{} }, .{ .target = done, .args = &.{} });
     try func.appendBarrier(body, .workgroup);
     const next = try func.appendArithImm(body, t, .add, i, 1);
     func.setTerminator(body, .{ .jump = .{ .target = head, .args = try func.internValues(&.{next}) } });
-    func.setTerminator(done, .{ .ret = ir.function.Ret.one(n) });
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(tiles) });
+
+    try testing.expectError(error.Unsupported, compileKernel(allocator, &func, nvidia_abi));
+}
+
+test "a divergent guard AROUND the barrier inside a uniform loop is still refused" {
+    // The loop is uniform, so its own exit branch is exempt. The `if (tid < 4)` inside the body
+    // is not, and the threads it turns away reach the latch without running the barrier. Each
+    // branch is judged on its own, so the exemption on one does not cover the other.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+
+    const entry = try func.appendBlock();
+    const tid = try func.appendBlockParam(entry, t);
+    const tiles = try func.appendBlockParam(entry, t);
+    try gpu.attrs.setBuiltin(&func, tid, .thread_id_x);
+    const head = try func.appendBlock();
+    const body = try func.appendBlock();
+    const guarded = try func.appendBlock();
+    const latch = try func.appendBlock();
+    const done = try func.appendBlock();
+    const zero = try func.appendInst(entry, t, .{ .iconst = 0 });
+    func.setTerminator(entry, .{ .jump = .{ .target = head, .args = try func.internValues(&.{zero}) } });
+    const i = try func.appendBlockParam(head, t);
+    const c = try func.appendInst(head, bool_t, .{ .icmp = .{ .op = .lt, .lhs = i, .rhs = tiles } });
+    try func.appendIf(head, c, .{ .target = body, .args = &.{} }, .{ .target = done, .args = &.{} });
+    const four = try func.appendInst(body, t, .{ .iconst = 4 });
+    const guard = try func.appendInst(body, bool_t, .{ .icmp = .{ .op = .lt, .lhs = tid, .rhs = four } });
+    try func.appendIf(body, guard, .{ .target = guarded, .args = &.{} }, .{ .target = latch, .args = &.{} });
+    try func.appendBarrier(guarded, .workgroup); // only some threads run it
+    try func.setJump(guarded, latch, &.{});
+    const next = try func.appendArithImm(latch, t, .add, i, 1);
+    func.setTerminator(latch, .{ .jump = .{ .target = head, .args = try func.internValues(&.{next}) } });
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(tiles) });
 
     try testing.expectError(error.Unsupported, compileKernel(allocator, &func, nvidia_abi));
 }
