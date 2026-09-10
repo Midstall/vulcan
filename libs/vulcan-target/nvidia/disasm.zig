@@ -121,6 +121,22 @@ pub fn decodeOne(w: encode.Inst) Inst {
             d.mnemonic = "STG";
             d.srcs = .{ srcA, srcB, RZ, srcA +% 1 }; // addr lo, data, addr hi
         },
+        0x984 => { // LDS (shared load: ONE address register, no pair)
+            // A shared address is a 32-bit byte offset into the CTA window, so
+            // there is no second address register to report. See `encode.lds`.
+            d.mnemonic = "LDS";
+            d.dst = dst;
+            d.srcs = .{ srcA, RZ, RZ, RZ }; // window offset @24
+        },
+        0x988 => { // STS (shared store: ONE address register, no pair)
+            d.mnemonic = "STS";
+            d.srcs = .{ srcA, srcB, RZ, RZ }; // window offset @24, data @32
+        },
+        0xb1d => { // BAR.SYNC (the workgroup barrier)
+            // The bare opcode plus the guard predicate, and nothing else. It
+            // reads and writes no register. See `encode.barSync`.
+            d.mnemonic = "BAR.SYNC";
+        },
         0x919 => { // S2R
             d.mnemonic = "S2R";
             d.dst = dst;
@@ -398,6 +414,38 @@ test "decodes the hardware-verified MOV/STG/EXIT round-trip" {
     const ex = decodeOne(encode.exit(.{ .stall = 1 }));
     try std.testing.expectEqualStrings("EXIT", ex.mnemonic);
     try std.testing.expectEqual(@as(u4, 1), ex.sched.stall);
+}
+
+test "decodes the shared-memory and barrier ops this backend emits" {
+    // These three came out of `compileKernel` as `??` while the encoder was
+    // already emitting them, so a listing of a kernel that used shared memory
+    // hid three instructions from every reader of it.
+    const lds = decodeOne(encode.ldsU32(6, 4, .{}));
+    try std.testing.expectEqual(@as(u12, 0x984), lds.opcode);
+    try std.testing.expectEqualStrings("LDS", lds.mnemonic);
+    try std.testing.expectEqual(@as(u8, 6), lds.dst);
+    try std.testing.expectEqual(@as(u8, 4), lds.srcs[0]); // ONE address register
+    try std.testing.expectEqual(RZ, lds.srcs[3]); // and no pair high half
+
+    const sts = decodeOne(encode.stsU32(4, 6, .{}));
+    try std.testing.expectEqual(@as(u12, 0x988), sts.opcode);
+    try std.testing.expectEqualStrings("STS", sts.mnemonic);
+    try std.testing.expectEqual(@as(u8, 4), sts.srcs[0]); // window offset
+    try std.testing.expectEqual(@as(u8, 6), sts.srcs[1]); // data
+    try std.testing.expectEqual(RZ, sts.srcs[3]);
+
+    const bar = decodeOne(encode.barSync(.{ .stall = 5 }));
+    try std.testing.expectEqual(@as(u12, 0xb1d), bar.opcode);
+    try std.testing.expectEqualStrings("BAR.SYNC", bar.mnemonic);
+    try std.testing.expectEqual(RZ, bar.dst); // reads and writes nothing
+    try std.testing.expectEqual(PT, bar.dst_pred);
+    try std.testing.expectEqual(@as(u4, 5), bar.sched.stall);
+
+    // A guarded barrier keeps its predicate, which is how a barrier inside a
+    // divergent region is expressed without a branch.
+    const guarded = decodeOne(encode.barSync(.{ .pred = 2 }));
+    try std.testing.expectEqualStrings("BAR.SYNC", guarded.mnemonic);
+    try std.testing.expectEqual(@as(u8, 2), guarded.sched.pred);
 }
 
 test "decodes the scheduling control (barriers + wait mask + guard)" {

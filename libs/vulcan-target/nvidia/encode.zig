@@ -106,12 +106,27 @@ pub fn movReg(dst: u8, src: u8, c: Control) Inst {
 // SEL, and SHF follow the same uniform-to-regular rule. The regular float
 // ALU ops 0x020-0x023 confirm it.
 
+/// Write one IADD3 carry-in operand: the predicate index at `lo`, three bits
+/// wide, and the negate flag at `not_bit`. NAK's `set_pred_src` does this.
+fn setCarryIn(w: *Inst, lo: usize, not_bit: usize, pred: u8, negate: bool) void {
+    setBits(w, lo, 3, pred);
+    setBits(w, not_bit, 1, @intFromBool(negate));
+}
+
 /// `IADD3 dst, a, b, RZ`: 32-bit integer add (dst = a + b). Regular IADD3
 /// 0x010. To add an immediate, materialize it with `movImm` first.
+///
+/// Both carry-in sources are set to the constant false, which NAK writes as
+/// `!PT`: predicate PT in the field with the negate bit set. NAK's
+/// `OpIAdd3::encode` does the same with `set_pred_src(87..90, 90, false)` and
+/// `set_pred_src(77..80, 80, false)`. Leaving the fields zero names P0 with no
+/// negate, which is a live predicate this backend gives to booleans.
 pub fn iadd3(dst: u8, a: u8, b: u8, c: Control) Inst {
     var w = alu(0x010, dst, a, b, RZ, c);
     setBits(&w, 81, 3, PT); // carry-out predicate = none
     setBits(&w, 84, 3, PT);
+    setCarryIn(&w, 87, 90, PT, true); // carry-in 0 = !PT
+    setCarryIn(&w, 77, 80, PT, true); // carry-in 1 = !PT
     return w;
 }
 
@@ -127,20 +142,28 @@ pub fn isub(dst: u8, a: u8, b: u8, c: Control) Inst {
 /// half of a 64-bit add). NAK puts the carry-out predicate at the first
 /// result-predicate field (81..83).
 pub fn iadd3CarryOut(dst: u8, a: u8, b: u8, cout: u8, c: Control) Inst {
-    var w = alu(0x010, dst, a, b, RZ, c);
+    var w = iadd3(dst, a, b, c);
     setBits(&w, 81, 3, cout); // carry-out predicate
-    setBits(&w, 84, 3, PT);
     return w;
 }
 
-/// `IADD3.X dst, a, b, RZ` with a carry-in from predicate `cin` (the high
-/// half of a 64-bit add). A real predicate in the carry-in source (87..89)
-/// selects the extended `.X` form.
+/// `IADD3.X dst, a, b, RZ, cin, !PT` with a carry-in from predicate `cin` (the
+/// high half of a 64-bit add).
+///
+/// BIT 74 IS THE `.X` FLAG, and it is the only thing that makes the hardware
+/// read the carry-in at all. NAK's `OpIAdd3X::encode` sets it with
+/// `e.set_bit(74, true)` after encoding the same 0x010 opcode `OpIAdd3` uses.
+/// Without bit 74 the instruction is a plain IADD3 that ignores bits 77..80
+/// and 87..90, so a 64-bit add silently drops every carry out of the low half.
+/// `nvdisasm -b SM120` confirms both readings: it prints `IADD3` for the same
+/// word with bit 74 clear and `IADD3.X ..., P6, !PT` with it set.
+///
+/// The second carry-in is the constant false, as NAK leaves it for a plain
+/// two-operand extended add.
 pub fn iadd3CarryIn(dst: u8, a: u8, b: u8, cin: u8, c: Control) Inst {
-    var w = alu(0x010, dst, a, b, RZ, c);
-    setBits(&w, 81, 3, PT);
-    setBits(&w, 84, 3, PT);
-    setBits(&w, 87, 3, cin); // carry-in predicate
+    var w = iadd3(dst, a, b, c);
+    setBits(&w, 74, 1, 1); // .X: read the carry-in
+    setCarryIn(&w, 87, 90, cin, false); // carry-in 0 = cin
     return w;
 }
 
@@ -429,26 +452,68 @@ pub const MemType = enum(u3) {
     }
 };
 
-/// `LDG.E dst, [addr:addr+1]`: load `ty` from the 64-bit global address in the
-/// register pair (addr, addr+1). Volta LDG 0x981, mirrors prism's STG.
+/// The memory-order field of a global access, bits 77..80. The values are
+/// NAK's `set_mem_order` table for sm >= 80.
 ///
-/// Source of the width field: NAK `sm70_encode.rs`, `impl SM70Op for OpLd`, the
-/// `MemSpace::Global` arm, which calls `set_mem_access` and through it
-/// `set_mem_type(73..76, ...)`. A `b64` load writes (dst, dst+1) and a `b128`
+/// `weak` is the DEFAULT, and it is what both ptxas and NAK emit for an
+/// ordinary load or store. A weak access still becomes visible to the host
+/// when the grid completes, because the launch's end-of-grid release flushes
+/// L2. The strong orders exist for a kernel that must publish a value to
+/// another CTA or to the host WHILE it still runs, and they cost bandwidth on
+/// every access that asks for them.
+pub const MemOrder = enum(u4) {
+    weak = 0x0,
+    constant = 0x4,
+    strong_cta = 0x5,
+    strong_gpu = 0x7,
+    strong_sys = 0xa,
+};
+
+/// `LDG.E dst, [addr:addr+1]`: load `ty` from the 64-bit global address in the
+/// register pair (addr, addr+1). Volta LDG 0x981.
+///
+/// Source: NAK `sm70_encode.rs`, `impl SM70Op for OpLd`, the `MemSpace::Global`
+/// arm. `set_reg_addr(24..32, addr, 90)` for the address pair;
+/// `set_ureg_addr(32, uniform, 72)` for the uniform base, URZ here, which also
+/// sets bit 72; `set_rev_pred_src(64..67, 67, pred)` for the guard;
+/// `set_pred_dst(81..84, None)` for the fault predicate; and `set_mem_access`,
+/// which writes `set_mem_type(73..76)`, the memory order at 77..81 and the
+/// eviction priority at 84..87. A `b64` load writes (dst, dst+1) and a `b128`
 /// load writes (dst .. dst+3), so the caller must own the whole block.
-pub fn ldg(dst: u8, addr: u8, ty: MemType, c: Control) Inst {
+///
+/// THE UNIFORM BASE OF A LOAD SITS AT BIT 32, not at bit 64 where a store keeps
+/// it. A store needs bits 32..40 for its data register and moves the uniform
+/// base out of the way; a load has no data register and leaves bits 64..67 for
+/// the guard predicate instead. Writing the uniform base at 64 therefore left
+/// UR0 in the address and `!P0` in the guard, and `nvdisasm -b SM120` printed
+/// exactly that: `LDG.E.LTC256B.STRONG.SYS P0, R4, [R2.64+UR0], !P0`.
+///
+/// The guard predicate is left zero, which is the encoding of an unconditional
+/// access: the field is REVERSED (NAK writes `7 - index`), so PT encodes as 0.
+/// The fault-predicate destination is PT and not the zero default, because P0
+/// is a register the boolean allocator hands out.
+pub fn ldgOrdered(dst: u8, addr: u8, ty: MemType, order: MemOrder, c: Control) Inst {
     var w = base(c);
     setBits(&w, 0, 12, 0x981);
     setBits(&w, 16, 8, dst);
     setBits(&w, 24, 8, addr);
-    setBits(&w, 64, 8, RZ); // URZ uniform base
+    setBits(&w, 32, 8, URZ); // uniform base, at 32 for a LOAD
+    setBits(&w, 64, 4, 0); // guard = PT, reversed, no negate
     setBits(&w, 72, 1, 1); // 64-bit uniform
     setBits(&w, 73, 3, @intFromEnum(ty));
-    setBits(&w, 77, 4, 0xa); // STRONG / SYS
+    setBits(&w, 77, 4, @intFromEnum(order));
+    setBits(&w, 81, 3, PT); // fault predicate = none
     setBits(&w, 84, 3, 1); // eviction NORMAL
     setBits(&w, 90, 1, 1); // 64-bit GPR address
     setBits(&w, 91, 1, 1); // UGPR mode
     return w;
+}
+
+/// `LDG.E dst, [addr:addr+1]` at the default weak memory order. This is the
+/// form the instruction selector emits; a kernel that needs a stronger order
+/// asks for it through `ldgOrdered`.
+pub fn ldg(dst: u8, addr: u8, ty: MemType, c: Control) Inst {
+    return ldgOrdered(dst, addr, ty, .weak, c);
 }
 
 /// `LDG.E.32 dst, [addr:addr+1]`: the single-word shorthand for `ldg`.
@@ -456,30 +521,38 @@ pub fn ldgU32(dst: u8, addr: u8, c: Control) Inst {
     return ldg(dst, addr, .b32, c);
 }
 
-/// `STG.E.STRONG.SYS [addr:addr+1], data`: store `ty` from the GPR block that
+/// `STG.E [addr:addr+1], data`: store `ty` from the GPR block that
 /// starts at `data` to the 64-bit global address in (addr, addr+1). The 32-bit
 /// form is verified bit-for-bit on hardware (prism).
 ///
-/// Source of the width field: NAK `sm70_encode.rs`, `impl SM70Op for OpSt`, the
-/// `MemSpace::Global` arm, which calls `set_mem_access` and through it
-/// `set_mem_type(73..76, ...)`. A `b64` store reads (data, data+1) and a `b128`
-/// store reads (data .. data+3).
-pub fn stg(addr: u8, data: u8, ty: MemType, c: Control) Inst {
+/// Source: NAK `sm70_encode.rs`, `impl SM70Op for OpSt`, the `MemSpace::Global`
+/// arm. `set_reg_addr(24..32, addr, 90)`; `set_ureg_addr(64, uniform, 72)` for
+/// the uniform base, which for a STORE sits at bit 64; `set_reg_src(32..40)`
+/// for the data; and `set_mem_access` as for `ldg`. A `b64` store reads
+/// (data, data+1) and a `b128` store reads (data .. data+3).
+pub fn stgOrdered(addr: u8, data: u8, ty: MemType, order: MemOrder, c: Control) Inst {
     var w = base(c);
     setBits(&w, 0, 12, 0x986);
     setBits(&w, 24, 8, addr);
     setBits(&w, 90, 1, 1); // 64-bit GPR address
-    setBits(&w, 64, 8, RZ); // URZ uniform base
+    setBits(&w, 64, 8, URZ); // uniform base, at 64 for a STORE
     setBits(&w, 72, 1, 1); // 64-bit uniform
     setBits(&w, 32, 8, data);
     setBits(&w, 73, 3, @intFromEnum(ty));
-    setBits(&w, 77, 4, 0xa); // STRONG / SYS
+    setBits(&w, 77, 4, @intFromEnum(order));
     setBits(&w, 84, 3, 1); // eviction NORMAL
     setBits(&w, 91, 1, 1); // UGPR mode (required or the SM traps)
     return w;
 }
 
-/// `STG.E.STRONG.SYS.32 [addr:addr+1], data`: the single-word shorthand for `stg`.
+/// `STG.E [addr:addr+1], data` at the default weak memory order. This is the
+/// form the instruction selector emits; a kernel that needs a stronger order
+/// asks for it through `stgOrdered`.
+pub fn stg(addr: u8, data: u8, ty: MemType, c: Control) Inst {
+    return stgOrdered(addr, data, ty, .weak, c);
+}
+
+/// `STG.E.32 [addr:addr+1], data`: the single-word shorthand for `stg`.
 pub fn stgU32(addr: u8, data: u8, c: Control) Inst {
     return stg(addr, data, .b32, c);
 }
@@ -1662,10 +1735,15 @@ test "MOV imm matches the hardware-verified encoding" {
 }
 
 test "STG matches the hardware-verified bits (prism, live on Blackwell)" {
+    // The word prism proved live carried the memory order STRONG/SYS in bits
+    // 77..80, which is 0xa and adds 0x14000 to dword 2. The default order is
+    // now weak, the same order ptxas and NAK give an ordinary store, so the
+    // one field differs from the recorded word and every other bit matches.
     const w = stgU32(0, 2, .{});
     try std.testing.expectEqual(@as(u32, 0x00007986), w[0]);
     try std.testing.expectEqual(@as(u32, 0x00000002), w[1]);
-    try std.testing.expectEqual(@as(u32, 0x0c1149ff), w[2]);
+    try std.testing.expectEqual(@as(u32, 0x0c1009ff), w[2]);
+    try std.testing.expectEqual(@as(u32, 0x0c1149ff), stgOrdered(0, 2, .b32, .strong_sys, .{})[2]);
 }
 
 test "EXIT matches the hardware-verified opcode" {
@@ -1718,6 +1796,42 @@ test "subtract sets the srcB negate modifier (bit 63)" {
     try std.testing.expectEqual(@as(u32, 1), (sub[1] >> 31) & 0x1); // sub: bit 63 set (word1 bit 31)
     try std.testing.expectEqual(@as(u32, 0x210), sub[0] & 0xfff); // still IADD3
     try std.testing.expectEqual(@as(u32, 1), (fsub(3, 1, 2, .{})[1] >> 31) & 0x1); // FADD negate too
+}
+
+test "the 64-bit add chain sets the .X bit and names the carry predicate (NAK OpIAdd3X)" {
+    // BIT 74 IS THE `.X` FLAG. NAK's OpIAdd3X encodes the same 0x010 opcode as
+    // a plain IADD3 and then calls `e.set_bit(74, true)`. Without it the
+    // hardware ignores bits 87..90 and the high half of every 64-bit add drops
+    // its carry. `nvdisasm -b SM120` prints `IADD3 R11, PT, PT, R7, RZ, RZ` for
+    // the word with bit 74 clear and
+    // `IADD3.X R11, PT, PT, R7, RZ, RZ, P6, !PT` for the word with it set.
+    const lo = iadd3CarryOut(10, 6, 9, 6, .{});
+    const hi = iadd3CarryIn(11, 7, RZ, 6, .{});
+
+    try std.testing.expectEqual(@as(u32, 0x210), lo[0] & 0xfff); // IADD3, register form
+    try std.testing.expectEqual(@as(u32, 0x210), hi[0] & 0xfff); // same opcode for .X
+    try std.testing.expectEqual(@as(u32, 0), (lo[2] >> (74 - 64)) & 0x1); // the low half is not .X
+    try std.testing.expectEqual(@as(u32, 1), (hi[2] >> (74 - 64)) & 0x1); // the high half IS .X
+
+    // The carry travels through P6: written by the low add at 81..83, read by
+    // the high add at 87..89 with the negate bit clear.
+    try std.testing.expectEqual(@as(u32, 6), (lo[2] >> (81 - 64)) & 0x7);
+    try std.testing.expectEqual(@as(u32, 6), (hi[2] >> (87 - 64)) & 0x7);
+    try std.testing.expectEqual(@as(u32, 0), (hi[2] >> (90 - 64)) & 0x1);
+
+    // Both carry-in operands of a plain add, and the second of an extended
+    // add, are the constant false: PT with the negate bit set.
+    const plain = iadd3(3, 1, 2, .{});
+    try std.testing.expectEqual(@as(u32, PT), (plain[2] >> (87 - 64)) & 0x7);
+    try std.testing.expectEqual(@as(u32, 1), (plain[2] >> (90 - 64)) & 0x1);
+    try std.testing.expectEqual(@as(u32, PT), (plain[2] >> (77 - 64)) & 0x7);
+    try std.testing.expectEqual(@as(u32, 1), (plain[2] >> (80 - 64)) & 0x1);
+    try std.testing.expectEqual(@as(u32, PT), (hi[2] >> (77 - 64)) & 0x7);
+    try std.testing.expectEqual(@as(u32, 1), (hi[2] >> (80 - 64)) & 0x1);
+
+    // A plain add carries neither the .X bit nor a carry-out predicate.
+    try std.testing.expectEqual(@as(u32, 0), (plain[2] >> (74 - 64)) & 0x1);
+    try std.testing.expectEqual(@as(u32, PT), (plain[2] >> (81 - 64)) & 0x7);
 }
 
 test "int<->float conversions carry size and signedness fields" {
@@ -1901,7 +2015,7 @@ test "a 64-bit LDG changes ONLY the memory type field" {
     // eviction priority or the UGPR bits, all of which a global access needs.
     const w32 = ldgU32(6, 4, .{});
     const w64 = ldg(6, 4, .b64, .{});
-    try std.testing.expectEqual([4]u32{ 0x04067981, 0x00000000, 0x0c114bff, 0x000fde00 }, w64);
+    try std.testing.expectEqual([4]u32{ 0x04067981, 0x000000ff, 0x0c1e0b00, 0x000fde00 }, w64);
     try std.testing.expectEqual(@as(u32, 5), (w64[2] >> (73 - 64)) & 0x7); // B64, not B32
     try std.testing.expectEqual(@as(u32, 4), (w32[2] >> (73 - 64)) & 0x7);
     // Every other bit of every dword is identical.
@@ -1910,15 +2024,58 @@ test "a 64-bit LDG changes ONLY the memory type field" {
     try std.testing.expectEqual(w32[1], w64[1]);
     try std.testing.expectEqual(w32[2] & mask, w64[2] & mask);
     try std.testing.expectEqual(w32[3], w64[3]);
-    // The address is still a 64-bit register pair with STRONG/SYS order.
+    // The address is still a 64-bit register pair at the default weak order.
     try std.testing.expectEqual(@as(u32, 4), (w64[0] >> 24) & 0xff); // address R4:R5
     try std.testing.expectEqual(@as(u32, 1), (w64[2] >> (90 - 64)) & 0x1); // 64-bit GPR address
-    try std.testing.expectEqual(@as(u32, 0xa), (w64[2] >> (77 - 64)) & 0xf); // STRONG / SYS
+    try std.testing.expectEqual(@as(u32, 0), (w64[2] >> (77 - 64)) & 0xf); // weak, the default
+}
+
+test "LDG keeps its uniform base at bit 32, guards on PT and writes no fault predicate" {
+    // The three fields a LOAD places differently from a store. NAK's OpLd
+    // global arm: set_ureg_addr(32, ..) for the uniform base, NOT 64 where a
+    // store keeps it; set_rev_pred_src(64..67, 67, ..) for the guard, whose
+    // index field is REVERSED, so an unconditional access encodes as plain
+    // zero; and set_pred_dst(81..84, None) = PT for the fault predicate.
+    //
+    // Writing the uniform base at bit 64, as this encoder once did, put UR0
+    // into the address, `!P0` into the guard and P0 into the fault
+    // destination. `nvdisasm -b SM120` rendered that word as
+    // `LDG.E.LTC256B.STRONG.SYS P0, R4, [R2.64+UR0], !P0` and renders the
+    // word below as `LDG.E R4, [R2.64+URZ]`. P0 is a register the boolean
+    // allocator hands out, so both the read and the write collided with it.
+    const w = ldgU32(4, 2, .{});
+    try std.testing.expectEqual(@as(u32, URZ), w[1] & 0xff); // uniform base URZ at bit 32
+    try std.testing.expectEqual(@as(u32, 0), w[2] & 0x7); // guard PT, reversed to 0
+    try std.testing.expectEqual(@as(u32, 0), (w[2] >> (67 - 64)) & 0x1); // guard not negated
+    try std.testing.expectEqual(@as(u32, PT), (w[2] >> (81 - 64)) & 0x7); // no fault predicate
+    // A store puts the same uniform base at bit 64 and its data at bit 32.
+    const st = stgU32(2, 4, .{});
+    try std.testing.expectEqual(@as(u32, 4), st[1] & 0xff); // data R4 at bit 32
+    try std.testing.expectEqual(@as(u32, URZ), st[2] & 0xff); // uniform base URZ at bit 64
+}
+
+test "every memory order selector matches NAK set_mem_order for sm >= 80" {
+    // NAK sm70_encode.rs, set_mem_order, the sm >= 80 arm: Weak 0x0,
+    // Constant 0x4, Strong(CTA) 0x5, Strong(GPU) 0x7, Strong(System) 0xa.
+    const cases = [_]struct { order: MemOrder, code: u32 }{
+        .{ .order = .weak, .code = 0x0 },
+        .{ .order = .constant, .code = 0x4 },
+        .{ .order = .strong_cta, .code = 0x5 },
+        .{ .order = .strong_gpu, .code = 0x7 },
+        .{ .order = .strong_sys, .code = 0xa },
+    };
+    for (cases) |c| {
+        try std.testing.expectEqual(c.code, (ldgOrdered(6, 4, .b32, c.order, .{})[2] >> (77 - 64)) & 0xf);
+        try std.testing.expectEqual(c.code, (stgOrdered(4, 6, .b32, c.order, .{})[2] >> (77 - 64)) & 0xf);
+    }
+    // The selector the instruction selector gets is the weak one.
+    try std.testing.expectEqual(@as(u32, 0), (ldgU32(6, 4, .{})[2] >> (77 - 64)) & 0xf);
+    try std.testing.expectEqual(@as(u32, 0), (stgU32(4, 6, .{})[2] >> (77 - 64)) & 0xf);
 }
 
 test "a 128-bit STG and a byte STG keep the global store frame" {
     const w128 = stg(4, 6, .b128, .{});
-    try std.testing.expectEqual([4]u32{ 0x04007986, 0x00000006, 0x0c114dff, 0x000fde00 }, w128);
+    try std.testing.expectEqual([4]u32{ 0x04007986, 0x00000006, 0x0c100dff, 0x000fde00 }, w128);
     try std.testing.expectEqual(@as(u32, 0x986), w128[0] & 0xfff);
     try std.testing.expectEqual(@as(u32, 6), w128[1] & 0xff); // data block base R6 at bit 32
     try std.testing.expectEqual(@as(u32, 6), (w128[2] >> (73 - 64)) & 0x7); // B128

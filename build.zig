@@ -650,6 +650,24 @@ pub fn build(b: *std.Build) void {
     }) });
     test_step.dependOn(&b.addRunArtifact(nvidia_execute).step);
 
+    // The 64-bit address carry chain. A global pointer add is an IADD3 plus an
+    // IADD3.X that reads the carry, and every other pointer test in this
+    // repository uses buffers whose low halves never overflow, so all of them
+    // pass with the carry dropped. This one places two buffers exactly 4 GiB
+    // apart and makes the carry the only difference between them.
+    const nvidia_carry = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("libs/vulcan-target/nvidia/tests/carry.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "vulcan-ir", .module = vulcan_ir },
+            .{ .name = "vulcan-gpu", .module = vulcan_gpu },
+            .{ .name = "vulcan-target", .module = vulcan_target },
+            .{ .name = "nvidia", .module = nvidia_dep.module("nvidia") },
+        },
+    }) });
+    test_step.dependOn(&b.addRunArtifact(nvidia_carry).step);
+
     // GLSL frontend tests: parsing/lowering (IR only), plus execution (GLSL -> IR ->
     // host JIT -> run) for scalar functions.
     const glsl_tests = b.addTest(.{ .root_module = vulcan_glsl });

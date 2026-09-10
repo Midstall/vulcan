@@ -249,8 +249,9 @@ fn readsSrc(opcode: u32, form: u32, pos: usize) bool {
         // is 1 to 4 registers by the dimension, and src1 at 32 holds the handle plus any
         // explicit LOD or depth-compare reference. `srcSpan` gives both lengths.
         encode.TEX_OPCODE, encode.TLD4_OPCODE, encode.TLD_OPCODE => pos == 24 or pos == 32,
-        // LDG and LDS: the address at 24, nothing else. LDG holds URZ in bits 64..71 and LDS
-        // leaves them zero, so neither field is a GPR source.
+        // LDG and LDS: the address at 24, nothing else. A LOAD keeps its uniform base at
+        // bits 32..39, which holds URZ, and LDG keeps its guard predicate at bits 64..67,
+        // which holds a zero that means PT. Neither field is a GPR source.
         0x981, 0x984 => pos == 24,
         // STG, STS and RED: the address at 24 and the data at 32.
         0x986, 0x988, encode.RED_OPCODE => pos == 24 or pos == 32,
