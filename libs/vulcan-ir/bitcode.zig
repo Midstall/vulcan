@@ -11,6 +11,7 @@ const std = @import("std");
 const function = @import("function.zig");
 const types = @import("types.zig");
 const parser = @import("parser.zig");
+const attribute = @import("attribute.zig");
 
 const Function = function.Function;
 const Value = function.Value;
@@ -18,10 +19,53 @@ const Inst = function.Inst;
 const Block = function.Block;
 const Type = types.Type;
 const Opcode = function.Opcode;
+const Attribute = attribute.Attribute;
 
 pub const Error = std.mem.Allocator.Error || error{MalformedBitcode};
 
 const magic = "VBC1";
+
+/// Bytes the stream header occupies before the type table: the magic, the whole-function
+/// flag byte, and the fixed-parameter count.
+const header_len = magic.len + @sizeOf(u8) + @sizeOf(u32);
+
+// Whole-function flag bits, packed into one header byte.
+const fn_flag_variadic: u8 = 1 << 0;
+const fn_flag_sret: u8 = 1 << 1;
+const fn_flag_local: u8 = 1 << 2;
+
+// Extra-field flag bits of a `call` or `call_indirect` record.
+const call_flag_variadic: u8 = 1 << 0;
+const call_flag_sret: u8 = 1 << 1;
+const call_flag_ret_dest: u8 = 1 << 2;
+
+// Attribute target tags (stable on the wire).
+const attr_target_func: u8 = 0;
+const attr_target_block: u8 = 1;
+const attr_target_inst: u8 = 2;
+const attr_target_value: u8 = 3;
+
+// Attribute body tags (stable on the wire).
+const attr_inline: u8 = 0;
+const attr_noreturn: u8 = 1;
+const attr_cold: u8 = 2;
+const attr_align: u8 = 3;
+const attr_endian: u8 = 4;
+const attr_custom: u8 = 5;
+
+// Namespaced attribute payload tags (stable on the wire).
+const attr_value_flag: u8 = 0;
+const attr_value_int: u8 = 1;
+const attr_value_string: u8 = 2;
+
+/// The stream header a hand-built test module starts with: the magic, no whole-function
+/// flags, and a zero fixed-parameter count. Only the tests below build a stream by hand.
+const test_header = magic ++ "\x00" ++ "\x00\x00\x00\x00";
+
+/// A canonical number that names nothing. An instruction that no block holds, or a value
+/// that no such instruction defines, has no place in the canonical walk, so an attribute
+/// on it names no entity in the decoded function and is not written.
+const no_serial: u32 = std.math.maxInt(u32);
 
 // Opcode tags (stable on the wire).
 const op_iconst: u8 = 0;
@@ -73,11 +117,18 @@ pub fn encode(allocator: std.mem.Allocator, func: *const Function) Error![]u8 {
     var w = Writer{ .allocator = allocator };
     errdefer w.bytes.deinit(allocator);
 
-    // Canonical serial number for each value (params then results, block order).
+    // Canonical serial number for each value (params then results, block order) and for
+    // each instruction (block order, then order within the block). Both start at
+    // `no_serial`, so an entity the walk never reaches keeps a number that names nothing.
     const serial = try allocator.alloc(u32, func.valueCount());
     defer allocator.free(serial);
+    @memset(serial, no_serial);
+    const inst_serial = try allocator.alloc(u32, func.instCount());
+    defer allocator.free(inst_serial);
+    @memset(inst_serial, no_serial);
     {
         var next: u32 = 0;
+        var next_inst: u32 = 0;
         for (0..func.blockCount()) |bi| {
             const block: Block = @enumFromInt(bi);
             for (func.blockParams(block)) |p| {
@@ -85,6 +136,8 @@ pub fn encode(allocator: std.mem.Allocator, func: *const Function) Error![]u8 {
                 next += 1;
             }
             for (func.blockInsts(block)) |inst| {
+                inst_serial[@intFromEnum(inst)] = next_inst;
+                next_inst += 1;
                 if (func.instResult(inst)) |r| {
                     serial[@intFromEnum(r)] = next;
                     next += 1;
@@ -99,6 +152,15 @@ pub fn encode(allocator: std.mem.Allocator, func: *const Function) Error![]u8 {
     }.of;
 
     try w.bytes.appendSlice(allocator, magic);
+
+    // Whole-function metadata. Each of these changes how the function is called or how
+    // its symbol binds, so a stream without them decodes to a different function.
+    var fn_flags: u8 = 0;
+    if (func.is_variadic) fn_flags |= fn_flag_variadic;
+    if (func.sret) fn_flags |= fn_flag_sret;
+    if (func.is_local) fn_flags |= fn_flag_local;
+    try w.u8v(fn_flags);
+    try w.u32v(func.num_fixed_params);
 
     // Types (interned in dependency order, so a kind's nested types precede it).
     try w.u32v(@intCast(func.types.count()));
@@ -127,7 +189,100 @@ pub fn encode(allocator: std.mem.Allocator, func: *const Function) Error![]u8 {
         try writeTerm(&w, func, block, serial, sv);
     }
 
+    // Attributes come last, because a target names a block, an instruction or a value,
+    // and the decoder can only resolve those once it has rebuilt the body. They carry the
+    // `vulcan.gpu` namespace the whole GPU path reads, so a stream without them lays out a
+    // kernel's parameter block differently.
+    try writeAttrs(&w, func, serial, inst_serial);
+
     return w.bytes.toOwnedSlice(allocator);
+}
+
+/// Write the attribute list. An entry whose target is not in the canonical walk names no
+/// entity in the decoded function, so it is dropped rather than written with a number the
+/// decoder would have to reject.
+fn writeAttrs(w: *Writer, func: *const Function, serial: []const u32, inst_serial: []const u32) Error!void {
+    const entries = func.attributeEntries();
+    var count: u32 = 0;
+    for (entries) |entry| {
+        if (attrTargetSerial(entry.target, serial, inst_serial) != null) count += 1;
+    }
+    try w.u32v(count);
+    for (entries) |entry| {
+        const number = attrTargetSerial(entry.target, serial, inst_serial) orelse continue;
+        switch (entry.target) {
+            .func => try w.u8v(attr_target_func),
+            .block => try w.u8v(attr_target_block),
+            .inst => try w.u8v(attr_target_inst),
+            .value => try w.u8v(attr_target_value),
+        }
+        if (entry.target != .func) try w.u32v(number);
+        try writeAttr(w, entry.attr);
+    }
+}
+
+/// The canonical number an attribute target resolves to, or null when the target is not
+/// part of the canonical walk. `func` has no number and reports 0.
+fn attrTargetSerial(target: function.AttrTarget, serial: []const u32, inst_serial: []const u32) ?u32 {
+    return switch (target) {
+        .func => 0,
+        .block => |b| @intFromEnum(b),
+        .inst => |i| blk: {
+            const n = inst_serial[@intFromEnum(i)];
+            break :blk if (n == no_serial) null else n;
+        },
+        .value => |v| blk: {
+            const n = serial[@intFromEnum(v)];
+            break :blk if (n == no_serial) null else n;
+        },
+    };
+}
+
+/// Write one attribute body. String payloads use the length-prefixed form the symbol
+/// table already uses.
+fn writeAttr(w: *Writer, attr: Attribute) Error!void {
+    switch (attr) {
+        .@"inline" => try w.u8v(attr_inline),
+        .noreturn => try w.u8v(attr_noreturn),
+        .cold => try w.u8v(attr_cold),
+        .@"align" => |a| {
+            try w.u8v(attr_align);
+            try w.u32v(a);
+        },
+        .endian => |e| {
+            try w.u8v(attr_endian);
+            // The decoder maps this byte back with `std.enums.fromInt`, so pin the tag
+            // values here. This follows the `float` and `ptr` arms of `writeType`.
+            comptime {
+                std.debug.assert(@intFromEnum(attribute.Endianness.little) == 0);
+                std.debug.assert(@intFromEnum(attribute.Endianness.big) == 1);
+                std.debug.assert(@intFromEnum(attribute.Endianness.native) == 2);
+            }
+            try w.u8v(@intFromEnum(e));
+        },
+        .custom => |c| {
+            try w.u8v(attr_custom);
+            try writeStr(w, c.namespace);
+            try writeStr(w, c.key);
+            switch (c.value) {
+                .flag => try w.u8v(attr_value_flag),
+                .int => |i| {
+                    try w.u8v(attr_value_int);
+                    try w.u64v(@bitCast(i));
+                },
+                .string => |s| {
+                    try w.u8v(attr_value_string);
+                    try writeStr(w, s);
+                },
+            }
+        },
+    }
+}
+
+/// Write a length-prefixed string, the same shape the symbol table uses.
+fn writeStr(w: *Writer, s: []const u8) Error!void {
+    try w.u32v(@intCast(s.len));
+    try w.bytes.appendSlice(w.allocator, s);
 }
 
 fn writeType(w: *Writer, kind: types.TypeKind) Error!void {
@@ -256,14 +411,13 @@ fn writeInst(w: *Writer, func: *const Function, inst: Inst, serial: []const u32,
             try w.u8v(op_alloca);
             try w.u32v(@intFromEnum(al.elem));
         },
-        // TODO: is_variadic/num_fixed do not round-trip here yet. Fix this before any
-        // variadic call is serialized, in bitcode, LTO, or text IR.
         .call => |c| {
             try w.u8v(op_call);
             try w.u32v(c.symbol);
             const args = func.valueList(c.args);
             try w.u32v(@intCast(args.len));
             for (args) |a| try w.u32v(sv(serial, a));
+            try writeCallExtras(w, c.is_variadic, c.num_fixed, c.sret, if (c.ret_dest) |rd| sv(serial, rd) else null, c.ret_regs, c.ret_pieces);
         },
         .call_indirect => |c| {
             try w.u8v(op_call_indirect);
@@ -271,15 +425,20 @@ fn writeInst(w: *Writer, func: *const Function, inst: Inst, serial: []const u32,
             const args = func.valueList(c.args);
             try w.u32v(@intCast(args.len));
             for (args) |a| try w.u32v(sv(serial, a));
+            try writeCallExtras(w, c.is_variadic, c.num_fixed, c.sret, if (c.ret_dest) |rd| sv(serial, rd) else null, c.ret_regs, c.ret_pieces);
         },
+        // `volatile` marks an access the optimizer must not remove, move or merge. A
+        // stream that drops it turns an MMIO register access into an ordinary one.
         .load => |l| {
             try w.u8v(op_load);
             try w.u32v(sv(serial, l.ptr));
+            try w.u8v(@intFromBool(l.@"volatile"));
         },
         .store => |st| {
             try w.u8v(op_store);
             try w.u32v(sv(serial, st.value));
             try w.u32v(sv(serial, st.ptr));
+            try w.u8v(@intFromBool(st.@"volatile"));
         },
         .prefetch => |pf| {
             try w.u8v(op_prefetch);
@@ -378,6 +537,30 @@ fn writeInst(w: *Writer, func: *const Function, inst: Inst, serial: []const u32,
     }
 }
 
+/// Write the extra fields a call carries: the variadic marker with the callee's fixed
+/// parameter count, the hidden-pointer struct return, and the register-return destination
+/// with its pieces. `ret_dest_serial` is the destination's canonical number, or null when
+/// the call has no register return. It goes LAST, after the argument serials, and the
+/// decoder reads it in the same place, so the operand fixup order stays fixed.
+fn writeCallExtras(w: *Writer, is_variadic: bool, num_fixed: u32, sret: bool, ret_dest_serial: ?u32, ret_regs: u8, ret_pieces: [4]function.RetPiece) Error!void {
+    var flags: u8 = 0;
+    if (is_variadic) flags |= call_flag_variadic;
+    if (sret) flags |= call_flag_sret;
+    if (ret_dest_serial != null) flags |= call_flag_ret_dest;
+    try w.u8v(flags);
+    try w.u32v(num_fixed);
+    // Only `ret_pieces[0..ret_regs]` carries meaning, so only that part goes on the wire
+    // and the decoder rebuilds the rest at its default.
+    std.debug.assert(ret_regs <= ret_pieces.len);
+    try w.u8v(ret_regs);
+    for (ret_pieces[0..ret_regs]) |p| {
+        try w.u8v(@intFromBool(p.fp));
+        try w.u8v(p.offset);
+        try w.u8v(p.bytes);
+    }
+    if (ret_dest_serial) |s| try w.u32v(s);
+}
+
 fn writeJump(w: *Writer, func: *const Function, jump: function.Jump, serial: []const u32, sv: fn ([]const u32, Value) u32) Error!void {
     try w.u32v(@intFromEnum(jump.target));
     const args = func.blockArgs(jump);
@@ -448,6 +631,15 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) Error!Function {
     var func = Function.init(allocator);
     errdefer func.deinit();
 
+    // Whole-function metadata. Unknown flag bits are malformed input: the stream carries
+    // no version, so a bit this build does not know is a stream it cannot read.
+    const fn_flags = try r.take(u8);
+    if (fn_flags & ~(fn_flag_variadic | fn_flag_sret | fn_flag_local) != 0) return error.MalformedBitcode;
+    func.is_variadic = fn_flags & fn_flag_variadic != 0;
+    func.sret = fn_flags & fn_flag_sret != 0;
+    func.is_local = fn_flags & fn_flag_local != 0;
+    func.num_fixed_params = try r.take(u32);
+
     // Types (interned in order, nested references resolve to earlier handles).
     const type_count = try r.take(u32);
     var type_map = try allocator.alloc(Type, type_count);
@@ -478,6 +670,11 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) Error!Function {
         fixups.deinit(allocator);
     }
 
+    // The instruction serial->Inst table, in the same canonical order, so an attribute can
+    // name the instruction it rides on.
+    var inst_serial: std.ArrayList(Inst) = .empty;
+    defer inst_serial.deinit(allocator);
+
     const dummy: Value = @enumFromInt(0);
     for (0..block_count) |bi| {
         const block: Block = @enumFromInt(bi);
@@ -487,7 +684,7 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) Error!Function {
             try serial.append(allocator, try func.appendBlockParam(block, ty));
         }
         const inst_count = try r.take(u32);
-        for (0..inst_count) |_| try readInst(&r, &func, block, type_map, block_count, dummy, &serial, &fixups, allocator);
+        for (0..inst_count) |_| try readInst(&r, &func, block, type_map, block_count, dummy, &serial, &inst_serial, &fixups, allocator);
         try readTerm(&r, &func, block, block_count, dummy, &fixups, allocator);
     }
 
@@ -501,7 +698,71 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) Error!Function {
     }
     for (fixups.items) |f| f.apply(&func, serial.items);
 
+    try readAttrs(&r, &func, block_count, serial.items, inst_serial.items);
+
     return func;
+}
+
+/// Read the attribute list written by `writeAttrs` and reattach each entry. Every target
+/// number comes off an UNTRUSTED stream, so one that names no entity is malformed input.
+fn readAttrs(r: *Reader, func: *Function, block_count: u32, serial: []const Value, inst_serial: []const Inst) Error!void {
+    const count = try r.take(u32);
+    for (0..count) |_| {
+        const kind = try r.take(u8);
+        const target: function.AttrTarget = switch (kind) {
+            attr_target_func => .func,
+            attr_target_block => .{ .block = try checkBlock(try r.take(u32), block_count) },
+            attr_target_inst => blk: {
+                const n = try r.take(u32);
+                if (n >= inst_serial.len) return error.MalformedBitcode;
+                break :blk .{ .inst = inst_serial[n] };
+            },
+            attr_target_value => blk: {
+                const n = try r.take(u32);
+                if (n >= serial.len) return error.MalformedBitcode;
+                break :blk .{ .value = serial[n] };
+            },
+            else => return error.MalformedBitcode,
+        };
+        try func.addAttr(target, try readAttr(r));
+    }
+}
+
+/// Read one attribute body. String payloads point into the input buffer; `addAttr` copies
+/// them into function-owned storage.
+fn readAttr(r: *Reader) Error!Attribute {
+    return switch (try r.take(u8)) {
+        attr_inline => .@"inline",
+        attr_noreturn => .noreturn,
+        attr_cold => .cold,
+        attr_align => .{ .@"align" = try r.take(u32) },
+        attr_endian => blk: {
+            // The byte comes off an UNTRUSTED stream, so an unknown value is a recoverable
+            // fault and never an invalid enum.
+            const raw = try r.take(u8);
+            const order = std.enums.fromInt(attribute.Endianness, raw) orelse
+                return error.MalformedBitcode;
+            break :blk .{ .endian = order };
+        },
+        attr_custom => blk: {
+            const namespace = try readStr(r);
+            const key = try readStr(r);
+            const value: attribute.AttrValue = switch (try r.take(u8)) {
+                attr_value_flag => .flag,
+                attr_value_int => .{ .int = @bitCast(try r.take(u64)) },
+                attr_value_string => .{ .string = try readStr(r) },
+                else => return error.MalformedBitcode,
+            };
+            break :blk .{ .custom = .{ .namespace = namespace, .key = key, .value = value } };
+        },
+        else => error.MalformedBitcode,
+    };
+}
+
+/// Read a length-prefixed string, the same shape the symbol table uses.
+fn readStr(r: *Reader) Error![]const u8 {
+    const len = try r.take(u32);
+    return r.takeBytes(len);
 }
 
 fn readType(r: *Reader, func: *Function, type_map: []const Type, valid: usize) Error!Type {
@@ -619,12 +880,16 @@ const Fixup = struct {
                     .struct_new => |sn| for (func.valueListMut(sn.fields)) |*f| {
                         f.* = next(&i, self.slots, serial);
                     },
-                    .call => |c| for (func.valueListMut(c.args)) |*a| {
-                        a.* = next(&i, self.slots, serial);
+                    // The register-return destination is an operand, and it comes after
+                    // the arguments on the wire, so it is filled in that order here.
+                    .call => |*c| {
+                        for (func.valueListMut(c.args)) |*a| a.* = next(&i, self.slots, serial);
+                        if (c.ret_dest) |*rd| rd.* = next(&i, self.slots, serial);
                     },
                     .call_indirect => |*c| {
                         c.target = next(&i, self.slots, serial);
                         for (func.valueListMut(c.args)) |*a| a.* = next(&i, self.slots, serial);
+                        if (c.ret_dest) |*rd| rd.* = next(&i, self.slots, serial);
                     },
                     .@"if" => |*cf| {
                         cf.cond = next(&i, self.slots, serial);
@@ -649,7 +914,7 @@ const Fixup = struct {
     }
 };
 
-fn readInst(r: *Reader, func: *Function, block: Block, type_map: []const Type, block_count: u32, dummy: Value, serial: *std.ArrayList(Value), fixups: *std.ArrayList(Fixup), allocator: std.mem.Allocator) Error!void {
+fn readInst(r: *Reader, func: *Function, block: Block, type_map: []const Type, block_count: u32, dummy: Value, serial: *std.ArrayList(Value), inst_serial: *std.ArrayList(Inst), fixups: *std.ArrayList(Fixup), allocator: std.mem.Allocator) Error!void {
     const has_result = (try r.take(u8)) != 0;
     const rty: Type = if (has_result) try mapType(type_map, type_map.len, try r.take(u32)) else undefined;
     const tag = try r.take(u8);
@@ -711,14 +976,22 @@ fn readInst(r: *Reader, func: *Function, block: Block, type_map: []const Type, b
             break :blk try appendRes(func, block, serial, rty, .{ .unary = .{ .op = uop, .value = dummy } });
         },
         op_alloca => try appendRes(func, block, serial, rty, .{ .alloca = .{ .elem = try mapType(type_map, type_map.len, try r.take(u32)) } }),
-        // TODO: is_variadic/num_fixed do not round-trip here yet. Fix this before any
-        // variadic call is serialized, in bitcode, LTO, or text IR.
         op_call => blk: {
             const symbol = try r.take(u32);
             const n = try r.take(u32);
             for (0..n) |_| try slots.append(allocator, try r.take(u32));
+            const extras = try readCallExtras(r, &slots, allocator);
             const list = try internDummies(func, n, dummy);
-            const op: Opcode = .{ .call = .{ .symbol = symbol, .args = list } };
+            const op: Opcode = .{ .call = .{
+                .symbol = symbol,
+                .args = list,
+                .is_variadic = extras.is_variadic,
+                .num_fixed = extras.num_fixed,
+                .ret_dest = if (extras.has_ret_dest) dummy else null,
+                .ret_regs = extras.ret_regs,
+                .ret_pieces = extras.ret_pieces,
+                .sret = extras.sret,
+            } };
             if (has_result) {
                 break :blk try appendRes(func, block, serial, rty, op);
             } else {
@@ -729,8 +1002,18 @@ fn readInst(r: *Reader, func: *Function, block: Block, type_map: []const Type, b
             try slots.append(allocator, try r.take(u32));
             const n = try r.take(u32);
             for (0..n) |_| try slots.append(allocator, try r.take(u32));
+            const extras = try readCallExtras(r, &slots, allocator);
             const list = try internDummies(func, n, dummy);
-            const op: Opcode = .{ .call_indirect = .{ .target = dummy, .args = list } };
+            const op: Opcode = .{ .call_indirect = .{
+                .target = dummy,
+                .args = list,
+                .is_variadic = extras.is_variadic,
+                .num_fixed = extras.num_fixed,
+                .ret_dest = if (extras.has_ret_dest) dummy else null,
+                .ret_regs = extras.ret_regs,
+                .ret_pieces = extras.ret_pieces,
+                .sret = extras.sret,
+            } };
             if (has_result) {
                 break :blk try appendRes(func, block, serial, rty, op);
             } else {
@@ -739,12 +1022,14 @@ fn readInst(r: *Reader, func: *Function, block: Block, type_map: []const Type, b
         },
         op_load => blk: {
             try slots.append(allocator, try r.take(u32));
-            break :blk try appendRes(func, block, serial, rty, .{ .load = .{ .ptr = dummy } });
+            const is_volatile = (try r.take(u8)) != 0;
+            break :blk try appendRes(func, block, serial, rty, .{ .load = .{ .ptr = dummy, .@"volatile" = is_volatile } });
         },
         op_store => blk: {
             try slots.append(allocator, try r.take(u32));
             try slots.append(allocator, try r.take(u32));
-            break :blk try appendStmtOp(func, block, .{ .store = .{ .value = dummy, .ptr = dummy } });
+            const is_volatile = (try r.take(u8)) != 0;
+            break :blk try appendStmtOp(func, block, .{ .store = .{ .value = dummy, .ptr = dummy, .@"volatile" = is_volatile } });
         },
         op_prefetch => blk: {
             try slots.append(allocator, try r.take(u32));
@@ -838,12 +1123,55 @@ fn readInst(r: *Reader, func: *Function, block: Block, type_map: []const Type, b
         else => return error.MalformedBitcode,
     };
 
+    try inst_serial.append(allocator, inst);
+
     if (slots.items.len > 0) {
         try fixups.append(allocator, .{ .target = .{ .inst = inst }, .slots = try slots.toOwnedSlice(allocator) });
     } else {
         slots.deinit(allocator);
     }
 }
+
+/// Read the extra fields `writeCallExtras` wrote. The destination serial, when present, is
+/// appended to `slots` after the argument serials, matching the write order and the fixup
+/// order.
+fn readCallExtras(r: *Reader, slots: *std.ArrayList(u32), allocator: std.mem.Allocator) Error!CallExtras {
+    const flags = try r.take(u8);
+    if (flags & ~(call_flag_variadic | call_flag_sret | call_flag_ret_dest) != 0) return error.MalformedBitcode;
+    const num_fixed = try r.take(u32);
+    const ret_regs = try r.take(u8);
+    // A call carries at most 4 return-register pieces. The count comes off an UNTRUSTED
+    // stream, so a larger one is malformed input and never an out-of-range array write.
+    var ret_pieces: [4]function.RetPiece = @splat(.{});
+    if (ret_regs > ret_pieces.len) return error.MalformedBitcode;
+    for (ret_pieces[0..ret_regs]) |*p| {
+        const fp = (try r.take(u8)) != 0;
+        const offset = try r.take(u8);
+        const bytes = try r.take(u8);
+        p.* = .{ .fp = fp, .offset = offset, .bytes = bytes };
+    }
+    const has_ret_dest = flags & call_flag_ret_dest != 0;
+    if (has_ret_dest) try slots.append(allocator, try r.take(u32));
+    return .{
+        .is_variadic = flags & call_flag_variadic != 0,
+        .num_fixed = num_fixed,
+        .has_ret_dest = has_ret_dest,
+        .ret_regs = ret_regs,
+        .ret_pieces = ret_pieces,
+        .sret = flags & call_flag_sret != 0,
+    };
+}
+
+/// The decoded extra fields of a call. `has_ret_dest` says whether the operand fixup must
+/// fill a destination value in.
+const CallExtras = struct {
+    is_variadic: bool,
+    num_fixed: u32,
+    has_ret_dest: bool,
+    ret_regs: u8,
+    ret_pieces: [4]function.RetPiece,
+    sret: bool,
+};
 
 fn readJumpDummy(r: *Reader, func: *Function, block_count: u32, slots: *std.ArrayList(u32), dummy: Value, allocator: std.mem.Allocator) Error!function.Jump {
     const target = try checkBlock(try r.take(u32), block_count);
@@ -1265,6 +1593,359 @@ test "round-trips an asymmetric-uint8 matmul quant epilogue (bias + zero_point) 
     try std.testing.expectEqualStrings(a, b);
 }
 
+/// Build one function that carries every field a stream can lose: whole-function
+/// metadata, a volatile load and store, a variadic direct call with all six call extras, a
+/// variadic indirect call with the hidden-pointer return, an accumulating matmul with a
+/// full quant payload, a barrier, and attributes on the function, a block, an instruction
+/// and a value.
+fn buildFullFunction(allocator: std.mem.Allocator) !Function {
+    var func = Function.init(allocator);
+    errdefer func.deinit();
+
+    func.is_variadic = true;
+    func.num_fixed_params = 2;
+    func.sret = true;
+    func.is_local = true;
+
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const entry = try func.appendBlock();
+    const mmio = try func.appendBlockParam(entry, ptr_t);
+    const fnptr = try func.appendBlockParam(entry, ptr_t);
+    const a = try func.appendBlockParam(entry, ptr_t);
+    const b = try func.appendBlockParam(entry, ptr_t);
+    const c = try func.appendBlockParam(entry, ptr_t);
+
+    const dest = try func.appendInst(entry, ptr_t, .{ .alloca = .{ .elem = i32_t } });
+    const reg = try func.appendInst(entry, i32_t, .{ .load = .{ .ptr = mmio, .@"volatile" = true } });
+    try func.appendStoreVol(entry, reg, mmio, true);
+    // A plain load and store beside the volatile pair, so a change that forces the flag ON
+    // fails too, not only one that drops it.
+    const plain = try func.appendInst(entry, i32_t, .{ .load = .{ .ptr = a } });
+    try func.appendStore(entry, plain, a);
+
+    // A variadic call that also returns a struct in two registers, one integer and one
+    // floating-point, so every one of the six extras carries a non-default value.
+    const args = try func.internValues(&.{ reg, reg });
+    const symbol = try func.internSymbol("printf");
+    _ = try func.appendStmtRaw(entry, .{ .call = .{
+        .symbol = symbol,
+        .args = args,
+        .is_variadic = true,
+        .num_fixed = 1,
+        .ret_dest = dest,
+        .ret_regs = 2,
+        .ret_pieces = .{
+            .{ .fp = false, .offset = 0, .bytes = 8 },
+            .{ .fp = true, .offset = 8, .bytes = 4 },
+            .{},
+            .{},
+        },
+        .sret = false,
+    } });
+    const iargs = try func.internValues(&.{reg});
+    _ = try func.appendStmtRaw(entry, .{ .call_indirect = .{
+        .target = fnptr,
+        .args = iargs,
+        .is_variadic = true,
+        .num_fixed = 1,
+        .sret = true,
+    } });
+
+    try func.appendMatmulQuantSpec(entry, a, b, c, 2, 2, 4, .int8, true, .{
+        .scale_per_column = &.{ 0x3F800000, 0x3F000000 },
+        .bias = &.{ 5, -7 },
+        .zero_point = -12,
+        .relu = true,
+        .out = .u8,
+    });
+    try func.appendBarrier(entry, .subgroup);
+    func.setTerminator(entry, .{ .ret = function.Ret.one(reg) });
+
+    try func.addAttr(.func, .@"inline");
+    try func.addAttr(.func, .{ .custom = .{
+        .namespace = "vulcan.gpu",
+        .key = "local_size_x",
+        .value = .{ .int = 64 },
+    } });
+    try func.addAttr(.{ .block = entry }, .{ .endian = .big });
+    try func.addAttr(.{ .value = mmio }, .{ .custom = .{
+        .namespace = "vulcan.gpu",
+        .key = "builtin",
+        .value = .{ .int = 3 },
+    } });
+    try func.addAttr(.{ .value = reg }, .{ .@"align" = 16 });
+    try func.addAttr(.{ .inst = func.definingInst(reg).? }, .{ .custom = .{
+        .namespace = "debug",
+        .key = "file",
+        .value = .{ .string = "mmio.c" },
+    } });
+    return func;
+}
+
+/// Check every field of `func` against what `buildFullFunction` put there. Field by field,
+/// not by comparing printed text: a field the printer drops is invisible to a text
+/// comparison, which is how these losses stayed hidden.
+fn expectFullFunction(func: *const Function) !void {
+    try std.testing.expect(func.is_variadic);
+    try std.testing.expectEqual(@as(u32, 2), func.num_fixed_params);
+    try std.testing.expect(func.sret);
+    try std.testing.expect(func.is_local);
+
+    const entry: Block = @enumFromInt(0);
+    const params = func.blockParams(entry);
+    try std.testing.expectEqual(@as(usize, 5), params.len);
+    const insts = func.blockInsts(entry);
+    try std.testing.expectEqual(@as(usize, 9), insts.len);
+
+    const load_op = func.opcode(insts[1]);
+    try std.testing.expect(load_op == .load);
+    try std.testing.expectEqual(params[0], load_op.load.ptr);
+    try std.testing.expect(load_op.load.@"volatile");
+
+    const store_op = func.opcode(insts[2]);
+    try std.testing.expect(store_op == .store);
+    try std.testing.expectEqual(params[0], store_op.store.ptr);
+    try std.testing.expect(store_op.store.@"volatile");
+
+    // The plain pair must stay plain, so a change that forces the flag on is caught too.
+    const plain_load_op = func.opcode(insts[3]);
+    try std.testing.expect(plain_load_op == .load);
+    try std.testing.expect(!plain_load_op.load.@"volatile");
+    const plain_store_op = func.opcode(insts[4]);
+    try std.testing.expect(plain_store_op == .store);
+    try std.testing.expect(!plain_store_op.store.@"volatile");
+
+    const call_op = func.opcode(insts[5]);
+    try std.testing.expect(call_op == .call);
+    const call = call_op.call;
+    try std.testing.expectEqualStrings("printf", func.symbolName(call.symbol));
+    try std.testing.expectEqual(@as(usize, 2), func.valueList(call.args).len);
+    try std.testing.expect(call.is_variadic);
+    try std.testing.expectEqual(@as(u32, 1), call.num_fixed);
+    try std.testing.expectEqual(func.instResult(insts[0]).?, call.ret_dest.?);
+    try std.testing.expectEqual(@as(u8, 2), call.ret_regs);
+    try std.testing.expectEqual(function.RetPiece{ .fp = false, .offset = 0, .bytes = 8 }, call.ret_pieces[0]);
+    try std.testing.expectEqual(function.RetPiece{ .fp = true, .offset = 8, .bytes = 4 }, call.ret_pieces[1]);
+    try std.testing.expectEqual(function.RetPiece{}, call.ret_pieces[2]);
+    try std.testing.expectEqual(function.RetPiece{}, call.ret_pieces[3]);
+    try std.testing.expect(!call.sret);
+
+    const ind_op = func.opcode(insts[6]);
+    try std.testing.expect(ind_op == .call_indirect);
+    const ind = ind_op.call_indirect;
+    try std.testing.expectEqual(params[1], ind.target);
+    try std.testing.expect(ind.is_variadic);
+    try std.testing.expectEqual(@as(u32, 1), ind.num_fixed);
+    try std.testing.expect(ind.sret);
+    try std.testing.expectEqual(@as(?Value, null), ind.ret_dest);
+    try std.testing.expectEqual(@as(u8, 0), ind.ret_regs);
+
+    const mm_op = func.opcode(insts[7]);
+    try std.testing.expect(mm_op == .matmul);
+    const mm = mm_op.matmul;
+    try std.testing.expectEqual(params[2], mm.a);
+    try std.testing.expectEqual(params[3], mm.b);
+    try std.testing.expectEqual(params[4], mm.c);
+    try std.testing.expectEqual(@as(u16, 2), mm.m);
+    try std.testing.expectEqual(@as(u16, 2), mm.n);
+    try std.testing.expectEqual(@as(u16, 4), mm.k);
+    try std.testing.expectEqual(function.MatMulType.int8, mm.dtype);
+    try std.testing.expect(mm.accumulate);
+    try std.testing.expect(!mm.embedded);
+    try std.testing.expectEqual(@as(?function.InputSigns, null), mm.input_signs);
+    const quant = mm.quant orelse return error.TestUnexpectedResult;
+    try std.testing.expect(quant.scale == .per_column);
+    try std.testing.expectEqualSlices(u32, &.{ 0x3F800000, 0x3F000000 }, func.scaleList(quant.scale.per_column));
+    try std.testing.expect(quant.relu);
+    try std.testing.expectEqual(function.MatMulQuantOut.u8, quant.out);
+    try std.testing.expectEqualSlices(i32, &.{ 5, -7 }, func.biasList(quant.bias.?));
+    try std.testing.expectEqual(@as(i32, -12), quant.zero_point);
+
+    const bar_op = func.opcode(insts[8]);
+    try std.testing.expect(bar_op == .barrier);
+    try std.testing.expectEqual(function.BarrierScope.subgroup, bar_op.barrier.scope);
+
+    var fn_attrs = func.attributesOf(.func);
+    try std.testing.expectEqual(Attribute.@"inline", fn_attrs.next().?);
+    const local_size = fn_attrs.next().?;
+    try std.testing.expectEqualStrings("vulcan.gpu", local_size.custom.namespace);
+    try std.testing.expectEqualStrings("local_size_x", local_size.custom.key);
+    try std.testing.expectEqual(@as(i64, 64), local_size.custom.value.int);
+    try std.testing.expectEqual(@as(?Attribute, null), fn_attrs.next());
+
+    var block_attrs = func.attributesOf(.{ .block = entry });
+    try std.testing.expectEqual(Attribute{ .endian = .big }, block_attrs.next().?);
+    try std.testing.expectEqual(@as(?Attribute, null), block_attrs.next());
+
+    var param_attrs = func.attributesOf(.{ .value = params[0] });
+    const builtin_tag = param_attrs.next().?;
+    try std.testing.expectEqualStrings("vulcan.gpu", builtin_tag.custom.namespace);
+    try std.testing.expectEqualStrings("builtin", builtin_tag.custom.key);
+    try std.testing.expectEqual(@as(i64, 3), builtin_tag.custom.value.int);
+
+    var result_attrs = func.attributesOf(.{ .value = func.instResult(insts[1]).? });
+    try std.testing.expectEqual(Attribute{ .@"align" = 16 }, result_attrs.next().?);
+
+    var inst_attrs = func.attributesOf(.{ .inst = insts[1] });
+    const file = inst_attrs.next().?;
+    try std.testing.expectEqualStrings("debug", file.custom.namespace);
+    try std.testing.expectEqualStrings("file", file.custom.key);
+    try std.testing.expectEqualStrings("mmio.c", file.custom.value.string);
+}
+
+test "bitcode round-trips every instruction, call, matmul and attribute field" {
+    // The oracle every other test in this file uses is `print(decode(encode(f))) ==
+    // print(f)`. A field the PRINTER drops is invisible to it, which is how volatile, the
+    // six call extras and the matmul accumulate flag all stayed lost in both directions.
+    // This test reads the decoded function FIELD BY FIELD instead.
+    const allocator = std.testing.allocator;
+
+    var func = try buildFullFunction(allocator);
+    defer func.deinit();
+    try expectFullFunction(&func); // the builder really put the fields there
+
+    const bytes = try encode(allocator, &func);
+    defer allocator.free(bytes);
+    var decoded = try decode(allocator, bytes);
+    defer decoded.deinit();
+
+    try expectFullFunction(&decoded);
+
+    // The attribute string payloads are the decoded function's OWN storage, not a view
+    // into the byte buffer, which is freed before the function is.
+    for (decoded.attributeEntries()) |entry| switch (entry.attr) {
+        .custom => |cu| {
+            try std.testing.expect(@intFromPtr(cu.namespace.ptr) < @intFromPtr(bytes.ptr) or
+                @intFromPtr(cu.namespace.ptr) >= @intFromPtr(bytes.ptr) + bytes.len);
+        },
+        .@"inline", .noreturn, .cold, .@"align", .endian => {},
+    };
+
+    // The printed text agrees too, so the print oracle now covers these fields.
+    const a = try std.fmt.allocPrint(allocator, "{f}", .{func});
+    defer allocator.free(a);
+    const b = try std.fmt.allocPrint(allocator, "{f}", .{decoded});
+    defer allocator.free(b);
+    try std.testing.expectEqualStrings(a, b);
+}
+
+test "the text IR round-trips every instruction, call, matmul and attribute field" {
+    // The parser's half of the same contract: what the printer writes must read back as
+    // the same function, field by field, not only as the same text.
+    const allocator = std.testing.allocator;
+
+    var func = try buildFullFunction(allocator);
+    defer func.deinit();
+
+    const text = try std.fmt.allocPrint(allocator, "{f}", .{func});
+    defer allocator.free(text);
+
+    var reparsed = try parser.parse(allocator, text);
+    defer reparsed.deinit();
+    try expectFullFunction(&reparsed);
+
+    const reprinted = try std.fmt.allocPrint(allocator, "{f}", .{reparsed});
+    defer allocator.free(reprinted);
+    try std.testing.expectEqualStrings(text, reprinted);
+}
+
+test "rejects the untrusted bytes the new fields added" {
+    // Suspicious cases: every byte below comes off an UNTRUSTED stream. An unknown flag
+    // bit, an out-of-range piece count, an unknown attribute tag and a target number that
+    // names no entity must all be recoverable faults, never an invalid enum, an
+    // out-of-range array write or an out-of-bounds table read.
+    const allocator = std.testing.allocator;
+
+    var func = try buildFullFunction(allocator);
+    defer func.deinit();
+    const bytes = try encode(allocator, &func);
+    defer allocator.free(bytes);
+
+    // An unknown whole-function flag bit. The flag byte follows the magic.
+    {
+        const patched = try allocator.dupe(u8, bytes);
+        defer allocator.free(patched);
+        patched[magic.len] = 0xff;
+        try std.testing.expectError(error.MalformedBitcode, decode(allocator, patched));
+    }
+
+    // A call claiming more return-register pieces than a call can hold. The piece count
+    // follows the call flag byte and the fixed-parameter count; the encoded function holds
+    // exactly one call with 2 pieces, so the first such byte pair names it.
+    {
+        const patched = try allocator.dupe(u8, bytes);
+        defer allocator.free(patched);
+        const flags = call_flag_variadic | call_flag_ret_dest;
+        var i: usize = 0;
+        const found = while (i + 6 < patched.len) : (i += 1) {
+            if (patched[i] != flags) continue;
+            if (patched[i + 5] != 2) continue; // ret_regs, after the u32 num_fixed
+            patched[i + 5] = 5; // more than the 4 a call can hold
+            break true;
+        } else false;
+        try std.testing.expect(found);
+        try std.testing.expectError(error.MalformedBitcode, decode(allocator, patched));
+    }
+
+    // An attribute target number past the end of the value table. The attribute section is
+    // last, so the final entry's target number is near the tail: rebuild the section
+    // instead of patching, by truncating to the count and writing one bad entry.
+    {
+        var bad: std.ArrayList(u8) = .empty;
+        defer bad.deinit(allocator);
+        try bad.appendSlice(allocator, bytes[0 .. bytes.len - 1]);
+        // A truncated stream is malformed on its own terms, which is the point: the decoder
+        // must not read past the buffer to discover it.
+        try std.testing.expectError(error.MalformedBitcode, decode(allocator, bad.items));
+    }
+}
+
+test "rejects an attribute naming a value that does not exist" {
+    // A hand-built module: one block, no instructions, and one attribute on value 7.
+    const allocator = std.testing.allocator;
+    const bad_attr = test_header ++
+        "\x00\x00\x00\x00" ++ // type_count = 0
+        "\x00\x00\x00\x00" ++ // sym_count = 0
+        "\x01\x00\x00\x00" ++ // block_count = 1
+        "\x00\x00\x00\x00" ++ // block 0 param_count = 0
+        "\x00\x00\x00\x00" ++ // inst_count = 0
+        "\x00" ++ // no terminator
+        "\x01\x00\x00\x00" ++ // attr_count = 1
+        "\x03" ++ // target kind = value
+        "\x07\x00\x00\x00" ++ // value number 7, which does not exist
+        "\x00"; // attribute body = inline
+    try std.testing.expectError(error.MalformedBitcode, decode(allocator, bad_attr));
+
+    // The same module with an unknown attribute body tag.
+    const bad_body = test_header ++
+        "\x00\x00\x00\x00" ++
+        "\x00\x00\x00\x00" ++
+        "\x01\x00\x00\x00" ++
+        "\x00\x00\x00\x00" ++
+        "\x00\x00\x00\x00" ++
+        "\x00" ++
+        "\x01\x00\x00\x00" ++
+        "\x00" ++ // target kind = func
+        "\x63"; // attribute body tag = 0x63, no such attribute
+    try std.testing.expectError(error.MalformedBitcode, decode(allocator, bad_body));
+
+    // And with an out-of-range endianness byte, which `@enumFromInt` would turn into an
+    // invalid enum tag.
+    const bad_endian = test_header ++
+        "\x00\x00\x00\x00" ++
+        "\x00\x00\x00\x00" ++
+        "\x01\x00\x00\x00" ++
+        "\x00\x00\x00\x00" ++
+        "\x00\x00\x00\x00" ++
+        "\x00" ++
+        "\x01\x00\x00\x00" ++
+        "\x00" ++ // target kind = func
+        "\x04" ++ // attribute body = endian
+        "\xff"; // endianness byte = 0xff, no such order
+    try std.testing.expectError(error.MalformedBitcode, decode(allocator, bad_endian));
+}
+
 test "rejects truncated bitcode" {
     const allocator = std.testing.allocator;
     try std.testing.expectError(error.MalformedBitcode, decode(allocator, "VBC1\x01"));
@@ -1277,7 +1958,7 @@ test "regression: rejects an out-of-range type index instead of OOB reading the 
     // The pre-fix code indexed `type_map[0]` (uninitialized memory) and interned a
     // garbage handle. Now it is a recoverable fault.
     const allocator = std.testing.allocator;
-    const self_ref = "VBC1" ++ // magic
+    const self_ref = test_header ++
         "\x01\x00\x00\x00" ++ // type_count = 1
         "\x04" ++ // type 0: vector
         "\x01\x00\x00\x00" ++ // vector len = 1
@@ -1285,7 +1966,7 @@ test "regression: rejects an out-of-range type index instead of OOB reading the 
     try std.testing.expectError(error.MalformedBitcode, decode(allocator, self_ref));
 
     // Same, but an index past the whole table (5 >= 1).
-    const past_end = "VBC1" ++
+    const past_end = test_header ++
         "\x01\x00\x00\x00" ++
         "\x04" ++
         "\x01\x00\x00\x00" ++
@@ -1298,7 +1979,7 @@ test "regression: rejects an unknown arith operator byte instead of @enumFromInt
     // byte 0xFF. BinOp has 10 variants, so the pre-fix `@enumFromInt(0xFF)` was
     // undefined behavior; std.enums.fromInt must reject it as malformed.
     const allocator = std.testing.allocator;
-    const bad_arith = "VBC1" ++ // magic
+    const bad_arith = test_header ++
         "\x01\x00\x00\x00" ++ // type_count = 1
         "\x01\x00\x20\x00" ++ // type 0: int, signed, 32 bits
         "\x00\x00\x00\x00" ++ // sym_count = 0
@@ -1365,7 +2046,7 @@ test "regression: rejects an unknown float-kind byte instead of silently aliasin
     // meant f64; now it must be a recoverable fault instead of misreading the
     // type.
     const allocator = std.testing.allocator;
-    const bad_float = "VBC1" ++ // magic
+    const bad_float = test_header ++
         "\x01\x00\x00\x00" ++ // type_count = 1
         "\x02" ++ // type 0: float
         "\x03"; // float-kind byte = 3 (no such FloatKind)
@@ -1456,8 +2137,8 @@ test "regression: rejects an unknown address-space byte instead of @enumFromInt 
     // offset. A scan for the first tag 3 is not safe here, because tag 3 is also
     // the `arith_imm` opcode and the low byte of many counts, so it can match
     // earlier by coincidence and patch a byte this test does not mean to touch.
-    // The layout is fixed instead: the magic, then a u32 type count, then the
-    // type records. The function holds exactly one type, so type 0 starts right
+    // The layout is fixed instead: the stream header, then a u32 type count, then
+    // the type records. The function holds exactly one type, so type 0 starts right
     // after the count.
     const allocator = std.testing.allocator;
     var func = Function.init(allocator);
@@ -1469,7 +2150,7 @@ test "regression: rejects an unknown address-space byte instead of @enumFromInt 
     const bytes = try encode(allocator, &func);
     defer allocator.free(bytes);
 
-    const tag_offset = magic.len + @sizeOf(u32);
+    const tag_offset = header_len + @sizeOf(u32);
     const space_offset = tag_offset + 1;
     try std.testing.expect(space_offset < bytes.len);
     // Prove the offset really names the pointer record before it is patched.

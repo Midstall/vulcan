@@ -1513,16 +1513,51 @@ pub const Function = struct {
             try printAttr(w, attr);
             try w.writeAll("]\n");
         }
-        try w.writeAll("fn {\n");
+        // Whole-function metadata prints only when it is not at its default, so an
+        // ordinary function still starts with a bare `fn {`. Each of these changes how
+        // the function is called or how its symbol binds, so the text form must carry
+        // them or a print/parse round trip silently makes a different function.
+        try w.writeAll("fn");
+        if (self.is_local) try w.writeAll(" local");
+        if (self.is_variadic) try w.print(" variadic({d})", .{self.num_fixed_params});
+        if (self.sret) try w.writeAll(" sret");
+        try w.writeAll(" {\n");
         for (self.blocks.items, 0..) |block, bi| {
+            // A block attribute prints above the label. The structured control-flow
+            // lowerings key merge and continue blocks this way, so the text form must
+            // carry it.
+            var block_attrs = self.attributesOf(.{ .block = @enumFromInt(bi) });
+            while (block_attrs.next()) |attr| {
+                try w.writeAll("  #[");
+                try printAttr(w, attr);
+                try w.writeAll("]\n");
+            }
             try w.print("  block{d}(", .{bi});
             for (block.params.items, 0..) |param, pi| {
                 if (pi != 0) try w.writeAll(", ");
                 try w.print("v{d}: {f}", .{ self.valueName(param), self.types.fmt(self.valueType(param)) });
+                // A parameter attribute prints right after the parameter. This is where
+                // the GPU path puts its `vulcan.gpu.builtin` tag, which decides whether
+                // the parameter takes space in the parameter block at all.
+                var param_attrs = self.attributesOf(.{ .value = param });
+                while (param_attrs.next()) |attr| {
+                    try w.writeAll(" #[");
+                    try printAttr(w, attr);
+                    try w.writeAll("]");
+                }
             }
             try w.writeAll("):\n");
 
             for (block.insts.items) |inst| {
+                // An attribute on the INSTRUCTION prints with a `#!` marker, an attribute
+                // on the value it defines with a plain `#`. They are different targets, so
+                // one spelling cannot stand for both.
+                var inst_attrs = self.attributesOf(.{ .inst = inst });
+                while (inst_attrs.next()) |attr| {
+                    try w.writeAll("    #![");
+                    try printAttr(w, attr);
+                    try w.writeAll("]\n");
+                }
                 if (self.instResult(inst)) |result| {
                     var attrs = self.attributesOf(.{ .value = result });
                     while (attrs.next()) |attr| {
@@ -1671,6 +1706,41 @@ fn printAttr(w: *std.Io.Writer, attr: Attribute) std.Io.Writer.Error!void {
     }
 }
 
+/// Render the extra fields a call carries after its argument list: the variadic marker,
+/// the hidden-pointer struct return, and the register-return destination with its pieces.
+/// Each part prints only when it is not at its default, so an ordinary call is unchanged.
+/// A piece prints as `bank@offset:bytes`, with `i` for an integer register and `f` for a
+/// floating-point one. `ret_regs` is recovered from the number of pieces, so it needs no
+/// separate spelling. Only `ret_pieces[0..ret_regs]` carries meaning, so only that part
+/// prints.
+fn printCallExtras(
+    self: *const Function,
+    w: *std.Io.Writer,
+    is_variadic: bool,
+    num_fixed: u32,
+    sret: bool,
+    ret_dest: ?Value,
+    ret_regs: u8,
+    ret_pieces: [4]RetPiece,
+) std.Io.Writer.Error!void {
+    if (is_variadic) try w.print(" variadic({d})", .{num_fixed});
+    if (sret) try w.writeAll(" sret");
+    if (ret_dest != null or ret_regs != 0) {
+        // A call carries at most 4 return-register pieces. Every construction site
+        // asserts it and the bitcode decoder rejects a larger count, so the slice below
+        // is in range.
+        std.debug.assert(ret_regs <= ret_pieces.len);
+        try w.writeAll(" retdest(");
+        if (ret_dest) |d| try w.print("v{d}", .{self.valueName(d)}) else try w.writeAll("none");
+        try w.writeAll(",[");
+        for (ret_pieces[0..ret_regs], 0..) |p, i| {
+            if (i != 0) try w.writeAll(",");
+            try w.print("{s}@{d}:{d}", .{ if (p.fp) "f" else "i", p.offset, p.bytes });
+        }
+        try w.writeAll("])");
+    }
+}
+
 /// Render an instruction statement. Constants bind with `const` and carry a type
 /// annotation. Other results bind with `let`.
 fn printInst(self: *const Function, w: *std.Io.Writer, inst: Inst) std.Io.Writer.Error!void {
@@ -1740,9 +1810,6 @@ fn printInst(self: *const Function, w: *std.Io.Writer, inst: Inst) std.Io.Writer
             if (ga.via_got) " got" else "",
             self.symbolName(ga.symbol),
         }),
-        // TODO: is_variadic/num_fixed are not printed here, so they do not round-trip
-        // through the text IR. This matches Load.@"volatile", which also is not printed.
-        // Fix this before any variadic call is serialized, in bitcode, LTO, or text IR.
         .call => |c| {
             if (data.result) |res| {
                 try w.print("let v{d} = call {f} @{s}(", .{
@@ -1758,6 +1825,7 @@ fn printInst(self: *const Function, w: *std.Io.Writer, inst: Inst) std.Io.Writer
                 try w.print("v{d}", .{self.valueName(arg)});
             }
             try w.writeAll(")");
+            try printCallExtras(self, w, c.is_variadic, c.num_fixed, c.sret, c.ret_dest, c.ret_regs, c.ret_pieces);
         },
         .call_indirect => |c| {
             if (data.result) |res| {
@@ -1770,6 +1838,7 @@ fn printInst(self: *const Function, w: *std.Io.Writer, inst: Inst) std.Io.Writer
                 try w.print("v{d}", .{self.valueName(arg)});
             }
             try w.writeAll(")");
+            try printCallExtras(self, w, c.is_variadic, c.num_fixed, c.sret, c.ret_dest, c.ret_regs, c.ret_pieces);
         },
         .convert => |cv| try w.print("let v{d} = convert {f}, v{d}", .{
             self.valueName(data.result.?),
@@ -1782,12 +1851,20 @@ fn printInst(self: *const Function, w: *std.Io.Writer, inst: Inst) std.Io.Writer
             self.types.fmt(self.valueType(data.result.?)),
             self.valueName(u.value),
         }),
-        .load => |ld| try w.print("let v{d} = load {f}, v{d}", .{
+        // `volatile` prints as a word after the mnemonic, the same shape as `global_addr
+        // got`. It marks an access the optimizer must not remove, move or merge, so the
+        // text form must carry it.
+        .load => |ld| try w.print("let v{d} = load{s} {f}, v{d}", .{
             self.valueName(data.result.?),
+            if (ld.@"volatile") " volatile" else "",
             self.types.fmt(self.valueType(data.result.?)),
             self.valueName(ld.ptr),
         }),
-        .store => |st| try w.print("store v{d}, v{d}", .{ self.valueName(st.value), self.valueName(st.ptr) }),
+        .store => |st| try w.print("store{s} v{d}, v{d}", .{
+            if (st.@"volatile") " volatile" else "",
+            self.valueName(st.value),
+            self.valueName(st.ptr),
+        }),
         .prefetch => |pf| try w.print("prefetch v{d}", .{self.valueName(pf.ptr)}),
         .va_start => |vs| try w.print("va_start v{d}", .{self.valueName(vs.list)}),
         .va_arg => |va| try w.print("let v{d} = va_arg {f}, v{d}", .{
@@ -1815,16 +1892,36 @@ fn printInst(self: *const Function, w: *std.Io.Writer, inst: Inst) std.Io.Writer
                 mm.k,
                 @tagName(mm.dtype),
             });
+            // `accumulate` picks between `c := a*b` and `c += a*b`. Two different
+            // computations, so it prints.
+            if (mm.accumulate) try w.writeAll(" acc");
             if (mm.embedded) try w.writeAll(" embedded");
             if (mm.input_signs) |s| {
                 try w.print(" a_uns={},b_uns={}", .{ s.a_unsigned, s.b_unsigned });
             }
             if (mm.quant) |q| {
+                // The per-column scales and the bias print as their VALUES, not as a
+                // count. They are constant data the epilogue computes with, so a count
+                // alone cannot rebuild the instruction.
                 switch (q.scale) {
                     .scalar => |bits| try w.print(" quant(scalar=0x{X},relu={},{s}", .{ bits, q.relu, @tagName(q.out) }),
-                    .per_column => |h| try w.print(" quant(per_col[{d}],relu={},{s}", .{ self.scaleList(h).len, q.relu, @tagName(q.out) }),
+                    .per_column => |h| {
+                        try w.writeAll(" quant(per_col[");
+                        for (self.scaleList(h), 0..) |s, i| {
+                            if (i != 0) try w.writeAll(",");
+                            try w.print("0x{X}", .{s});
+                        }
+                        try w.print("],relu={},{s}", .{ q.relu, @tagName(q.out) });
+                    },
                 }
-                if (q.bias) |bh| try w.print(",bias[{d}]", .{self.biasList(bh).len}) else try w.writeAll(",bias=none");
+                if (q.bias) |bh| {
+                    try w.writeAll(",bias[");
+                    for (self.biasList(bh), 0..) |bv, i| {
+                        if (i != 0) try w.writeAll(",");
+                        try w.print("{d}", .{bv});
+                    }
+                    try w.writeAll("]");
+                } else try w.writeAll(",bias=none");
                 if (q.zero_point != 0) try w.print(",zp={d}", .{q.zero_point});
                 try w.writeAll(")");
             }

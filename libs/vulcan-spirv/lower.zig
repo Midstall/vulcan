@@ -2935,7 +2935,9 @@ test "lowers a compute shader: buffer store through a thread-indexed pointer" {
     // and pointer arithmetic producing the element address.
     var buf: [2048]u8 = undefined;
     const text = try std.fmt.bufPrint(&buf, "{f}", .{func});
-    try testing.expect(std.mem.indexOf(u8, text, "block0(v0: i32, v1: ptr):") != null);
+    // The invocation-id parameter carries its `vulcan.gpu.builtin` tag, which the printer
+    // now writes: the tag decides whether the parameter takes space in the parameter block.
+    try testing.expect(std.mem.indexOf(u8, text, "block0(v0: i32 #[vulcan.gpu.builtin = 12], v1: ptr):") != null);
     try testing.expect(std.mem.indexOf(u8, text, "load i32") != null);
     try testing.expect(std.mem.indexOf(u8, text, "store ") != null);
     try testing.expect(std.mem.indexOf(u8, text, "ret void") != null);

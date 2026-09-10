@@ -57,8 +57,11 @@ fn isLetter(c: u8) bool {
     return std.ascii.isAlphabetic(c);
 }
 
+/// An underscore is part of a word. The printer writes mnemonics such as `call_indirect`
+/// and `global_addr`, and attribute keys such as `local_size_x`, so a word that stops at
+/// the underscore cannot read back what the printer wrote.
 fn isWordChar(c: u8) bool {
-    return std.ascii.isAlphanumeric(c);
+    return std.ascii.isAlphanumeric(c) or c == '_';
 }
 
 fn allDigits(s: []const u8) bool {
@@ -177,6 +180,7 @@ const FunctionParser = struct {
         try self.parseAttrs(.func);
         self.skipWs();
         try self.expectWord("fn");
+        try self.parseFunctionModifiers();
         self.skipWs();
         try self.eat('{');
 
@@ -186,8 +190,67 @@ const FunctionParser = struct {
                 self.pos += 1;
                 break;
             }
-            try self.parseBlock();
+            // Attributes here sit above a block label, so they belong to that block. The
+            // label is read first, so they attach to the block the label names.
+            var pending: std.ArrayList(Attribute) = .empty;
+            defer pending.deinit(self.allocator());
+            try self.collectAttrs(&pending, null);
+            try self.parseBlock(&pending);
         }
+    }
+
+    /// Read the whole-function metadata words the printer writes between `fn` and `{`:
+    /// `local`, `variadic(n)` and `sret`, in any order and any number. An ordinary
+    /// function has none of them and this stops at once.
+    fn parseFunctionModifiers(self: *FunctionParser) Error!void {
+        while (true) {
+            const save = self.pos;
+            self.skipWs();
+            if (self.peek() == '{') return;
+            const word = self.readWord();
+            if (std.mem.eql(u8, word, "local")) {
+                self.func.is_local = true;
+            } else if (std.mem.eql(u8, word, "sret")) {
+                self.func.sret = true;
+            } else if (std.mem.eql(u8, word, "variadic")) {
+                try self.eat('(');
+                self.func.num_fixed_params = std.math.cast(u32, try self.readUnsigned()) orelse
+                    return error.InvalidSyntax;
+                try self.eat(')');
+                self.func.is_variadic = true;
+            } else {
+                self.pos = save;
+                return;
+            }
+        }
+    }
+
+    /// Try to read `word` at the cursor. On a different word the cursor does not move, so
+    /// the caller can fall through to another spelling.
+    fn tryWord(self: *FunctionParser, word: []const u8) bool {
+        const save = self.pos;
+        self.skipWs();
+        if (std.mem.eql(u8, self.readWord(), word)) return true;
+        self.pos = save;
+        return false;
+    }
+
+    /// Read a `true` or `false` word.
+    fn readBool(self: *FunctionParser) Error!bool {
+        self.skipWs();
+        const word = self.readWord();
+        if (std.mem.eql(u8, word, "true")) return true;
+        if (std.mem.eql(u8, word, "false")) return false;
+        return error.InvalidSyntax;
+    }
+
+    /// Read an unsigned literal that may carry a `0x` prefix, as the printer writes the
+    /// quant scale bits.
+    fn readRadixUnsigned(self: *FunctionParser) Error!u64 {
+        self.skipWs();
+        const word = self.readWord();
+        if (word.len == 0) return error.InvalidSyntax;
+        return std.fmt.parseInt(u64, word, 0) catch error.InvalidSyntax;
     }
 
     /// Parse zero or more `#[...]` attributes, attaching each to `target`.
@@ -223,16 +286,26 @@ const FunctionParser = struct {
             const order = std.meta.stringToEnum(attribute.Endianness, e) orelse return error.InvalidSyntax;
             return .{ .endian = order };
         }
-        // Namespaced: `namespace.key` with an optional `= value`.
-        try self.eat('.');
-        const key = self.readWord();
+        // Namespaced: `namespace.key` with an optional `= value`. A namespace may itself
+        // hold dots (`vulcan.gpu` is the one the whole GPU path uses), so read the full
+        // dotted path and split it at the LAST dot: everything before it is the
+        // namespace, the final segment is the key.
+        const path_start = self.pos - word.len;
+        while (self.peek() == '.') {
+            self.pos += 1;
+            if (self.readWord().len == 0) return error.InvalidSyntax;
+        }
+        const path = self.src[path_start..self.pos];
+        const dot = std.mem.lastIndexOfScalar(u8, path, '.') orelse return error.InvalidSyntax;
+        const namespace = path[0..dot];
+        const key = path[dot + 1 ..];
         self.skipWs();
         var value: AttrValue = .flag;
         if (self.tryChar('=')) {
             self.skipWs();
             value = try self.parseAttrValue();
         }
-        return .{ .custom = .{ .namespace = word, .key = key, .value = value } };
+        return .{ .custom = .{ .namespace = namespace, .key = key, .value = value } };
     }
 
     fn parseAttrValue(self: *FunctionParser) Error!AttrValue {
@@ -261,12 +334,13 @@ const FunctionParser = struct {
         while (i < count) : (i += 1) _ = try self.func.appendBlock();
     }
 
-    fn parseBlock(self: *FunctionParser) Error!void {
+    fn parseBlock(self: *FunctionParser, block_attrs: *const std.ArrayList(Attribute)) Error!void {
         self.skipWs();
         const label = self.readWord();
         if (!std.mem.startsWith(u8, label, "block")) return error.InvalidSyntax;
         const bnum = std.fmt.parseInt(u32, label["block".len..], 10) catch return error.InvalidSyntax;
         const block = try self.checkedBlock(bnum);
+        for (block_attrs.items) |attr| try self.func.addAttr(.{ .block = block }, attr);
 
         try self.eat('(');
         self.skipWs();
@@ -295,6 +369,8 @@ const FunctionParser = struct {
         const ty = try self.parseType();
         const value = try self.func.appendBlockParam(block, ty);
         try self.recordValue(value);
+        // Attributes that follow the parameter attach to it, not to the block.
+        try self.parseAttrs(.{ .value = value });
     }
 
     /// Parse instructions until a terminator ends the block.
@@ -304,7 +380,13 @@ const FunctionParser = struct {
 
             var pending: std.ArrayList(Attribute) = .empty;
             defer pending.deinit(self.allocator());
-            try self.collectAttrs(&pending);
+            var pending_inst: std.ArrayList(Attribute) = .empty;
+            defer pending_inst.deinit(self.allocator());
+            try self.collectAttrs(&pending, &pending_inst);
+
+            // An instruction attribute attaches to whatever instruction the statement
+            // appends, so remember where the block ended before the statement is read.
+            const insts_before = self.func.blockInsts(block).len;
 
             self.skipWs();
             const word = self.readWord();
@@ -326,29 +408,65 @@ const FunctionParser = struct {
             } else if (std.mem.eql(u8, word, "call")) {
                 if (pending.items.len != 0) return error.InvalidSyntax;
                 try self.parseVoidCall(block);
-            } else if (std.mem.eql(u8, word, "ret")) {
+            } else if (std.mem.eql(u8, word, "call_indirect")) {
                 if (pending.items.len != 0) return error.InvalidSyntax;
+                try self.parseVoidCallIndirect(block);
+            } else if (std.mem.eql(u8, word, "prefetch")) {
+                if (pending.items.len != 0) return error.InvalidSyntax;
+                self.skipWs();
+                try self.func.appendPrefetch(block, try self.parseValueRef());
+            } else if (std.mem.eql(u8, word, "va_start")) {
+                if (pending.items.len != 0) return error.InvalidSyntax;
+                self.skipWs();
+                try self.func.appendVaStart(block, try self.parseValueRef());
+            } else if (std.mem.eql(u8, word, "va_end")) {
+                if (pending.items.len != 0) return error.InvalidSyntax;
+                self.skipWs();
+                try self.func.appendVaEnd(block, try self.parseValueRef());
+            } else if (std.mem.eql(u8, word, "matmul")) {
+                if (pending.items.len != 0) return error.InvalidSyntax;
+                try self.parseMatmul(block);
+            } else if (std.mem.eql(u8, word, "ret")) {
+                if (pending.items.len != 0 or pending_inst.items.len != 0) return error.InvalidSyntax;
                 try self.parseRet(block);
                 return;
             } else if (std.mem.startsWith(u8, word, "block")) {
-                if (pending.items.len != 0) return error.InvalidSyntax;
+                if (pending.items.len != 0 or pending_inst.items.len != 0) return error.InvalidSyntax;
                 try self.parseJump(block, word);
                 return;
             } else {
                 return error.InvalidSyntax;
             }
+
+            // A terminator appends no instruction, so both arms above return before this.
+            if (pending_inst.items.len != 0) {
+                const insts = self.func.blockInsts(block);
+                if (insts.len == insts_before) return error.InvalidSyntax;
+                const inst = insts[insts.len - 1];
+                for (pending_inst.items) |attr| try self.func.addAttr(.{ .inst = inst }, attr);
+            }
         }
     }
 
-    /// Collect leading `#[...]` attributes into `list` without attaching them yet.
-    fn collectAttrs(self: *FunctionParser, list: *std.ArrayList(Attribute)) Error!void {
+    /// Collect leading attributes without attaching them yet. A plain `#[...]` goes to
+    /// `list`, a `#![...]` to `inst_list`, which names the instruction rather than the
+    /// value it defines. When `inst_list` is null a `#!` form is a parse error, because
+    /// there is no instruction at that position.
+    fn collectAttrs(self: *FunctionParser, list: *std.ArrayList(Attribute), inst_list: ?*std.ArrayList(Attribute)) Error!void {
         while (true) {
             self.skipWs();
             if (self.peek() != '#') break;
             try self.eat('#');
+            const on_inst = self.tryChar('!');
             try self.eat('[');
             self.skipWs();
-            try list.append(self.allocator(), try self.parseAttrBody());
+            const attr = try self.parseAttrBody();
+            if (on_inst) {
+                const target = inst_list orelse return error.InvalidSyntax;
+                try target.append(self.allocator(), attr);
+            } else {
+                try list.append(self.allocator(), attr);
+            }
             self.skipWs();
             try self.eat(']');
         }
@@ -470,13 +588,90 @@ const FunctionParser = struct {
 
         const op = self.readWord();
         if (std.mem.eql(u8, op, "load")) {
+            // `volatile` marks an access the optimizer must not remove, move or merge.
+            const is_volatile = self.tryWord("volatile");
             self.skipWs();
             const ty = try self.parseType();
             self.skipWs();
             try self.eat(',');
             self.skipWs();
             const ptr = try self.parseValueRef();
-            const result = try self.func.appendInst(block, ty, .{ .load = .{ .ptr = ptr } });
+            const result = try self.func.appendInst(block, ty, .{ .load = .{ .ptr = ptr, .@"volatile" = is_volatile } });
+            try self.recordValue(result);
+            return result;
+        }
+        if (std.mem.eql(u8, op, "global_addr")) {
+            const via_got = self.tryWord("got");
+            self.skipWs();
+            try self.eat('@');
+            const name = self.readWord();
+            const symbol = try self.func.internSymbol(name);
+            // The printed form carries no result type, so the address space is the
+            // default one, the same rule `alloca` already follows here.
+            const ptr_t = try self.func.types.ptrGlobal();
+            const result = try self.func.appendInst(block, ptr_t, .{ .global_addr = .{ .symbol = symbol, .via_got = via_got } });
+            try self.recordValue(result);
+            return result;
+        }
+        if (std.mem.eql(u8, op, "dot")) {
+            self.skipWs();
+            const acc = try self.parseValueRef();
+            self.skipWs();
+            try self.eat(',');
+            self.skipWs();
+            const a = try self.parseValueRef();
+            self.skipWs();
+            try self.eat(',');
+            self.skipWs();
+            const b = try self.parseValueRef();
+            const result = try self.func.appendDot(block, acc, a, b);
+            try self.recordValue(result);
+            return result;
+        }
+        if (std.mem.eql(u8, op, "va_arg")) {
+            self.skipWs();
+            const ty = try self.parseType();
+            self.skipWs();
+            try self.eat(',');
+            self.skipWs();
+            const list = try self.parseValueRef();
+            const result = try self.func.appendVaArg(block, list, ty);
+            try self.recordValue(result);
+            return result;
+        }
+        if (std.meta.stringToEnum(function.UnaryOp, op)) |uop| {
+            self.skipWs();
+            const ty = try self.parseType();
+            self.skipWs();
+            try self.eat(',');
+            self.skipWs();
+            const value = try self.parseValueRef();
+            const result = try self.func.appendInst(block, ty, .{ .unary = .{ .op = uop, .value = value } });
+            try self.recordValue(result);
+            return result;
+        }
+        if (std.mem.eql(u8, op, "call_indirect")) {
+            self.skipWs();
+            const ty = try self.parseType();
+            self.skipWs();
+            const target = try self.parseValueRef();
+
+            var args: std.ArrayList(Value) = .empty;
+            defer args.deinit(self.allocator());
+            try self.parseCallArgs(&args);
+            const extras = try self.parseCallExtras();
+
+            const list = try self.func.internValues(args.items);
+            const result = try self.func.appendInst(block, ty, .{ .call_indirect = .{
+                .target = target,
+                .args = list,
+                .is_variadic = extras.is_variadic,
+                .num_fixed = extras.num_fixed,
+                .ret_dest = extras.ret_dest,
+                .ret_regs = extras.ret_regs,
+                .ret_pieces = extras.ret_pieces,
+                .sret = extras.sret,
+            } });
             try self.recordValue(result);
             return result;
         }
@@ -488,34 +683,30 @@ const FunctionParser = struct {
             try self.recordValue(result);
             return result;
         }
-        // TODO: is_variadic/num_fixed do not round-trip here yet. This arm and the
-        // void-call arm in parseVoidCall both build a plain, non-variadic call. Fix this
-        // before any variadic call is serialized, in bitcode, LTO, or text IR.
         if (std.mem.eql(u8, op, "call")) {
             self.skipWs();
             const ty = try self.parseType();
             self.skipWs();
             try self.eat('@');
             const name = self.readWord();
-            self.skipWs();
-            try self.eat('(');
 
             var args: std.ArrayList(Value) = .empty;
             defer args.deinit(self.allocator());
-            self.skipWs();
-            if (self.peek() != ')') {
-                while (true) {
-                    self.skipWs();
-                    try args.append(self.allocator(), try self.parseValueRef());
-                    self.skipWs();
-                    if (self.tryChar(',')) continue;
-                    break;
-                }
-            }
-            self.skipWs();
-            try self.eat(')');
+            try self.parseCallArgs(&args);
+            const extras = try self.parseCallExtras();
 
-            const result = try self.func.appendCall(block, ty, name, args.items);
+            const symbol = try self.func.internSymbol(name);
+            const list = try self.func.internValues(args.items);
+            const result = try self.func.appendInst(block, ty, .{ .call = .{
+                .symbol = symbol,
+                .args = list,
+                .is_variadic = extras.is_variadic,
+                .num_fixed = extras.num_fixed,
+                .ret_dest = extras.ret_dest,
+                .ret_regs = extras.ret_regs,
+                .ret_pieces = extras.ret_pieces,
+                .sret = extras.sret,
+            } });
             try self.recordValue(result);
             return result;
         }
@@ -563,13 +754,15 @@ const FunctionParser = struct {
     }
 
     fn parseStore(self: *FunctionParser, block: Block) Error!void {
+        // `volatile` marks an access the optimizer must not remove, move or merge.
+        const is_volatile = self.tryWord("volatile");
         self.skipWs();
         const value = try self.parseValueRef();
         self.skipWs();
         try self.eat(',');
         self.skipWs();
         const ptr = try self.parseValueRef();
-        try self.func.appendStore(block, value, ptr);
+        try self.func.appendStoreVol(block, value, ptr, is_volatile);
     }
 
     /// Parse a barrier statement: `barrier workgroup`. A result-less statement with one
@@ -584,21 +777,63 @@ const FunctionParser = struct {
         try self.func.appendBarrier(block, scope);
     }
 
-    /// Parse a void call statement: `call @name(args)`.
+    /// Parse a void call statement: `call @name(args)` with its trailing extras.
     fn parseVoidCall(self: *FunctionParser, block: Block) Error!void {
         self.skipWs();
         try self.eat('@');
         const name = self.readWord();
-        self.skipWs();
-        try self.eat('(');
 
         var args: std.ArrayList(Value) = .empty;
         defer args.deinit(self.allocator());
+        try self.parseCallArgs(&args);
+        const extras = try self.parseCallExtras();
+
+        const symbol = try self.func.internSymbol(name);
+        const list = try self.func.internValues(args.items);
+        _ = try self.func.appendStmtRaw(block, .{ .call = .{
+            .symbol = symbol,
+            .args = list,
+            .is_variadic = extras.is_variadic,
+            .num_fixed = extras.num_fixed,
+            .ret_dest = extras.ret_dest,
+            .ret_regs = extras.ret_regs,
+            .ret_pieces = extras.ret_pieces,
+            .sret = extras.sret,
+        } });
+    }
+
+    /// Parse a void indirect call statement: `call_indirect vT(args)` with its extras.
+    fn parseVoidCallIndirect(self: *FunctionParser, block: Block) Error!void {
+        self.skipWs();
+        const target = try self.parseValueRef();
+
+        var args: std.ArrayList(Value) = .empty;
+        defer args.deinit(self.allocator());
+        try self.parseCallArgs(&args);
+        const extras = try self.parseCallExtras();
+
+        const list = try self.func.internValues(args.items);
+        _ = try self.func.appendStmtRaw(block, .{ .call_indirect = .{
+            .target = target,
+            .args = list,
+            .is_variadic = extras.is_variadic,
+            .num_fixed = extras.num_fixed,
+            .ret_dest = extras.ret_dest,
+            .ret_regs = extras.ret_regs,
+            .ret_pieces = extras.ret_pieces,
+            .sret = extras.sret,
+        } });
+    }
+
+    /// Parse a parenthesized, comma-separated argument list into `list`.
+    fn parseCallArgs(self: *FunctionParser, list: *std.ArrayList(Value)) Error!void {
+        self.skipWs();
+        try self.eat('(');
         self.skipWs();
         if (self.peek() != ')') {
             while (true) {
                 self.skipWs();
-                try args.append(self.allocator(), try self.parseValueRef());
+                try list.append(self.allocator(), try self.parseValueRef());
                 self.skipWs();
                 if (self.tryChar(',')) continue;
                 break;
@@ -606,7 +841,223 @@ const FunctionParser = struct {
         }
         self.skipWs();
         try self.eat(')');
-        try self.func.appendVoidCall(block, name, args.items);
+    }
+
+    /// The extra fields a call carries after its argument list. The defaults are those of
+    /// an ordinary, non-variadic call that returns a scalar or nothing.
+    const CallExtras = struct {
+        is_variadic: bool = false,
+        num_fixed: u32 = 0,
+        ret_dest: ?Value = null,
+        ret_regs: u8 = 0,
+        ret_pieces: [4]function.RetPiece = @splat(.{}),
+        sret: bool = false,
+    };
+
+    /// Read the clauses the printer writes after a call's argument list: `variadic(n)`,
+    /// `sret`, and `retdest(dest,[pieces])`. Each is optional and they come in any order.
+    /// An unknown word ends the list and leaves the cursor on it, because it belongs to
+    /// the next statement.
+    fn parseCallExtras(self: *FunctionParser) Error!CallExtras {
+        var out: CallExtras = .{};
+        while (true) {
+            const save = self.pos;
+            self.skipWs();
+            const word = self.readWord();
+            if (std.mem.eql(u8, word, "variadic")) {
+                try self.eat('(');
+                out.num_fixed = std.math.cast(u32, try self.readUnsigned()) orelse
+                    return error.InvalidSyntax;
+                try self.eat(')');
+                out.is_variadic = true;
+            } else if (std.mem.eql(u8, word, "sret")) {
+                out.sret = true;
+            } else if (std.mem.eql(u8, word, "retdest")) {
+                try self.eat('(');
+                if (self.peek() == 'v') {
+                    out.ret_dest = try self.parseValueRef();
+                } else {
+                    try self.expectWord("none");
+                }
+                try self.eat(',');
+                try self.eat('[');
+                var count: usize = 0;
+                if (self.peek() != ']') {
+                    while (true) {
+                        if (count >= out.ret_pieces.len) return error.InvalidSyntax;
+                        out.ret_pieces[count] = try self.parseRetPiece();
+                        count += 1;
+                        if (self.tryChar(',')) continue;
+                        break;
+                    }
+                }
+                try self.eat(']');
+                try self.eat(')');
+                out.ret_regs = @intCast(count);
+            } else {
+                self.pos = save;
+                return out;
+            }
+        }
+    }
+
+    /// Read one return-register piece, `bank@offset:bytes`, where the bank is `i` for an
+    /// integer register and `f` for a floating-point one.
+    fn parseRetPiece(self: *FunctionParser) Error!function.RetPiece {
+        const bank = self.readWord();
+        const fp = if (std.mem.eql(u8, bank, "f"))
+            true
+        else if (std.mem.eql(u8, bank, "i"))
+            false
+        else
+            return error.InvalidSyntax;
+        try self.eat('@');
+        const offset = std.math.cast(u8, try self.readUnsigned()) orelse return error.InvalidSyntax;
+        try self.eat(':');
+        const bytes = std.math.cast(u8, try self.readUnsigned()) orelse return error.InvalidSyntax;
+        return .{ .fp = fp, .offset = offset, .bytes = bytes };
+    }
+
+    /// Parse a matmul statement, the shape `printInst` writes:
+    /// `matmul c=vC, a=vA, b=vB [m x n x k] dtype [acc] [embedded] [signs] [quant(...)]`.
+    fn parseMatmul(self: *FunctionParser, block: Block) Error!void {
+        const c = try self.parseNamedOperand("c");
+        self.skipWs();
+        try self.eat(',');
+        const a = try self.parseNamedOperand("a");
+        self.skipWs();
+        try self.eat(',');
+        const b = try self.parseNamedOperand("b");
+
+        self.skipWs();
+        try self.eat('[');
+        const m = std.math.cast(u16, try self.readRadixUnsigned()) orelse return error.InvalidSyntax;
+        try self.expectWordAfterWs("x");
+        const n = std.math.cast(u16, try self.readRadixUnsigned()) orelse return error.InvalidSyntax;
+        try self.expectWordAfterWs("x");
+        const k = std.math.cast(u16, try self.readRadixUnsigned()) orelse return error.InvalidSyntax;
+        self.skipWs();
+        try self.eat(']');
+
+        self.skipWs();
+        // The dtype word comes off UNTRUSTED text, so an unknown one is a parse error and
+        // never an invalid enum.
+        const dtype = std.meta.stringToEnum(function.MatMulType, self.readWord()) orelse
+            return error.InvalidSyntax;
+        const accumulate = self.tryWord("acc");
+        const embedded = self.tryWord("embedded");
+
+        var input_signs: ?function.InputSigns = null;
+        if (self.tryWord("a_uns")) {
+            try self.eat('=');
+            const a_unsigned = try self.readBool();
+            try self.eat(',');
+            try self.expectWordAfterWs("b_uns");
+            try self.eat('=');
+            const b_unsigned = try self.readBool();
+            input_signs = .{ .a_unsigned = a_unsigned, .b_unsigned = b_unsigned };
+        }
+
+        var quant: ?function.MatMulQuant = null;
+        if (self.tryWord("quant")) quant = try self.parseMatmulQuant();
+
+        _ = try self.func.appendStmtRaw(block, .{ .matmul = .{
+            .a = a,
+            .b = b,
+            .c = c,
+            .m = m,
+            .n = n,
+            .k = k,
+            .dtype = dtype,
+            .accumulate = accumulate,
+            .embedded = embedded,
+            .quant = quant,
+            .input_signs = input_signs,
+        } });
+    }
+
+    /// Read a `name=vN` operand of a matmul.
+    fn parseNamedOperand(self: *FunctionParser, name: []const u8) Error!Value {
+        try self.expectWordAfterWs(name);
+        try self.eat('=');
+        return self.parseValueRef();
+    }
+
+    /// `expectWord` with leading whitespace skipped first.
+    fn expectWordAfterWs(self: *FunctionParser, word: []const u8) Error!void {
+        self.skipWs();
+        try self.expectWord(word);
+    }
+
+    /// Parse a matmul's requantize epilogue, the body inside `quant(...)`. The scale and
+    /// the bias are constant data written as values, so they rebuild exactly.
+    fn parseMatmulQuant(self: *FunctionParser) Error!function.MatMulQuant {
+        try self.eat('(');
+        self.skipWs();
+        const scale_word = self.readWord();
+        var scale: function.MatMulScale = undefined;
+        if (std.mem.eql(u8, scale_word, "scalar")) {
+            try self.eat('=');
+            scale = .{ .scalar = std.math.cast(u32, try self.readRadixUnsigned()) orelse
+                return error.InvalidSyntax };
+        } else if (std.mem.eql(u8, scale_word, "per_col")) {
+            try self.eat('[');
+            var scales: std.ArrayList(u32) = .empty;
+            defer scales.deinit(self.allocator());
+            if (self.peek() != ']') {
+                while (true) {
+                    const s = std.math.cast(u32, try self.readRadixUnsigned()) orelse
+                        return error.InvalidSyntax;
+                    try scales.append(self.allocator(), s);
+                    if (self.tryChar(',')) continue;
+                    break;
+                }
+            }
+            try self.eat(']');
+            scale = .{ .per_column = try self.func.internScales(scales.items) };
+        } else return error.InvalidSyntax;
+
+        try self.eat(',');
+        try self.expectWordAfterWs("relu");
+        try self.eat('=');
+        const relu = try self.readBool();
+
+        try self.eat(',');
+        self.skipWs();
+        const out = std.meta.stringToEnum(function.MatMulQuantOut, self.readWord()) orelse
+            return error.InvalidSyntax;
+
+        try self.eat(',');
+        try self.expectWordAfterWs("bias");
+        var bias: ?function.BiasList = null;
+        if (self.tryChar('=')) {
+            try self.expectWordAfterWs("none");
+        } else {
+            try self.eat('[');
+            var values: std.ArrayList(i32) = .empty;
+            defer values.deinit(self.allocator());
+            if (self.peek() != ']') {
+                while (true) {
+                    const v = std.math.cast(i32, try self.readSigned()) orelse
+                        return error.InvalidSyntax;
+                    try values.append(self.allocator(), v);
+                    if (self.tryChar(',')) continue;
+                    break;
+                }
+            }
+            try self.eat(']');
+            bias = try self.func.internBias(values.items);
+        }
+
+        // A zero zero-point is the symmetric default and does not print.
+        var zero_point: i32 = 0;
+        if (self.tryChar(',')) {
+            try self.expectWordAfterWs("zp");
+            try self.eat('=');
+            zero_point = std.math.cast(i32, try self.readSigned()) orelse return error.InvalidSyntax;
+        }
+        try self.eat(')');
+        return .{ .scale = scale, .relu = relu, .out = out, .bias = bias, .zero_point = zero_point };
     }
 
     /// Parse the value form `vN := if vC { vT } else { vE }`. `name` is the

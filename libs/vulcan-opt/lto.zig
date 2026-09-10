@@ -236,6 +236,52 @@ test "cross-module inlining then dead-function elimination" {
     }
 }
 
+test "an LTO module round trip keeps volatile, the variadic marker and the GPU builtin tag" {
+    // Every LTO consumer serializes through bitcode, so a field bitcode drops is a field
+    // LTO drops. A volatile access that comes back plain is an MMIO register the optimizer
+    // may then remove or merge, and a parameter that loses its `vulcan.gpu.builtin` tag is
+    // laid out in the parameter block instead of taken from hardware.
+    const allocator = std.testing.allocator;
+    var module = Module.init(allocator);
+    defer module.deinit();
+    {
+        var f = Function.init(allocator);
+        const t = try i32k(&f);
+        const p = try f.types.ptrGlobal();
+        const b = try f.appendBlock();
+        const reg = try f.appendBlockParam(b, p);
+        const v = try f.appendInst(b, t, .{ .load = .{ .ptr = reg, .@"volatile" = true } });
+        try f.appendStoreVol(b, v, reg, true);
+        try f.appendVoidCallV(b, "printf", &.{v}, 1);
+        try f.addAttr(.{ .value = reg }, .{ .custom = .{
+            .namespace = "vulcan.gpu",
+            .key = "builtin",
+            .value = .{ .int = 3 },
+        } });
+        f.setTerminator(b, .{ .ret = ir.function.Ret.one(v) });
+        try module.add("mmio", f);
+    }
+
+    const bytes = try encode(allocator, &module);
+    defer allocator.free(bytes);
+    var back = try decode(allocator, bytes);
+    defer back.deinit();
+
+    const f = back.get("mmio") orelse return error.TestUnexpectedResult;
+    const entry: ir.function.Block = @enumFromInt(0);
+    const insts = f.blockInsts(entry);
+    try std.testing.expect(f.opcode(insts[0]).load.@"volatile");
+    try std.testing.expect(f.opcode(insts[1]).store.@"volatile");
+    try std.testing.expect(f.opcode(insts[2]).call.is_variadic);
+    try std.testing.expectEqual(@as(u32, 1), f.opcode(insts[2]).call.num_fixed);
+
+    var attrs = f.attributesOf(.{ .value = f.blockParams(entry)[0] });
+    const tag = attrs.next() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("vulcan.gpu", tag.custom.namespace);
+    try std.testing.expectEqualStrings("builtin", tag.custom.key);
+    try std.testing.expectEqual(@as(i64, 3), tag.custom.value.int);
+}
+
 test "module round-trips through bitcode" {
     const allocator = std.testing.allocator;
     var module = Module.init(allocator);
