@@ -642,6 +642,11 @@ pub fn compileShaderOpts(allocator: std.mem.Allocator, func: *Function, stage: S
     var max_reg: u8 = r_outptr + 1; // the output pointer pair is always live
     try assignLocs(allocator, func, &loc, &max_reg, &fma);
 
+    // Give each hoisted constant addend a register above everything `assignLocs` handed
+    // out. The prologue below writes them, once each, before the first block. See
+    // `commitHoists`.
+    try reserveHoistRegs(func, stage, &fma, &max_reg);
+
     // Texture-sample lowering. The SPIR-V image-sample op becomes a
     // host-sampler `call_indirect(sampler_fn, {desc, u, v, lod, out_ptr})`
     // that writes an RGBA vec4 into a stack alloca, followed by four reload
@@ -936,6 +941,14 @@ pub fn compileShaderOpts(allocator: std.mem.Allocator, func: *Function, stage: S
             if (stage == .fragment)
                 try deriv.prologue_reg.put(allocator, attr, rd);
         }
+    }
+
+    // The constant addends of the contracted `a * k1 + k2` sites. ONE MOV32I EACH, HERE
+    // AND NOWHERE ELSE. This point is ahead of the first block, so a loop body pays
+    // nothing for it, and that is the only reason the fused form is shorter than the FMUL
+    // and FADD pair it replaced. See `collectHoist`.
+    for (fma.hoist_imm[0..fma.hoist_len], fma.hoist_reg[0..fma.hoist_len]) |imm, reg| {
+        try code.append(allocator, encode.movImm(reg, imm, .{}));
     }
 
     // Convergence-barrier plan (Volta and later): wrap each divergent `if`
@@ -1554,7 +1567,7 @@ fn foldAddressDisplacements(allocator: std.mem.Allocator, func: *Function, out: 
     }
 }
 
-/// One contracted multiply-add: `dst = mul_a * (mul_b or mul_imm) + addend`.
+/// One contracted multiply-add: `dst = mul_a * (mul_b or mul_imm) + (addend or addend_imm)`.
 const Fma = struct {
     /// The multiply's first operand. Always a register.
     mul_a: Value,
@@ -1564,10 +1577,41 @@ const Fma = struct {
     /// The constant multiplier, valid only when `mul_b` is null. For a float this is the
     /// IEEE-754 binary32 bit pattern, exactly as `arithImm` passes it.
     mul_imm: u32,
-    /// The value the add contributed, which becomes the third source.
-    addend: Value,
+    /// The value the add contributed, which becomes the third source. Null when the add
+    /// contributed a CONSTANT instead. A prologue MOV32I then holds that constant in the
+    /// register `FmaFold.hoistRegOf(addend_imm)` names. See `commitHoists`.
+    addend: ?Value,
+    /// The constant addend, valid only when `addend` is null. It is the key into the hoist
+    /// table, and for a float it is the IEEE-754 binary32 bit pattern.
+    addend_imm: u32,
     /// True for FFMA, false for IMAD.
     is_float: bool,
+};
+
+/// How many DISTINCT constant addends may take a register of their own. See `commitHoists`.
+///
+/// A HOISTED CONSTANT HOLDS A GPR FOR THE WHOLE KERNEL, and the GPRs per thread set how
+/// many warps an SM holds, which is how this hardware hides latency. Registers are a
+/// budget and not an appetite, and this is the budget.
+///
+/// FOUR IS HALF AN ALLOCATION GRANULE. The hardware hands out registers in multiples of
+/// eight per thread, which `regCount` rounds to. A kernel whose count does not already sit
+/// on a granule boundary absorbs some of these for nothing, and the worst case over the
+/// whole cap is ONE granule step, that is one step of occupancy. A larger cap lets one
+/// kernel walk occupancy down several steps to save one instruction per step, which gives
+/// away more latency hiding than the saved instructions buy back.
+const hoist_reg_cap: usize = 4;
+
+/// One `a * k1 + k2` waiting on the hoist decision. See `commitHoists`.
+const HoistCand = struct {
+    /// The add's result.
+    result: Value,
+    /// The multiply's result, which the fused form absorbs.
+    mul: Value,
+    /// The fused form, with `addend_imm` filled in and `addend` null.
+    m: Fma,
+    /// Whether the add sits inside a loop, where one prologue MOV serves every trip.
+    in_loop: bool,
 };
 
 /// Fused multiply-add contraction: which multiplies disappear into which adds.
@@ -1595,6 +1639,12 @@ const FmaFold = struct {
     folded: std.AutoHashMapUnmanaged(Value, void) = .empty,
     /// The fused form of each contracted add, keyed by the add's RESULT value.
     at: std.AutoHashMapUnmanaged(Value, Fma) = .empty,
+    /// The constant addends that earned a register, in prologue order. The prologue writes
+    /// `hoist_imm[i]` into `hoist_reg[i]` with one MOV32I. `commitHoists` fills the
+    /// constants and `reserveHoistRegs` fills the registers.
+    hoist_imm: [hoist_reg_cap]u32 = [_]u32{0} ** hoist_reg_cap,
+    hoist_reg: [hoist_reg_cap]u8 = [_]u8{0} ** hoist_reg_cap,
+    hoist_len: usize = 0,
 
     fn deinit(self: *FmaFold, allocator: std.mem.Allocator) void {
         self.folded.deinit(allocator);
@@ -1605,7 +1655,89 @@ const FmaFold = struct {
     fn isFolded(self: *const FmaFold, v: Value) bool {
         return self.folded.contains(v);
     }
+
+    /// Where `imm` sits in the hoist table, or null when it was not hoisted. THIS IS THE
+    /// DEDUPLICATION: the key is the constant itself, so every site that adds the same
+    /// number finds the same entry, and therefore the same register.
+    fn hoistIndexOf(self: *const FmaFold, imm: u32) ?usize {
+        for (self.hoist_imm[0..self.hoist_len], 0..) |k, i| {
+            if (k == imm) return i;
+        }
+        return null;
+    }
+
+    /// The register a prologue MOV32I loaded `imm` into. Meaningful only after
+    /// `reserveHoistRegs` has run.
+    fn hoistRegOf(self: *const FmaFold, imm: u32) ?u8 {
+        return self.hoist_reg[self.hoistIndexOf(imm) orelse return null];
+    }
 };
+
+/// Give every hoisted constant a register above all the registers `assignLocs` handed out,
+/// and step over the few the shader writes through another path.
+///
+/// THE REGISTERS THIS SKIPS ARE IN NO POOL. `assignLocs` takes the graphics prologue pad,
+/// the fragment depth output and the extra MRT color registers out of its free list, and
+/// none of the three is covered by the `max_reg` watermark, because nothing is ALLOCATED
+/// into them. A hoisted constant put on one of them would be overwritten by the pad MOV or
+/// read by the ROP as a color.
+fn reserveHoistRegs(func: *const Function, stage: Stage, fold: *FmaFold, max_reg: *u8) Error!void {
+    var r: u32 = @as(u32, max_reg.*) + 1;
+    for (fold.hoist_reg[0..fold.hoist_len]) |*out| {
+        while (r < encode.RZ and hoistRegTaken(func, stage, @intCast(r))) r += 1;
+        if (r >= encode.RZ) return error.Unsupported;
+        out.* = @intCast(r);
+        if (r > max_reg.*) max_reg.* = @intCast(r);
+        r += 1;
+    }
+}
+
+/// Whether register `r` is one `assignLocs` reserves outside its pool. See `reserveHoistRegs`.
+fn hoistRegTaken(func: *const Function, stage: Stage, r: u8) bool {
+    if (stage != .compute and r == graphics_pad_reg) return true;
+    if (stage == .fragment) {
+        if (writesFragDepth(func) and r == fragDepthReg(func)) return true;
+        const nt: u32 = colorTargetCount(func);
+        if (nt > 1 and r < nt * 4) return true;
+    }
+    return false;
+}
+
+/// Which blocks lie inside a loop, by the BACK-EDGE INTERVAL rule: an edge from block `b`
+/// to a block `h` at or before it in the block order closes a loop, and every block from
+/// `h` to `b` is in that loop. The machine backends already require the block order to
+/// follow dominance, which makes the interval the natural loop's block set on a reducible
+/// control-flow graph.
+///
+/// THIS STEERS A COST DECISION AND NOTHING ELSE. A block wrongly called a loop member
+/// spends one register and one prologue MOV. A loop member wrongly missed leaves a
+/// multiply-add unfused. Neither changes the number the kernel computes, so an
+/// approximation is safe here in a way it would not be inside the fold itself.
+fn loopBlocks(allocator: std.mem.Allocator, func: *const Function) Error![]bool {
+    const nblocks = func.blockCount();
+    const out = try allocator.alloc(bool, nblocks);
+    @memset(out, false);
+    for (0..nblocks) |bi| {
+        const block: Block = @enumFromInt(bi);
+        for (func.blockInsts(block)) |inst| {
+            if (func.opcode(inst) == .@"if") {
+                const cf = func.opcode(inst).@"if";
+                markBackEdge(out, bi, @intFromEnum(cf.then.target));
+                markBackEdge(out, bi, @intFromEnum(cf.@"else".target));
+            }
+        }
+        if (func.terminator(block)) |term| {
+            if (term == .jump) markBackEdge(out, bi, @intFromEnum(term.jump.target));
+        }
+    }
+    return out;
+}
+
+/// Mark every block an edge from `from` to `to` encloses, when that edge runs backwards.
+fn markBackEdge(in_loop: []bool, from: usize, to: usize) void {
+    if (to > from) return;
+    for (in_loop[to .. from + 1]) |*x| x.* = true;
+}
 
 /// The multiply an `add` can absorb, or null when it cannot absorb `v`.
 ///
@@ -1621,24 +1753,28 @@ const FmaFold = struct {
 ///     use inside a block, so membership is the whole test.
 ///   - THE SAME 32-BIT TYPE. FFMA and IMAD are both 32 bits wide. A wider or narrower
 ///     type would be truncated silently, so it is refused rather than contracted.
+///
+/// `same_type_as` is the value whose type the multiply must match: the addend for a
+/// register addend, and the add's own result for a constant one. THE ADDEND FIELDS COME
+/// BACK EMPTY, because only the caller knows which of the two the add carried.
 fn fmaOperand(
     func: *const Function,
     uses: []const u32,
     in_block: *const std.AutoHashMapUnmanaged(Value, void),
     v: Value,
-    addend: Value,
+    same_type_as: Value,
 ) ?Fma {
     if (uses[@intFromEnum(v)] != 1) return null;
     if (!in_block.contains(v)) return null;
     // Both sources of the fused instruction must be the SAME 32-bit type. Checking the
     // add's result alone would not say that, so each operand is tested here.
     if (!isFmaWidth(func, v)) return null;
-    if (func.valueType(v) != func.valueType(addend)) return null;
+    if (func.valueType(v) != func.valueType(same_type_as)) return null;
     const inst = func.definingInst(v) orelse return null;
     const is_float = isFloat(func, v);
     return switch (func.opcode(inst)) {
         .arith => |m| if (m.op == .mul)
-            .{ .mul_a = m.lhs, .mul_b = m.rhs, .mul_imm = 0, .addend = addend, .is_float = is_float }
+            .{ .mul_a = m.lhs, .mul_b = m.rhs, .mul_imm = 0, .addend = null, .addend_imm = 0, .is_float = is_float }
         else
             null,
         // `foldConstantsToImm` has already turned `x * k` into an `arith_imm`. FFMA and
@@ -1649,7 +1785,8 @@ fn fmaOperand(
                 .mul_a = m.lhs,
                 .mul_b = null,
                 .mul_imm = @truncate(@as(u64, @bitCast(m.imm))),
-                .addend = addend,
+                .addend = null,
+                .addend_imm = 0,
                 .is_float = is_float,
             }
         else
@@ -1684,6 +1821,16 @@ fn scanFma(allocator: std.mem.Allocator, func: *const Function, options: Options
     defer allocator.free(uses);
     opt.dce.countUses(func, uses);
 
+    const in_loop = try loopBlocks(allocator, func);
+    defer allocator.free(in_loop);
+
+    // `a * k1 + k2` cannot be decided one instruction at a time: the register its addend
+    // needs is only worth spending once the whole function says how many sites share the
+    // constant and whether any of them runs in a loop. So the sites are collected here and
+    // judged together in `commitHoists`.
+    var cands: std.ArrayList(HoistCand) = .empty;
+    defer cands.deinit(allocator);
+
     var in_block: std.AutoHashMapUnmanaged(Value, void) = .empty;
     defer in_block.deinit(allocator);
 
@@ -1693,11 +1840,13 @@ fn scanFma(allocator: std.mem.Allocator, func: *const Function, options: Options
         for (func.blockParams(block)) |p| try in_block.put(allocator, p, {});
         for (func.blockInsts(block)) |inst| {
             try contractOne(allocator, func, uses, &in_block, inst, out);
+            try collectHoist(allocator, func, uses, &in_block, in_loop[bi], inst, &cands);
             // After the decision, never before it: `in_block` must hold what stands ABOVE
             // this instruction, so an add can never absorb its own result.
             if (func.instResult(inst)) |r| try in_block.put(allocator, r, {});
         }
     }
+    try commitHoists(allocator, cands.items, out);
 }
 
 /// Contract `inst` if it is an add that can absorb a multiply. See `scanFma`.
@@ -1712,8 +1861,8 @@ fn contractOne(
     const a = switch (func.opcode(inst)) {
         .arith => |x| x,
         // An `arith_imm` add carries its addend as an IMMEDIATE, and neither FFMA nor IMAD
-        // has an immediate third source: the immediate field is the multiplier. So `a * b
-        // + k` keeps its two instructions.
+        // has an immediate third source: the immediate field is the multiplier. That shape
+        // is `collectHoist`'s, which puts the constant in a register first.
         else => return,
     };
     if (a.op != .add) return;
@@ -1726,17 +1875,136 @@ fn contractOne(
     // `a * b + c`, then the commuted `c + a * b`. Both forms reach here, because nothing
     // orders an add's operands. When BOTH operands are contractible multiplies only one is
     // taken, since the instruction has room for one multiply.
-    const fused = fmaOperand(func, uses, in_block, a.rhs, a.lhs) orelse
-        fmaOperand(func, uses, in_block, a.lhs, a.rhs) orelse
-        return;
-    try out.folded.put(allocator, if (fused.addend == a.lhs) a.rhs else a.lhs, {});
+    const on_rhs = fmaOperand(func, uses, in_block, a.rhs, a.lhs);
+    var fused = on_rhs orelse fmaOperand(func, uses, in_block, a.lhs, a.rhs) orelse return;
+    fused.addend = if (on_rhs != null) a.lhs else a.rhs;
+    try out.folded.put(allocator, if (on_rhs != null) a.rhs else a.lhs, {});
     try out.at.put(allocator, r, fused);
 }
 
+/// Collect `a * k1 + k2`, where BOTH the multiplier and the addend are constants, as a
+/// candidate for a hoisted register. `commitHoists` makes the decision.
+///
+/// FFMA AND IMAD ENCODE AT MOST ONE IMMEDIATE, and that one is the multiplier: the third
+/// source is always a register. So this shape cannot fuse as it stands, and `x * 0.9 +
+/// 0.05` stays an FMUL and an FADD however many times it appears. It fuses when the addend
+/// constant is already sitting in a register, which is what ptxas does and what
+/// `commitHoists` arranges.
+///
+/// THE CONSTANT MUST BE MATERIALIZED OUTSIDE THE LOOP, which is the whole point. A MOV32I
+/// in the loop body would make the pair `MOV + FFMA`: two instructions per trip, exactly
+/// what `FMUL + FADD` already cost, and one register worse. The MOV therefore goes in the
+/// prologue, ahead of the first block, and `in_loop` is what says the trip count makes it
+/// worth a register at all.
+///
+/// THIS IS THE WEIGHT-DEQUANTIZATION SHAPE, not only a benchmark's. `w = scale * (q -
+/// zero)` expands to `scale * q - scale * zero`, and a scale-and-bias in a normalization
+/// or an activation is the same two constants.
+fn collectHoist(
+    allocator: std.mem.Allocator,
+    func: *const Function,
+    uses: []const u32,
+    in_block: *const std.AutoHashMapUnmanaged(Value, void),
+    in_loop: bool,
+    inst: ir.function.Inst,
+    out: *std.ArrayList(HoistCand),
+) Error!void {
+    const a = switch (func.opcode(inst)) {
+        .arith_imm => |x| x,
+        else => return,
+    };
+    if (a.op != .add) return;
+    const r = func.instResult(inst) orelse return;
+    // The same two refusals `contractOne` makes, for the same reasons: a 64-bit pointer add
+    // is a carry chain and a boolean add is a predicate combine.
+    if (!isFmaWidth(func, r)) return;
+    if (isWidePtr(func, r)) return;
+    // There is NO COMMUTED FORM to try here. `foldConstantsToImm` has already moved the
+    // constant into the immediate field, so `lhs` is the add's only register operand.
+    var m = fmaOperand(func, uses, in_block, a.lhs, r) orelse return;
+    m.addend_imm = @truncate(@as(u64, @bitCast(a.imm)));
+    try out.append(allocator, .{ .result = r, .mul = a.lhs, .m = m, .in_loop = in_loop });
+}
+
+/// Decide which constant addends earn a register, then contract the sites that use them.
+///
+/// TWO RULES, AND BOTH ASK WHETHER THE REGISTER PAYS FOR ITSELF:
+///
+///   - THE MOV MUST BE AMORTIZED. A single site outside every loop saves one instruction
+///     and spends one on the prologue MOV, so it breaks even on the count and loses a
+///     register. A site inside a loop saves one instruction PER TRIP, and two or more
+///     sites sharing one constant save two or more. Those two cases are taken, and nothing
+///     else is.
+///   - THE BUDGET IS `hoist_reg_cap`. When more constants qualify than that, the ones a
+///     loop uses go first, then the ones with the most sites. The order is total and
+///     stable, ties breaking on first appearance, so one function always gives one answer.
+///
+/// DEDUPLICATION IS THE TABLE ITSELF. The key is the 32-bit constant, so sixteen
+/// multiply-adds that all add 0.05 share ONE entry, ONE register and ONE prologue MOV.
+///
+/// A SEPARATE WASTE IS STILL HERE AND IS NOT THIS FUNCTION'S. When `foldConstantsToImm`
+/// moves a constant into an immediate field it leaves the `fconst` or `iconst` that
+/// supplied it with NO READER, and `lowerInst` still gives that instruction a register and
+/// a MOV32I of the same value. This hoist neither causes nor cures that.
+fn commitHoists(allocator: std.mem.Allocator, cands: []const HoistCand, out: *FmaFold) Error!void {
+    if (cands.len == 0) return;
+    const Tally = struct { imm: u32, count: u32, in_loop: bool, first: u32 };
+
+    var seen: std.AutoHashMapUnmanaged(u32, u32) = .empty; // constant -> index into `tally`
+    defer seen.deinit(allocator);
+    var tally: std.ArrayList(Tally) = .empty;
+    defer tally.deinit(allocator);
+    for (cands) |c| {
+        const gop = try seen.getOrPut(allocator, c.m.addend_imm);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = @intCast(tally.items.len);
+            try tally.append(allocator, .{
+                .imm = c.m.addend_imm,
+                .count = 0,
+                .in_loop = false,
+                .first = @intCast(tally.items.len),
+            });
+        }
+        const t = &tally.items[gop.value_ptr.*];
+        t.count += 1;
+        t.in_loop = t.in_loop or c.in_loop;
+    }
+
+    // Drop every constant the prologue MOV would not pay for, then rank what is left.
+    var keep: std.ArrayList(Tally) = .empty;
+    defer keep.deinit(allocator);
+    for (tally.items) |t| {
+        if (t.in_loop or t.count >= 2) try keep.append(allocator, t);
+    }
+    std.mem.sort(Tally, keep.items, {}, struct {
+        fn less(_: void, x: Tally, y: Tally) bool {
+            if (x.in_loop != y.in_loop) return x.in_loop;
+            if (x.count != y.count) return x.count > y.count;
+            return x.first < y.first;
+        }
+    }.less);
+
+    out.hoist_len = @min(keep.items.len, hoist_reg_cap);
+    for (keep.items[0..out.hoist_len], 0..) |t, i| out.hoist_imm[i] = t.imm;
+
+    // Contract every site whose constant made the budget. The rest keep the FMUL and FADD
+    // pair they already had, which is why nothing above may touch `out` before here.
+    for (cands) |c| {
+        if (out.hoistIndexOf(c.m.addend_imm) == null) continue;
+        try out.folded.put(allocator, c.mul, {});
+        try out.at.put(allocator, c.result, c.m);
+    }
+}
+
 /// The one instruction a contracted multiply-add becomes.
-fn fmaInst(loc: std.AutoHashMapUnmanaged(Value, Loc), rd: u8, m: Fma) Inst {
+///
+/// THE HOISTED REGISTER IS LOOKED UP AGAIN HERE, not remembered from the scan. A constant
+/// addend reaches this point only when `commitHoists` put it in the table and
+/// `reserveHoistRegs` gave it a register, and re-reading the table is what proves both ran
+/// instead of assuming it.
+fn fmaInst(loc: std.AutoHashMapUnmanaged(Value, Loc), fold: *const FmaFold, rd: u8, m: Fma) Error!Inst {
     const ra = gprOf(loc, m.mul_a);
-    const rc = gprOf(loc, m.addend);
+    const rc = if (m.addend) |v| gprOf(loc, v) else fold.hoistRegOf(m.addend_imm) orelse return error.Unsupported;
     if (m.mul_b) |b| {
         const rb = gprOf(loc, b);
         return if (m.is_float) encode.ffma(rd, ra, rb, rc, .{}) else encode.imad(rd, ra, rb, rc, .{});
@@ -2866,7 +3134,7 @@ fn lowerInst(allocator: std.mem.Allocator, func: *const Function, loc: *std.Auto
             // FFMA or IMAD that multiplies and adds together. See `FmaFold`.
             if (fma.isFolded(result)) return;
             if (fma.at.get(result)) |m| {
-                try code.append(allocator, fmaInst(loc.*, gprOf(loc.*, result), m));
+                try code.append(allocator, try fmaInst(loc.*, fma, gprOf(loc.*, result), m));
                 return;
             }
             if (isWidePtr(func, result) and a.op == .add) {
@@ -3075,6 +3343,13 @@ fn lowerInst(allocator: std.mem.Allocator, func: *const Function, loc: *std.Auto
             // A constant-scale multiply that a fused multiply-add absorbed. The add reads
             // the same constant out of the FFMA or IMAD immediate field. See `FmaFold`.
             if (fma.isFolded(result)) return;
+            // `a * k1 + k2`, with a constant on BOTH sides. The multiplier stays in the
+            // immediate field and the addend comes from the register the prologue loaded
+            // it into, so the pair is one instruction here. See `collectHoist`.
+            if (fma.at.get(result)) |m| {
+                try code.append(allocator, try fmaInst(loc.*, fma, gprOf(loc.*, result), m));
+                return;
+            }
             // Logical NOT lowers to `bool ^ -1` (bit_xor against all-ones).
             // A boolean result lives in a predicate, so negate the source
             // predicate with PLOP3 (`p ^ PT` = `!p`, since PT is true). The
@@ -4098,6 +4373,38 @@ const FFMA_IMM: u32 = 0x823;
 const IMAD_REG: u32 = 0x224;
 const IMAD_IMM: u32 = 0x824;
 const IADD3_REG: u32 = 0x210;
+/// FADD against an immediate is NOT form 4. `encode.faddImm` goes through `aluImm2`, which
+/// carries the 32-bit value in the srcC slot and sets form 2, so the low 12 bits read
+/// `0x021 | 2 << 9`. Reading it as 0x821 finds nothing at all and every count comes back
+/// zero, which is a test that passes for the wrong reason.
+const FADD_IMM: u32 = 0x421;
+const MOV_IMM: u32 = 0x802;
+const ISETP_REG: u32 = 0x20c;
+
+/// How many instructions in a compiled kernel carry opcode `want`.
+fn countOp(code: []const u32, want: u32) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i * 4 < code.len) : (i += 1) {
+        if (opAt(code, i) == want) n += 1;
+    }
+    return n;
+}
+
+/// The single instruction with opcode `want` AND 32-bit immediate `imm`, failing when
+/// there is not exactly one. One MOV32I is told from the next only by the constant it
+/// writes, since a kernel materializes several, so the hoist tests match on both halves.
+fn onlyOpWithImm(code: []const u32, want: u32, imm: u32) !usize {
+    var found: ?usize = null;
+    var i: usize = 0;
+    while (i * 4 < code.len) : (i += 1) {
+        if (opAt(code, i) == want and immAt(code, i) == imm) {
+            try testing.expect(found == null); // exactly one, never two
+            found = i;
+        }
+    }
+    return found orelse error.NotFound;
+}
 
 /// A three-parameter scalar kernel `out = f(p0, p1, p2)`, where `body` builds the value to
 /// return out of the three parameters. Every contraction test has this shape.
@@ -4149,6 +4456,240 @@ test "a float multiply-add contracts into ONE FFMA that names all three operands
     try testing.expectEqual(gprOfCompiled(&func, p.a, .{}), regAt(kernel.code, at, 24));
     try testing.expectEqual(gprOfCompiled(&func, p.b, .{}), regAt(kernel.code, at, 32));
     try testing.expectEqual(gprOfCompiled(&func, p.c, .{}), regAt(kernel.code, at, 64));
+}
+
+/// One `acc = acc * mul + add` step of a test loop body. See `buildHoistLoop`.
+const HoistStep = struct {
+    /// The multiplier and the addend. A float loop reads them as they stand, and an
+    /// integer loop truncates them, so an integer test passes whole numbers.
+    mul: f64,
+    add: f64,
+};
+
+/// The `arith_imm` payload for a constant, exactly as `foldConstantsToImm` writes it: an
+/// integer as it stands, and a float as its IEEE-754 binary32 bit pattern.
+fn hoistImm(float: bool, v: f64) i64 {
+    if (!float) return @intFromFloat(v);
+    return @as(i64, @as(u32, @bitCast(@as(f32, @floatCast(v)))));
+}
+
+/// One `acc = acc * mul + add` as the two `arith_imm` instructions the backend sees.
+///
+/// THE CONSTANTS GO STRAIGHT INTO THE IMMEDIATE FIELDS, and no `fconst` instruction is
+/// built. `foldConstantsToImm` would reach the same `arith_imm` from an `fconst` plus an
+/// `arith`, but it leaves the `fconst` behind with no reader, and a dead `fconst` still
+/// emits a MOV32I of THE SAME constant. The hoist tests count MOV32I by its value, so that
+/// second MOV would make every count ambiguous. See the note in `commitHoists`.
+fn hoistStepInsts(func: *Function, blk: Block, ty: ir.types.Type, float: bool, acc: Value, s: HoistStep) !Value {
+    const m = try func.appendInst(blk, ty, .{ .arith_imm = .{ .op = .mul, .lhs = acc, .imm = hoistImm(float, s.mul) } });
+    return func.appendInst(blk, ty, .{ .arith_imm = .{ .op = .add, .lhs = m, .imm = hoistImm(float, s.add) } });
+}
+
+/// A counted loop `while (t < trips) { for each step: acc = acc * mul + add }`, returning
+/// the accumulator.
+///
+/// EVERY HOIST TEST NEEDS A LOOP, because a single site outside one is refused on purpose:
+/// there the prologue MOV only breaks even and the register is lost for nothing. See
+/// `commitHoists`.
+fn buildHoistLoop(func: *Function, float: bool, steps: []const HoistStep) !void {
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const ty = if (float) try func.types.intern(.{ .float = .f32 }) else i32_t;
+
+    const entry = try func.appendBlock();
+    const head = try func.appendBlock();
+    const body = try func.appendBlock();
+    const done = try func.appendBlock();
+
+    const trips = try func.appendBlockParam(entry, i32_t);
+    const seed = try func.appendBlockParam(entry, ty);
+    const zero = try func.appendInst(entry, i32_t, .{ .iconst = 0 });
+    try func.setJump(entry, head, &.{ zero, seed });
+
+    const t = try func.appendBlockParam(head, i32_t);
+    const acc_in = try func.appendBlockParam(head, ty);
+    const more = try func.appendInst(head, bool_t, .{ .icmp = .{ .op = .lt, .lhs = t, .rhs = trips } });
+    try func.appendIf(head, more, .{ .target = body }, .{ .target = done, .args = &.{acc_in} });
+
+    var acc = acc_in;
+    for (steps) |s| acc = try hoistStepInsts(func, body, ty, float, acc, s);
+    const next = try func.appendInst(body, i32_t, .{ .arith_imm = .{ .op = .add, .lhs = t, .imm = 1 } });
+    try func.setJump(body, head, &.{ next, acc });
+
+    const out = try func.appendBlockParam(done, ty);
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(out) });
+}
+
+/// A single-block kernel that runs `x * mul + add` on each element of `steps`, chained.
+/// The straight-line counterpart of `buildHoistLoop`.
+fn buildHoistLine(func: *Function, steps: []const HoistStep) !void {
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const blk = try func.appendBlock();
+    var acc = try func.appendBlockParam(blk, f32_t);
+    for (steps) |s| acc = try hoistStepInsts(func, blk, f32_t, true, acc, s);
+    func.setTerminator(blk, .{ .ret = ir.function.Ret.one(acc) });
+}
+
+test "`a * k1 + k2` fuses against a constant the PROLOGUE materializes ONCE" {
+    // THE SHAPE THE WHOLE HOIST EXISTS FOR. `x * 0.9 + 0.05` carries a constant on BOTH
+    // sides, and FFMA encodes exactly one immediate whose third source must be a register,
+    // so this stayed an FMUL and an FADD however hot the loop was. ptxas puts 0.05 in a
+    // register ahead of the loop and issues `FFMA Rd, Ra, 0.9, Rk`, and this is that.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    try buildHoistLoop(&func, true, &.{.{ .mul = 0.9, .add = 0.05 }});
+
+    var kernel = try compileKernel(allocator, &func, nvidia_abi);
+    defer kernel.deinit(allocator);
+
+    const mov = try onlyOpWithImm(kernel.code, MOV_IMM, @bitCast(@as(f32, 0.05)));
+    const at = try onlyOpAt(kernel.code, FFMA_IMM);
+    // THE MOV IS OUTSIDE THE LOOP, which is the only reason the fused form is shorter than
+    // the pair it replaced. `mov < at` alone would not say that, since a MOV at the top of
+    // the body also precedes the FFMA. The loop-head compare does say it: the head runs
+    // once per trip and the MOV stands ahead of it, so the MOV runs once per thread.
+    const isetp = try onlyOpAt(kernel.code, ISETP_REG);
+    try testing.expect(mov < isetp);
+    // The multiplier stays in the immediate field, at bits 32..63.
+    try testing.expectEqual(@as(u32, @bitCast(@as(f32, 0.9))), immAt(kernel.code, at));
+    // The FFMA's third source, at bits 64..71, is the register the MOV wrote, at 16..23.
+    try testing.expectEqual(regAt(kernel.code, mov, 16), regAt(kernel.code, at, 64));
+    // Neither half of the pair survives.
+    try testing.expectEqual(@as(usize, 0), countOp(kernel.code, FMUL_IMM));
+    try testing.expectEqual(@as(usize, 0), countOp(kernel.code, FADD_IMM));
+}
+
+test "sixteen multiply-adds that share one constant share ONE register and ONE MOV" {
+    // DEDUPLICATION. Sixteen sites adding 0.05 must find one table entry, so the loop body
+    // is sixteen FFMA and the prologue is one MOV. Sixteen MOVs would cost sixteen
+    // registers and would not shorten the body at all.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const steps = [_]HoistStep{.{ .mul = 0.9, .add = 0.05 }} ** 16;
+    try buildHoistLoop(&func, true, &steps);
+
+    var kernel = try compileKernel(allocator, &func, nvidia_abi);
+    defer kernel.deinit(allocator);
+
+    const mov = try onlyOpWithImm(kernel.code, MOV_IMM, @bitCast(@as(f32, 0.05)));
+    const reg = regAt(kernel.code, mov, 16);
+    try testing.expectEqual(@as(usize, 16), countOp(kernel.code, FFMA_IMM));
+    try testing.expectEqual(@as(usize, 0), countOp(kernel.code, FMUL_IMM));
+    try testing.expectEqual(@as(usize, 0), countOp(kernel.code, FADD_IMM));
+    // All sixteen read the SAME register as their addend.
+    var i: usize = 0;
+    var seen: usize = 0;
+    while (i * 4 < kernel.code.len) : (i += 1) {
+        if (opAt(kernel.code, i) != FFMA_IMM) continue;
+        try testing.expectEqual(reg, regAt(kernel.code, i, 64));
+        seen += 1;
+    }
+    try testing.expectEqual(@as(usize, 16), seen);
+}
+
+test "a single `a * k1 + k2` outside every loop is NOT hoisted" {
+    // THE GUARD IN THE OTHER DIRECTION, and a guard that never refuses is not a guard. One
+    // site in straight-line code saves one instruction and spends one on the prologue MOV,
+    // so it breaks even on the count and loses a register for the whole kernel. It keeps
+    // the FMUL and FADD pair.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    try buildHoistLine(&func, &.{.{ .mul = 0.9, .add = 0.05 }});
+
+    var kernel = try compileKernel(allocator, &func, nvidia_abi);
+    defer kernel.deinit(allocator);
+
+    try testing.expectEqual(@as(usize, 0), countOp(kernel.code, FFMA_IMM));
+    try testing.expectEqual(@as(usize, 1), countOp(kernel.code, FMUL_IMM));
+    try testing.expectEqual(@as(usize, 1), countOp(kernel.code, FADD_IMM));
+    try testing.expectError(error.NotFound, onlyOpWithImm(kernel.code, MOV_IMM, @bitCast(@as(f32, 0.05))));
+}
+
+test "TWO straight-line sites sharing one constant DO earn the register" {
+    // The other arm of the same rule. Two sites save two instructions against the one the
+    // prologue MOV spends, so the register pays for itself with no loop at all.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    try buildHoistLine(&func, &.{ .{ .mul = 0.9, .add = 0.05 }, .{ .mul = 0.8, .add = 0.05 } });
+
+    var kernel = try compileKernel(allocator, &func, nvidia_abi);
+    defer kernel.deinit(allocator);
+
+    _ = try onlyOpWithImm(kernel.code, MOV_IMM, @bitCast(@as(f32, 0.05)));
+    try testing.expectEqual(@as(usize, 2), countOp(kernel.code, FFMA_IMM));
+    try testing.expectEqual(@as(usize, 0), countOp(kernel.code, FMUL_IMM));
+    try testing.expectEqual(@as(usize, 0), countOp(kernel.code, FADD_IMM));
+}
+
+test "the hoist budget stops at `hoist_reg_cap`, and the rest keep their pair" {
+    // REGISTERS ARE NOT FREE. Six distinct constants all inside a loop all qualify, and
+    // the budget takes the first `hoist_reg_cap` of them. The remainder must come out as
+    // the FMUL and FADD pair, not as a fused instruction reading a register nothing wrote.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const steps = [_]HoistStep{
+        .{ .mul = 0.9, .add = 0.05 },
+        .{ .mul = 0.8, .add = 0.06 },
+        .{ .mul = 0.7, .add = 0.07 },
+        .{ .mul = 0.6, .add = 0.08 },
+        .{ .mul = 0.5, .add = 0.09 },
+        .{ .mul = 0.4, .add = 0.10 },
+    };
+    try buildHoistLoop(&func, true, &steps);
+
+    var kernel = try compileKernel(allocator, &func, nvidia_abi);
+    defer kernel.deinit(allocator);
+
+    // THE CAP MUST STAND BELOW THE NUMBER OF DISTINCT CONSTANTS HERE, or the budget is
+    // never reached and this test proves nothing. The saturating subtraction keeps a
+    // raised cap a TEST failure and not a compile error, so the guard still reports.
+    try testing.expect(hoist_reg_cap < steps.len);
+    const left = steps.len -| hoist_reg_cap;
+    try testing.expectEqual(hoist_reg_cap, countOp(kernel.code, FFMA_IMM));
+    try testing.expectEqual(left, countOp(kernel.code, FMUL_IMM));
+    try testing.expectEqual(left, countOp(kernel.code, FADD_IMM));
+}
+
+test "an integer `a * k1 + k2` fuses into IMAD against the same hoisted register" {
+    // The integer half of the shape. `IMAD Rd, Ra, imm, Rk` is the same encoding the
+    // float path uses, and `foldConstantsToImm` leaves the same two immediates behind.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    try buildHoistLoop(&func, false, &.{.{ .mul = 3.0, .add = 7.0 }});
+
+    var kernel = try compileKernel(allocator, &func, nvidia_abi);
+    defer kernel.deinit(allocator);
+
+    const mov = try onlyOpWithImm(kernel.code, MOV_IMM, 7);
+    // The loop counter increment is an IADD3 with an immediate too, so the multiply-add is
+    // told apart by its opcode and not by counting immediates.
+    const at = try onlyOpAt(kernel.code, IMAD_IMM);
+    try testing.expectEqual(@as(u32, 3), immAt(kernel.code, at));
+    try testing.expectEqual(regAt(kernel.code, mov, 16), regAt(kernel.code, at, 64));
+}
+
+test "contract_fma = false hoists nothing and keeps the FMUL and FADD pair" {
+    // ONE SWITCH TURNS OFF THE WHOLE TRANSFORM, the hoisted register included. A caller
+    // isolating a codegen question must get the kernel it would have got before any of
+    // this existed, and a stray MOV32I in the prologue would not be that.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    try buildHoistLoop(&func, true, &.{ .{ .mul = 0.9, .add = 0.05 }, .{ .mul = 0.8, .add = 0.05 } });
+
+    var kernel = try compileKernelOpts(allocator, &func, nvidia_abi, .{ .contract_fma = false });
+    defer kernel.deinit(allocator);
+
+    try testing.expectEqual(@as(usize, 0), countOp(kernel.code, FFMA_IMM));
+    try testing.expectEqual(@as(usize, 2), countOp(kernel.code, FMUL_IMM));
+    try testing.expectEqual(@as(usize, 2), countOp(kernel.code, FADD_IMM));
+    try testing.expectError(error.NotFound, onlyOpWithImm(kernel.code, MOV_IMM, @bitCast(@as(f32, 0.05))));
 }
 
 test "the commuted float form c + a * b contracts, with the same three operands" {

@@ -1134,6 +1134,129 @@ test "live: a CONSTANT-scale multiply-add fuses through the immediate FFMA field
     }
 }
 
+/// A second multiplicand for the hoist test, with nonzero low mantissa bits of its own.
+/// `fmaRefs` re-checks that it separates single from double rounding, so the second site
+/// cannot quietly decay into one that passes whichever answer the hardware gives.
+const fma_a2: u32 = 0x3F7FFFF7;
+
+test "live: `x * k1 + k2` fuses against a HOISTED constant addend, and rounds once" {
+    // BOTH THE MULTIPLIER AND THE ADDEND ARE CONSTANTS, which is the shape a weight
+    // dequantization and a scale-and-bias take. FFMA holds exactly one immediate, and its
+    // third source must be a register, so the addend reaches the instruction through a
+    // register the prologue loaded once. TWO SITES SHARE THAT ONE CONSTANT here, because a
+    // lone site in straight-line code is refused: the prologue MOV would only break even.
+    //
+    // THE ANSWER IS THE ONLY THING THAT SAYS THE RIGHT REGISTER REACHED THE RIGHT SOURCE.
+    // An FFMA that read the wrong register is shorter AND wrong, and the operands below
+    // make single rounding and double rounding differ, which `fmaRefs` re-checks at the
+    // point of use.
+    const allocator = testing.allocator;
+    const k1: f32 = @bitCast(fma_b);
+    const k2: f32 = @bitCast(fma_c);
+    const want0 = try fmaRefs(@bitCast(fma_a), k1, k2);
+    const want1 = try fmaRefs(@bitCast(fma_a2), k1, k2);
+
+    var h = try Harness.open();
+    defer h.deinit();
+    const out_buf = try h.alloc(0x1000);
+
+    for ([_]bool{ true, false }) |contract| {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const f32_t = try func.types.intern(.{ .float = .f32 });
+        const ptr_t = try func.types.ptrGlobal();
+        const blk = try func.appendBlock();
+        const out = try func.appendBlockParam(blk, ptr_t);
+        const x0 = try func.appendBlockParam(blk, f32_t);
+        const x1 = try func.appendBlockParam(blk, f32_t);
+        const kc1 = try func.appendInst(blk, f32_t, .{ .fconst = k1 });
+        const kc2 = try func.appendInst(blk, f32_t, .{ .fconst = k2 });
+        const m0 = try bin(&func, blk, f32_t, .mul, x0, kc1);
+        const s0 = try bin(&func, blk, f32_t, .add, m0, kc2);
+        try func.appendStore(blk, s0, out);
+        const m1 = try bin(&func, blk, f32_t, .mul, x1, kc1);
+        const s1 = try bin(&func, blk, f32_t, .add, m1, kc2);
+        try func.appendStore(blk, s1, try ptrAdd(&func, blk, ptr_t, out, 4));
+        func.setTerminator(blk, .{ .ret = ir.function.Ret.none() });
+
+        var launch = try h.compileOpts(&func, runner_abi, .{ .contract_fma = contract });
+        defer launch.deinit();
+
+        out_buf.slice(u32)[0] = 0;
+        out_buf.slice(u32)[1] = 0;
+        launch.setPtr(launch.kernel.launch.params[0].offset, out_buf.va);
+        launch.setU32(launch.kernel.launch.params[1].offset, fma_a);
+        launch.setU32(launch.kernel.launch.params[2].offset, fma_a2);
+        try launch.run(.{ 1, 1, 1 });
+
+        try testing.expectEqual(if (contract) want0.fused else want0.unfused, out_buf.read(f32, 0));
+        try testing.expectEqual(if (contract) want1.fused else want1.unfused, out_buf.read(f32, 1));
+    }
+}
+
+test "live: a hoisted constant addend survives every trip of a loop" {
+    // THE HOISTED REGISTER IS WRITTEN ONCE AND READ FOREVER, so anything that reused it
+    // inside the loop would give a wrong answer only from the second trip on. A single
+    // dispatch of the straight-line shape cannot see that. This runs the recurrence
+    // `acc = acc * 0.9 + 0.05` for sixteen trips and compares every bit against a host
+    // reference built from the same single-rounded step.
+    const allocator = testing.allocator;
+    const trips: i32 = 16;
+    const seed: f32 = 0.125;
+    var want: f32 = seed;
+    for (0..@intCast(trips)) |_| want = @mulAdd(f32, want, 0.9, 0.05);
+
+    var h = try Harness.open();
+    defer h.deinit();
+    const out_buf = try h.alloc(0x1000);
+
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const ptr_t = try func.types.ptrGlobal();
+
+    const entry = try func.appendBlock();
+    const head = try func.appendBlock();
+    const body = try func.appendBlock();
+    const done = try func.appendBlock();
+
+    const out = try func.appendBlockParam(entry, ptr_t);
+    const n = try func.appendBlockParam(entry, i32_t);
+    const s = try func.appendBlockParam(entry, f32_t);
+    const zero = try func.appendInst(entry, i32_t, .{ .iconst = 0 });
+    try func.setJump(entry, head, &.{ zero, s });
+
+    const t = try func.appendBlockParam(head, i32_t);
+    const acc = try func.appendBlockParam(head, f32_t);
+    const more = try func.appendInst(head, bool_t, .{ .icmp = .{ .op = .lt, .lhs = t, .rhs = n } });
+    try func.appendIf(head, more, .{ .target = body }, .{ .target = done, .args = &.{acc} });
+
+    const kc1 = try func.appendInst(body, f32_t, .{ .fconst = 0.9 });
+    const kc2 = try func.appendInst(body, f32_t, .{ .fconst = 0.05 });
+    const scaled = try bin(&func, body, f32_t, .mul, acc, kc1);
+    const stepped = try bin(&func, body, f32_t, .add, scaled, kc2);
+    const one = try func.appendInst(body, i32_t, .{ .iconst = 1 });
+    const next = try bin(&func, body, i32_t, .add, t, one);
+    try func.setJump(body, head, &.{ next, stepped });
+
+    const result = try func.appendBlockParam(done, f32_t);
+    try func.appendStore(done, result, out);
+    func.setTerminator(done, .{ .ret = ir.function.Ret.none() });
+
+    var launch = try h.compileOpts(&func, runner_abi, .{});
+    defer launch.deinit();
+
+    out_buf.slice(u32)[0] = 0;
+    launch.setPtr(launch.kernel.launch.params[0].offset, out_buf.va);
+    launch.setU32(launch.kernel.launch.params[1].offset, @bitCast(trips));
+    launch.setU32(launch.kernel.launch.params[2].offset, @bitCast(seed));
+    try launch.run(.{ 1, 1, 1 });
+
+    try testing.expectEqual(want, out_buf.read(f32, 0));
+}
+
 test "live: an integer multiply-add through IMAD gives the same bits fused or not" {
     // Integer contraction is EXACT either way. `a * b + c` in 32-bit wrapping arithmetic
     // has one answer, so unlike the float case the switch must not change the number. It
