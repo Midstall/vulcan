@@ -1594,7 +1594,40 @@ fn nvidiaRegDescription(allocator: std.mem.Allocator, ctx: *const WimmerCtx) Err
         .hosts_critical_edge_moves = true,
         .regWidth = wimmerRegWidth,
         .fusedOperands = wimmerFusedOperands,
+        .copySource = wimmerCopySource,
     };
+}
+
+/// The `copySource` hook: a contracted multiply-add's result takes the register of the
+/// operand that dies at it, which is the loop-carried accumulator.
+///
+/// THIS EXTENDS THE HOOK'S DOCUMENTED CONTRACT, and the extension is sound for exactly the
+/// two consumers `copy_src` has inside the allocator. The contract asks for a plain copy
+/// because for a copy the elision is the point: sharing a register turns the copy into a
+/// no-op the backend drops. A multiply-add is not a copy and this backend emits it whatever
+/// registers it lands on. What sharing a register with its source buys is the chain: the
+/// instruction reads the operand at issue and writes the result at completion, a
+/// read-before-write, so the two may share one register exactly as a copy's may. The
+/// allocator's two consumers are both sound for that: the placement hint, which keeps the
+/// dying operand's register free and prefers it, and the verifier's pair acceptance, whose
+/// overlap is the one instruction that reads before it writes.
+///
+/// THE PAYOFF IS THE BACK EDGE. Each accumulator chain then holds ONE register for the whole
+/// kernel: the head parameter hints toward its entry argument, the first fused op coalesces
+/// with the parameter's register, and every later one coalesces with the value before it,
+/// so the back-edge move that a four-accumulator loop paid five MOVs a trip for becomes a
+/// same-register no-op the edge resolver drops. ptxas's loop carries no such MOVs.
+///
+/// WHICH OPERAND: the addend when it is a value (`acc = a * b + acc`), else the multiplier's
+/// left operand (`acc = acc * k + c`). Those are the two loop shapes this backend
+/// contracts, and the operand named is the one whose death at the instruction makes the
+/// hint fire.
+fn wimmerCopySource(ctx: *const anyopaque, func: *const Function, v: Value) ?Value {
+    _ = func;
+    const self: *const WimmerCtx = @alignCast(@ptrCast(ctx));
+    const m = self.fma.at.get(v) orelse return null;
+    if (m.addend) |a| return a;
+    return m.mul_a;
 }
 
 /// Turn a completed `wimmer.Allocation` into the one-location-per-value map the emitter reads,
@@ -7776,4 +7809,31 @@ test "a CRITICAL edge compiles: the arms carry their own block-parameter copies"
     var kernel = try compileKernel(allocator, &func, nvidia_abi);
     defer kernel.deinit(allocator);
     try testing.expect(kernel.code.len > 0);
+}
+
+test "an accumulator chain holds one register across the back edge" {
+    // THE BACK-EDGE ROTATION IS GONE. A four-accumulator loop used to pay five MOVs a
+    // trip rotating the carried values back into the registers the next trip's readers
+    // expected, because each chain's fused op landed on whatever register the free pool
+    // handed it. `wimmerCopySource` coalesces each fused op's result with the carried
+    // operand that dies at it, so every chain holds ONE register for the whole kernel and
+    // the back-edge move becomes a same-register no-op the edge resolver drops. ptxas's
+    // loop carries no such MOVs either. This pins the shape: the FFMA reads and writes
+    // the SAME register, and the kernel carries no register-to-register MOV at all.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    try buildHoistLoop(&func, true, &.{.{ .mul = 0.9, .add = 0.05 }});
+
+    var kernel = try compileKernel(allocator, &func, nvidia_abi);
+    defer kernel.deinit(allocator);
+
+    // The FFMA reads and writes the SAME register: dst at bits 16..23, srcA at 24..31.
+    const at = try onlyOpAt(kernel.code, FFMA_ADD_IMM);
+    try testing.expectEqual(regAt(kernel.code, at, 16), regAt(kernel.code, at, 24));
+
+    // The accumulator rotation is gone: the ONE register-to-register MOV left is the
+    // COUNTER's back-edge move, whose IADD3 result nothing coalesces. The unrolled loop
+    // dodges even that by ping-ponging the counter between two IADD3 results.
+    try testing.expectEqual(@as(usize, 1), countOp(kernel.code, MOV_REG));
 }

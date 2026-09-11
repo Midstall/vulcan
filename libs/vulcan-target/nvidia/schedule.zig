@@ -1245,6 +1245,15 @@ fn consumes(inst: Inst, later_op: u32, want: Consumer) Consumes {
 /// its fallthrough, and the walk takes both. Only a conditional branch can fork, so
 /// the walk visits at most 2 to the power of the latency instructions, and it needs
 /// no visited set: the depth bound alone ends it.
+/// The latency of a predicate read by a branch's taken condition, MEASURED on the
+/// RTX 5070: a compare at distance 1 from its branch passes at stall 13 and fails at
+/// 12, so the latency is 14. ptxas agrees without saying so: it never places a branch
+/// adjacent to the compare that feeds it, and its closest spacing is seven
+/// instructions at stall 1, which is exactly 14 cycles. The read sits inside the
+/// branch pipe, not at its issue, which is why it is four cycles longer than any ALU
+/// result. See `consumes` for the read point.
+const branch_pred_latency: u32 = 14;
+
 fn scanConsumers(
     insts: []const Inst,
     from: usize,
@@ -1252,30 +1261,30 @@ fn scanConsumers(
     latency: u32,
     want: Consumer,
     need: *u32,
-    branch_pred: *bool,
+    bneed: *u32,
 ) void {
-    if (dist > latency or from >= insts.len) return;
+    if (dist > @max(latency, branch_pred_latency) or from >= insts.len) return;
     const later = insts[from];
     const later_op = getField(later, 0, 12);
 
     switch (consumes(later, later_op, want)) {
         .consumer => need.* = @max(need.*, latency -| dist),
-        .branch_pred => branch_pred.* = true,
+        .branch_pred => bneed.* = @max(bneed.*, branch_pred_latency -| dist),
         .none => {},
     }
 
     if (later_op == 0x947) { // BRA
         const t = braTargetIndex(later, from, insts.len);
-        if (t) |tt| scanConsumers(insts, tt, dist + 1, latency, want, need, branch_pred);
+        if (t) |tt| scanConsumers(insts, tt, dist + 1, latency, want, need, bneed);
         // A taken-condition other than PT makes the fallthrough a live path too.
         const cond = getField(later, 87, 3);
         const neg = getField(later, 90, 1);
         if (cond != encode.PT or neg == 1)
-            scanConsumers(insts, from + 1, dist + 1, latency, want, need, branch_pred);
+            scanConsumers(insts, from + 1, dist + 1, latency, want, need, bneed);
         return;
     }
     if (later_op == 0x94d or later_op == 0x95b) return; // EXIT, KIL: the path ends
-    scanConsumers(insts, from + 1, dist + 1, latency, want, need, branch_pred);
+    scanConsumers(insts, from + 1, dist + 1, latency, want, need, bneed);
 }
 
 /// The predicate a coupled instruction WRITES, or null when it writes none.
@@ -1394,13 +1403,9 @@ fn assignStalls(insts: []Inst) void {
             const latency = coupledLatency(opcode);
             const wspan = if (has_gpr_dst) dstSpan(opcode, inst.*) else 0;
             const want = Consumer{ .pred = own_pred, .reg = wdst, .span = wspan, .reg_live = has_gpr_dst };
-            var feeds_branch = false;
-            scanConsumers(insts, idx + 1, 1, latency, want, &need, &feeds_branch);
-            // A predicate that a branch reads as its taken condition has NO latency
-            // model: the read sits inside the branch pipe, not at its issue, and a
-            // computed stall at the model's boundary let a real loop read a stale
-            // predicate and skip its whole body. The isel's stall stands for that one.
-            if (feeds_branch) continue;
+            var bneed: u32 = 0;
+            scanConsumers(insts, idx + 1, 1, latency, want, &need, &bneed);
+            need = @max(need, bneed);
         }
         if (need > 15) need = 15;
         // THE FLOOR IS 1, NOT 0, AND THE REASON IS NOT A HINT. A stall of 0 on an ALU op
