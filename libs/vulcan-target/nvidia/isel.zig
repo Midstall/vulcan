@@ -2,9 +2,13 @@
 //! a compute kernel or a graphics shader.
 //!
 //! Kernels are leaf functions. The isel inlines calls before it runs, so there
-//! is no call stack. The GPU has about 255 GPRs, so register allocation stays
-//! simple: a pointer takes an even-aligned register pair, and a boolean takes a
-//! predicate register (P0 to P5, where P6 holds the 64-bit-add carry). Kernel
+//! is no call stack. A pointer takes an even-aligned register pair, and a boolean takes a
+//! predicate register (P0 to P5, where P6 holds the 64-bit-add carry). A COMPUTE kernel
+//! allocates through the SHARED Wimmer-Franz allocator in `wimmer.zig`, the same one the four
+//! CPU backends use, which coalesces a block parameter onto the register of the argument that
+//! feeds it. A graphics SHADER still uses this module's own `assignLocs` linear scan, because a
+//! fragment colour output and a derivative SHFL read registers that are not SSA uses and no
+//! interval over the IR expresses that. See `assignLocsWimmer`. Kernel
 //! ABI: parameters arrive in constant bank 0 at the caller's `Abi.param_base`,
 //! and `vulcan-gpu` places them. A kernel that
 //! returns a value reads a 64-bit output pointer first (its `ret` stores the
@@ -27,6 +31,7 @@ const gpu = @import("vulcan-gpu");
 const opt = @import("vulcan-opt");
 const encode = @import("encode.zig");
 const schedule = @import("schedule.zig");
+const wimmer = @import("../wimmer.zig");
 
 const Function = ir.function.Function;
 const Value = ir.function.Value;
@@ -640,7 +645,15 @@ pub fn compileShaderOpts(allocator: std.mem.Allocator, func: *Function, stage: S
     var loc = std.AutoHashMapUnmanaged(Value, Loc){};
     defer loc.deinit(allocator);
     var max_reg: u8 = r_outptr + 1; // the output pointer pair is always live
-    try assignLocs(allocator, func, &loc, &max_reg, &fma);
+    // A COMPUTE kernel goes through the shared Wimmer-Franz allocator. A SHADER stays on this
+    // backend's own `assignLocs`, which extends live ranges for two fragment consumers that are
+    // NOT SSA uses and that no interval over the IR can express. See the section comment above
+    // `assignLocsWimmer`.
+    if (stage == .compute) {
+        try assignLocsWimmer(allocator, func, stage, &loc, &max_reg, &fma);
+    } else {
+        try assignLocs(allocator, func, &loc, &max_reg, &fma);
+    }
 
     // Give each hoisted constant addend a register above everything `assignLocs` handed
     // out. The prologue below writes them, once each, before the first block. See
@@ -1349,6 +1362,291 @@ fn firstFreePair(gpr_free: []const bool) ?usize {
     var r: usize = value_reg_base; // R4 is even, so the scan keeps pairs aligned
     while (r + 1 < encode.RZ) : (r += 2) if (gpr_free[r] and gpr_free[r + 1]) return r;
     return null;
+}
+
+// ---------------------------------------------------------------------------
+// The shared Wimmer-Franz allocator, THE register allocator for a COMPUTE KERNEL.
+//
+// `assignLocs` above is a bespoke linear scan with NO coalescing: it gives a block
+// parameter a fresh register and `emitMoves` then copies the incoming argument into it,
+// once per parameter per edge. `wimmer.zig` has interference-aware block-parameter
+// coalescing, which places the parameter on the argument's register and makes that copy a
+// same-register no-op the emitter drops. Measured on the three-kernel comparison against
+// `ptxas`, on an RTX 5070: a four-accumulator loop kernel fell from 59 SASS instructions,
+// 24 declared registers and 15 register copies to 49, 16 and 5, and a naive matmul from 40
+// instructions to 39. Runtime was UNCHANGED on all three, because the copies that vanished
+// were the loop's ENTRY and EXIT shuffles and every one of the five left is inside the body.
+//
+// IT COSTS COMPILE TIME. The shared allocator builds real lifetime intervals, runs a scan
+// that can split and spill, and resolves data flow, where `assignLocs` walks the blocks once.
+// Measured with the optimizer off: a 13-instruction kernel went from 6.5 to 15.8 microseconds
+// and the loop kernel above from 24.8 to 100 microseconds. About a fifth of the second figure
+// is the 251-register file, which the scan sweeps per interval; the rest is what the CPU
+// backends already pay. It stays about a hundred times faster than `ptxas`.
+//
+// THE BACK EDGE STILL COPIES, and coalescing cannot reach it. Each carried value's chain
+// ends in whatever register the chain's last instruction took, and a chain of four steps
+// over a rotating free pool does not end where it began. The hint that WOULD fix it, a
+// carried value placed on its own parameter's register, is refused because at that point
+// the parameter's register holds a mid-chain value of a NEIGHBOURING chain. Removing those
+// copies needs unrolling (what ptxas does) or chain-aware placement, not a better hint.
+//
+// THIS PATH IS COMPUTE ONLY, and that is not a simplification. `assignLocs` extends a live
+// range for two consumers that are NOT SSA uses, and neither can be expressed as an
+// interval over the IR: a fragment colour output that the ROP reads from R0..R3 at EXIT,
+// and a fragment varying register the derivative lowering SHFLs by register NUMBER. See
+// the two comments inside `assignLocs`.
+//
+// WHAT A SHADER WOULD NEED to follow, stated so the next person does not have to rederive
+// it. One new optional hook on `wimmer.RegDescription`, in the style of `regWidth` and
+// `fusedOperands`:
+//
+//     extraLiveRange: ?*const fn (ctx, func, v) ?u32
+//
+// It answers "value v stays live at least to POSITION p", and `buildIntervals` adds
+// `[def(v), p + 1)` to that value's ranges with no use at `p`. The position is in the
+// allocator's own numbering, which this backend can reproduce exactly: `buildIntervals` and
+// `assignLocs` number a function identically (one slot for the block-parameter row, one per
+// instruction, one for the terminator), so the walk that finds the last colour store already
+// gives the right number. The three registers `assignLocs` keeps out of its pool (the
+// graphics prologue pad, the fragment depth output, the extra MRT colour registers) need no
+// new mechanism at all: they simply leave `RegClass.allocatable`.
+//
+// IT WAS NOT DONE HERE, and the reason is evidence, not effort. This repository executes
+// COMPUTE kernels on real silicon and only inspects the STRUCTURE of a shader, so a shader
+// allocation regression would not be caught by any test that runs. A register allocator
+// gives a silently wrong answer when it is wrong, so the shader path waits for an execution
+// test, not for a hook.
+//
+// IT ALSO CANNOT SPILL. The emitter has no place to put `Allocation.actions`, a
+// cross-block location change, or a `Location.slot`, and a dropped spill move is a silently
+// wrong answer. So this REFUSES every allocation that needs one, rather than emitting
+// code that loses it. See `wimmerLocsFrom`.
+// ---------------------------------------------------------------------------
+
+/// The general-register class index in the `wimmer.RegDescription` this backend builds.
+const gpr_class: u16 = 0;
+/// The predicate class index. A boolean lives in a predicate, never in a GPR.
+const pred_class: u16 = 1;
+
+/// The predicate named as the shared allocator's class scratch. It is `carry_pred`, P6, and that
+/// sharing is safe only because NO PREDICATE EVER MOVES on this backend.
+///
+/// `wimmer.orderMoves` needs one reserved scratch per class to break a parallel-move cycle, and
+/// every predicate is already spoken for: P0..P5 are the pool `assignLocs` hands out, P6 carries
+/// the 64-bit-add carry chain, and P7 is PT, the hardware always-true predicate, which is not
+/// assignable. Shrinking the pool to make room would cost a predicate the old allocator gave out,
+/// which is a regression on a cutover.
+///
+/// So the pool stays P0..P5 and the scratch is P6, under a CHECKED condition rather than a hoped
+/// one: a predicate lives in a predicate register, `emitMoves` refuses a boolean block parameter
+/// outright, and `wimmerLocsFrom` refuses any allocation with a predicate-class move in it. A
+/// predicate move therefore never reaches the hardware, so nothing is ever routed through P6 and
+/// the carry chain is never touched. If that ever changes, the refusal fires instead of the carry
+/// silently going missing.
+const wimmer_pred_scratch: u8 = carry_pred;
+
+/// The predicates the shared allocator may hand out: P0..P5, the same pool `assignLocs` uses.
+const wimmer_pred_count: u8 = carry_pred;
+
+/// The context the `wimmer.RegDescription` hooks read. `func` arrives as a hook argument, so
+/// only the contraction decision has to be carried.
+const WimmerCtx = struct { fma: *const FmaFold };
+
+/// A boolean takes a predicate, everything else a general register.
+fn wimmerClassOf(ctx: *const anyopaque, func: *const Function, v: Value) u16 {
+    _ = ctx;
+    return if (isBool(func, v)) pred_class else gpr_class;
+}
+
+/// Every SASS source operand reads a register. This target has no memory operand, so no use
+/// may be served from a spill slot.
+fn wimmerUseKind(ctx: *const anyopaque, func: *const Function, inst: ir.function.Inst, operand: Value) wimmer.UseKind {
+    _ = ctx;
+    _ = func;
+    _ = inst;
+    _ = operand;
+    return .must_have_register;
+}
+
+/// A 64-bit address occupies an even-aligned GPR pair, everything else one register. This is
+/// the same width question `isWidePtr` answers for `assignLocs`, asked through the shared
+/// allocator's hook.
+fn wimmerRegWidth(ctx: *const anyopaque, func: *const Function, v: Value) wimmer.RegWidth {
+    _ = ctx;
+    return if (isWidePtr(func, v)) .{ .regs = 2, .alignment = 2 } else .{};
+}
+
+/// What a CONTRACTED multiply-add really reads: the two multiply sources and the addend, which is
+/// exactly the operand list `fmaInst` encodes. The IR instead says the add reads the PRODUCT, and
+/// both halves of that difference matter.
+///
+/// The multiply sources, read by the multiply in the IR, would otherwise die there. The fused
+/// instruction would then multiply whatever landed in their registers, with no diagnostic. This is
+/// the same live-range extension `assignLocs` makes from `fma.at`.
+///
+/// The product, counted as a use it is not, would otherwise hold a register ACROSS the fused
+/// instruction. That blocks the register the result wants, which on a loop back edge is the very
+/// register that makes the edge copy disappear. Measured on the `a = a * c + k` kernel: the product
+/// sat on the loop parameter's register and cost one MOV per accumulator per trip.
+///
+/// A constant multiplier or a constant addend is in the instruction's own immediate field, or in a
+/// hoisted register, so neither is a value here. See `Fma`.
+fn wimmerFusedOperands(ctx: *const anyopaque, func: *const Function, inst: ir.function.Inst, out: *[wimmer.max_fused_operands]Value) ?u8 {
+    const self: *const WimmerCtx = @ptrCast(@alignCast(ctx));
+    const result = func.instResult(inst) orelse return null;
+    const m = self.fma.at.get(result) orelse return null;
+    var n: u8 = 0;
+    out[n] = m.mul_a;
+    n += 1;
+    if (m.mul_b) |b| {
+        out[n] = b;
+        n += 1;
+    }
+    if (m.addend) |a| {
+        out[n] = a;
+        n += 1;
+    }
+    return n;
+}
+
+/// Build the register model this backend hands the shared allocator. The caller owns the
+/// result and must call `deinit`.
+fn nvidiaRegDescription(allocator: std.mem.Allocator, ctx: *const WimmerCtx) Error!wimmer.RegDescription {
+    // GPRs R4..R254. R0 and R1 are the prologue scratch pair, R2:R3 is the output pointer, and
+    // R255 is RZ. R254 is the last assignable register, matching `firstFreeSingle`.
+    const gprs = try allocator.alloc(u16, encode.RZ - value_reg_base);
+    errdefer allocator.free(gprs);
+    for (gprs, 0..) |*g, i| g.* = @intCast(value_reg_base + i);
+    // P0..P5. See `wimmer_pred_scratch` for where P6 and P7 went.
+    const preds = try allocator.alloc(u16, wimmer_pred_count);
+    errdefer allocator.free(preds);
+    for (preds, 0..) |*p, i| p.* = @intCast(i);
+
+    const classes = try allocator.alloc(wimmer.RegClass, 2);
+    errdefer allocator.free(classes);
+    classes[gpr_class] = .{
+        .name = "gpr",
+        .allocatable = gprs,
+        .callee_saved = try allocator.alloc(u16, 0),
+        // A kernel is a leaf, so nothing spills and no slot is ever laid out. The size still has
+        // to cover the class's widest value, a 64-bit address pair, in case one ever is.
+        .slot_bytes = 8,
+    };
+    classes[pred_class] = .{
+        .name = "pred",
+        .allocatable = preds,
+        .callee_saved = try allocator.alloc(u16, 0),
+        .slot_bytes = 4,
+    };
+
+    const scratch = try allocator.alloc(u16, 2);
+    errdefer allocator.free(scratch);
+    // R0 is the base of the reserved R0:R1 prologue scratch PAIR, which is what a routed move of
+    // a 64-bit address needs. `assertScratchFitsWidth` re-checks that, so this is not a promise.
+    scratch[gpr_class] = r_scratch;
+    scratch[pred_class] = wimmer_pred_scratch;
+
+    return .{
+        .classes = classes,
+        .classOf = wimmerClassOf,
+        .useKind = wimmerUseKind,
+        // A kernel takes its parameters from the constant bank, and the prologue loads each into
+        // whatever register the allocator picked, so no value is pinned at entry.
+        .entry_fixed = try allocator.alloc(wimmer.FixedAssign, 0),
+        // A kernel is a leaf: the isel inlines every call before it runs, so nothing clobbers.
+        .call_sites = try allocator.alloc(wimmer.CallSite, 0),
+        .scratch = scratch,
+        .ctx = ctx,
+        .coalesce_block_params = true,
+        // A conditional is laid out here as a per-arm branch sequence, so each arm's edge moves sit
+        // on a path only that edge takes. `wimmerLocsFrom` refuses `needs_resolution`, the other half
+        // of what the no-critical-edge precondition protects.
+        .hosts_critical_edge_moves = true,
+        .regWidth = wimmerRegWidth,
+        .fusedOperands = wimmerFusedOperands,
+    };
+}
+
+/// Turn a completed `wimmer.Allocation` into the one-location-per-value map the emitter reads,
+/// REFUSING anything this emitter cannot realize.
+///
+/// The emitter looks a value up once, in `loc`, and uses that answer everywhere. So a value
+/// this backend can emit must hold ONE register for its whole life. The shared allocator may
+/// instead split a value across two registers, put it in a spill slot, or ask for a move on a
+/// control-flow edge, and this emitter has nowhere to put any of the three: `Allocation.actions`
+/// and `needs_resolution` are both unhandled, and a dropped spill move is a silently wrong
+/// answer, the failure this project has shipped most often. Each one is refused here.
+///
+/// `edge_moves` is NOT refused wholesale, and that is deliberate. With every value on one
+/// register for its whole life, the only move the resolver can produce is a block parameter
+/// reading its incoming argument, which `emitMoves` recomputes from `loc` and emits as its own
+/// parallel copy. Coalescing makes most of those same-register, and `emitMoves` drops those.
+/// A PREDICATE move is refused, because the predicate class scratch is the 64-bit-add carry
+/// predicate and a routed move would destroy a carry. See `wimmer_pred_scratch`.
+fn wimmerLocsFrom(
+    allocator: std.mem.Allocator,
+    func: *const Function,
+    result: *const wimmer.Allocation,
+    loc: *std.AutoHashMapUnmanaged(Value, Loc),
+    max_reg: *u8,
+) Error!void {
+    if (result.needs_resolution) return error.Unsupported;
+    if (result.actions.len != 0) return error.Unsupported;
+    for (result.slot_count_per_class) |n| {
+        if (n != 0) return error.Unsupported;
+    }
+    for (result.edge_moves) |em| {
+        for (em.moves) |m| {
+            if (m.class == pred_class) return error.Unsupported;
+        }
+    }
+    var it = result.segments.iterator();
+    while (it.next()) |e| {
+        const v = e.key_ptr.*;
+        const segs = e.value_ptr.*;
+        if (segs.len != 1) return error.Unsupported;
+        const reg = switch (segs[0].loc) {
+            .reg => |r| r,
+            .slot => return error.Unsupported,
+        };
+        if (isBool(func, v)) {
+            std.debug.assert(reg < wimmer_pred_count);
+            try loc.put(allocator, v, .{ .pred = @intCast(reg) });
+            continue;
+        }
+        const wide = isWidePtr(func, v);
+        const top: u16 = reg + @intFromBool(wide);
+        // Recomputed, not trusted. A base below the pool would sit on the output pointer, an odd
+        // base would split a 64-bit address across a pair boundary, and a span reaching RZ would
+        // address through the zero register, which reads as zero and drops every write.
+        std.debug.assert(reg >= value_reg_base and top < encode.RZ);
+        std.debug.assert(!wide or reg % 2 == 0);
+        if (top > max_reg.*) max_reg.* = @intCast(top);
+        try loc.put(allocator, v, .{ .gpr = @intCast(reg) });
+    }
+}
+
+/// Register allocation through the shared Wimmer-Franz allocator. THE allocator for a compute
+/// kernel. Refuses a shader stage, and any allocation this emitter cannot realize. See the
+/// section comment above.
+fn assignLocsWimmer(
+    allocator: std.mem.Allocator,
+    func: *const Function,
+    stage: Stage,
+    loc: *std.AutoHashMapUnmanaged(Value, Loc),
+    max_reg: *u8,
+    fma: *const FmaFold,
+) Error!void {
+    if (stage != .compute) return error.Unsupported;
+    if (func.valueCount() == 0) return;
+
+    const ctx = WimmerCtx{ .fma = fma };
+    var desc = try nvidiaRegDescription(allocator, &ctx);
+    defer desc.deinit(allocator);
+    var result = try wimmer.allocate(allocator, func, &desc);
+    defer result.deinit(allocator);
+    try wimmerLocsFrom(allocator, func, &result, loc, max_reg);
 }
 
 fn isBool(func: *const Function, v: Value) bool {
@@ -6390,23 +6688,23 @@ test "a compare-exchange lowers to the CAS opcode of its address space" {
     }
 }
 
-/// The register a kernel parameter lands in, recomputed the way `assignLocs` does, so the CAS
-/// test can name the operand registers without reaching into the isel's private map.
+/// The register a kernel parameter lands in, recomputed the way a COMPUTE kernel's allocation is,
+/// so the CAS test can name the operand registers without reaching into the isel's private map.
 fn gprOfTest(func: *const Function, v: Value) u8 {
     var locs: std.AutoHashMapUnmanaged(Value, Loc) = .empty;
     defer locs.deinit(std.testing.allocator);
-    var max_reg: u8 = 0;
+    var max_reg: u8 = r_outptr + 1;
     // An empty fold: the atomic kernels this helper serves contain no multiply-add, so
     // nothing here changes when contraction is on.
     const fma = FmaFold{};
-    assignLocs(std.testing.allocator, func, &locs, &max_reg, &fma) catch unreachable;
+    assignLocsWimmer(std.testing.allocator, func, .compute, &locs, &max_reg, &fma) catch unreachable;
     return gprOf(locs, v);
 }
 
 /// The register `compileShaderOpts` gives `v`, recomputed by running the SAME pre-passes in
 /// the same order it does. A contraction test needs this and not `gprOfTest`: the fused
 /// instruction names the MULTIPLY's operand registers, and keeping those operands live to
-/// the add is itself part of what `assignLocs` now decides.
+/// the add is itself part of what the allocation decides.
 ///
 /// Every pre-pass here is idempotent, so calling this after `compileKernel` on the same
 /// function gives the allocation that kernel used.
@@ -6422,7 +6720,7 @@ fn gprOfCompiled(func: *Function, v: Value, options: Options) u8 {
     defer fma.deinit(allocator);
     scanFma(allocator, func, options, &fma) catch unreachable;
     var max_reg: u8 = r_outptr + 1;
-    assignLocs(allocator, func, &locs, &max_reg, &fma) catch unreachable;
+    assignLocsWimmer(allocator, func, .compute, &locs, &max_reg, &fma) catch unreachable;
     return gprOf(locs, v);
 }
 
@@ -6820,4 +7118,378 @@ test "a CHAIN of edge moves needs no scratch register" {
     for (code.items) |inst| {
         try testing.expect(@as(u8, @truncate(inst[0] >> 16)) != r_scratch);
     }
+}
+
+// ---------------------------------------------------------------------------
+// The shared Wimmer-Franz allocator on the compute path. See `assignLocsWimmer`.
+// ---------------------------------------------------------------------------
+
+/// The opcode of a register-to-register MOV (`encode.movReg`: base 0x002, form 1).
+const MOV_REG: u32 = 0x202;
+
+/// How many register copies `emitMoves` emits over every edge of `func` under the locations
+/// `locs` holds. This is the edge-copy cost of one allocation, and lowering it is the whole
+/// reason the compute path moved to the shared allocator. It counts exactly what `emitMoves`
+/// counts: one copy per differing register, two for a 64-bit address pair.
+fn edgeCopyCount(func: *const Function, locs: std.AutoHashMapUnmanaged(Value, Loc)) usize {
+    var n: usize = 0;
+    for (0..func.blockCount()) |bi| {
+        const block: Block = @enumFromInt(bi);
+        for (func.blockInsts(block)) |inst| {
+            if (func.opcode(inst) != .@"if") continue;
+            const cf = func.opcode(inst).@"if";
+            n += edgeCopyCountOne(func, locs, cf.then);
+            n += edgeCopyCountOne(func, locs, cf.@"else");
+        }
+        if (func.terminator(block)) |term| switch (term) {
+            .jump => |j| n += edgeCopyCountOne(func, locs, j),
+            .ret => {},
+        };
+    }
+    return n;
+}
+
+fn edgeCopyCountOne(func: *const Function, locs: std.AutoHashMapUnmanaged(Value, Loc), jump: ir.function.Jump) usize {
+    var n: usize = 0;
+    for (func.blockArgs(jump), func.blockParams(jump.target)) |arg, param| {
+        const dst = gprOf(locs, param);
+        const src = gprOf(locs, arg);
+        const span: u8 = if (isWidePtr(func, param)) 2 else 1;
+        var i: u8 = 0;
+        while (i < span) : (i += 1) {
+            if (dst + i != src + i) n += 1;
+        }
+    }
+    return n;
+}
+
+/// Build `out = a0 * a1 * ... over a counted loop that carries `carried` accumulators`, the
+/// shape whose edge copies this backend used to pay per trip. Every accumulator is multiplied
+/// and added by a constant, so each one is a separate carried value.
+fn buildCarriedLoop(func: *Function, carried: usize) Error!void {
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+
+    const entry = try func.appendBlock();
+    const head = try func.appendBlock();
+    const body = try func.appendBlock();
+    const done = try func.appendBlock();
+
+    const trips = try func.appendBlockParam(entry, i32_t);
+    const seed = try func.appendBlockParam(entry, f32_t);
+    var init_args: [5]Value = undefined;
+    init_args[0] = try func.appendInst(entry, i32_t, .{ .iconst = 0 });
+    for (0..carried) |k| {
+        init_args[k + 1] = try func.appendArithImm(entry, f32_t, .add, seed, @as(i64, @intCast(k + 1)));
+    }
+    func.setTerminator(entry, .{ .jump = .{
+        .target = head,
+        .args = try func.internValues(init_args[0 .. carried + 1]),
+    } });
+
+    const t = try func.appendBlockParam(head, i32_t);
+    var acc: [4]Value = undefined;
+    for (0..carried) |k| acc[k] = try func.appendBlockParam(head, f32_t);
+    const more = try func.appendInst(head, bool_t, .{ .icmp = .{ .op = .lt, .lhs = t, .rhs = trips } });
+    try func.appendIf(head, more, .{ .target = body, .args = &.{} }, .{ .target = done, .args = acc[0..carried] });
+
+    var next_args: [5]Value = undefined;
+    for (0..carried) |k| {
+        const m = try func.appendArithImm(body, f32_t, .mul, acc[k], @as(i64, 0x3f666666));
+        next_args[k + 1] = try func.appendArithImm(body, f32_t, .add, m, @as(i64, 0x3d4ccccd));
+    }
+    next_args[0] = try func.appendArithImm(body, i32_t, .add, t, 1);
+    func.setTerminator(body, .{ .jump = .{
+        .target = head,
+        .args = try func.internValues(next_args[0 .. carried + 1]),
+    } });
+
+    var out: [4]Value = undefined;
+    for (0..carried) |k| out[k] = try func.appendBlockParam(done, f32_t);
+    var s = out[0];
+    for (out[1..carried]) |x| s = try func.appendInst(done, f32_t, .{ .arith = .{ .op = .mul, .lhs = s, .rhs = x } });
+    func.setTerminator(done, .{ .ret = ir.function.Ret.one(s) });
+}
+
+/// Run the pre-passes `compileShaderOpts` runs, then the named allocator, and give back the
+/// locations. The pre-passes are idempotent, so this reproduces what a compile decided.
+fn locsUnder(allocator: std.mem.Allocator, func: *Function, use_wimmer: bool, locs: *std.AutoHashMapUnmanaged(Value, Loc)) !void {
+    foldConstantsToImm(func);
+    var disp = DispFold{};
+    defer disp.deinit(allocator);
+    try foldAddressDisplacements(allocator, func, &disp);
+    var fma = FmaFold{};
+    defer fma.deinit(allocator);
+    try scanFma(allocator, func, .{}, &fma);
+    var max_reg: u8 = r_outptr + 1;
+    if (use_wimmer) {
+        try assignLocsWimmer(allocator, func, .compute, locs, &max_reg, &fma);
+    } else {
+        try assignLocs(allocator, func, locs, &max_reg, &fma);
+    }
+}
+
+test "the shared allocator coalesces loop edge copies the old linear scan emitted" {
+    // THE REASON THE COMPUTE PATH MOVED. `assignLocs` gives a block parameter a fresh register
+    // and never looks at the argument that feeds it, so every carried value costs one copy on
+    // every edge. The shared allocator hints the parameter onto the argument's register where
+    // they do not interfere. The comparison is over the SAME IR under both allocators, so the
+    // only difference is the allocation.
+    const allocator = testing.allocator;
+    for ([_]usize{ 2, 3, 4 }) |carried| {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        try buildCarriedLoop(&func, carried);
+
+        var old_locs: std.AutoHashMapUnmanaged(Value, Loc) = .empty;
+        defer old_locs.deinit(allocator);
+        try locsUnder(allocator, &func, false, &old_locs);
+        const old_copies = edgeCopyCount(&func, old_locs);
+
+        var new_locs: std.AutoHashMapUnmanaged(Value, Loc) = .empty;
+        defer new_locs.deinit(allocator);
+        try locsUnder(allocator, &func, true, &new_locs);
+        const new_copies = edgeCopyCount(&func, new_locs);
+
+        try testing.expect(new_copies < old_copies);
+        // The entry and exit edges coalesce completely: what is left is the back edge, whose
+        // arguments are defined AFTER the parameters they feed, so each chain ends in whatever
+        // register its last instruction took. See the section comment on `assignLocsWimmer`.
+        try testing.expect(new_copies <= carried + 1);
+    }
+}
+
+test "a compute kernel's block-parameter copies survive into the emitted stream as no-ops" {
+    // The end-to-end half of the test above: a compiled kernel has to CONTAIN fewer MOVs, not
+    // just a better location map. A four-accumulator loop pays the old allocator a copy on the
+    // entry edge, the exit edge and the back edge for every carried value.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    try buildCarriedLoop(&func, 4);
+
+    var kernel = try compileKernel(allocator, &func, nvidia_abi);
+    defer kernel.deinit(allocator);
+
+    // Five carried values over three edges is fifteen copies under the old scan. Coalescing
+    // clears the entry and the exit edge outright.
+    try testing.expect(countOp(kernel.code, MOV_REG) <= 5);
+    try testing.expectEqual(@as(usize, 4), countOp(kernel.code, FFMA_IMM));
+}
+
+test "a contracted multiply-add keeps its own sources alive across the suppressed multiply" {
+    // THE SILENT WRONG ANSWER THIS GUARDS. Contraction emits nothing for the multiply and makes
+    // the fused add read the multiply's operands. In the IR those operands are read by the
+    // multiply and die there, so an allocator that believes the IR hands their registers to a
+    // value defined in between, and the FFMA then multiplies that value instead. Here `spacer`
+    // is exactly such a value: defined after the multiply and live past the fused add.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const b = try func.appendBlock();
+    const x = try func.appendBlockParam(b, f32_t);
+    const y = try func.appendBlockParam(b, f32_t);
+    const z = try func.appendBlockParam(b, f32_t);
+    const w = try func.appendBlockParam(b, f32_t);
+    const prod = try func.appendInst(b, f32_t, .{ .arith = .{ .op = .mul, .lhs = x, .rhs = y } });
+    const spacer = try func.appendInst(b, f32_t, .{ .arith = .{ .op = .mul, .lhs = z, .rhs = w } });
+    const fused = try func.appendInst(b, f32_t, .{ .arith = .{ .op = .add, .lhs = prod, .rhs = z } });
+    const use = try func.appendInst(b, f32_t, .{ .arith = .{ .op = .mul, .lhs = fused, .rhs = spacer } });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(use) });
+
+    var locs: std.AutoHashMapUnmanaged(Value, Loc) = .empty;
+    defer locs.deinit(allocator);
+    try locsUnder(allocator, &func, true, &locs);
+
+    // The two multiply sources must not share a register with the value defined between the
+    // multiply and the add.
+    try testing.expect(gprOf(locs, x) != gprOf(locs, spacer));
+    try testing.expect(gprOf(locs, y) != gprOf(locs, spacer));
+}
+
+test "a graphics stage is refused by the shared allocator, and compute is not" {
+    // A fragment colour output and a derivative SHFL read registers that are not SSA uses, and
+    // no interval over the IR expresses that, so a shader stays on `assignLocs`. The refusal is
+    // the guard, and the compute case is the control that proves the refusal is not universal.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const b = try func.appendBlock();
+    const x = try func.appendBlockParam(b, f32_t);
+    const y = try func.appendInst(b, f32_t, .{ .arith = .{ .op = .mul, .lhs = x, .rhs = x } });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(y) });
+
+    const fma = FmaFold{};
+    for ([_]Stage{ .vertex, .fragment }) |stage| {
+        var locs: std.AutoHashMapUnmanaged(Value, Loc) = .empty;
+        defer locs.deinit(allocator);
+        var max_reg: u8 = r_outptr + 1;
+        try testing.expectError(error.Unsupported, assignLocsWimmer(allocator, &func, stage, &locs, &max_reg, &fma));
+    }
+    var locs: std.AutoHashMapUnmanaged(Value, Loc) = .empty;
+    defer locs.deinit(allocator);
+    var max_reg: u8 = r_outptr + 1;
+    try assignLocsWimmer(allocator, &func, .compute, &locs, &max_reg, &fma);
+    try testing.expect(locs.count() > 0);
+}
+
+/// One hand-built `wimmer.Allocation` for the refusal tests below. The allocator itself only
+/// produces these shapes under register pressure a kernel with 251 GPRs does not reach, so the
+/// guard is exercised by handing `wimmerLocsFrom` the shape directly.
+fn oneSegmentAlloc(allocator: std.mem.Allocator, v: Value, segs: []const wimmer.Segment) !wimmer.Allocation {
+    var result: wimmer.Allocation = .{};
+    const owned = try allocator.alloc(wimmer.Segment, segs.len);
+    @memcpy(owned, segs);
+    try result.segments.put(allocator, v, owned);
+    return result;
+}
+
+test "every allocation shape this emitter cannot realize is refused, not emitted" {
+    // A REGISTER ALLOCATOR BUG IS A SILENTLY WRONG ANSWER. The emitter holds ONE location per
+    // value for the whole kernel, so a split, a spill slot, an intra-block move or a
+    // cross-block location change has nowhere to go. Each is refused here. The last case is the
+    // control: a single register segment is accepted.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const b = try func.appendBlock();
+    const v = try func.appendBlockParam(b, f32_t);
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(v) });
+
+    // A value split across two registers.
+    {
+        var result = try oneSegmentAlloc(allocator, v, &.{ .{ .from = 0, .loc = .{ .reg = 4 } }, .{ .from = 3, .loc = .{ .reg = 5 } } });
+        defer result.deinit(allocator);
+        var locs: std.AutoHashMapUnmanaged(Value, Loc) = .empty;
+        defer locs.deinit(allocator);
+        var max_reg: u8 = r_outptr + 1;
+        try testing.expectError(error.Unsupported, wimmerLocsFrom(allocator, &func, &result, &locs, &max_reg));
+    }
+    // A value in a spill slot.
+    {
+        var result = try oneSegmentAlloc(allocator, v, &.{.{ .from = 0, .loc = .{ .slot = 0 } }});
+        defer result.deinit(allocator);
+        var locs: std.AutoHashMapUnmanaged(Value, Loc) = .empty;
+        defer locs.deinit(allocator);
+        var max_reg: u8 = r_outptr + 1;
+        try testing.expectError(error.Unsupported, wimmerLocsFrom(allocator, &func, &result, &locs, &max_reg));
+    }
+    // An intra-block spill, reload or move.
+    {
+        var result = try oneSegmentAlloc(allocator, v, &.{.{ .from = 0, .loc = .{ .reg = 4 } }});
+        defer result.deinit(allocator);
+        result.actions = try allocator.alloc(wimmer.Action, 1);
+        result.actions[0] = .{ .at = 1, .kind = .move, .class = gpr_class, .src = .{ .reg = 4 }, .dst = .{ .reg = 5 }, .value = v };
+        var locs: std.AutoHashMapUnmanaged(Value, Loc) = .empty;
+        defer locs.deinit(allocator);
+        var max_reg: u8 = r_outptr + 1;
+        try testing.expectError(error.Unsupported, wimmerLocsFrom(allocator, &func, &result, &locs, &max_reg));
+    }
+    // A location that changes across a control-flow edge.
+    {
+        var result = try oneSegmentAlloc(allocator, v, &.{.{ .from = 0, .loc = .{ .reg = 4 } }});
+        defer result.deinit(allocator);
+        result.needs_resolution = true;
+        var locs: std.AutoHashMapUnmanaged(Value, Loc) = .empty;
+        defer locs.deinit(allocator);
+        var max_reg: u8 = r_outptr + 1;
+        try testing.expectError(error.Unsupported, wimmerLocsFrom(allocator, &func, &result, &locs, &max_reg));
+    }
+    // A PREDICATE move: the predicate class scratch is the 64-bit-add carry predicate, so a
+    // routed predicate move would destroy a carry. See `wimmer_pred_scratch`.
+    {
+        var result = try oneSegmentAlloc(allocator, v, &.{.{ .from = 0, .loc = .{ .reg = 4 } }});
+        defer result.deinit(allocator);
+        result.edge_moves = try allocator.alloc(wimmer.EdgeMoves, 1);
+        const moves = try allocator.alloc(wimmer.Move, 1);
+        moves[0] = .{ .src = .{ .reg = 0 }, .dst = .{ .reg = 1 }, .class = pred_class, .value = v };
+        result.edge_moves[0] = .{ .pred = b, .succ = b, .moves = moves };
+        var locs: std.AutoHashMapUnmanaged(Value, Loc) = .empty;
+        defer locs.deinit(allocator);
+        var max_reg: u8 = r_outptr + 1;
+        try testing.expectError(error.Unsupported, wimmerLocsFrom(allocator, &func, &result, &locs, &max_reg));
+    }
+    // The control: one register segment, which the emitter CAN realize.
+    {
+        var result = try oneSegmentAlloc(allocator, v, &.{.{ .from = 0, .loc = .{ .reg = 4 } }});
+        defer result.deinit(allocator);
+        var locs: std.AutoHashMapUnmanaged(Value, Loc) = .empty;
+        defer locs.deinit(allocator);
+        var max_reg: u8 = r_outptr + 1;
+        try wimmerLocsFrom(allocator, &func, &result, &locs, &max_reg);
+        try testing.expectEqual(@as(u8, 4), gprOf(locs, v));
+        try testing.expectEqual(@as(u8, 4), max_reg);
+    }
+}
+
+test "a 64-bit address takes an even-aligned pair, and two of them never overlap" {
+    // The width rule the shared allocator reads out of `isWidePtr`. A pointer that landed on an
+    // odd base, or on a pair overlapping another pointer's pair, addresses another place with
+    // no diagnostic.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const ptr_t = try func.types.ptrGlobal();
+    const b = try func.appendBlock();
+    const p0 = try func.appendBlockParam(b, ptr_t);
+    const p1 = try func.appendBlockParam(b, ptr_t);
+    const p2 = try func.appendBlockParam(b, ptr_t);
+    const v = try func.appendInst(b, i32_t, .{ .load = .{ .ptr = p0 } });
+    try func.appendStore(b, v, p1);
+    try func.appendStore(b, v, p2);
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
+
+    var locs: std.AutoHashMapUnmanaged(Value, Loc) = .empty;
+    defer locs.deinit(allocator);
+    try locsUnder(allocator, &func, true, &locs);
+
+    const regs = [_]u8{ gprOf(locs, p0), gprOf(locs, p1), gprOf(locs, p2) };
+    for (regs) |r| {
+        try testing.expectEqual(@as(u8, 0), r % 2);
+        try testing.expect(r >= value_reg_base);
+    }
+    for (regs, 0..) |a, i| {
+        for (regs[i + 1 ..]) |c| {
+            try testing.expect(a + 1 < c or c + 1 < a);
+        }
+    }
+}
+
+test "a CRITICAL edge compiles: the arms carry their own block-parameter copies" {
+    // The shared allocator normally demands that critical edges be split first, because a
+    // resolution move has no block to sit in: the source has a sibling edge and the target has
+    // another predecessor. THIS backend has a third place. It lays a conditional out as a
+    // per-arm branch sequence, so each arm's copies run only on the path that edge takes, and
+    // `wimmerLocsFrom` refuses the cross-block location changes that are the other half of what
+    // the precondition protects. Here `join` has two predecessors and one of them ends in an
+    // `if`, which is exactly the shape the precondition rejects.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+
+    const entry = try func.appendBlock();
+    const mid = try func.appendBlock();
+    const join = try func.appendBlock();
+
+    const a = try func.appendBlockParam(entry, i32_t);
+    const b = try func.appendBlockParam(entry, i32_t);
+    const c = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .lt, .lhs = a, .rhs = b } });
+    // The `then` arm goes to `join` directly, and `join` is ALSO reached from `mid`. That edge
+    // is critical: `entry` has two successors and `join` has two predecessors.
+    try func.appendIf(entry, c, .{ .target = join, .args = &.{a} }, .{ .target = mid, .args = &.{} });
+    const d = try func.appendArithImm(mid, i32_t, .add, b, 7);
+    func.setTerminator(mid, .{ .jump = .{ .target = join, .args = try func.internValues(&.{d}) } });
+    const p = try func.appendBlockParam(join, i32_t);
+    func.setTerminator(join, .{ .ret = ir.function.Ret.one(p) });
+
+    var kernel = try compileKernel(allocator, &func, nvidia_abi);
+    defer kernel.deinit(allocator);
+    try testing.expect(kernel.code.len > 0);
 }

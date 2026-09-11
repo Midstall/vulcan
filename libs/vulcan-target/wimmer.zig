@@ -51,6 +51,11 @@ pub const RegWidth = struct {
     alignment: u16 = 1,
 };
 
+/// How many operands `RegDescription.fusedOperands` may report for one instruction. Three is what
+/// the NVIDIA multiply-add contraction needs (two multiply sources and one addend), and the buffer
+/// is sized above that so a later fusion has room without a shared-module change.
+pub const max_fused_operands: usize = 4;
+
 /// Whether an operand use requires a register. A `must_have_register` operand cannot read from a
 /// spill slot on this target. This is the safe, conservative default. A `should_have_register`
 /// operand may fold or reload from a slot. A target that supports this, for example x86 memory
@@ -133,6 +138,22 @@ pub const RegDescription = struct {
     // register. False (the default) keeps the allocator byte-identical for a backend that does not
     // opt in.
     coalesce_block_params: bool = false,
+    // OPTIONAL declaration that the backend can host an edge move on a CRITICAL edge, so the
+    // no-critical-edge precondition below does not apply to it.
+    //
+    // Resolution normally places an edge's moves in one of the two blocks the edge joins, and a
+    // critical edge (a multi-successor source feeding a multi-predecessor target) has neither block
+    // to spare: moves in the source corrupt the sibling edge, moves in the target corrupt the other
+    // predecessor's path. So every caller splits critical edges first and `assertNoCriticalEdges`
+    // fails loudly on a wiring mistake.
+    //
+    // A backend that emits its own per-arm branch sequence has a third place: the arm itself. The
+    // NVIDIA backend lays a conditional out as `@P BRA L_then; <else moves>; BRA else; L_then:
+    // <then moves>; BRA then`, so each arm's moves sit on a path only that edge takes. Such a
+    // backend sets this to skip the check. It is still responsible for realizing, or refusing,
+    // `Allocation.needs_resolution`, which is the other half of what the precondition protects.
+    // False (the default) keeps the check for every backend that relies on split edges.
+    hosts_critical_edge_moves: bool = false,
     // OPTIONAL spill-slot coalescing. When true, after the scan a block parameter that SPILLED shares
     // ONE spill slot with an incoming argument that also spilled, when the two do not interfere. The
     // edge move that fed the parameter then becomes a same-slot no-op the edge resolver drops, so a
@@ -152,6 +173,20 @@ pub const RegDescription = struct {
     // to the prior behavior for a backend that does not opt in. Read the `RegWidth` doc comment for
     // the two obligations a width above one puts on the backend.
     regWidth: ?*const fn (ctx: *const anyopaque, func: *const Function, v: Value) RegWidth = null,
+    // OPTIONAL operand-rewrite hook for an instruction the backend FUSES. Return null to leave the
+    // IR operand walk alone, which is what every instruction of a backend that does not opt in does.
+    // Otherwise fill `out` with the values the MACHINE instruction really reads and return how many
+    // (at most `max_fused_operands`); that list then REPLACES the IR operands of `inst` for uses and
+    // live ranges.
+    //
+    // It exists because a fused instruction reads neither more nor less than the IR says, but
+    // something DIFFERENT. The NVIDIA multiply-add contraction emits nothing for the multiply and
+    // makes the ADD read the multiply's own sources: the IR says the add reads the product, and the
+    // machine says it reads the two factors. Both halves of that matter. Left unreported, the
+    // factors die at the suppressed multiply and the fused instruction multiplies whatever landed in
+    // their registers, with no diagnostic. And the product, counted as a use it is not, holds a
+    // register across the fused instruction and blocks the very register the result wants.
+    fusedOperands: ?*const fn (ctx: *const anyopaque, func: *const Function, inst: Inst, out: *[max_fused_operands]Value) ?u8 = null,
 
     /// Free every owned slice the backend builder allocated: each class's `allocatable` and
     /// `callee_saved`, the `classes` slice, each call site's per-class `regs` and its `clobbered`
@@ -508,7 +543,16 @@ pub fn buildIntervals(allocator: std.mem.Allocator, func: *const Function, desc:
                 .inst = inst,
                 .term_kind = false,
             };
-            visitOperands(func, inst, &g, Gather.visit);
+            // What the MACHINE instruction reads, which a fusing backend may report as a different
+            // list from the IR operands. See `RegDescription.fusedOperands`.
+            var fused: [max_fused_operands]Value = undefined;
+            const fused_len: ?u8 = if (desc.fusedOperands) |hook| hook(desc.ctx, func, inst, &fused) else null;
+            if (fused_len) |n| {
+                std.debug.assert(n <= max_fused_operands);
+                for (fused[0..n]) |fv| g.visit(fv, false);
+            } else {
+                visitOperands(func, inst, &g, Gather.visit);
+            }
             if (g.err) |e| return e;
             if (func.opcode(inst) == .@"if") {
                 const cf = func.opcode(inst).@"if";
@@ -860,8 +904,35 @@ pub const AllocateError = Error || error{Unsupported};
 /// A free-until position meaning "never conflicts". Program positions never reach it.
 const infinity: u32 = std.math.maxInt(u32);
 
-/// The widest physical register index the freeUntilPos bookkeeping supports. aarch64 uses 0..31.
-const max_phys_regs: usize = 64;
+/// The widest physical register index the freeUntilPos bookkeeping supports. aarch64 uses 0..31,
+/// and the NVIDIA GPR file reaches R254, so the fixed-size scan arrays are sized for the widest
+/// register file any backend has. A backend does NOT pay for the whole array: `regLimit` gives one
+/// function the bound its own description reaches, and every scan loop stops there. See `regLimit`.
+const max_phys_regs: usize = 256;
+
+/// One past the highest register index the scan can touch for ONE function. Every fixed-size scan
+/// array is `max_phys_regs` wide, but a backend whose classes hand out 32 registers must not pay for
+/// 256: a loop over the whole array made the aarch64 allocator twice as slow when the array grew for
+/// NVIDIA. This RECOMPUTES the bound from the description and the built intervals, so a class that
+/// grows, or a fixed pin that reaches higher, cannot leave a stale bound behind.
+///
+/// It covers every index the scan writes or reads: each class pool, both scratch sets, and the whole
+/// span of each fixed interval (an entry-parameter pin owns its parameter's full register span).
+/// A register above the bound is never a candidate, so stopping there drops only registers the scan
+/// would have skipped, and the pick is unchanged.
+fn regLimit(intervals: []const Interval, desc: *const RegDescription) usize {
+    var m: usize = 0;
+    for (desc.classes) |c| {
+        for (c.allocatable) |r| m = @max(m, @as(usize, r) + 1);
+    }
+    for (desc.scratch) |r| m = @max(m, @as(usize, r) + 1);
+    for (desc.scratch2) |r| m = @max(m, @as(usize, r) + 1);
+    for (intervals) |*iv| {
+        const fr = iv.fixed_reg orelse continue;
+        m = @max(m, @as(usize, fr) + iv.regs);
+    }
+    return @min(m, max_phys_regs);
+}
 
 fn intervalStartLessThan(_: void, a: *Interval, b: *Interval) bool {
     return a.start() < b.start();
@@ -907,19 +978,24 @@ fn spansOverlap(base_a: u16, regs_a: u16, base_b: u16, regs_b: u16) bool {
 }
 
 /// True iff `[base, base + regs)` is a legal placement for a value of this alignment: the base meets
-/// the alignment, the span fits inside the per-register bookkeeping, and every register of the span
-/// is in the candidate set. When `evictable` is given, every register of the span must be evictable
-/// too. For a one-register value with alignment 1 this reduces to the candidate (and evictable) flag
-/// of the single register, which is what the scan tested before multi-register values existed.
+/// the alignment, the span fits inside `limit` (the scan bound `regLimit` gave this function), and
+/// every register of the span is in the candidate set. When `evictable` is given, every register of
+/// the span must be evictable too. For a one-register value with alignment 1 this reduces to the
+/// candidate (and evictable) flag of the single register, which is what the scan tested before
+/// multi-register values existed.
 fn spanPlaceable(
     is_candidate: *const [max_phys_regs]bool,
     evictable: ?*const [max_phys_regs]bool,
+    limit: usize,
     base: usize,
     regs: u16,
     alignment: u16,
 ) bool {
-    if (base % alignment != 0) return false;
-    if (base + regs > max_phys_regs) return false;
+    // The modulo is skipped for the alignment of one every backend but NVIDIA uses, and that
+    // NVIDIA uses for every value but an address. An integer division per candidate register per
+    // interval is the dominant cost of the scan on a 251-register file.
+    if (alignment != 1 and base % alignment != 0) return false;
+    if (base + regs > limit) return false;
     for (base..base + regs) |r| {
         if (!is_candidate[r]) return false;
         if (evictable) |e| {
@@ -986,15 +1062,19 @@ fn tryAllocateFreeReg(
     active: []const *Interval,
     inactive: []const *Interval,
     desc: *const RegDescription,
+    limit: usize,
     param_hint: ?u16,
 ) ?u16 {
     const class_idx = current.class;
     const class = desc.classes[class_idx];
 
-    var free_until = [_]u32{0} ** max_phys_regs;
-    var is_candidate = [_]bool{false} ** max_phys_regs;
+    // Only `[0, limit)` of each array is initialized, read, or scanned. See `regLimit`.
+    var free_until: [max_phys_regs]u32 = undefined;
+    var is_candidate: [max_phys_regs]bool = undefined;
+    @memset(free_until[0..limit], 0);
+    @memset(is_candidate[0..limit], false);
     for (class.allocatable) |r| {
-        std.debug.assert(r < max_phys_regs);
+        std.debug.assert(r < limit);
         is_candidate[r] = true;
         free_until[r] = infinity;
     }
@@ -1004,7 +1084,7 @@ fn tryAllocateFreeReg(
         // candidate set. For a one-register value this is the single hinted register, as before.
         var k: u16 = 0;
         while (k < current.regs) : (k += 1) {
-            std.debug.assert(h + k < max_phys_regs);
+            std.debug.assert(h + k < limit);
             is_candidate[h + k] = true;
             free_until[h + k] = infinity;
         }
@@ -1022,7 +1102,7 @@ fn tryAllocateFreeReg(
         if (sameValue(it, current)) continue;
         const r = assignedReg(it);
         if (copyDiesAt(current, it)) {
-            if (r < max_phys_regs and is_candidate[r]) coalesce_hint = r;
+            if (r < limit and is_candidate[r]) coalesce_hint = r;
             continue;
         }
         // The occupant holds its WHOLE span right now, so every register of it is busy. Marking only
@@ -1030,7 +1110,7 @@ fn tryAllocateFreeReg(
         var k: u16 = 0;
         while (k < it.regs) : (k += 1) {
             const rr = r +| k;
-            if (rr < max_phys_regs and is_candidate[rr]) free_until[rr] = 0;
+            if (rr < limit and is_candidate[rr]) free_until[rr] = 0;
         }
     }
     // An inactive interval of this class has a hole here, so its register is free only until the two
@@ -1040,14 +1120,14 @@ fn tryAllocateFreeReg(
         if (it.class != class_idx) continue;
         if (sameValue(it, current)) continue;
         const r = assignedReg(it);
-        if (r >= max_phys_regs) continue;
+        if (r >= limit) continue;
         const x = if (it.fixed_reg != null) fixedClobberConflict(current, it) else current.nextIntersection(it);
         if (x) |xx| {
             // The reclaim takes back the occupant's WHOLE span, so clamp every register of it.
             var k: u16 = 0;
             while (k < it.regs) : (k += 1) {
                 const rr = r +| k;
-                if (rr < max_phys_regs and is_candidate[rr] and xx < free_until[rr]) free_until[rr] = xx;
+                if (rr < limit and is_candidate[rr] and xx < free_until[rr]) free_until[rr] = xx;
             }
         }
     }
@@ -1063,20 +1143,26 @@ fn tryAllocateFreeReg(
     // in the same ascending order, so the pick is byte-identical.
     const pref_hint = coalesce_hint orelse param_hint orelse hint;
     var best_free: u32 = 0;
-    for (0..max_phys_regs) |b| {
-        if (!spanPlaceable(&is_candidate, null, b, current.regs, current.reg_align)) continue;
+    for (0..limit) |b| {
+        if (!spanPlaceable(&is_candidate, null, limit, b, current.regs, current.reg_align)) continue;
         const f = spanMin(&free_until, b, current.regs);
         if (f > best_free) best_free = f;
+        // `infinity` is the largest value a span can hold, so no later register can beat it and the
+        // rest of the sweep cannot change the answer. Stopping makes the common case, a register
+        // free for the whole lifetime, cost the distance to the FIRST free register instead of a
+        // pass over the whole file. That matters on a 251-register file and changes nothing: the
+        // maximum is the same, and the pick below still starts its own sweep at zero.
+        if (best_free == infinity) break;
     }
     if (best_free == 0) return null;
     var chosen: ?u16 = null;
     if (pref_hint) |h| {
-        if (spanPlaceable(&is_candidate, null, h, current.regs, current.reg_align) and
+        if (spanPlaceable(&is_candidate, null, limit, h, current.regs, current.reg_align) and
             spanMin(&free_until, h, current.regs) == best_free) chosen = h;
     }
     if (chosen == null) {
-        for (0..max_phys_regs) |b| {
-            if (!spanPlaceable(&is_candidate, null, b, current.regs, current.reg_align)) continue;
+        for (0..limit) |b| {
+            if (!spanPlaceable(&is_candidate, null, limit, b, current.regs, current.reg_align)) continue;
             if (spanMin(&free_until, b, current.regs) == best_free) {
                 chosen = @intCast(b);
                 break;
@@ -1216,6 +1302,12 @@ fn freeParamArgs(allocator: std.mem.Allocator, map: *ParamArgs) void {
 /// placed argument (for example one on a loop back-edge) is simply skipped. A parameter and its
 /// argument never interfere, so this is a pure preference. Null when `current` is not a parameter, or
 /// no incoming argument is placed yet.
+///
+/// THE OTHER DIRECTION WAS TRIED AND DROPPED. Hinting a back-edge ARGUMENT toward the register of the
+/// parameter it feeds looks like the missing half, and it is measurably worthless: by the time the
+/// carried value is computed, its parameter's register holds a mid-chain value of a NEIGHBOURING
+/// carried chain, so the hint is never placeable. Measured on the NVIDIA four-accumulator loop
+/// kernel: identical SASS, identical runtime, and no test could tell the two apart.
 fn computeParamHint(map: *const ParamArgs, intervals: []const Interval, children: []const *Interval, current: *const Interval) ?u16 {
     const v = current.value orelse return null;
     const list = map.getPtr(v) orelse return null;
@@ -1572,6 +1664,10 @@ pub fn allocate(allocator: std.mem.Allocator, func: *const Function, desc: *cons
     // the backend must remember. It costs nothing for a backend with no `regWidth` hook.
     if (std.debug.runtime_safety) assertScratchFitsWidth(intervals, desc);
 
+    // The scan bound for THIS function. Every fixed-size register array below is `max_phys_regs`
+    // wide, and every loop over one stops here instead. See `regLimit`.
+    const limit = regLimit(intervals, desc);
+
     // Split children are heap-allocated intervals born during the scan. They are tracked here, so
     // their owned `ranges`, `uses`, and the interval box itself are freed even on an error path.
     var children: std.ArrayList(*Interval) = .empty;
@@ -1677,11 +1773,11 @@ pub fn allocate(allocator: std.mem.Allocator, func: *const Function, desc: *cons
             computeParamHint(&param_args, intervals, children.items, current)
         else
             null;
-        if (tryAllocateFreeReg(current, active.items, inactive.items, desc, param_hint)) |reg| {
+        if (tryAllocateFreeReg(current, active.items, inactive.items, desc, limit, param_hint)) |reg| {
             current.location = .{ .reg = reg };
             try active.append(allocator, current);
         } else {
-            try allocateBlockedReg(allocator, current, &active, &inactive, &unhandled, &children, slots, desc);
+            try allocateBlockedReg(allocator, current, &active, &inactive, &unhandled, &children, slots, desc, limit);
         }
     }
 
@@ -1946,22 +2042,28 @@ fn allocateBlockedReg(
     children: *std.ArrayList(*Interval),
     slots: []u32,
     desc: *const RegDescription,
+    limit: usize,
 ) AllocateError!void {
     const class_idx = current.class;
     const class = desc.classes[class_idx];
     const p = current.start();
 
-    var next_use = [_]u32{infinity} ** max_phys_regs;
-    var block_pos = [_]u32{infinity} ** max_phys_regs;
-    var is_candidate = [_]bool{false} ** max_phys_regs;
+    // Only `[0, limit)` of each array is initialized, read, or scanned. See `regLimit`.
+    var next_use: [max_phys_regs]u32 = undefined;
+    var block_pos: [max_phys_regs]u32 = undefined;
+    var is_candidate: [max_phys_regs]bool = undefined;
+    @memset(next_use[0..limit], infinity);
+    @memset(block_pos[0..limit], infinity);
+    @memset(is_candidate[0..limit], false);
     // A register is EVICTABLE only if the active value interval occupying it can be legally split
     // at `p`. That is, that interval starts strictly before `p`. An occupant starting AT `p`, a
     // same-start same-class value, for example one of a block's params when there are more of
     // them than the pool, cannot be split there, since `splitInterval` requires `pos > start`. So
     // its register is not evictable here.
-    var evictable = [_]bool{true} ** max_phys_regs;
+    var evictable: [max_phys_regs]bool = undefined;
+    @memset(evictable[0..limit], true);
     for (class.allocatable) |r| {
-        std.debug.assert(r < max_phys_regs);
+        std.debug.assert(r < limit);
         is_candidate[r] = true;
     }
 
@@ -1972,7 +2074,7 @@ fn allocateBlockedReg(
         if (it.class != class_idx) continue;
         if (it.fixed_reg != null) continue;
         const r = assignedReg(it);
-        if (r >= max_phys_regs) continue;
+        if (r >= limit) continue;
         const u = it.firstUseAfter(p) orelse it.end();
         // The occupant holds its WHOLE span, so every register of it is wanted again at that use,
         // and every register of it is unevictable when the occupant starts here. Recording the base
@@ -1980,7 +2082,7 @@ fn allocateBlockedReg(
         var k: u16 = 0;
         while (k < it.regs) : (k += 1) {
             const rr = r +| k;
-            if (rr >= max_phys_regs or !is_candidate[rr]) continue;
+            if (rr >= limit or !is_candidate[rr]) continue;
             if (u < next_use[rr]) next_use[rr] = u;
             if (it.start() == p) evictable[rr] = false;
         }
@@ -1991,13 +2093,13 @@ fn allocateBlockedReg(
         if (it.class != class_idx) continue;
         if (it.fixed_reg != null) continue;
         const r = assignedReg(it);
-        if (r >= max_phys_regs) continue;
+        if (r >= limit) continue;
         if (current.nextIntersection(it) == null) continue;
         const u = it.firstUseAfter(p) orelse it.end();
         var k: u16 = 0;
         while (k < it.regs) : (k += 1) {
             const rr = r +| k;
-            if (rr >= max_phys_regs or !is_candidate[rr]) continue;
+            if (rr >= limit or !is_candidate[rr]) continue;
             if (u < next_use[rr]) next_use[rr] = u;
         }
     }
@@ -2015,7 +2117,7 @@ fn allocateBlockedReg(
             if (it.class != class_idx) continue;
             if (sameValue(it, current)) continue;
             const r = it.fixed_reg.?;
-            if (r >= max_phys_regs) continue;
+            if (r >= limit) continue;
             const x = if (it.value == null) fixedClobberConflict(current, it) else current.nextIntersection(it);
             if (x) |xx| {
                 // A call clobber is one register wide, but an entry pin covers its parameter's whole
@@ -2023,7 +2125,7 @@ fn allocateBlockedReg(
                 var k: u16 = 0;
                 while (k < it.regs) : (k += 1) {
                     const rr = r +| k;
-                    if (rr >= max_phys_regs or !is_candidate[rr]) continue;
+                    if (rr >= limit or !is_candidate[rr]) continue;
                     if (xx < next_use[rr]) next_use[rr] = xx;
                     if (xx < block_pos[rr]) block_pos[rr] = xx;
                 }
@@ -2038,13 +2140,17 @@ fn allocateBlockedReg(
     // old per-register loop in the same order, so the pick is byte-identical.
     var chosen: ?u16 = null;
     var best: u32 = 0;
-    for (0..max_phys_regs) |b| {
-        if (!spanPlaceable(&is_candidate, &evictable, b, current.regs, current.reg_align)) continue;
+    for (0..limit) |b| {
+        if (!spanPlaceable(&is_candidate, &evictable, limit, b, current.regs, current.reg_align)) continue;
         const nu = spanMin(&next_use, b, current.regs);
         if (chosen == null or nu > best) {
             best = nu;
             chosen = @intCast(b);
         }
+        // Same bound as in `tryAllocateFreeReg`: `infinity` is the furthest a next use can be, and
+        // the comparison above is strict, so the register already chosen is the one the whole sweep
+        // would have chosen.
+        if (best == infinity) break;
     }
 
     // No register is evictable: every candidate is held by a same-start same-class interval (e.g. more
@@ -2429,7 +2535,7 @@ fn resolveDataFlow(
     children: []const *Interval,
     result: *Allocation,
 ) Error!void {
-    if (std.debug.runtime_safety) try assertNoCriticalEdges(allocator, func);
+    if (std.debug.runtime_safety and !desc.hosts_critical_edge_moves) try assertNoCriticalEdges(allocator, func);
 
     const bounds = try computeBlockBounds(allocator, func);
     defer allocator.free(bounds.from);
