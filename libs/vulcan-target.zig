@@ -53,6 +53,11 @@ pub const host = @import("vulcan-target/host.zig");
 /// UEFI/Windows/macOS providers slot in via `mapWith`).
 pub const jit_platform = @import("vulcan-target/jit_platform.zig");
 
+/// The optimizer seam. Re-exported so a standalone test root (the NVIDIA
+/// hardware execute tests) can run the optimizer passes over IR before it
+/// compiles the result. The backends import the module the same way.
+pub const opt = @import("vulcan-opt");
+
 test {
     std.testing.refAllDecls(@This());
 }

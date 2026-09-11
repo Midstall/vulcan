@@ -2,8 +2,17 @@
 //! to expose the independent work the hardware needs to hide latency. Conservative: only
 //! reducible, innermost, single-latch loops with a pure test header and
 //! header-param loop-carried values are transformed, everything else is skipped unchanged. The
-//! transform is a guarded partial unroll (K guarded body copies), correct by construction, proven
-//! by the differential JIT tests in libs/vulcan-target/tests/unroll_differential.zig.
+//! transform emits one of two shapes, both correct by construction. A CPU model, or a SIMT loop
+//! that fails the strict counted checks, gets a guarded partial unroll: K body copies, each closed
+//! by its own recomputed guard. A SIMT loop that passes those checks gets a main loop plus a
+//! remainder: one guard, K unguarded copies in one block, and the original loop left whole as the
+//! tail. The guarded shape is proven by the differential JIT tests in
+//! libs/vulcan-target/tests/unroll_differential.zig.
+//!
+//! Why the second shape exists: the SIMT scheduler (microarch/schedule.zig) hoists loads only
+//! inside one block. A guard per copy splits the copies into separate blocks, so a load-bound
+//! loop waits on each copy's loads in turn. One guard per K copies keeps the loads in one block,
+//! where the scheduler hoists them as a group. That is the shape ptxas gives a counted loop.
 //!
 //! Two targets, two bounds. A CPU core is bounded by issue width: enough copies to fill the ports
 //! across a dependency chain. A streaming multiprocessor has no issue width, and is bounded by the
@@ -563,6 +572,15 @@ test "unrollFactor grows with issue width for a wide model, bounded" {
     try std.testing.expect(unrollFactor(registry.modelFor(.@"ampere-altra"), 1) <= 8);
 }
 
+/// The strict counted-loop shape, proven by `countedShape`. A loop that
+/// matches it can take the main-loop-plus-remainder emission, which needs one
+/// guard for K body copies instead of one guard per copy.
+const Counted = struct {
+    counter: u32, // the header param position of the loop counter
+    bound: Value, // the loop-invariant bound the counter is compared against
+    op: ir.function.CmpOp, // the header test's relation, `.lt` or `.le`
+};
+
 /// A vetted, eligible loop plus everything the transform needs, snapshotted so
 /// later mutation (we only ever append blocks/values) cannot invalidate it.
 const Plan = struct {
@@ -574,6 +592,8 @@ const Plan = struct {
     body_blocks: []Block, // the loop minus the header, in block order (owned)
     in_loop: []bool, // owned copy of the loop's body bitset
     factor: u32, // K >= 2
+    preheader: Block, // the loop's single clean entry
+    counted: ?Counted, // non-null when the strict SIMT counted shape was proven
 };
 
 /// Whether `b` is inside the loop described by `in_loop`. Blocks added after the
@@ -588,13 +608,19 @@ fn rv(map: *const ValueMap, v: Value) Value {
     return map.get(v) orelse v;
 }
 
-/// Model-driven guarded partial unroll. Analyzes `func`'s natural loops, unrolls
+/// Model-driven partial unroll. Analyzes `func`'s natural loops, unrolls
 /// every loop it can prove eligible by `unrollFactor(model, ...)` copies, and
 /// leaves everything else untouched. Returns whether anything changed. An
 /// ineligible or un-cleanly-transformable loop is always left exactly as it was.
-/// Idempotence note: re-running `run` on an already-unrolled function does not
-/// re-unroll it, because the body has grown (extra guard blocks and copies),
-/// so `unrollFactor` collapses to 1 and `eligible` below rejects it again.
+/// Two shapes are emitted: K guarded body copies, or, when the model is SIMT
+/// and the loop matches the strict counted shape, a main block of K unguarded
+/// copies plus the original loop as the remainder. See `countedShape` for
+/// what the strict checks prove.
+/// Idempotence note: re-running `run` on its own output stays correct. The
+/// remainder loop loses its preheader (the main header branches to two
+/// blocks), the main loop no longer matches the strict shape, and any nested
+/// transform is correct by construction, so nesting is legal rather than
+/// forbidden.
 pub fn run(allocator: std.mem.Allocator, func: *Function, model: *const mm.Model) Error!bool {
     var info = try loops.analyze(allocator, func);
     defer info.deinit(allocator);
@@ -783,6 +809,20 @@ fn eligible(
     const in_loop_copy = try allocator.dupe(bool, in_loop);
     errdefer allocator.free(in_loop_copy);
 
+    // The strict counted shape decides between the two emissions. Null means
+    // the loop keeps the per-copy-guard shape.
+    const counted = countedShape(
+        func,
+        model,
+        header,
+        iff,
+        l,
+        body_entry,
+        body_list.items,
+        func.blockParams(header),
+        back_args,
+    );
+
     return Plan{
         .header = header,
         .if_inst = iff,
@@ -792,11 +832,137 @@ fn eligible(
         .body_blocks = try body_list.toOwnedSlice(allocator),
         .in_loop = in_loop_copy,
         .factor = factor,
+        .preheader = @enumFromInt(loop.preheader.?),
+        .counted = counted,
     };
 }
 
-/// Steps B and C: rewrite escaping values into loop-closed form, then splice K-1
-/// guarded body copies between the header entry and the back-edge.
+/// Whether `v` is a parameter or an instruction result of `block`.
+fn definedInBlock(func: *const Function, v: Value, block: Block) bool {
+    for (func.blockParams(block)) |p| {
+        if (p == v) return true;
+    }
+    for (func.blockInsts(block)) |inst| {
+        if (func.instResult(inst)) |r| {
+            if (r == v) return true;
+        }
+    }
+    return false;
+}
+
+/// Prove the strict counted shape on a loop `eligible` already accepted, for
+/// the SIMT main-loop-plus-remainder emission. Every condition must hold. Any
+/// miss returns null, and the loop keeps the per-copy-guard shape:
+///
+///   1. The model executes as SIMT.
+///   2. The loop is one straight-line body block: it is the body entry and the
+///      latch at once, and holds no `if`.
+///   3. The body receives the carried values either through identity edge
+///      args (body param k enters as header param k) or by reading the
+///      header params directly with no edge args.
+///   4. One header param j is the counter: the back edge feeds it the value
+///      `body param j + 1`.
+///   5. The header test is `hparams[j] <op> bound` with `.lt` or `.le`, and
+///      the bound is defined outside the loop.
+///   6. The counter is an integer.
+fn countedShape(
+    func: *const Function,
+    model: *const mm.Model,
+    header: Block,
+    iff: Inst,
+    latch: Block,
+    body_entry: Block,
+    body_blocks: []const Block,
+    hparams: []const Value,
+    back_args: []const Value,
+) ?Counted {
+    if (model.exec != .simt) return null;
+
+    // One body block, which is the body entry and the latch at once.
+    if (body_blocks.len != 1) return null;
+    const body = body_blocks[0];
+    if (body != body_entry or latch != body) return null;
+
+    // A straight-line body: the K copies must fall through each other inside
+    // one block, so nothing inside the body may branch.
+    for (func.blockInsts(body)) |inst| {
+        if (func.opcode(inst) == .@"if") return null;
+    }
+
+    // How the body receives the carried values. Two shapes are accepted:
+    // either the header passes its params to the body unchanged (body param k
+    // enters as header param k), or the body takes no edge args at all and
+    // reads the header params directly. Both name the same values, and both
+    // map onto the main header's params one to one.
+    const cf = func.opcode(iff).@"if";
+    const in_jump = if (cf.then.target == body_entry) cf.then else cf.@"else";
+    const in_args = func.blockArgs(in_jump);
+    const bparams = func.blockParams(body);
+    if (in_args.len == 0) {
+        if (bparams.len != 0) return null;
+    } else {
+        if (in_args.len != hparams.len) return null;
+        if (bparams.len != hparams.len) return null;
+        for (in_args, hparams) |ia, hp| {
+            if (ia != hp) return null;
+        }
+    }
+
+    // The header test: `counter <op> bound`, the counter on the left.
+    const cmp = switch (func.opcode(func.definingInst(cf.cond) orelse return null)) {
+        .icmp => |c| c,
+        else => return null,
+    };
+    if (cmp.op != .lt and cmp.op != .le) return null;
+
+    // The counter: a back-edge arg that is `counter + 1`, with the test
+    // reading header param j. The +1 step is what lets one guard prove K
+    // iterations: the counter at copy k is exactly `counter + k`. The step
+    // reads either the header param itself (the no-args shape) or the body
+    // param bound to it (the pass-through shape).
+    var counter: ?u32 = null;
+    for (back_args, 0..) |ba, j| {
+        const step = switch (func.opcode(func.definingInst(ba) orelse continue)) {
+            .arith_imm => |a| a,
+            else => continue,
+        };
+        if (step.op != .add or step.imm != 1) continue;
+        if (cmp.lhs != hparams[j]) continue;
+        const stepped_on = if (bparams.len == hparams.len and j < bparams.len)
+            step.lhs == bparams[j] or step.lhs == hparams[j]
+        else
+            step.lhs == hparams[j];
+        if (!stepped_on) continue;
+        counter = @intCast(j);
+        break;
+    }
+    const j = counter orelse return null;
+
+    // The bound must be loop-invariant: the main header reads it, and it is
+    // reached from the preheader, so a value defined inside the loop would not
+    // dominate the new block.
+    if (definedInBlock(func, cmp.rhs, header)) return null;
+    if (definedInBlock(func, cmp.rhs, body)) return null;
+
+    // The counter must be an integer: the main guard adds (K-1) to it with an
+    // integer add. The guard carries its own wrap check, so every width is
+    // safe, and no width rule is needed here.
+    switch (func.types.type_kind(func.valueType(hparams[j]))) {
+        .int => {},
+        else => return null,
+    }
+
+    return .{
+        .counter = j,
+        .bound = cmp.rhs,
+        .op = cmp.op,
+    };
+}
+
+/// Steps B and C: rewrite escaping values into loop-closed form, then unroll by
+/// K. The strict counted shape takes the main-loop-plus-remainder emission; any
+/// other eligible loop gets K-1 extra guarded body copies spliced between the
+/// header entry and the back-edge.
 fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error!void {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -854,7 +1020,14 @@ fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error
         if (exit_is_then) cfp2.@"if".then.args = newlist else cfp2.@"if".@"else".args = newlist;
     }
 
-    // --- Step C: guarded unroll by K ---
+    // --- Step C: unroll by K ---
+    // The strict SIMT counted shape takes the main-loop-plus-remainder
+    // emission. Everything else takes the guarded one below.
+    if (plan.counted) |ct| {
+        try applyCounted(a, func, plan, ct);
+        return;
+    }
+
     // Snapshot the header test's pieces (cloning below mutates the value pool).
     const cf = func.opcode(plan.if_inst).@"if";
     const cond0 = cf.cond;
@@ -917,6 +1090,152 @@ fn apply(allocator: std.mem.Allocator, func: *Function, plan: *const Plan) Error
             .{ .target = g.body_entry, .args = then_args_i },
             .{ .target = plan.exit, .args = else_args_i },
         );
+    }
+}
+
+/// Step C, counted shape: a main loop of K unguarded body copies plus the
+/// original loop as the remainder.
+///
+/// WHY ONE GUARD IS ENOUGH. In the guarded shape, copy k tests the counter at
+/// `c + k`. The main guard tests only the last of those counters, `c + (K-1)`,
+/// and adds one check: that the add did not wrap. With no wrap, the counter
+/// rises by exactly one per copy, so the last copy's test proves every earlier
+/// copy's test at once, and the K copies need no guards of their own. When the
+/// add wraps (the counter sits within K-1 of the top of its range), the main
+/// loop is refused, and the remainder runs the copies one by one under their
+/// own wrapped tests. The wrap check is `sum > counter` in the counter's own
+/// width: a positive addend that wraps lands the sum below its operand, in
+/// both signed and unsigned arithmetic. No wider type is needed, so the guard
+/// costs one add, two compares, and one and.
+///
+/// The blocks built (P the preheader, H the original header, B the original
+/// body, K the factor):
+///
+///   P        jumps to H_main instead of H, with the same initial values
+///   H_main   one param per H param, same types. The FIRST trip's guard
+///            branches to M or H. It runs once per kernel.
+///   M        the rotated main body, one param per H param. Each trip computes
+///            the NEXT trip's guard at its top, runs K instruction-clones of B
+///            chained copy to copy, and closes with the guarded branch at its
+///            bottom: back to M, or out to H with the values the trip ended on
+///   H and B  untouched: the remainder loop, entered from H_main and from M
+///
+/// WHY THE BRANCH SITS AT THE BOTTOM. A compare feeding a branch needs about
+/// fourteen cycles on sm_120 before the branch can read its predicate. A guard
+/// in its own head block puts the two beside each other, and the warp stalls
+/// on that gap every trip. The rotated form computes the next trip's guard at
+/// the top of the body, so a full body of work travels between the compare
+/// and the branch that reads it, and the latency hides behind the copies. The
+/// one guard chain left in H_main runs once per kernel.
+///
+/// The body never reads a header instruction result (`eligible` proves that),
+/// so nothing but the guard needs recomputing in H_main or M.
+fn applyCounted(a: std.mem.Allocator, func: *Function, plan: *const Plan, ct: Counted) Error!void {
+    // Snapshot every borrowed slice first. The appends below can move the
+    // pools those slices point into.
+    const hparams = try a.dupe(Value, func.blockParams(plan.header));
+    const bparams = try a.dupe(Value, func.blockParams(plan.body_entry));
+    const body_insts = try a.dupe(Inst, func.blockInsts(plan.body_entry));
+    const back_args = try a.dupe(Value, func.blockArgs(func.terminator(plan.latch).?.jump));
+
+    // H_main: one param per original header param, same types. It holds the
+    // guard for the FIRST main trip only, so its short predicate chain runs
+    // once per kernel, not once per trip.
+    const h_main = try func.appendBlock();
+    const hmparams = try a.alloc(Value, hparams.len);
+    for (hparams, 0..) |hp, k| hmparams[k] = try func.appendBlockParam(h_main, func.valueType(hp));
+
+    // The guard: two tests in the counter's own width. The add may wrap, and
+    // the first test catches that: a positive addend that wraps lands the sum
+    // below its operand. The second test is the last copy's own test, and
+    // with no wrap it proves every copy's test at once.
+    const counter_t = func.valueType(hmparams[ct.counter]);
+    const bool_t = try func.types.intern(.bool);
+    const last0 = try func.appendArithImm(h_main, counter_t, .add, hmparams[ct.counter], @intCast(plan.factor - 1));
+    const nowrap0 = try func.appendInst(h_main, bool_t, .{ .icmp = .{ .op = .gt, .lhs = last0, .rhs = hmparams[ct.counter] } });
+    const fits0 = try func.appendInst(h_main, bool_t, .{ .icmp = .{ .op = ct.op, .lhs = last0, .rhs = ct.bound } });
+    const guard0 = try func.appendInst(h_main, bool_t, .{ .arith = .{ .op = .bit_and, .lhs = nowrap0, .rhs = fits0 } });
+
+    // M: the rotated main body, one param per header param. The trip enters
+    // through its params, computes the guard for the NEXT trip at the top,
+    // runs the K copies, and closes with the guarded branch at the bottom.
+    const m = try func.appendBlock();
+    const mparams = try a.alloc(Value, hparams.len);
+    for (hparams, 0..) |hp, k| mparams[k] = try func.appendBlockParam(m, func.valueType(hp));
+    try func.appendIf(h_main, guard0, .{ .target = m, .args = hmparams }, .{ .target = plan.header, .args = hmparams });
+
+    // The guard compares for the next trip, from THIS trip's entry counter.
+    // The copies advance the counter by exactly K, so the next trip's last
+    // copy runs the counter `c + 2K - 1`: one add covers it. The wrap check
+    // reads the entry counter itself: a positive addend that wraps lands the
+    // sum below the value it was added to, and with no wrap the counter rises
+    // by exactly one per copy, so the last copy's test proves every earlier
+    // copy's test at once. Sitting at the top, the compares have the whole
+    // body to travel before anything reads their predicates.
+    const last = try func.appendArithImm(m, counter_t, .add, mparams[ct.counter], @intCast(2 * plan.factor - 1));
+    const nowrap = try func.appendInst(m, bool_t, .{ .icmp = .{ .op = .gt, .lhs = last, .rhs = mparams[ct.counter] } });
+    const fits = try func.appendInst(m, bool_t, .{ .icmp = .{ .op = ct.op, .lhs = last, .rhs = ct.bound } });
+
+    // K copies of the body in one block, chained through the map: the entry
+    // values of copy n+1 are the back-edge args of copy n, read through the
+    // map. Copy 0 reads M's own params, through both the body params (the
+    // pass-through shape) and the header params (both shapes).
+    var vmap: ValueMap = .empty;
+    for (hparams, mparams) |hp, mp| try vmap.put(a, hp, mp);
+    if (bparams.len == hparams.len) {
+        for (bparams, mparams) |bp, mp| try vmap.put(a, bp, mp);
+    }
+    var carried = try a.alloc(Value, back_args.len);
+    // The combine lands mid-body, after half the copies. The predicate path
+    // holds two slow hops, compare to combine and combine to branch, so a
+    // combine beside its compares stacks both at the top of the block, and a
+    // combine beside the branch stacks both at the bottom. Mid-body splits
+    // them: each hop gets half the copies to travel.
+    const combine_after = (plan.factor + 1) / 2;
+    var copy: u32 = 0;
+    var guard: Value = undefined;
+    while (copy < plan.factor) : (copy += 1) {
+        for (body_insts) |inst| try cloneInstInto(func, m, inst, &vmap, a);
+
+        // Read the whole carried list before any map entry is overwritten. A
+        // back-edge arg may name a header or body param directly, and its
+        // entry still maps to the copy that just ran.
+        for (back_args, 0..) |ba, k| carried[k] = rv(&vmap, ba);
+        if (copy + 1 < plan.factor) {
+            for (hparams, 0..) |hp, k| try vmap.put(a, hp, carried[k]);
+            for (bparams, 0..) |bp, k| try vmap.put(a, bp, carried[k]);
+        }
+        if (copy + 1 == combine_after) {
+            guard = try func.appendInst(m, bool_t, .{ .arith = .{ .op = .bit_and, .lhs = nowrap, .rhs = fits } });
+        }
+    }
+
+    // The closing branch. The guard was computed at the top of this trip, so
+    // it is ready when the trip ends. Both edges carry the values the trip
+    // finished on: the back edge feeds M's params, and the else edge hands
+    // the remainder the counter and accumulators as they stand.
+    try func.appendIf(m, guard, .{ .target = m, .args = carried }, .{ .target = plan.header, .args = carried });
+
+    // Move the preheader onto the main header, keeping the initial values.
+    // The loop analysis names a preheader only when its single successor is
+    // the header, so a jump is the shape that reaches here. The `if` arm
+    // keeps a conditional preheader correct should the analysis ever name
+    // one.
+    if (func.terminatorPtr(plan.preheader).*) |term| switch (term) {
+        .jump => |j| {
+            func.terminatorPtr(plan.preheader).* = null;
+            try func.setJump(plan.preheader, h_main, func.valueList(j.args));
+        },
+        // A preheader with a `ret` terminator has no successor, so the loop
+        // analysis cannot have named it one.
+        .ret => {},
+    } else {
+        for (func.blockInsts(plan.preheader)) |inst| {
+            const op = func.opcodeMut(inst);
+            if (op.* != .@"if") continue;
+            if (op.@"if".then.target == plan.header) op.@"if".then.target = h_main;
+            if (op.@"if".@"else".target == plan.header) op.@"if".@"else".target = h_main;
+        }
     }
 }
 
@@ -1179,6 +1498,62 @@ fn buildGpuLoop(func: *Function, pad: u32) Error!void {
     func.setTerminator(done, .{ .ret = ir.function.Ret.none() });
 }
 
+/// `buildGpuLoop(0)` with the counter stepping by two. The strict counted check
+/// needs `body param + 1` on the back edge, so this loop must keep the
+/// per-copy-guard shape.
+fn buildGpuLoopStep2(func: *Function) Error!void {
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const ptr_t = try func.types.ptrGlobal();
+    const entry = try func.appendBlock();
+    const loop = try func.appendBlock();
+    const body = try func.appendBlock();
+    const done = try func.appendBlock();
+    const n = try func.appendBlockParam(entry, i32_t);
+    const i = try func.appendBlockParam(loop, i32_t);
+    const bi = try func.appendBlockParam(body, i32_t);
+    const zero = try func.appendInst(entry, i32_t, .{ .iconst = 0 });
+    const base = try func.appendGlobalAddr(entry, ptr_t, "A");
+    try func.setJump(entry, loop, &.{zero});
+
+    const cmp = try func.appendInst(loop, bool_t, .{ .icmp = .{ .op = .lt, .lhs = i, .rhs = n } });
+    try func.appendIf(loop, cmp, .{ .target = body, .args = &.{i} }, .{ .target = done });
+
+    _ = try func.appendInst(body, i32_t, .{ .load = .{ .ptr = base } });
+    const next = try func.appendArithImm(body, i32_t, .add, bi, 2);
+    try func.setJump(body, loop, &.{next});
+
+    func.setTerminator(done, .{ .ret = ir.function.Ret.none() });
+}
+
+/// `buildGpuLoop(0)` with an i64 counter. Every strict condition holds, and
+/// the wrap check makes the guard exact at any width, so the counted emission
+/// must take it.
+fn buildGpuLoopI64(func: *Function) Error!void {
+    const i64_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 64 } });
+    const bool_t = try func.types.intern(.bool);
+    const ptr_t = try func.types.ptrGlobal();
+    const entry = try func.appendBlock();
+    const loop = try func.appendBlock();
+    const body = try func.appendBlock();
+    const done = try func.appendBlock();
+    const n = try func.appendBlockParam(entry, i64_t);
+    const i = try func.appendBlockParam(loop, i64_t);
+    const bi = try func.appendBlockParam(body, i64_t);
+    const zero = try func.appendInst(entry, i64_t, .{ .iconst = 0 });
+    const base = try func.appendGlobalAddr(entry, ptr_t, "A");
+    try func.setJump(entry, loop, &.{zero});
+
+    const cmp = try func.appendInst(loop, bool_t, .{ .icmp = .{ .op = .lt, .lhs = i, .rhs = n } });
+    try func.appendIf(loop, cmp, .{ .target = body, .args = &.{i} }, .{ .target = done });
+
+    _ = try func.appendInst(body, i64_t, .{ .load = .{ .ptr = base } });
+    const next = try func.appendArithImm(body, i64_t, .add, bi, 1);
+    try func.setJump(body, loop, &.{next});
+
+    func.setTerminator(done, .{ .ret = ir.function.Ret.none() });
+}
+
 /// How many `load` instructions the whole function holds.
 fn countLoads(func: *const Function) u32 {
     var loads: u32 = 0;
@@ -1191,10 +1566,20 @@ fn countLoads(func: *const Function) u32 {
     return loads;
 }
 
+/// How many `load` instructions one block holds.
+fn loadsInBlock(func: *const Function, block: Block) u32 {
+    var loads: u32 = 0;
+    for (func.blockInsts(block)) |inst| {
+        if (func.opcode(inst) == .load) loads += 1;
+    }
+    return loads;
+}
+
 test "a GPU loop unrolls by exactly the factor the SIMT rule predicts, and stays verifiable" {
     // The end-to-end check of the rule at the IR level. `buildGpuLoop(pad)` makes a loop whose body
     // budget is `pad + 4` (two header instructions plus the load, the pads and the increment), and
-    // the function must come out holding exactly `unrollFactor` loads.
+    // the function must come out holding `unrollFactor + 1` loads: one per copy in the main block,
+    // plus the single load of the remainder body the split leaves behind.
     const registry = @import("registry.zig");
     const allocator = std.testing.allocator;
     const g = registry.modelFor(.sm_120);
@@ -1218,7 +1603,13 @@ test "a GPU loop unrolls by exactly the factor the SIMT rule predicts, and stays
         const before_blocks = func.blockCount();
         const changed = try run(allocator, &func, g);
         try std.testing.expectEqual(c.factor > 1, changed);
-        try std.testing.expectEqual(c.factor, countLoads(&func));
+        // The counted shape holds K copies in the main block plus the one
+        // remainder body. A loop too large to unroll keeps its single load.
+        if (c.factor > 1) {
+            try std.testing.expectEqual(c.factor + 1, countLoads(&func));
+        } else {
+            try std.testing.expectEqual(@as(u32, 1), countLoads(&func));
+        }
         if (c.factor == 1) try std.testing.expectEqual(before_blocks, func.blockCount());
 
         var diags = try ir.verify.verify(allocator, &func, .low);
@@ -1239,6 +1630,204 @@ test "the same GPU loop under a CPU model unrolls by the CPU factor, not the SIM
     const changed = try run(allocator, &func, registry.modelFor(.@"ampere-altra"));
     try std.testing.expect(!changed);
     try std.testing.expectEqual(@as(u32, 1), countLoads(&func));
+}
+
+test "a counted sm_120 loop becomes one unguarded main block plus a guarded remainder" {
+    // The counted emission, checked end to end at the IR level. `buildGpuLoop(0)`
+    // makes a body budget of 4, so sm_120 unrolls by 8. The result must hold: a
+    // main body block with exactly 8 loads, all copies unguarded and closed by
+    // one rotated guard branch at the block's end (which is what lets the
+    // per-block load hoister group them), the original loop left whole as the
+    // remainder (still guarding its one load), and the preheader moved onto
+    // the new main header.
+    const registry = @import("registry.zig");
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    try buildGpuLoop(&func, 0);
+    const entry: Block = @enumFromInt(0);
+    const loop: Block = @enumFromInt(1);
+    const body: Block = @enumFromInt(2);
+
+    const changed = try run(allocator, &func, registry.modelFor(.sm_120));
+    try std.testing.expect(changed);
+
+    // The preheader now jumps to the main header, not to the original one.
+    const h_main = func.terminator(entry).?.jump.target;
+    try std.testing.expect(h_main != loop);
+
+    // The main header holds exactly one `if`, the promoted guard, and it
+    // branches to the main body and back to the remainder header.
+    var m: Block = undefined;
+    var guard_ifs: usize = 0;
+    for (func.blockInsts(h_main)) |inst| {
+        if (func.opcode(inst) != .@"if") continue;
+        guard_ifs += 1;
+        const cf = func.opcode(inst).@"if";
+        m = cf.then.target;
+        try std.testing.expectEqual(loop, cf.@"else".target);
+    }
+    try std.testing.expectEqual(@as(usize, 1), guard_ifs);
+
+    // The main body: K unguarded copies in ONE block, closed by the rotated
+    // guard branch. That one `if` is the ONLY branch in the block, it is the
+    // last instruction, and it loops back to the block itself.
+    try std.testing.expectEqual(@as(u32, 8), loadsInBlock(&func, m));
+    var m_ifs: usize = 0;
+    for (func.blockInsts(m)) |inst| {
+        if (func.opcode(inst) != .@"if") continue;
+        m_ifs += 1;
+        const cf = func.opcode(inst).@"if";
+        try std.testing.expectEqual(m, cf.then.target);
+        try std.testing.expectEqual(loop, cf.@"else".target);
+    }
+    try std.testing.expectEqual(@as(usize, 1), m_ifs);
+    try std.testing.expect(func.terminator(m) == null);
+
+    // The guard must add (K-1) to the counter, and test the sum twice: once
+    // against the counter itself (the wrap check) and once against the bound
+    // (the last copy's test). The unguarded copies are legal only because the
+    // pair proves every per-copy test at once.
+    var icmps: usize = 0;
+    var gt = false;
+    var lt = false;
+    for (func.blockInsts(h_main)) |inst| {
+        if (func.opcode(inst) != .icmp) continue;
+        icmps += 1;
+        const cmp = func.opcode(inst).icmp;
+        switch (func.opcode(func.definingInst(cmp.lhs).?)) {
+            .arith_imm => |a| {
+                try std.testing.expectEqual(ir.function.BinOp.add, a.op);
+                try std.testing.expectEqual(@as(i64, 7), a.imm);
+            },
+            else => return error.TestUnexpectedResult,
+        }
+        switch (cmp.op) {
+            .gt => gt = cmp.rhs == func.blockParams(h_main)[0],
+            .lt => lt = cmp.rhs == func.blockParams(@enumFromInt(0))[0],
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), icmps);
+    try std.testing.expect(gt);
+    try std.testing.expect(lt);
+    var ands: usize = 0;
+    for (func.blockInsts(h_main)) |inst| {
+        if (func.opcode(inst) != .arith) continue;
+        const ar = func.opcode(inst).arith;
+        if (ar.op == .bit_and) ands += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), ands);
+
+    // The remainder: the original header still guards the original body, and
+    // the body keeps its single load.
+    for (func.blockInsts(loop)) |inst| {
+        if (func.opcode(inst) != .@"if") continue;
+        try std.testing.expectEqual(body, func.opcode(inst).@"if".then.target);
+    }
+    try std.testing.expectEqual(@as(u32, 1), loadsInBlock(&func, body));
+
+    var diags = try ir.verify.verify(allocator, &func, .low);
+    defer diags.deinit();
+    try std.testing.expect(diags.ok());
+}
+
+test "the main header's guard works in the counter's own width, with no converts" {
+    // The guard must not widen the counter. The wrap check makes the add
+    // exact in the counter's own width, so the guard holds no convert at all:
+    // the backend for a target without wide scalars still lowers it.
+    const registry = @import("registry.zig");
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    try buildGpuLoop(&func, 0);
+
+    const changed = try run(allocator, &func, registry.modelFor(.sm_120));
+    try std.testing.expect(changed);
+
+    const h_main = func.terminator(@enumFromInt(0)).?.jump.target;
+    var converts: usize = 0;
+    var add: ?Inst = null;
+    for (func.blockInsts(h_main)) |inst| {
+        if (func.opcode(inst) == .convert) converts += 1;
+        if (func.opcode(inst) == .arith_imm) add = inst;
+    }
+    try std.testing.expectEqual(@as(usize, 0), converts);
+
+    // The add runs in the counter's own type, an i32.
+    const bits = switch (func.types.type_kind(func.valueType(func.instResult(add.?).?))) {
+        .int => |i| i.bits,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(u16, 32), bits);
+}
+
+test "a counted loop with a runtime trip count still verifies, and keeps both loop headers" {
+    // The tail path. The trip count is a runtime value, so the guard decides at
+    // run time how many main trips run before the remainder takes over. After
+    // the split, the original header must still head a loop (the remainder) and
+    // the new main header must head one too, or the two halves cannot close.
+    const registry = @import("registry.zig");
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    try buildGpuLoop(&func, 0);
+    const loop: Block = @enumFromInt(1);
+
+    const changed = try run(allocator, &func, registry.modelFor(.sm_120));
+    try std.testing.expect(changed);
+
+    var info = try loops.analyze(allocator, &func);
+    defer info.deinit(allocator);
+    var loop_is_header = false;
+    for (info.loops) |l| {
+        if (@as(Block, @enumFromInt(l.header)) == loop) loop_is_header = true;
+    }
+    try std.testing.expect(loop_is_header);
+    try std.testing.expectEqual(@as(usize, 2), info.loops.len);
+
+    var diags = try ir.verify.verify(allocator, &func, .low);
+    defer diags.deinit();
+    try std.testing.expect(diags.ok());
+}
+
+test "a simt counter that steps by two keeps the per-copy guards" {
+    // The strict checks need `body param + 1` on the back edge, because the
+    // promoted guard proves only a counter that grows by one per copy. A step
+    // of two must fall back to the guarded shape, which holds exactly
+    // `factor` loads: one per copy, and no remainder copy.
+    const registry = @import("registry.zig");
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    try buildGpuLoopStep2(&func);
+
+    const changed = try run(allocator, &func, registry.modelFor(.sm_120));
+    try std.testing.expect(changed);
+    try std.testing.expectEqual(@as(u32, 8), countLoads(&func));
+
+    var diags = try ir.verify.verify(allocator, &func, .low);
+    defer diags.deinit();
+    try std.testing.expect(diags.ok());
+}
+
+test "an i64 counter takes the counted shape on simt" {
+    // The wrap check makes the guard exact in any width, so a 64-bit counter
+    // is no longer a reason to refuse the counted shape. The loop must come
+    // out with the main block plus the one remainder body.
+    const registry = @import("registry.zig");
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    try buildGpuLoopI64(&func);
+
+    const changed = try run(allocator, &func, registry.modelFor(.sm_120));
+    try std.testing.expect(changed);
+    try std.testing.expectEqual(@as(u32, 9), countLoads(&func));
+
+    var diags = try ir.verify.verify(allocator, &func, .low);
+    defer diags.deinit();
+    try std.testing.expect(diags.ok());
 }
 
 test "run leaves an ineligible loop (impure header) unchanged" {
@@ -1688,4 +2277,50 @@ test "cloneBlocks copies BOTH atomic forms, keeping each copy's result state" {
     try std.testing.expectEqual(new_params[1], cas.value);
     try std.testing.expectEqual(new_params[2], cas.compare.?);
     try std.testing.expect(func.instResult(copied[1]) != null);
+}
+
+/// `buildGpuLoop(0)` with no edge args: the body reads the header param
+/// directly. This is the shape the GPU frontends build, so the counted
+/// emission must take it exactly like the pass-through shape.
+fn buildGpuLoopNoArgs(func: *Function) Error!void {
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const ptr_t = try func.types.ptrGlobal();
+    const entry = try func.appendBlock();
+    const loop = try func.appendBlock();
+    const body = try func.appendBlock();
+    const done = try func.appendBlock();
+    const n = try func.appendBlockParam(entry, i32_t);
+    const i = try func.appendBlockParam(loop, i32_t);
+    const zero = try func.appendInst(entry, i32_t, .{ .iconst = 0 });
+    const base = try func.appendGlobalAddr(entry, ptr_t, "A");
+    try func.setJump(entry, loop, &.{zero});
+
+    const cmp = try func.appendInst(loop, bool_t, .{ .icmp = .{ .op = .lt, .lhs = i, .rhs = n } });
+    try func.appendIf(loop, cmp, .{ .target = body }, .{ .target = done });
+
+    _ = try func.appendInst(body, i32_t, .{ .load = .{ .ptr = base } });
+    const next = try func.appendArithImm(body, i32_t, .add, i, 1);
+    try func.setJump(body, loop, &.{next});
+
+    func.setTerminator(done, .{ .ret = ir.function.Ret.none() });
+}
+
+test "a counted loop whose body reads the header params directly takes the counted shape" {
+    // The no-args shape: the body holds no params of its own and names the
+    // header params instead. The counted emission must still fire, with the
+    // main block holding K copies plus the one remainder body.
+    const registry = @import("registry.zig");
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    try buildGpuLoopNoArgs(&func);
+
+    const changed = try run(allocator, &func, registry.modelFor(.sm_120));
+    try std.testing.expect(changed);
+    try std.testing.expectEqual(@as(u32, 9), countLoads(&func));
+
+    var diags = try ir.verify.verify(allocator, &func, .low);
+    defer diags.deinit();
+    try std.testing.expect(diags.ok());
 }

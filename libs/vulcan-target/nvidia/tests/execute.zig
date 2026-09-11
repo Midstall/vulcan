@@ -1257,6 +1257,72 @@ test "live: a hoisted constant addend survives every trip of a loop" {
     try testing.expectEqual(want, out_buf.read(f32, 0));
 }
 
+test "live: a counted loop runs one main trip of 8 and a remainder of 5" {
+    // THE MAIN BLOCK AND THE TAIL MUST AGREE ON THE COUNTER. The unroller
+    // splits a counted SIMT loop into a main block of 8 unguarded copies plus
+    // the original loop as the remainder, entered through one guard that tests
+    // `counter + 7` against the bound. A guard that over-runs takes trips past
+    // the bound, a remainder that loses its counter starts the tail at the
+    // wrong value, and neither shows up in a single dispatch of the
+    // straight-line shape. This sums the induction variable for 13 trips: one
+    // main trip of 8 plus a remainder of 5, which exercises the main loop, the
+    // tail, and the exit, and compares the exact total.
+    const allocator = testing.allocator;
+    const trips: i32 = 13;
+    const want: i32 = 13 * 12 / 2; // 0 + 1 + ... + 12
+
+    var h = try Harness.open();
+    defer h.deinit();
+    const out_buf = try h.alloc(0x1000);
+
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const ptr_t = try func.types.ptrGlobal();
+
+    const entry = try func.appendBlock();
+    const head = try func.appendBlock();
+    const body = try func.appendBlock();
+    const done = try func.appendBlock();
+
+    const out = try func.appendBlockParam(entry, ptr_t);
+    const n = try func.appendBlockParam(entry, i32_t);
+    const zero = try func.appendInst(entry, i32_t, .{ .iconst = 0 });
+    try func.setJump(entry, head, &.{ zero, zero });
+
+    const i = try func.appendBlockParam(head, i32_t);
+    const s = try func.appendBlockParam(head, i32_t);
+    const more = try func.appendInst(head, bool_t, .{ .icmp = .{ .op = .lt, .lhs = i, .rhs = n } });
+    try func.appendIf(head, more, .{ .target = body, .args = &.{ i, s } }, .{ .target = done, .args = &.{s} });
+
+    const bi = try func.appendBlockParam(body, i32_t);
+    const bs = try func.appendBlockParam(body, i32_t);
+    const sum = try bin(&func, body, i32_t, .add, bs, bi);
+    const next = try binImm(&func, body, i32_t, .add, bi, 1);
+    try func.setJump(body, head, &.{ next, sum });
+
+    const result = try func.appendBlockParam(done, i32_t);
+    try func.appendStore(done, result, out);
+    func.setTerminator(done, .{ .ret = ir.function.Ret.none() });
+
+    // Unroll for sm_120 first. The body budget is 4 (two header instructions
+    // plus the body's two), which the SIMT rule answers with the factor 8.
+    const g = target.opt.microarch.modelFor(.sm_120);
+    const changed = try target.opt.microarch.unroll.run(allocator, &func, g);
+    try testing.expect(changed);
+
+    var launch = try h.compileOpts(&func, runner_abi, .{});
+    defer launch.deinit();
+
+    out_buf.slice(u32)[0] = 0;
+    launch.setPtr(launch.kernel.launch.params[0].offset, out_buf.va);
+    launch.setU32(launch.kernel.launch.params[1].offset, @bitCast(trips));
+    try launch.run(.{ 1, 1, 1 });
+
+    try testing.expectEqual(want, out_buf.read(i32, 0));
+}
+
 test "live: an integer multiply-add through IMAD gives the same bits fused or not" {
     // Integer contraction is EXACT either way. `a * b + c` in 32-bit wrapping arithmetic
     // has one answer, so unlike the float case the switch must not change the number. It
@@ -1311,4 +1377,131 @@ test "live: an integer multiply-add through IMAD gives the same bits fused or no
         try testing.expectEqual(want_reg, out_buf.read(i32, 0));
         try testing.expectEqual(want_imm, out_buf.read(i32, 1));
     }
+}
+
+test "live: a dot product loop carries its counter and accumulator across the closing branch" {
+    // THE CLOSING BRANCH MUST LAND ON ITS EDGE MOVES. The rotated main block
+    // of the counted unroll ends in a guarded branch whose taken edge carries
+    // the counter and the accumulator back to the block's own params. When the
+    // allocator gives a carried value a register other than the param's, the
+    // taken path must run the move first: a branch that lands past it loses
+    // the value, and the loop reads the wrong elements. Two loads per trip
+    // make the shape the same as the matmul bench that caught this.
+    const allocator = testing.allocator;
+    const trips: i32 = 21;
+
+    var h = try Harness.open();
+    defer h.deinit();
+    const out_buf = try h.alloc(0x1000);
+    const a_buf = try h.alloc(0x1000);
+    const b_buf = try h.alloc(0x1000);
+
+    // Every product is exactly 2, so every partial sum is exact and the
+    // total is exact no matter how the additions group.
+    for (a_buf.slice(f32)) |*x| x.* = 1.0;
+    for (b_buf.slice(f32)) |*x| x.* = 2.0;
+    const want: f32 = 2.0 * @as(f32, @floatFromInt(trips));
+
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const ptr_t = try func.types.ptrGlobal();
+
+    const entry = try func.appendBlock();
+    const head = try func.appendBlock();
+    const body = try func.appendBlock();
+    const done = try func.appendBlock();
+
+    const out = try func.appendBlockParam(entry, ptr_t);
+    const ap = try func.appendBlockParam(entry, ptr_t);
+    const bp = try func.appendBlockParam(entry, ptr_t);
+    const n = try func.appendBlockParam(entry, i32_t);
+    const zero = try func.appendInst(entry, i32_t, .{ .iconst = 0 });
+    const fzero = try func.appendInst(entry, f32_t, .{ .fconst = 0.0 });
+    try func.setJump(entry, head, &.{ zero, fzero });
+
+    const i = try func.appendBlockParam(head, i32_t);
+    const acc = try func.appendBlockParam(head, f32_t);
+    const more = try func.appendInst(head, bool_t, .{ .icmp = .{ .op = .lt, .lhs = i, .rhs = n } });
+    try func.appendIf(head, more, .{ .target = body }, .{ .target = done, .args = &.{acc} });
+
+    const byte = try binImm(&func, body, i32_t, .shl, i, 2);
+    const av = try func.appendInst(body, f32_t, .{ .load = .{ .ptr = try ptrAddVal(&func, body, ptr_t, ap, byte) } });
+    const bv = try func.appendInst(body, f32_t, .{ .load = .{ .ptr = try ptrAddVal(&func, body, ptr_t, bp, byte) } });
+    const prod = try bin(&func, body, f32_t, .mul, av, bv);
+    const sum = try bin(&func, body, f32_t, .add, acc, prod);
+    const next = try binImm(&func, body, i32_t, .add, i, 1);
+    try func.setJump(body, head, &.{ next, sum });
+
+    const result = try func.appendBlockParam(done, f32_t);
+    try func.appendStore(done, result, out);
+    func.setTerminator(done, .{ .ret = ir.function.Ret.none() });
+
+    const g = target.opt.microarch.modelFor(.sm_120);
+    _ = try target.opt.microarch.unroll.run(allocator, &func, g);
+
+    var launch = try h.compileOpts(&func, runner_abi, .{});
+    defer launch.deinit();
+
+    out_buf.slice(u32)[0] = 0;
+    launch.setPtr(launch.kernel.launch.params[0].offset, out_buf.va);
+    launch.setPtr(launch.kernel.launch.params[1].offset, a_buf.va);
+    launch.setPtr(launch.kernel.launch.params[2].offset, b_buf.va);
+    launch.setU32(launch.kernel.launch.params[3].offset, @bitCast(trips));
+    try launch.run(.{ 1, 1, 1 });
+
+    try testing.expectEqual(want, out_buf.read(f32, 0));
+}
+
+test "live: a taken branch lands on its then-edge moves" {
+    // The guarded branch of an `if` must land ON the moves of its taken
+    // edge, never past them. Passing one live value to three parameters of
+    // the target forces two copies that only the taken path runs: a branch
+    // that skips them leaves the parameters reading whatever sat in their
+    // registers. The else edge keeps the value, so both paths are checkable.
+    const allocator = testing.allocator;
+    const x: i32 = 1234567;
+
+    var h = try Harness.open();
+    defer h.deinit();
+    const out_buf = try h.alloc(0x1000);
+
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const ptr_t = try func.types.ptrGlobal();
+
+    const entry = try func.appendBlock();
+    const then_block = try func.appendBlock();
+    const done = try func.appendBlock();
+
+    const out = try func.appendBlockParam(entry, ptr_t);
+    const xv = try func.appendBlockParam(entry, i32_t);
+    const zero = try func.appendInst(entry, i32_t, .{ .iconst = 0 });
+    const more = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .ne, .lhs = xv, .rhs = zero } });
+    try func.appendIf(entry, more, .{ .target = then_block, .args = &.{ xv, xv, xv } }, .{ .target = done, .args = &.{xv} });
+
+    const a = try func.appendBlockParam(then_block, i32_t);
+    const b = try func.appendBlockParam(then_block, i32_t);
+    const c = try func.appendBlockParam(then_block, i32_t);
+    const ab = try bin(&func, then_block, i32_t, .add, a, b);
+    const abc = try bin(&func, then_block, i32_t, .add, ab, c);
+    try func.appendStore(then_block, abc, out);
+    func.setTerminator(then_block, .{ .ret = ir.function.Ret.none() });
+
+    const kept = try func.appendBlockParam(done, i32_t);
+    try func.appendStore(done, kept, out);
+    func.setTerminator(done, .{ .ret = ir.function.Ret.none() });
+
+    var launch = try h.compile(&func, runner_abi);
+    defer launch.deinit();
+
+    out_buf.slice(u32)[0] = 0;
+    launch.setPtr(launch.kernel.launch.params[0].offset, out_buf.va);
+    launch.setU32(launch.kernel.launch.params[1].offset, @bitCast(x));
+    try launch.run(.{ 1, 1, 1 });
+    try testing.expectEqual(3 * x, out_buf.read(i32, 0));
 }

@@ -1187,10 +1187,12 @@ fn braTargetIndex(inst: Inst, at: usize, len: usize) ?usize {
 }
 
 /// What `inst` does with what `want` describes: reads the register run, overwrites
-/// it, or reads the predicate. `.branch_pred` is the one case where the consumer is
-/// a branch reading its taken condition: that read has NO latency model here, and a
-/// computed stall at the model's boundary let a real loop read a stale predicate and
-/// skip its whole body, so the caller keeps the isel's stall for it instead.
+/// it, or reads the predicate. `.branch_pred` covers the reads with no latency
+/// model here: a branch reading its taken condition, and a PLOP3 reading its
+/// operand predicates. Both sit on the slow predicate path, about fourteen
+/// cycles, and a computed stall at the model's boundary once let a real loop
+/// read a stale predicate and skip its whole body, so the caller keeps the
+/// isel's stall for it instead.
 const Consumes = enum { none, consumer, branch_pred };
 
 fn consumes(inst: Inst, later_op: u32, want: Consumer) Consumes {
@@ -1198,6 +1200,11 @@ fn consumes(inst: Inst, later_op: u32, want: Consumer) Consumes {
         if (later_op == 0x947) { // BRA: its taken condition reads the predicate
             const c: u8 = @intCast(getField(inst, 87, 3));
             if (c == p) return .branch_pred;
+        }
+        if (later_op == 0x81c) { // PLOP3 reads its operand predicates on the same slow path
+            const a: u8 = @intCast(getField(inst, 87, 3));
+            const b: u8 = @intCast(getField(inst, 77, 3));
+            if ((a != encode.PT and a == p) or (b != encode.PT and b == p)) return .branch_pred;
         }
         if (predRead(inst, p)) return .consumer;
     }
@@ -1329,6 +1336,12 @@ fn predRead(inst: Inst, pred: u8) bool {
         const p: u8 = @intCast(getField(inst, 87, 3));
         if (p != encode.PT and p == pred) return true;
     }
+    if (base == 0x81c) { // PLOP3 reads its two operand predicates
+        const a: u8 = @intCast(getField(inst, 87, 3));
+        const b: u8 = @intCast(getField(inst, 77, 3));
+        if (a != encode.PT and a == pred) return true;
+        if (b != encode.PT and b == pred) return true;
+    }
     return false;
 }
 
@@ -1457,12 +1470,13 @@ fn markReuse(insts: []Inst, block_starts: []const usize, entry_start: usize) voi
         // Only a coupled ALU op gets bits. See the marking policy above.
         if (!isAluOp(opcode) or isVariableLatency(opcode)) continue;
         // An instruction the stall pass left at 15 carries a value across a branch, and
-        // that stall is load-bearing. It also makes a legal encoding with bit 109:
-        // nvdisasm's validator rejects a word with stall 15 AND bit 109 set ("undefined
-        // value for table TABLES_opex_8"), while ptxas never writes stall 15 at all.
-        // Reuse buys nothing across a branch anyway, so the mark waits for a computed
-        // stall.
-        if (getField(inst.*, 105, 4) == 15) continue;
+        // that stall is load-bearing. Large stalls are illegal WITH the reuse encoding:
+        // nvdisasm's validator rejects a word with bit 109 set and a stall of 12 or 15
+        // ("undefined value for table TABLES_opex_8"), while every proven-good reuse
+        // mark in the kernels sits at a stall of 6 or less, the coupled ALU latencies.
+        // A stall above 6 means a cross-branch or predicate-path carry anyway, where
+        // reuse buys nothing, so the mark waits for a small computed stall.
+        if (getField(inst.*, 105, 4) > 6) continue;
         const form = getField(inst.*, 9, 3);
 
         var mask: u4 = 0;
@@ -3523,3 +3537,45 @@ test "an ISETP result predicate delays the guarded instruction that reads it" {
     try std.testing.expectEqual(coupled_alu_latency - 2, getField(insts[0], 105, 4));
 }
 
+
+test "an instruction whose predicate feeds a nearby PLOP3 carries no reuse bits" {
+    // The reuse encoding is illegal beside a large stall: nvdisasm's validator
+    // rejects a word with bit 109 set and a stall of 12 or 15 ("undefined
+    // value for table TABLES_opex_8"). A compare feeding a PLOP3 one slot
+    // later needs a stall of 13 to cover the slow predicate hop, so the
+    // reuse mark must stay off it even though its operands repeat in a later
+    // reader. With the slow hop far away, the same compare takes the mark.
+    var near = [_]Inst{
+        encode.isetp(0, 4, 5, .lt, true, .{}),
+        encode.plop3(2, 0, 1, encode.LUT_AND, .{}),
+        encode.iadd3(6, 4, 5, .{}),
+        encode.iadd3(7, 6, 6, .{}),
+        encode.iadd3(8, 7, 7, .{}),
+        encode.iadd3(9, 8, 8, .{}),
+        encode.iadd3(10, 9, 9, .{}),
+        encode.iadd3(11, 10, 10, .{}),
+        encode.bra(0, .{ .pred = 2, .stall = 6 }),
+        encode.exit(.{}),
+    };
+    scheduleBlocks(&near, &.{0});
+    try std.testing.expectEqual(@as(u32, 13), getField(near[0], 105, 4));
+    try std.testing.expectEqual(@as(u32, 0), getField(near[0], 122, 4));
+    try std.testing.expectEqual(@as(u32, 0), getField(near[0], 109, 1));
+
+    var far = [_]Inst{
+        encode.isetp(0, 4, 5, .lt, true, .{}),
+        encode.iadd3(6, 4, 5, .{}),
+        encode.iadd3(7, 6, 6, .{}),
+        encode.iadd3(8, 7, 7, .{}),
+        encode.iadd3(9, 8, 8, .{}),
+        encode.iadd3(10, 9, 9, .{}),
+        encode.iadd3(11, 10, 10, .{}),
+        encode.iadd3(12, 11, 11, .{}),
+        encode.bra(0, .{ .pred = 0, .stall = 6 }),
+        encode.exit(.{}),
+    };
+    scheduleBlocks(&far, &.{0});
+    try std.testing.expect(getField(far[0], 105, 4) <= 6);
+    try std.testing.expectEqual(@as(u32, 0b11), getField(far[0], 122, 4));
+    try std.testing.expectEqual(@as(u32, 1), getField(far[0], 109, 1));
+}

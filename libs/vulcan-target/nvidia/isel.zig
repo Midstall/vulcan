@@ -4281,9 +4281,17 @@ fn emitIf(allocator: std.mem.Allocator, func: *const Function, loc: *std.AutoHas
     const else_bra = code.items.len;
     try code.append(allocator, encode.bra(0, .{}));
     try fixups.append(allocator, .{ .at = else_bra, .target = @intFromEnum(cf.@"else".target) });
-    // L_then: patch the guarded branch to here (a local fixup by instruction index).
-    try fixups.append(allocator, .{ .at = skip_else, .target_inst = code.items.len });
+    // L_then: the then edge moves. With none, the guarded branch jumps
+    // straight to the then block, and a taken path costs one branch instead
+    // of two: the old layout landed it on a bare trampoline BRA that only
+    // existed to reach moves that were not there.
+    const then_moves_start = code.items.len;
     try emitMoves(allocator, func, loc, code, cf.then);
+    if (code.items.len == then_moves_start) {
+        try fixups.append(allocator, .{ .at = skip_else, .target = @intFromEnum(cf.then.target) });
+        return;
+    }
+    try fixups.append(allocator, .{ .at = skip_else, .target_inst = then_moves_start });
     // A jump to the block that comes next in emission order is a fallthrough: the
     // code that follows this block IS the target, so the branch costs an issue slot
     // and a branch latency for nothing. ptxas emits no such trampoline. The else

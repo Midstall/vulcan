@@ -221,7 +221,22 @@ fn simtSchedule(allocator: std.mem.Allocator, func: *Function) std.mem.Allocator
             const cf = func.opcode(insts[n - 1]).@"if";
             var work: std.ArrayList(Value) = .empty;
             defer work.deinit(allocator);
-            try work.append(allocator, cf.cond);
+            // A boolean combine as the condition stays where the body placed it: its
+            // inputs hoist to the top, the combine keeps its place, and the two slow
+            // predicate hops (compare to combine, combine to branch) split across the
+            // body instead of stacking at the top. Any other condition def hoists with
+            // its whole cone.
+            var combine = false;
+            if (func.definingInst(cf.cond)) |di| {
+                const op = func.opcode(di);
+                if (op == .arith and op.arith.op == .bit_and) combine = true;
+            }
+            if (combine) {
+                try collectOperands(allocator, func, func.definingInst(cf.cond).?, &buf);
+                for (buf.items) |operand| try work.append(allocator, operand);
+            } else {
+                try work.append(allocator, cf.cond);
+            }
             while (work.pop()) |v| {
                 const li = local_of[@intFromEnum(v)];
                 if (li == none) continue;
