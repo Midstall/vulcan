@@ -113,7 +113,13 @@ const Harness = struct {
 
     /// Compile `func` under `abi` and bind it to this context.
     fn compile(self: *Harness, func: *Function, abi: gpu_abi.Abi) !Launch {
-        const kernel = try isel.compileKernel(testing.allocator, func, abi);
+        return self.compileOpts(func, abi, .{});
+    }
+
+    /// `compile` with explicit code-generation options, for a test that needs the same IR
+    /// built two ways. See `isel.Options`.
+    fn compileOpts(self: *Harness, func: *Function, abi: gpu_abi.Abi, options: isel.Options) !Launch {
+        const kernel = try isel.compileKernelOpts(testing.allocator, func, abi, options);
         return .{ .harness = self, .kernel = kernel, .base = abi.param_base };
     }
 };
@@ -954,6 +960,13 @@ test "live: a converted value reaches its consumer, and not the register's old c
     // so if the second convert has not landed, the second FMUL squares the FIRST convert's
     // result and the kernel answers `2 * w * w`. That is the tidy failure. The others were
     // arbitrary, because the register held whatever the hardware left in it.
+    //
+    // CONTRACTION IS OFF HERE ON PURPOSE. `v * v + w * w` is a multiply-add, so with
+    // contraction on the second multiply folds into the add, `w`'s converted value stays
+    // live to the fused instruction, and the two I2Fs land in DIFFERENT registers. The
+    // stream above is then no longer what the kernel emits, and the shape this test pins
+    // stops existing. The scoreboard rule it guards belongs to I2F and not to
+    // contraction, so the test keeps the unfused shape and states why.
     const allocator = testing.allocator;
     var func = Function.init(allocator);
     defer func.deinit();
@@ -974,7 +987,7 @@ test "live: a converted value reaches its consumer, and not the register's old c
 
     var h = try Harness.open();
     defer h.deinit();
-    var launch = try h.compile(&func, runner_abi);
+    var launch = try h.compileOpts(&func, runner_abi, .{ .contract_fma = false });
     defer launch.deinit();
 
     const out_buf = try h.alloc(0x1000);
@@ -985,4 +998,194 @@ test "live: a converted value reaches its consumer, and not the register's old c
 
     // Every thread writes the same slot, so one thread that lost the race shows it.
     try testing.expectEqual(conv_want, out_buf.read(f32, 0));
+}
+
+// The operand triple every float contraction test below uses, as IEEE-754 binary32 bit
+// patterns. ALL THREE HAVE DIRTY LOW MANTISSA BITS, which is a deliberate choice: a
+// register FADD that silently truncated its source A to bfloat16 once survived every float
+// test in this repository, because those tests used values such as `1.0 + 0.001` whose low
+// 16 mantissa bits are zero. These do not survive that.
+//
+// The triple also SEPARATES THE TWO ROUNDINGS. `a * b + c` rounds once fused and twice
+// unfused, and here the two answers differ, so a test that expects the fused answer really
+// does prove the FFMA fired. `fmaRefs` re-checks that separation at the point of use, and
+// does not take it on trust from this comment.
+const fma_a: u32 = 0x3F7FFFFD;
+const fma_b: u32 = 0x3F7FFFFB;
+const fma_c: u32 = 0xBF7FFFF9;
+
+/// The two answers `a * b + c` has: fused, rounding once, and unfused, rounding twice.
+/// They must differ, or a test built on them cannot tell an FFMA from an FMUL plus an FADD.
+fn fmaRefs(a: f32, b: f32, c: f32) !struct { fused: f32, unfused: f32 } {
+    const fused = @mulAdd(f32, a, b, c);
+    const unfused = a * b + c;
+    // The host compiler must not fuse this itself, or both references would be the fused
+    // answer and every assertion below would pass for the wrong reason.
+    try testing.expect(fused != unfused);
+    return .{ .fused = fused, .unfused = unfused };
+}
+
+/// A void kernel `out[0] = a * b + c` over three f32 parameters. `commuted` writes the add
+/// as `c + a * b`, which is the same arithmetic in the other operand order.
+fn buildFmaKernel(allocator: std.mem.Allocator, commuted: bool) !Function {
+    var func = Function.init(allocator);
+    errdefer func.deinit();
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const ptr_t = try func.types.ptrGlobal();
+    const b = try func.appendBlock();
+    const out = try func.appendBlockParam(b, ptr_t);
+    const x = try func.appendBlockParam(b, f32_t);
+    const y = try func.appendBlockParam(b, f32_t);
+    const z = try func.appendBlockParam(b, f32_t);
+    const prod = try bin(&func, b, f32_t, .mul, x, y);
+    const sum = if (commuted)
+        try bin(&func, b, f32_t, .add, z, prod)
+    else
+        try bin(&func, b, f32_t, .add, prod, z);
+    try func.appendStore(b, sum, out);
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
+    return func;
+}
+
+test "live: a float multiply-add FUSES on the silicon, and rounds once instead of twice" {
+    // THE ONLY TEST THAT CAN TELL THE TWO APART IS A TEST OVER VALUES. An FFMA and an
+    // FMUL plus an FADD compute the same thing to within a rounding, so an opcode count
+    // proves the shorter stream and nothing about the answer. Here the operands are
+    // chosen so single rounding and double rounding give DIFFERENT bits, and the same IR
+    // is compiled both ways against the same hardware: contraction on must give the
+    // once-rounded answer, and contraction off the twice-rounded one.
+    const allocator = testing.allocator;
+    const a: f32 = @bitCast(fma_a);
+    const b: f32 = @bitCast(fma_b);
+    const c: f32 = @bitCast(fma_c);
+    const want = try fmaRefs(a, b, c);
+
+    var h = try Harness.open();
+    defer h.deinit();
+    const out_buf = try h.alloc(0x1000);
+
+    for ([_]bool{ false, true }) |commuted| {
+        for ([_]bool{ true, false }) |contract| {
+            var func = try buildFmaKernel(allocator, commuted);
+            defer func.deinit();
+            var launch = try h.compileOpts(&func, runner_abi, .{ .contract_fma = contract });
+            defer launch.deinit();
+
+            out_buf.slice(u32)[0] = 0;
+            launch.setPtr(launch.kernel.launch.params[0].offset, out_buf.va);
+            launch.setU32(launch.kernel.launch.params[1].offset, fma_a);
+            launch.setU32(launch.kernel.launch.params[2].offset, fma_b);
+            launch.setU32(launch.kernel.launch.params[3].offset, fma_c);
+            try launch.run(.{ 1, 1, 1 });
+
+            // The commuted form `c + a * b` must fuse exactly as `a * b + c` does, so both
+            // rows expect the same number.
+            try testing.expectEqual(
+                if (contract) want.fused else want.unfused,
+                out_buf.read(f32, 0),
+            );
+        }
+    }
+}
+
+test "live: a CONSTANT-scale multiply-add fuses through the immediate FFMA field" {
+    // `x * k + y`, where the scale is a compile-time constant that `foldConstantsToImm`
+    // has already moved into the multiply's immediate field. The fused form is
+    // `FFMA dst, x, k, y`, which is a source form this encoder had never emitted before:
+    // the immediate is at src1 and the addend is a register at src2. `nvdisasm -b SM120
+    // -c` reads the word back as `FFMA R6, R4, 0.25, R7`, and this test is the other half
+    // of that proof, because a decoder agreeing on the operand names still does not say
+    // the hardware multiplies by the right one.
+    const allocator = testing.allocator;
+    const x: f32 = @bitCast(fma_a);
+    const k: f32 = @bitCast(fma_b);
+    const y: f32 = @bitCast(fma_c);
+    const want = try fmaRefs(x, k, y);
+
+    var h = try Harness.open();
+    defer h.deinit();
+    const out_buf = try h.alloc(0x1000);
+
+    for ([_]bool{ true, false }) |contract| {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const f32_t = try func.types.intern(.{ .float = .f32 });
+        const ptr_t = try func.types.ptrGlobal();
+        const blk = try func.appendBlock();
+        const out = try func.appendBlockParam(blk, ptr_t);
+        const xp = try func.appendBlockParam(blk, f32_t);
+        const yp = try func.appendBlockParam(blk, f32_t);
+        const kc = try func.appendInst(blk, f32_t, .{ .fconst = k });
+        const scaled = try bin(&func, blk, f32_t, .mul, xp, kc);
+        const sum = try bin(&func, blk, f32_t, .add, scaled, yp);
+        try func.appendStore(blk, sum, out);
+        func.setTerminator(blk, .{ .ret = ir.function.Ret.none() });
+
+        var launch = try h.compileOpts(&func, runner_abi, .{ .contract_fma = contract });
+        defer launch.deinit();
+
+        out_buf.slice(u32)[0] = 0;
+        launch.setPtr(launch.kernel.launch.params[0].offset, out_buf.va);
+        launch.setU32(launch.kernel.launch.params[1].offset, fma_a);
+        launch.setU32(launch.kernel.launch.params[2].offset, fma_c);
+        try launch.run(.{ 1, 1, 1 });
+
+        try testing.expectEqual(if (contract) want.fused else want.unfused, out_buf.read(f32, 0));
+    }
+}
+
+test "live: an integer multiply-add through IMAD gives the same bits fused or not" {
+    // Integer contraction is EXACT either way. `a * b + c` in 32-bit wrapping arithmetic
+    // has one answer, so unlike the float case the switch must not change the number. It
+    // still changes the instruction count, and the operands below make a wrong addend
+    // field visible: the register form `base + i * stride` and the immediate form
+    // `base + i * 4` both run, and each product wraps past 32 bits so a wide multiply
+    // would answer differently from a narrow one.
+    const allocator = testing.allocator;
+    const base: i32 = -1234567;
+    const index: i32 = 0x0001_3579;
+    const stride: i32 = 0x0002_4680;
+    const want_reg: i32 = base +% index *% stride;
+    const want_imm: i32 = base +% index *% 4;
+
+    var h = try Harness.open();
+    defer h.deinit();
+    const out_buf = try h.alloc(0x1000);
+
+    for ([_]bool{ true, false }) |contract| {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+        const ptr_t = try func.types.ptrGlobal();
+        const blk = try func.appendBlock();
+        const out = try func.appendBlockParam(blk, ptr_t);
+        const bp = try func.appendBlockParam(blk, i32_t);
+        const ip = try func.appendBlockParam(blk, i32_t);
+        const sp = try func.appendBlockParam(blk, i32_t);
+        // The register form: the add takes the multiply on its LEFT.
+        const prod = try bin(&func, blk, i32_t, .mul, ip, sp);
+        const reg_sum = try bin(&func, blk, i32_t, .add, prod, bp);
+        try func.appendStore(blk, reg_sum, out);
+        // The immediate form, stored one slot along: the scale is a constant.
+        const four = try func.appendInst(blk, i32_t, .{ .iconst = 4 });
+        const scaled = try bin(&func, blk, i32_t, .mul, ip, four);
+        const imm_sum = try bin(&func, blk, i32_t, .add, bp, scaled);
+        const slot1 = try ptrAdd(&func, blk, ptr_t, out, 4);
+        try func.appendStore(blk, imm_sum, slot1);
+        func.setTerminator(blk, .{ .ret = ir.function.Ret.none() });
+
+        var launch = try h.compileOpts(&func, runner_abi, .{ .contract_fma = contract });
+        defer launch.deinit();
+
+        out_buf.slice(i32)[0] = 0;
+        out_buf.slice(i32)[1] = 0;
+        launch.setPtr(launch.kernel.launch.params[0].offset, out_buf.va);
+        launch.setU32(launch.kernel.launch.params[1].offset, @bitCast(base));
+        launch.setU32(launch.kernel.launch.params[2].offset, @bitCast(index));
+        launch.setU32(launch.kernel.launch.params[3].offset, @bitCast(stride));
+        try launch.run(.{ 1, 1, 1 });
+
+        try testing.expectEqual(want_reg, out_buf.read(i32, 0));
+        try testing.expectEqual(want_imm, out_buf.read(i32, 1));
+    }
 }

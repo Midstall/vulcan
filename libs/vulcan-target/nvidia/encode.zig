@@ -600,6 +600,24 @@ pub fn fmulImm(dst: u8, a: u8, imm: u32, c: Control) Inst {
     return w;
 }
 
+/// `FFMA dst, a, imm, c_in`: fused multiply-add whose MULTIPLIER is a 32-bit
+/// float immediate, given as its IEEE-754 binary32 bit pattern. This is the
+/// shape `x * k + y` takes, which a scaled accumulation writes.
+///
+/// IT IS FORM 4, NOT FORM 2. The form field states which of the two later
+/// sources is the immediate, and NAK's `encode_alu` picks it from that pair:
+/// an immediate at src1 with a register at src2 is form 4, and an immediate at
+/// src2 is form 2. `faddImm` is form 2 because FADD passes its immediate as
+/// src2 with `Src::ZERO` at src1. FFMA keeps a real addend at src2, so the
+/// immediate is src1 and the form is 4, exactly as `imadImm` encodes the same
+/// operand pattern.
+///
+/// `nvdisasm -b SM120 -c` reads this word back as `FFMA R6, R4, 0.25, R7`, so
+/// NVIDIA's own decoder agrees on the form and on all three operands.
+pub fn ffmaImm(dst: u8, a: u8, imm: u32, c_in: u8, c: Control) Inst {
+    return aluImm(0x023, dst, a, imm, c_in, c);
+}
+
 /// `IMAD.WIDE dst:dst+1, a, b, c:c+1`: a 32 by 32 multiply added to a 64-bit
 /// value, giving a 64-bit result. NAK opcode 0x025, the same encoding as `imad`
 /// with the wide opcode. `signed` selects IMAD.WIDE over IMAD.WIDE.U32, and it
@@ -2222,6 +2240,38 @@ test "FMUL sets the PDIV field, and every other bit of 81..90 stays clear" {
     const f = ffma(8, 4, 6, 5, .{});
     try std.testing.expectEqual(@as(u32, 5), f[2] & 0xff); // srcC R5 at bits 64..71
     try std.testing.expectEqual(@as(u32, 0), f[2] >> 8); // and nothing above it
+}
+
+test "the immediate FFMA is form 4: the multiplier at src1, the addend still a register" {
+    // `FFMA R6, R4, 0.25, R7`. The form field is the whole difference between this and a
+    // wrong encoding, and getting it wrong is silent: `faddImm` is FORM 2 because FADD
+    // passes its immediate as src2, and a live GPU run of `x + 0.25` returned 0 while it
+    // was encoded as form 4. FFMA keeps a real addend at src2, so its immediate is src1
+    // and the form is 4, the same pair `imadImm` encodes.
+    //
+    // `nvdisasm -b SM120 -c` reads this exact word back as `FFMA R6, R4, 0.25, R7`.
+    const quarter: u32 = @bitCast(@as(f32, 0.25));
+    const w = ffmaImm(6, 4, quarter, 7, .{});
+    try std.testing.expectEqual(@as(u32, 0x823), w[0] & 0xfff); // 0x023 with form 4 at bits 9..11
+    try std.testing.expectEqual(@as(u32, 6), (w[0] >> 16) & 0xff); // dst R6
+    try std.testing.expectEqual(@as(u32, 4), (w[0] >> 24) & 0xff); // srcA R4
+    try std.testing.expectEqual(quarter, w[1]); // the multiplier at bits 32..63
+    try std.testing.expectEqual(@as(u32, 7), w[2] & 0xff); // the addend R7 at bits 64..71
+    // Bits 81..90 stay clear, exactly as the register FFMA and FADD leave them. Writing PT
+    // into them turned the register FADD into a bfloat16 add. See the note above `fadd`.
+    try std.testing.expectEqual(@as(u32, 0), w[2] >> 8);
+}
+
+test "the immediate IMAD keeps its addend, which is what an integer multiply-add needs" {
+    // A plain integer multiply is `imadImm(dst, a, imm, RZ, ...)`, so the addend field is
+    // the ONLY difference between it and a contracted `base + index * stride`. This pins
+    // that the field carries a real register and that the result predicate stays PT, which
+    // Blackwell rejects when it is left at 0 (P0).
+    const w = imadImm(6, 4, 3, 7, .{});
+    try std.testing.expectEqual(@as(u32, 0x824), w[0] & 0xfff); // 0x024 with form 4
+    try std.testing.expectEqual(@as(u32, 3), w[1]); // the multiplier at bits 32..63
+    try std.testing.expectEqual(@as(u32, 7), w[2] & 0xff); // the addend R7, not RZ
+    try std.testing.expectEqual(@as(u32, PT), (w[2] >> (81 - 64)) & 0x7); // result predicate
 }
 
 test "SHFL.BFLY quad shuffle encodes the NAK fddx/fddy form" {

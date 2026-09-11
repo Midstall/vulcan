@@ -552,13 +552,46 @@ fn barrierCount(func: *const Function) u32 {
 /// (vertex inputs via ALD, fragment inputs via IPA, outputs via AST).
 pub const Stage = enum { compute, vertex, fragment };
 
+/// Code-generation choices this backend leaves to the caller. Every field has the default
+/// this target ships with, so `.{}` is the shipped compiler.
+pub const Options = struct {
+    /// Contract `a * b + c` into ONE instruction: FFMA for floats, IMAD for 32-bit
+    /// integers. See `FmaFold` for the conditions.
+    ///
+    /// THIS CHANGES FLOAT RESULTS. `a * b + c` as one FFMA rounds once, and as an FMUL
+    /// followed by an FADD it rounds twice. The fused answer is the more accurate of the
+    /// two, but it is a DIFFERENT answer, so a program that depends on the rounded
+    /// intermediate changes behaviour.
+    ///
+    /// IT IS ON BY DEFAULT because that is what the platform does. nvcc contracts unless
+    /// it is told `-fmad=false`, so a kernel built here matches what the same source
+    /// gives under NVIDIA's own compiler. A caller that needs the two-rounding answer,
+    /// such as a differential test against a scalar CPU oracle that does not fuse, sets
+    /// this to false.
+    ///
+    /// Integer contraction is exact either way: `a * b + c` in 32-bit wrapping
+    /// arithmetic gives the same bits fused or not. The flag still covers it, so that one
+    /// switch turns off the whole transform when a codegen question is being isolated.
+    contract_fma: bool = true,
+};
+
 /// Lower `func` to a SASS compute kernel under the parameter ABI `a`. The caller owns the result.
 pub fn compileKernel(allocator: std.mem.Allocator, func: *Function, a: gpu.Abi) Error!Kernel {
-    return compileShader(allocator, func, .compute, a);
+    return compileShaderOpts(allocator, func, .compute, a, .{});
+}
+
+/// `compileKernel` with explicit code-generation options. See `Options`.
+pub fn compileKernelOpts(allocator: std.mem.Allocator, func: *Function, a: gpu.Abi, options: Options) Error!Kernel {
+    return compileShaderOpts(allocator, func, .compute, a, options);
 }
 
 /// Lower `func` to a SASS shader for `stage` under the parameter ABI `a`. The caller owns the result.
 pub fn compileShader(allocator: std.mem.Allocator, func: *Function, stage: Stage, a: gpu.Abi) Error!Kernel {
+    return compileShaderOpts(allocator, func, stage, a, .{});
+}
+
+/// `compileShader` with explicit code-generation options. See `Options`.
+pub fn compileShaderOpts(allocator: std.mem.Allocator, func: *Function, stage: Stage, a: gpu.Abi, options: Options) Error!Kernel {
     // This backend does not lower f16 yet. Reject it cleanly instead of
     // silently treating it as f64. This check covers both this direct entry
     // and compileKernel, which calls this function.
@@ -597,10 +630,17 @@ pub fn compileShader(allocator: std.mem.Allocator, func: *Function, stage: Stage
     defer disp.deinit(allocator);
     try foldAddressDisplacements(allocator, func, &disp);
 
+    // Decide which `a * b + c` pairs become ONE fused instruction. This runs before
+    // `assignLocs`, because the allocator has to keep the multiply's operands live as far
+    // as the add that now reads them. See `FmaFold`.
+    var fma = FmaFold{};
+    defer fma.deinit(allocator);
+    try scanFma(allocator, func, options, &fma);
+
     var loc = std.AutoHashMapUnmanaged(Value, Loc){};
     defer loc.deinit(allocator);
     var max_reg: u8 = r_outptr + 1; // the output pointer pair is always live
-    try assignLocs(allocator, func, &loc, &max_reg);
+    try assignLocs(allocator, func, &loc, &max_reg, &fma);
 
     // Texture-sample lowering. The SPIR-V image-sample op becomes a
     // host-sampler `call_indirect(sampler_fn, {desc, u, v, lod, out_ptr})`
@@ -926,7 +966,7 @@ pub fn compileShader(allocator: std.mem.Allocator, func: *Function, stage: Stage
         var terminated = false;
 
         for (func.blockInsts(block)) |inst| {
-            try lowerInst(allocator, func, &loc, &code, &tex, &deriv, &math, &shared, &disp, inst);
+            try lowerInst(allocator, func, &loc, &code, &tex, &deriv, &math, &shared, &disp, &fma, inst);
             if (func.opcode(inst) == .@"if") {
                 // Set up the convergence barrier just before the divergent
                 // branch. BCLEAR initializes the barrier register, and BSSY
@@ -1069,7 +1109,7 @@ fn lessByStart(_: void, a: Interval, b: Interval) bool {
 /// Booleans take predicates P0..P5 (P6 is the 64-bit-add carry scratch).
 /// There is no spilling: a class running out returns `error.Unsupported`,
 /// which a real kernel should never hit, since it has 250 or more GPRs.
-fn assignLocs(allocator: std.mem.Allocator, func: *const Function, loc: *std.AutoHashMapUnmanaged(Value, Loc), max_reg: *u8) Error!void {
+fn assignLocs(allocator: std.mem.Allocator, func: *const Function, loc: *std.AutoHashMapUnmanaged(Value, Loc), max_reg: *u8, fma: *const FmaFold) Error!void {
     const nval = func.valueCount();
     if (nval == 0) return;
     const nblocks = func.blockCount();
@@ -1104,6 +1144,18 @@ fn assignLocs(allocator: std.mem.Allocator, func: *const Function, loc: *std.Aut
         for (func.blockInsts(block)) |inst| {
             forEachUse(func, inst, last_use, pos);
             if (func.instResult(inst)) |r| def_pos[@intFromEnum(r)] = pos;
+            // A contracted multiply-add reads the MULTIPLY'S OPERANDS here, at the add,
+            // because the multiply itself emits nothing. `forEachUse` cannot see that: it
+            // reads the IR, where those operands are read by the multiply and nowhere
+            // else. Left unextended, a value defined between the two takes an operand's
+            // register and the fused instruction multiplies the wrong number, silently.
+            // See `FmaFold`.
+            if (func.instResult(inst)) |r| {
+                if (fma.at.get(r)) |m| {
+                    markUse(last_use, m.mul_a, pos);
+                    if (m.mul_b) |b| markUse(last_use, b, pos);
+                }
+            }
             // A fragment color-output store: its value lands in a ROP color
             // register (R0..R3), and the ROP reads all of them together at
             // EXIT. So every color value must stay live until the last color
@@ -1500,6 +1552,196 @@ fn foldAddressDisplacements(allocator: std.mem.Allocator, func: *Function, out: 
             }
         }
     }
+}
+
+/// One contracted multiply-add: `dst = mul_a * (mul_b or mul_imm) + addend`.
+const Fma = struct {
+    /// The multiply's first operand. Always a register.
+    mul_a: Value,
+    /// The multiply's second operand, when it is a register. Null when the multiply
+    /// scales by a constant, which `foldConstantsToImm` has already moved into `mul_imm`.
+    mul_b: ?Value,
+    /// The constant multiplier, valid only when `mul_b` is null. For a float this is the
+    /// IEEE-754 binary32 bit pattern, exactly as `arithImm` passes it.
+    mul_imm: u32,
+    /// The value the add contributed, which becomes the third source.
+    addend: Value,
+    /// True for FFMA, false for IMAD.
+    is_float: bool,
+};
+
+/// Fused multiply-add contraction: which multiplies disappear into which adds.
+///
+/// THIS IS WORTH A FACTOR OF TWO ON COMPUTE-BOUND KERNELS. Without it `a * b + c` is an
+/// FMUL and then an FADD: two instructions, and two dependent latencies, where the
+/// hardware has a single-instruction fused multiply-add. Measured against ptxas on an RTX
+/// 5070 (sm_120), the missing contraction was the largest single part of a 3.09x gap on
+/// compute-bound work. The integer half costs nothing at all to add, because `.mul`
+/// already emits `IMAD dst, a, b, RZ` and the addend field it wastes on RZ is exactly
+/// where the add's operand belongs.
+///
+/// `scan` decides, and `lowerInst` obeys: a multiply in `folded` emits NOTHING, and the
+/// add in `at` emits the fused instruction instead of a plain add.
+///
+/// THE MULTIPLY'S OPERANDS MUST STILL BE IN THEIR REGISTERS AT THE ADD. The multiply no
+/// longer reads them where it stood, so nothing but this would keep them: the linear-scan
+/// allocator ends a value's interval at its last use, which for such an operand was the
+/// multiply. `assignLocs` therefore extends both operands to the add, and the scan below
+/// is what tells it which those are. Without that extension a value defined between the
+/// multiply and the add can take an operand's register and the fused instruction
+/// multiplies the wrong number, with no diagnostic.
+const FmaFold = struct {
+    /// Multiplies that emit nothing, keyed by the multiply's RESULT value.
+    folded: std.AutoHashMapUnmanaged(Value, void) = .empty,
+    /// The fused form of each contracted add, keyed by the add's RESULT value.
+    at: std.AutoHashMapUnmanaged(Value, Fma) = .empty,
+
+    fn deinit(self: *FmaFold, allocator: std.mem.Allocator) void {
+        self.folded.deinit(allocator);
+        self.at.deinit(allocator);
+    }
+
+    /// Whether the instruction that defines `v` is a multiply the fused form absorbed.
+    fn isFolded(self: *const FmaFold, v: Value) bool {
+        return self.folded.contains(v);
+    }
+};
+
+/// The multiply an `add` can absorb, or null when it cannot absorb `v`.
+///
+/// EVERY CONDITION HERE IS CHECKED, NOT ASSUMED, because each one is a wrong answer when
+/// it does not hold:
+///
+///   - ONE USE. A multiply read twice must keep its own instruction. Contracting it would
+///     put the multiply inside the add and leave the other reader with an unwritten
+///     register. `uses` comes from `opt.dce.countUses`, which counts every instruction
+///     operand, every `if` edge argument and every terminator operand.
+///   - SAME BLOCK. `in_block` holds the values this block defines above the add, so a
+///     multiply from another block is refused. SSA already orders a definition before its
+///     use inside a block, so membership is the whole test.
+///   - THE SAME 32-BIT TYPE. FFMA and IMAD are both 32 bits wide. A wider or narrower
+///     type would be truncated silently, so it is refused rather than contracted.
+fn fmaOperand(
+    func: *const Function,
+    uses: []const u32,
+    in_block: *const std.AutoHashMapUnmanaged(Value, void),
+    v: Value,
+    addend: Value,
+) ?Fma {
+    if (uses[@intFromEnum(v)] != 1) return null;
+    if (!in_block.contains(v)) return null;
+    // Both sources of the fused instruction must be the SAME 32-bit type. Checking the
+    // add's result alone would not say that, so each operand is tested here.
+    if (!isFmaWidth(func, v)) return null;
+    if (func.valueType(v) != func.valueType(addend)) return null;
+    const inst = func.definingInst(v) orelse return null;
+    const is_float = isFloat(func, v);
+    return switch (func.opcode(inst)) {
+        .arith => |m| if (m.op == .mul)
+            .{ .mul_a = m.lhs, .mul_b = m.rhs, .mul_imm = 0, .addend = addend, .is_float = is_float }
+        else
+            null,
+        // `foldConstantsToImm` has already turned `x * k` into an `arith_imm`. FFMA and
+        // IMAD both read a 32-bit immediate multiplier with a register addend, which is
+        // the `base + index * stride` an array walk writes.
+        .arith_imm => |m| if (m.op == .mul)
+            .{
+                .mul_a = m.lhs,
+                .mul_b = null,
+                .mul_imm = @truncate(@as(u64, @bitCast(m.imm))),
+                .addend = addend,
+                .is_float = is_float,
+            }
+        else
+            null,
+        else => null,
+    };
+}
+
+/// Whether `v` is a 32-bit float or a 32-bit integer, the two types FFMA and IMAD cover.
+/// A bool, a pointer, a vector and every other width are refused.
+fn isFmaWidth(func: *const Function, v: Value) bool {
+    return switch (func.types.type_kind(func.valueType(v))) {
+        .float => |k| k == .f32,
+        .int => |x| x.bits == 32,
+        .bool, .ptr, .vector, .array, .slice, .@"struct" => false,
+    };
+}
+
+/// Find every `a * b + c` this backend can fuse. See `FmaFold`.
+///
+/// SUBTRACTION IS DELIBERATELY LEFT ALONE. `a * b - c` and `c - a * b` are both fusible on
+/// the hardware, but each negates a DIFFERENT source, and this encoder has no tested
+/// negate modifier for either FFMA or IMAD. A wrong negate bit is a silent wrong answer,
+/// which this backend has been bitten by before, so `sub` keeps its FMUL and FADD pair
+/// until the negate bits are read out of a real ptxas encoding and tested.
+fn scanFma(allocator: std.mem.Allocator, func: *const Function, options: Options, out: *FmaFold) Error!void {
+    if (!options.contract_fma) return;
+    const nval = func.valueCount();
+    if (nval == 0) return;
+
+    const uses = try allocator.alloc(u32, nval);
+    defer allocator.free(uses);
+    opt.dce.countUses(func, uses);
+
+    var in_block: std.AutoHashMapUnmanaged(Value, void) = .empty;
+    defer in_block.deinit(allocator);
+
+    for (0..func.blockCount()) |bi| {
+        const block: Block = @enumFromInt(bi);
+        in_block.clearRetainingCapacity();
+        for (func.blockParams(block)) |p| try in_block.put(allocator, p, {});
+        for (func.blockInsts(block)) |inst| {
+            try contractOne(allocator, func, uses, &in_block, inst, out);
+            // After the decision, never before it: `in_block` must hold what stands ABOVE
+            // this instruction, so an add can never absorb its own result.
+            if (func.instResult(inst)) |r| try in_block.put(allocator, r, {});
+        }
+    }
+}
+
+/// Contract `inst` if it is an add that can absorb a multiply. See `scanFma`.
+fn contractOne(
+    allocator: std.mem.Allocator,
+    func: *const Function,
+    uses: []const u32,
+    in_block: *const std.AutoHashMapUnmanaged(Value, void),
+    inst: ir.function.Inst,
+    out: *FmaFold,
+) Error!void {
+    const a = switch (func.opcode(inst)) {
+        .arith => |x| x,
+        // An `arith_imm` add carries its addend as an IMMEDIATE, and neither FFMA nor IMAD
+        // has an immediate third source: the immediate field is the multiplier. So `a * b
+        // + k` keeps its two instructions.
+        else => return,
+    };
+    if (a.op != .add) return;
+    const r = func.instResult(inst) orelse return;
+    // Only the plain 32-bit register-add arm of `lowerInst` becomes a fused instruction. A
+    // 64-bit pointer add is an IMAD.WIDE carry chain and a boolean add is a predicate
+    // combine, and the width test refuses both.
+    if (!isFmaWidth(func, r)) return;
+    if (isWidePtr(func, r)) return;
+    // `a * b + c`, then the commuted `c + a * b`. Both forms reach here, because nothing
+    // orders an add's operands. When BOTH operands are contractible multiplies only one is
+    // taken, since the instruction has room for one multiply.
+    const fused = fmaOperand(func, uses, in_block, a.rhs, a.lhs) orelse
+        fmaOperand(func, uses, in_block, a.lhs, a.rhs) orelse
+        return;
+    try out.folded.put(allocator, if (fused.addend == a.lhs) a.rhs else a.lhs, {});
+    try out.at.put(allocator, r, fused);
+}
+
+/// The one instruction a contracted multiply-add becomes.
+fn fmaInst(loc: std.AutoHashMapUnmanaged(Value, Loc), rd: u8, m: Fma) Inst {
+    const ra = gprOf(loc, m.mul_a);
+    const rc = gprOf(loc, m.addend);
+    if (m.mul_b) |b| {
+        const rb = gprOf(loc, b);
+        return if (m.is_float) encode.ffma(rd, ra, rb, rc, .{}) else encode.imad(rd, ra, rb, rc, .{});
+    }
+    return if (m.is_float) encode.ffmaImm(rd, ra, m.mul_imm, rc, .{}) else encode.imadImm(rd, ra, m.mul_imm, rc, .{});
 }
 
 /// The address space a pointer-typed value points into, or null when the value is not a
@@ -2594,7 +2836,7 @@ fn emitCubeAtlasUv(allocator: std.mem.Allocator, code: *std.ArrayList(Inst), loc
     try code.append(allocator, encode.ffma(call.coord + 1, s + 3, s + 1, s + 1, .{})); // v
 }
 
-fn lowerInst(allocator: std.mem.Allocator, func: *const Function, loc: *std.AutoHashMapUnmanaged(Value, Loc), code: *std.ArrayList(Inst), tex: *const TexLowering, deriv: *const DerivLowering, math: *const MathLowering, shared: *const gpu.abi.SharedFrame, disp: *const DispFold, inst: ir.function.Inst) Error!void {
+fn lowerInst(allocator: std.mem.Allocator, func: *const Function, loc: *std.AutoHashMapUnmanaged(Value, Loc), code: *std.ArrayList(Inst), tex: *const TexLowering, deriv: *const DerivLowering, math: *const MathLowering, shared: *const gpu.abi.SharedFrame, disp: *const DispFold, fma: *const FmaFold, inst: ir.function.Inst) Error!void {
     switch (func.opcode(inst)) {
         .iconst => |c| {
             // A graphics output-attribute store pointer is a tag-carrier
@@ -2620,6 +2862,13 @@ fn lowerInst(allocator: std.mem.Allocator, func: *const Function, loc: *std.Auto
             // a tag carrier: the load is replaced by the SHFL-quad
             // derivative, so its address arith is never emitted.
             if (deriv.grad_ptr.contains(result)) return;
+            // A multiply the add below absorbed emits NOTHING here, and the add emits one
+            // FFMA or IMAD that multiplies and adds together. See `FmaFold`.
+            if (fma.isFolded(result)) return;
+            if (fma.at.get(result)) |m| {
+                try code.append(allocator, fmaInst(loc.*, gprOf(loc.*, result), m));
+                return;
+            }
             if (isWidePtr(func, result) and a.op == .add) {
                 // 64-bit pointer add: (dst:dst+1) = (base:base+1) + zext(offset).
                 //
@@ -2823,6 +3072,9 @@ fn lowerInst(allocator: std.mem.Allocator, func: *const Function, loc: *std.Auto
             // sum has no reader left, so computing it would waste an instruction and a
             // register. See `foldAddressDisplacements`.
             if (disp.isDead(inst)) return;
+            // A constant-scale multiply that a fused multiply-add absorbed. The add reads
+            // the same constant out of the FFMA or IMAD immediate field. See `FmaFold`.
+            if (fma.isFolded(result)) return;
             // Logical NOT lowers to `bool ^ -1` (bit_xor against all-ones).
             // A boolean result lives in a predicate, so negate the source
             // predicate with PLOP3 (`p ^ PT` = `!p`, since PT is true). The
@@ -3806,9 +4058,13 @@ test "compiles a kernel: load params, multiply-add, store, exit" {
     defer kernel.deinit(allocator);
 
     // Prologue: ONE LDC.64 for the output pointer plus two scalar LDCs equals 3
-    // instructions, then IMAD, IADD3, STG, EXIT equals 7 instructions total (28 dwords).
+    // instructions, then IMAD, STG, EXIT equals 6 instructions total (24 dwords).
     // The output pointer took two LDCs of its own before.
-    try testing.expectEqual(@as(usize, 7 * 4), kernel.code.len);
+    //
+    // THE ADD IS GONE, and that is the contraction: `x * y + x` is one IMAD, whose addend
+    // field held RZ while the sum needed a separate IADD3. This test read 7 instructions
+    // with an IADD3 after the IMAD before `FmaFold` existed.
+    try testing.expectEqual(@as(usize, 6 * 4), kernel.code.len);
     try testing.expectEqual(@as(u32, 0xb82), kernel.code[0] & 0xfff); // first LDC
     // The first LDC reads the whole output pointer at the ABI's parameter base.
     try testing.expectEqual(
@@ -3816,7 +4072,7 @@ test "compiles a kernel: load params, multiply-add, store, exit" {
         @as(u32, @as(u16, @truncate(kernel.code[1] >> 6)) & 0xffff),
     );
 
-    // The instruction words: LDC.64, LDC, LDC, IMAD, IADD3, STG, EXIT.
+    // The instruction words: LDC.64, LDC, LDC, IMAD, STG, EXIT.
     const op = struct {
         fn at(code: []const u32, i: usize) u32 {
             return code[i * 4] & 0xfff;
@@ -3824,9 +4080,278 @@ test "compiles a kernel: load params, multiply-add, store, exit" {
     }.at;
     try testing.expectEqual(@as(u32, 0xb82), op(kernel.code, 2)); // last param LDC
     try testing.expectEqual(@as(u32, 0x224), op(kernel.code, 3)); // IMAD (base 0x024 | reg form)
-    try testing.expectEqual(@as(u32, 0x210), op(kernel.code, 4)); // IADD3
-    try testing.expectEqual(@as(u32, 0x986), op(kernel.code, 5)); // STG
-    try testing.expectEqual(@as(u32, 0x94d), op(kernel.code, 6)); // EXIT
+    try testing.expectEqual(@as(u32, 0x986), op(kernel.code, 4)); // STG
+    try testing.expectEqual(@as(u32, 0x94d), op(kernel.code, 5)); // EXIT
+    // The addend is x, not RZ. A plain multiply leaves RZ there, so this field is the
+    // whole difference between a contracted IMAD and the multiply it grew out of.
+    try testing.expectEqual(gprOfCompiled(&func, x, .{}), regAt(kernel.code, 3, 64));
+}
+
+// The opcodes the contraction tests below read, as `opAt` sees them: the 9-bit NAK base
+// ORed with the source form in bits 9..11. Form 1 is a register second source and form 4 a
+// 32-bit immediate one. See `encode.alu` and `encode.aluImm`.
+const FMUL_REG: u32 = 0x220;
+const FMUL_IMM: u32 = 0x820;
+const FADD_REG: u32 = 0x221;
+const FFMA_REG: u32 = 0x223;
+const FFMA_IMM: u32 = 0x823;
+const IMAD_REG: u32 = 0x224;
+const IMAD_IMM: u32 = 0x824;
+const IADD3_REG: u32 = 0x210;
+
+/// A three-parameter scalar kernel `out = f(p0, p1, p2)`, where `body` builds the value to
+/// return out of the three parameters. Every contraction test has this shape.
+fn buildTernaryKernel(
+    func: *Function,
+    ty: ir.types.Type,
+    body: *const fn (*Function, Block, Value, Value, Value) anyerror!Value,
+) !struct { a: Value, b: Value, c: Value } {
+    const blk = try func.appendBlock();
+    const a = try func.appendBlockParam(blk, ty);
+    const b = try func.appendBlockParam(blk, ty);
+    const c = try func.appendBlockParam(blk, ty);
+    const r = try body(func, blk, a, b, c);
+    func.setTerminator(blk, .{ .ret = ir.function.Ret.one(r) });
+    return .{ .a = a, .b = b, .c = c };
+}
+
+fn mulThenAdd(func: *Function, blk: Block, a: Value, b: Value, c: Value) anyerror!Value {
+    const ty = func.valueType(a);
+    const p = try func.appendInst(blk, ty, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = b } });
+    return func.appendInst(blk, ty, .{ .arith = .{ .op = .add, .lhs = p, .rhs = c } });
+}
+
+fn addThenMul(func: *Function, blk: Block, a: Value, b: Value, c: Value) anyerror!Value {
+    const ty = func.valueType(a);
+    const p = try func.appendInst(blk, ty, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = b } });
+    return func.appendInst(blk, ty, .{ .arith = .{ .op = .add, .lhs = c, .rhs = p } });
+}
+
+test "a float multiply-add contracts into ONE FFMA that names all three operands" {
+    // `a * b + c`. The pair it replaces is an FMUL and then an FADD: two instructions and
+    // two dependent latencies where the hardware fuses both into one.
+    //
+    // COUNTING OPCODES IS NOT ENOUGH. An FFMA whose operand fields name the wrong
+    // registers is shorter AND wrong, so every field is checked against the register the
+    // allocator really gave that value.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const p = try buildTernaryKernel(&func, f32_t, mulThenAdd);
+
+    var kernel = try compileKernel(allocator, &func, nvidia_abi);
+    defer kernel.deinit(allocator);
+
+    try testing.expectEqual(@as(?usize, null), findOp(kernel.code, FMUL_REG));
+    try testing.expectEqual(@as(?usize, null), findOp(kernel.code, FADD_REG));
+    const at = try onlyOpAt(kernel.code, FFMA_REG);
+    try testing.expectEqual(gprOfCompiled(&func, p.a, .{}), regAt(kernel.code, at, 24));
+    try testing.expectEqual(gprOfCompiled(&func, p.b, .{}), regAt(kernel.code, at, 32));
+    try testing.expectEqual(gprOfCompiled(&func, p.c, .{}), regAt(kernel.code, at, 64));
+}
+
+test "the commuted float form c + a * b contracts, with the same three operands" {
+    // Nothing orders an add's operands, so a rule that only reads the left one leaves half
+    // the multiply-adds in a real kernel uncontracted.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const p = try buildTernaryKernel(&func, f32_t, addThenMul);
+
+    var kernel = try compileKernel(allocator, &func, nvidia_abi);
+    defer kernel.deinit(allocator);
+
+    try testing.expectEqual(@as(?usize, null), findOp(kernel.code, FMUL_REG));
+    try testing.expectEqual(@as(?usize, null), findOp(kernel.code, FADD_REG));
+    const at = try onlyOpAt(kernel.code, FFMA_REG);
+    // The multiply keeps its own operands at srcA and srcB. The ADD's other operand is the
+    // addend, wherever it stood in the add.
+    try testing.expectEqual(gprOfCompiled(&func, p.a, .{}), regAt(kernel.code, at, 24));
+    try testing.expectEqual(gprOfCompiled(&func, p.b, .{}), regAt(kernel.code, at, 32));
+    try testing.expectEqual(gprOfCompiled(&func, p.c, .{}), regAt(kernel.code, at, 64));
+}
+
+test "an integer multiply-add contracts into IMAD, with the addend where RZ stood" {
+    // This costs nothing to encode. A plain integer `.mul` ALREADY emits
+    // `IMAD dst, a, b, RZ`, so contraction is the addend field holding the add's other
+    // operand instead of the zero register.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const p = try buildTernaryKernel(&func, i32_t, mulThenAdd);
+
+    var kernel = try compileKernel(allocator, &func, nvidia_abi);
+    defer kernel.deinit(allocator);
+
+    try testing.expectEqual(@as(?usize, null), findOp(kernel.code, IADD3_REG));
+    const at = try onlyOpAt(kernel.code, IMAD_REG);
+    try testing.expectEqual(gprOfCompiled(&func, p.a, .{}), regAt(kernel.code, at, 24));
+    try testing.expectEqual(gprOfCompiled(&func, p.b, .{}), regAt(kernel.code, at, 32));
+    const addend = regAt(kernel.code, at, 64);
+    try testing.expectEqual(gprOfCompiled(&func, p.c, .{}), addend);
+    try testing.expect(addend != encode.RZ); // the uncontracted multiply's addend
+}
+
+test "a constant-scale multiply-add contracts into the IMMEDIATE FFMA and IMAD forms" {
+    // `x * k + y`, where the scale is a compile-time constant. `foldConstantsToImm` has
+    // already put the constant in the multiply's immediate field, and FFMA and IMAD both
+    // read a 32-bit immediate multiplier beside a register addend. This is the shape
+    // `base + index * stride` takes, which every array walk writes.
+    const allocator = testing.allocator;
+    const Case = struct { float: bool, want: u32, imm: u32 };
+    for ([_]Case{
+        .{ .float = true, .want = FFMA_IMM, .imm = @bitCast(@as(f32, 0.5)) },
+        .{ .float = false, .want = IMAD_IMM, .imm = 4 },
+    }) |case| {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const ty = if (case.float)
+            try func.types.intern(.{ .float = .f32 })
+        else
+            try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+        const blk = try func.appendBlock();
+        const x = try func.appendBlockParam(blk, ty);
+        const y = try func.appendBlockParam(blk, ty);
+        const k = if (case.float)
+            try func.appendInst(blk, ty, .{ .fconst = 0.5 })
+        else
+            try func.appendInst(blk, ty, .{ .iconst = 4 });
+        const scaled = try func.appendInst(blk, ty, .{ .arith = .{ .op = .mul, .lhs = x, .rhs = k } });
+        const sum = try func.appendInst(blk, ty, .{ .arith = .{ .op = .add, .lhs = scaled, .rhs = y } });
+        func.setTerminator(blk, .{ .ret = ir.function.Ret.one(sum) });
+
+        var kernel = try compileKernel(allocator, &func, nvidia_abi);
+        defer kernel.deinit(allocator);
+
+        try testing.expectEqual(@as(?usize, null), findOp(kernel.code, FMUL_IMM));
+        const at = try onlyOpAt(kernel.code, case.want);
+        try testing.expectEqual(gprOfCompiled(&func, x, .{}), regAt(kernel.code, at, 24));
+        try testing.expectEqual(case.imm, immAt(kernel.code, at)); // the scale, at bits 32..63
+        try testing.expectEqual(gprOfCompiled(&func, y, .{}), regAt(kernel.code, at, 64));
+    }
+}
+
+test "a multiply read TWICE keeps its own FMUL, and neither add contracts" {
+    // THE GUARD IN THE OTHER DIRECTION. Contracting a multiply with two readers would put
+    // the multiply inside one add and leave the second reader with a register nothing ever
+    // writes. A guard that never refuses is not a guard, so this proves it refuses.
+    //
+    // `p = a * b; s = p + c; out = s + p`. p has two readers.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const blk = try func.appendBlock();
+    const a = try func.appendBlockParam(blk, f32_t);
+    const b = try func.appendBlockParam(blk, f32_t);
+    const c = try func.appendBlockParam(blk, f32_t);
+    const prod = try func.appendInst(blk, f32_t, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = b } });
+    const s = try func.appendInst(blk, f32_t, .{ .arith = .{ .op = .add, .lhs = prod, .rhs = c } });
+    const out = try func.appendInst(blk, f32_t, .{ .arith = .{ .op = .add, .lhs = s, .rhs = prod } });
+    func.setTerminator(blk, .{ .ret = ir.function.Ret.one(out) });
+
+    var kernel = try compileKernel(allocator, &func, nvidia_abi);
+    defer kernel.deinit(allocator);
+
+    try testing.expectError(error.NotFound, onlyOpAt(kernel.code, FFMA_REG));
+    const mul_at = try onlyOpAt(kernel.code, FMUL_REG);
+    try testing.expectEqual(gprOfCompiled(&func, a, .{}), regAt(kernel.code, mul_at, 24));
+    try testing.expectEqual(gprOfCompiled(&func, b, .{}), regAt(kernel.code, mul_at, 32));
+    // Both adds are still there, in their own instructions.
+    var adds: usize = 0;
+    var i: usize = 0;
+    while (i * 4 < kernel.code.len) : (i += 1) {
+        if (opAt(kernel.code, i) == FADD_REG) adds += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), adds);
+}
+
+test "a multiply in ANOTHER block is not contracted into the add that reads it" {
+    // The operand registers of the multiply have to survive as far as the add, and this
+    // backend only extends live ranges inside the block it scans. A multiply reached
+    // through a branch can be executed a different number of times from the add, so
+    // folding it across the edge would move work onto a path that never ran it.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const entry = try func.appendBlock();
+    const a = try func.appendBlockParam(entry, f32_t);
+    const b = try func.appendBlockParam(entry, f32_t);
+    const c = try func.appendBlockParam(entry, f32_t);
+    const tail = try func.appendBlock();
+    const prod = try func.appendInst(entry, f32_t, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = b } });
+    try func.setJump(entry, tail, &.{});
+    const sum = try func.appendInst(tail, f32_t, .{ .arith = .{ .op = .add, .lhs = prod, .rhs = c } });
+    func.setTerminator(tail, .{ .ret = ir.function.Ret.one(sum) });
+
+    var kernel = try compileKernel(allocator, &func, nvidia_abi);
+    defer kernel.deinit(allocator);
+
+    try testing.expectError(error.NotFound, onlyOpAt(kernel.code, FFMA_REG));
+    _ = try onlyOpAt(kernel.code, FMUL_REG);
+    _ = try onlyOpAt(kernel.code, FADD_REG);
+}
+
+test "contract_fma = false emits the FMUL and FADD pair, and nothing fuses" {
+    // The default is ON, matching nvcc's `-fmad=true`. This proves the switch is real: the
+    // SAME function compiled with contraction off keeps both instructions, so a caller
+    // that needs the two-rounding answer can have it. See `Options.contract_fma`.
+    const allocator = testing.allocator;
+    const cases = [_]struct { options: Options, fused: bool }{
+        .{ .options = .{}, .fused = true },
+        .{ .options = .{ .contract_fma = false }, .fused = false },
+    };
+    for (cases) |case| {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        const f32_t = try func.types.intern(.{ .float = .f32 });
+        _ = try buildTernaryKernel(&func, f32_t, mulThenAdd);
+
+        var kernel = try compileKernelOpts(allocator, &func, nvidia_abi, case.options);
+        defer kernel.deinit(allocator);
+
+        if (case.fused) {
+            _ = try onlyOpAt(kernel.code, FFMA_REG);
+            try testing.expectError(error.NotFound, onlyOpAt(kernel.code, FMUL_REG));
+            try testing.expectError(error.NotFound, onlyOpAt(kernel.code, FADD_REG));
+        } else {
+            try testing.expectError(error.NotFound, onlyOpAt(kernel.code, FFMA_REG));
+            _ = try onlyOpAt(kernel.code, FMUL_REG);
+            _ = try onlyOpAt(kernel.code, FADD_REG);
+        }
+    }
+}
+
+test "a SUBTRACT is left alone: no negate bit is guessed at" {
+    // `a * b - c` is fusible on the hardware, and so is `c - a * b`, but the two negate
+    // DIFFERENT sources and this encoder has no tested negate modifier for FFMA. A wrong
+    // negate bit returns a wrong number with no diagnostic, so the pair stands until the
+    // bits are read out of a real ptxas encoding. This test states that choice, so a later
+    // change that adds the negate has to come here and say so.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const blk = try func.appendBlock();
+    const a = try func.appendBlockParam(blk, f32_t);
+    const b = try func.appendBlockParam(blk, f32_t);
+    const c = try func.appendBlockParam(blk, f32_t);
+    const prod = try func.appendInst(blk, f32_t, .{ .arith = .{ .op = .mul, .lhs = a, .rhs = b } });
+    const diff = try func.appendInst(blk, f32_t, .{ .arith = .{ .op = .sub, .lhs = prod, .rhs = c } });
+    func.setTerminator(blk, .{ .ret = ir.function.Ret.one(diff) });
+
+    var kernel = try compileKernel(allocator, &func, nvidia_abi);
+    defer kernel.deinit(allocator);
+
+    try testing.expectError(error.NotFound, onlyOpAt(kernel.code, FFMA_REG));
+    _ = try onlyOpAt(kernel.code, FMUL_REG);
+    // FADD with the srcB negate bit (63) set is the subtract. See `encode.fsub`.
+    const at = try onlyOpAt(kernel.code, FADD_REG);
+    try testing.expectEqual(@as(u32, 1), (kernel.code[at * 4 + 1] >> 31) & 1);
 }
 
 test "the emitted LDC offsets match the offsets LaunchInfo reports" {
@@ -5330,7 +5855,33 @@ fn gprOfTest(func: *const Function, v: Value) u8 {
     var locs: std.AutoHashMapUnmanaged(Value, Loc) = .empty;
     defer locs.deinit(std.testing.allocator);
     var max_reg: u8 = 0;
-    assignLocs(std.testing.allocator, func, &locs, &max_reg) catch unreachable;
+    // An empty fold: the atomic kernels this helper serves contain no multiply-add, so
+    // nothing here changes when contraction is on.
+    const fma = FmaFold{};
+    assignLocs(std.testing.allocator, func, &locs, &max_reg, &fma) catch unreachable;
+    return gprOf(locs, v);
+}
+
+/// The register `compileShaderOpts` gives `v`, recomputed by running the SAME pre-passes in
+/// the same order it does. A contraction test needs this and not `gprOfTest`: the fused
+/// instruction names the MULTIPLY's operand registers, and keeping those operands live to
+/// the add is itself part of what `assignLocs` now decides.
+///
+/// Every pre-pass here is idempotent, so calling this after `compileKernel` on the same
+/// function gives the allocation that kernel used.
+fn gprOfCompiled(func: *Function, v: Value, options: Options) u8 {
+    const allocator = std.testing.allocator;
+    var locs: std.AutoHashMapUnmanaged(Value, Loc) = .empty;
+    defer locs.deinit(allocator);
+    foldConstantsToImm(func);
+    var disp = DispFold{};
+    defer disp.deinit(allocator);
+    foldAddressDisplacements(allocator, func, &disp) catch unreachable;
+    var fma = FmaFold{};
+    defer fma.deinit(allocator);
+    scanFma(allocator, func, options, &fma) catch unreachable;
+    var max_reg: u8 = r_outptr + 1;
+    assignLocs(allocator, func, &locs, &max_reg, &fma) catch unreachable;
     return gprOf(locs, v);
 }
 
