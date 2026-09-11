@@ -207,6 +207,9 @@ fn recognize(allocator: std.mem.Allocator, func: *Function, model: *const mm.Mod
         .aarch64 => |f| f.neon,
         .riscv64 => |f| f.v or f.vpu,
         .x86_64 => false,
+        // See vectorize.zig: a warp lane is already the vector lane on an SM, so there is no IR
+        // vector op for the NVIDIA backend to lower.
+        .nvidia => false,
     };
     if (!vec_ok or model.vector_bits < 2 * ELEM_BITS) return null;
     const V: u32 = @min(model.vector_bits / ELEM_BITS, MAX_LANES);
@@ -508,6 +511,9 @@ fn recognizeReduction(func: *const Function, model: *const mm.Model, loop: *cons
         .aarch64 => |f| f.neon,
         .riscv64 => |f| f.v or f.vpu,
         .x86_64 => false,
+        // See vectorize.zig: a warp lane is already the vector lane on an SM, so there is no IR
+        // vector op for the NVIDIA backend to lower.
+        .nvidia => false,
     };
     if (!vec_ok or model.vector_bits < 2 * ELEM_BITS) return null;
     const V: u32 = @min(model.vector_bits / ELEM_BITS, MAX_LANES);

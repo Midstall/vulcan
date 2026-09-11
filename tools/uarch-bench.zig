@@ -628,6 +628,9 @@ fn canJit(model: *const Model) bool {
         .aarch64 => builtin.cpu.arch == .aarch64,
         .riscv64 => builtin.cpu.arch == .riscv64,
         .x86_64 => builtin.cpu.arch == .x86_64,
+        // An NVIDIA model never JITs here: the code runs on a device, not on this host, and there
+        // is no `selectFunctionForModel` on that backend. It always takes the transform-stats path.
+        .nvidia => false,
     };
 }
 
@@ -685,6 +688,9 @@ fn selectAndMap(allocator: std.mem.Allocator, func: *const Function, model: ?*co
             defer allocator.free(code);
             break :blk .{ .x86_64 = try target.x86_64.jit.CodeBuffer.map(std.mem.sliceAsBytes(code)) };
         },
+        // Unreachable in practice: `canJit` answers false for NVIDIA, and this is only called after
+        // that check passes. Refusing beats a host buffer that cannot hold device code.
+        .nvidia => error.UnsupportedHostArch,
     };
 }
 

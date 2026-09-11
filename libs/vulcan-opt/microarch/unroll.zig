@@ -1,9 +1,21 @@
-//! Model-driven loop unrolling. Unrolls hot innermost loops by a factor derived from the target's
-//! issue width and latency, to expose instruction-level parallelism a wide out-of-order core can
-//! use. Conservative: only reducible, innermost, single-latch loops with a pure test header and
+//! Model-driven loop unrolling. Unrolls hot innermost loops by a factor the target model decides,
+//! to expose the independent work the hardware needs to hide latency. Conservative: only
+//! reducible, innermost, single-latch loops with a pure test header and
 //! header-param loop-carried values are transformed, everything else is skipped unchanged. The
 //! transform is a guarded partial unroll (K guarded body copies), correct by construction, proven
 //! by the differential JIT tests in libs/vulcan-target/tests/unroll_differential.zig.
+//!
+//! Two targets, two bounds. A CPU core is bounded by issue width: enough copies to fill the ports
+//! across a dependency chain. A streaming multiprocessor has no issue width, and is bounded by the
+//! REGISTER BUDGET, because registers per thread decide how many warps stay resident and resident
+//! warps are what hides latency. `unrollFactor` therefore splits on `Model.exec`.
+//!
+//! What the SIMT rule cannot see, stated plainly: this pass runs on SSA IR, before register
+//! allocation, so the live-value count of a loop body is not available to it. The register bound is
+//! computed from an UPPER BOUND on that count (a body of N instructions defines at most N values),
+//! which makes the rule conservative rather than accurate. A body whose values die quickly is
+//! under-unrolled. Closing that gap needs a live-range estimate the IR does not carry today, and a
+//! guess dressed up as one would be worse than the bound.
 
 const std = @import("std");
 const ir = @import("vulcan-ir");
@@ -283,11 +295,108 @@ pub fn cloneBlocks(
 /// The largest factor we ever unroll by (keeps code growth bounded).
 const MAX_FACTOR: u32 = 8;
 
-/// How many times to unroll a loop whose body has `body_ops` instructions for `model`. Returns 1
+/// The share of peak occupancy a SIMT unroll refuses to fall below, written as a divisor of
+/// `Simt.warps_per_sm`: 2 means "never below half the resident warps the SM can hold".
+///
+/// This is a POLICY number and not a hardware one, so it lives here and not in the model. Its
+/// justification: NVIDIA's own CUDA C++ Best Practices Guide ("Occupancy") states that raising
+/// occupancy past roughly half of peak usually stops improving performance, because by then the SM
+/// already has enough warps to switch to. Read the other way round, which is the way this rule
+/// needs, half of peak is where the SM stops having a spare warp for every one that is waiting, and
+/// so it is where trading occupancy for in-flight work stops paying. sm_120 has four warp
+/// schedulers per SM, so half of its 48 resident warps leaves six per scheduler.
+///
+/// It is a rule of thumb, not a measurement. It is the one number in this file that a measured
+/// sweep on real silicon should replace first.
+const OCCUPANCY_FLOOR_DIVISOR: u32 = 2;
+
+/// The fewest resident warps a SIMT unroll may leave. Never below 1, so the rule still answers for
+/// a model with a tiny warp ceiling.
+fn occupancyFloor(s: mm.Simt) u32 {
+    return @max(1, @as(u32, s.warps_per_sm) / OCCUPANCY_FLOOR_DIVISOR);
+}
+
+/// The registers one thread holds after unrolling a `body_ops`-instruction body `k` times.
+///
+/// THIS IS AN UPPER BOUND AND NOT AN ESTIMATE, and the reason matters. Unrolling runs on SSA IR,
+/// before register allocation, so the true live-value count of a body is not available here: it is
+/// decided later by the allocator, over an interval graph this pass cannot see. What IS available
+/// is the instruction count, and a body of `body_ops` instructions defines at most `body_ops`
+/// values, so `k * body_ops` can never understate the demand. Using the bound makes the rule
+/// conservative in the safe direction: it under-unrolls a body whose values die quickly, and it
+/// never over-unrolls one into a spill. See the note in the module doc comment above.
+///
+/// Saturating, so a pathological body size cannot wrap into a small number and unlock an unroll.
+fn simtLiveRegs(body_ops: u32, k: u32) u32 {
+    return body_ops *| k;
+}
+
+/// Whether `warps` resident warps, each holding `k` iterations worth of independent work, already
+/// put enough operations in flight to cover a memory access of `latency` cycles.
+///
+/// Little's law: an SM whose load/store unit accepts one request per cycle needs `latency` requests
+/// outstanding to keep from idling across that latency, and the requests come from every resident
+/// warp at once. Past that point more unrolling only adds registers.
+///
+/// On sm_120 this clause cannot fire: the SM's own ceiling of 48 resident warps times the cap of 8
+/// copies is 384 operations, and a device-memory access costs about 500 cycles. That is the whole
+/// reason the register budget, not the latency, is what bounds a GPU unroll here, and it is checked
+/// by the comptime block below rather than left as a claim.
+fn coversLatency(warps: u32, k: u32, latency: u32) bool {
+    return warps *| k >= latency;
+}
+
+comptime {
+    // Recompute the regime claim in `coversLatency`'s doc comment: on sm_120 the most work this
+    // pass can ever put in flight falls short of a device-memory round trip, so that clause is
+    // inert and the register budget is what decides. A part where this stops holding gets a
+    // different rule, and the build says so here instead of silently changing factors.
+    const s = @import("registry.zig").modelFor(.sm_120).simt.?;
+    if (coversLatency(s.warps_per_sm, MAX_FACTOR, s.global_latency))
+        @compileError("sm_120 can now cover a global access from warp parallelism alone: the unroll rule's register-bound assumption needs re-deriving");
+}
+
+/// How many times to unroll a `body_ops`-instruction loop body on a SIMT target.
+///
+/// A GPU hides latency with warps in flight and with independent work inside each warp. Unrolling
+/// buys the second, and pays for it in the first: every extra copy raises the registers a thread
+/// holds, and registers are the fixed budget that decides how many warps stay resident. So the rule
+/// takes the largest factor that still leaves the SM enough resident warps, and it stops for one of
+/// three reasons, each of which the tests below make fire:
+///
+///   1. The thread would need more registers than the hardware gives one (`max_regs_per_thread`),
+///      so the kernel would spill to local memory. A spill is a memory access added to hide a
+///      memory access.
+///   2. Occupancy would fall below `occupancyFloor`. This is the real bound on this hardware.
+///   3. The work in flight already covers the memory latency, so another copy buys nothing. Inert
+///      on sm_120, see `coversLatency`.
+///
+/// Note what is NOT here: issue width, port pressure and a reorder window, which is what the CPU
+/// rule is made of. An SM has none of the three.
+fn simtUnrollFactor(s: mm.Simt, body_ops: u32) u32 {
+    if (body_ops == 0) return 1;
+    const floor = occupancyFloor(s);
+    var best: u32 = 1;
+    var k: u32 = 2;
+    while (k <= MAX_FACTOR) : (k += 1) {
+        const regs = simtLiveRegs(body_ops, k);
+        // Check the raw demand before the rounded one, so an absurd body size cannot reach the
+        // rounding arithmetic at all.
+        if (regs > s.max_regs_per_thread) break;
+        if (s.allocFor(regs) > s.max_regs_per_thread) break; // rounding up can cross the cap on its own
+        const warps = s.residentWarps(regs);
+        if (warps < floor) break;
+        best = k;
+        if (coversLatency(warps, k, s.global_latency)) break;
+    }
+    return best;
+}
+
+/// How many times to unroll a loop whose body has `body_ops` instructions on a CPU model. Returns 1
 /// (no unroll) for a single-issue in-order model, since it has no width to fill. For a wider model,
 /// enough copies to keep issue_width ports busy across the dominant latency, capped at MAX_FACTOR
 /// and never more than makes sense for the body size.
-pub fn unrollFactor(model: *const mm.Model, body_ops: u32) u32 {
+fn cpuUnrollFactor(model: *const mm.Model, body_ops: u32) u32 {
     if (model.issue_width <= 1) return 1; // in-order single-issue gains nothing
     if (body_ops == 0) return 1;
     // Rough ILP target: cover the issue width across a typical multi-cycle latency (use 3 as a
@@ -296,10 +405,152 @@ pub fn unrollFactor(model: *const mm.Model, body_ops: u32) u32 {
     return std.math.clamp(target, 1, MAX_FACTOR);
 }
 
+/// How many times to unroll a loop whose body has `body_ops` instructions for `model`. A CPU core
+/// and a streaming multiprocessor are bounded by different things, so they get different rules: see
+/// `cpuUnrollFactor` (issue width and port pressure) and `simtUnrollFactor` (the register budget,
+/// through occupancy). The split is on `exec` and not on a width, because a SIMT model's
+/// `issue_width` is zero and would otherwise land in the CPU rule's single-issue arm.
+pub fn unrollFactor(model: *const mm.Model, body_ops: u32) u32 {
+    return switch (model.exec) {
+        // `validate` ties `.simt` to a non-null `simt` block, so the orelse is unreachable for a
+        // validated model. It answers 1 rather than trapping for a hand-built one.
+        .simt => if (model.simt) |s| simtUnrollFactor(s, body_ops) else 1,
+        .in_order, .out_of_order => cpuUnrollFactor(model, body_ops),
+    };
+}
+
 test "unrollFactor is 1 for single-issue in-order models" {
     const registry = @import("registry.zig");
     try std.testing.expectEqual(@as(u32, 1), unrollFactor(registry.modelFor(.@"et-soc"), 2));
     try std.testing.expectEqual(@as(u32, 1), unrollFactor(registry.modelFor(.@"river-rc1.s"), 2));
+}
+
+/// The CPU unroll rule as it stood before a SIMT branch existed, written out again so the test
+/// below compares against an INDEPENDENT statement of it rather than against the function it is
+/// meant to be guarding.
+fn preSimtCpuFactor(issue_width: u8, body_ops: u32) u32 {
+    if (issue_width <= 1) return 1;
+    if (body_ops == 0) return 1;
+    return std.math.clamp((@as(u32, issue_width) * 3) / body_ops, 1, MAX_FACTOR);
+}
+
+test "every CPU model's factor is unchanged by the SIMT branch, over the whole body-size range" {
+    // The guard on the whole change: adding a SIMT rule must move no CPU factor at all. Checked for
+    // EVERY predefined CPU part against a separate statement of the old formula, over every body
+    // size that can produce a factor above 1 plus a long tail that cannot.
+    const registry = @import("registry.zig");
+    inline for (std.meta.tags(mm.Microarch)) |t| {
+        const m = registry.modelFor(t);
+        // An `if` block and not a `continue`: the loop is an inline one, so a `continue` under a
+        // run-time condition is comptime control flow in a run-time block.
+        if (m.exec != .simt) {
+            var body: u32 = 0;
+            while (body <= 64) : (body += 1) {
+                try std.testing.expectEqual(preSimtCpuFactor(m.issue_width, body), unrollFactor(m, body));
+            }
+            try std.testing.expectEqual(preSimtCpuFactor(m.issue_width, 1000), unrollFactor(m, 1000));
+            try std.testing.expectEqual(preSimtCpuFactor(m.issue_width, std.math.maxInt(u32)), unrollFactor(m, std.math.maxInt(u32)));
+        }
+    }
+}
+
+test "sm_120 unrolls by the factor the register budget allows, for several body sizes" {
+    // Every expectation below is the largest K whose thread allocation still leaves at least half
+    // of sm_120's 48 resident warps. On this part that means an allocation of at most 80 registers
+    // (81 rounds to 88, which holds only 23 warps), so the factor is about 80 / body_ops, in the
+    // steps the 8-register granularity creates.
+    const registry = @import("registry.zig");
+    const g = registry.modelFor(.sm_120);
+    const cases = [_]struct { body: u32, factor: u32 }{
+        .{ .body = 0, .factor = 1 }, // nothing to unroll
+        .{ .body = 1, .factor = 8 }, // MAX_FACTOR, not the register budget
+        .{ .body = 4, .factor = 8 },
+        .{ .body = 10, .factor = 8 }, // 80 registers exactly: the last body size that reaches the cap
+        .{ .body = 11, .factor = 7 }, // 88 would drop occupancy below the floor
+        .{ .body = 12, .factor = 6 },
+        .{ .body = 16, .factor = 5 },
+        .{ .body = 20, .factor = 4 },
+        .{ .body = 27, .factor = 2 },
+        .{ .body = 40, .factor = 2 },
+        .{ .body = 41, .factor = 1 }, // two copies already cost the occupancy
+        .{ .body = 100, .factor = 1 },
+    };
+    for (cases) |c| {
+        try std.testing.expectEqual(c.factor, unrollFactor(g, c.body));
+    }
+}
+
+test "the sm_120 factor sits exactly on the occupancy floor: one more copy crosses it" {
+    // The boundary the rule is built on, checked from the occupancy side rather than by repeating
+    // the expected factors. For every body size that gives a factor below the cap, the chosen K
+    // must hold at least the floor and K+1 must not. This is the assertion that fails if the
+    // occupancy bound is removed (the factor runs to MAX_FACTOR) or pinned to 1.
+    const registry = @import("registry.zig");
+    const g = registry.modelFor(.sm_120);
+    const s = g.simt.?;
+    const floor = occupancyFloor(s);
+    try std.testing.expectEqual(@as(u32, 24), floor); // half of 48 resident warps
+
+    var body: u32 = 1;
+    while (body <= 80) : (body += 1) {
+        const k = unrollFactor(g, body);
+        try std.testing.expect(k >= 1 and k <= MAX_FACTOR);
+        if (k > 1) try std.testing.expect(s.residentWarps(simtLiveRegs(body, k)) >= floor);
+        if (k < MAX_FACTOR) try std.testing.expect(s.residentWarps(simtLiveRegs(body, k + 1)) < floor);
+    }
+}
+
+/// A hand-built SM whose register file is large enough that occupancy never binds, so the
+/// per-thread register CAP is the clause that stops the unroll. `Model` is public and
+/// user-constructible for exactly this reason.
+const uncapped_occupancy_simt = mm.Simt{
+    .warp_size = 32,
+    .warps_per_sm = 4, // a tiny ceiling, so the floor is 2 warps and easily met
+    .regfile_per_sm = 1 << 24, // far more than 4 warps can spend
+    // Deliberately NOT a multiple of the granularity, as sm_120's own 255 is not, so the rounding
+    // can carry a request that fits over the cap. The test below proves that case.
+    .max_regs_per_thread = 60,
+    .reg_alloc_granularity = 8,
+    .min_regs_per_thread = 16,
+    .global_latency = 500,
+    .shared_latency = 30,
+};
+
+test "the per-thread register cap stops the unroll when occupancy does not" {
+    // On sm_120 the occupancy floor always bites first, so this clause never fires there. It is not
+    // dead: a part with a large register file relative to its warp ceiling reaches the per-thread
+    // cap instead, and a kernel past that cap spills to local memory, which adds a memory access to
+    // hide a memory access.
+    const s = uncapped_occupancy_simt;
+    try std.testing.expectEqual(@as(u32, 4), simtUnrollFactor(s, 12)); // 48 registers, under the 60 cap
+    try std.testing.expectEqual(@as(u32, 3), simtUnrollFactor(s, 15)); // a fourth copy would need 60, which rounds to 64
+    try std.testing.expectEqual(@as(u32, 1), simtUnrollFactor(s, 31)); // two copies need 62 outright
+    // Rounding crosses the cap on its own: 58 registers is under 60, but it rounds up to 64.
+    try std.testing.expectEqual(@as(u32, 1), simtUnrollFactor(s, 29));
+}
+
+/// A hand-built SM whose memory latency is small enough that the resident warps already cover it.
+/// Same shape as sm_120 otherwise.
+const short_latency_simt = mm.Simt{
+    .warp_size = 32,
+    .warps_per_sm = 48,
+    .regfile_per_sm = 65536,
+    .max_regs_per_thread = 255,
+    .reg_alloc_granularity = 8,
+    .min_regs_per_thread = 16,
+    .global_latency = 96, // 48 warps * 2 copies covers it exactly
+    .shared_latency = 30,
+};
+
+test "the latency-cover clause stops an unroll once the work in flight already covers the memory" {
+    // Inert on sm_120 (a comptime block above asserts it cannot fire there), so it is proven on a
+    // part where it can. With 48 resident warps and a 96-cycle memory, two copies per warp put 96
+    // operations in flight and a third buys nothing but registers.
+    try std.testing.expectEqual(@as(u32, 2), simtUnrollFactor(short_latency_simt, 4));
+    // The same body under sm_120's real 500-cycle memory is bounded by registers instead, and goes
+    // all the way to the cap.
+    const registry = @import("registry.zig");
+    try std.testing.expectEqual(@as(u32, 8), unrollFactor(registry.modelFor(.sm_120), 4));
 }
 
 test "unrollFactor grows with issue width for a wide model, bounded" {
@@ -891,6 +1142,103 @@ fn buildCountedLoop(func: *Function, impure_header: bool) Error!void {
     const next = try func.appendArithImm(body, i32_t, .add, bi, 1);
     try func.setJump(body, loop, &.{next});
     func.setTerminator(done, .{ .ret = ir.function.Ret.one(i) });
+}
+
+/// A loop shaped like a GPU kernel's inner loop: one global load per iteration, `pad` independent
+/// index computations beside it, and a counted induction variable. `pad` is how the test varies the
+/// body size, which is the only thing the SIMT rule reads.
+///
+/// The single load is the marker the tests count: guards re-emit only the header's pure test, never
+/// a load, so the number of loads in the whole function after unrolling IS the unroll factor.
+fn buildGpuLoop(func: *Function, pad: u32) Error!void {
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const ptr_t = try func.types.ptrGlobal();
+    const entry = try func.appendBlock();
+    const loop = try func.appendBlock();
+    const body = try func.appendBlock();
+    const done = try func.appendBlock();
+    const n = try func.appendBlockParam(entry, i32_t);
+    const i = try func.appendBlockParam(loop, i32_t);
+    const bi = try func.appendBlockParam(body, i32_t);
+    const zero = try func.appendInst(entry, i32_t, .{ .iconst = 0 });
+    const base = try func.appendGlobalAddr(entry, ptr_t, "A");
+    try func.setJump(entry, loop, &.{zero});
+
+    const cmp = try func.appendInst(loop, bool_t, .{ .icmp = .{ .op = .lt, .lhs = i, .rhs = n } });
+    try func.appendIf(loop, cmp, .{ .target = body, .args = &.{i} }, .{ .target = done });
+
+    _ = try func.appendInst(body, i32_t, .{ .load = .{ .ptr = base } });
+    var j: u32 = 0;
+    while (j < pad) : (j += 1) {
+        _ = try func.appendArithImm(body, i32_t, .add, bi, @intCast(j + 2));
+    }
+    const next = try func.appendArithImm(body, i32_t, .add, bi, 1);
+    try func.setJump(body, loop, &.{next});
+
+    func.setTerminator(done, .{ .ret = ir.function.Ret.none() });
+}
+
+/// How many `load` instructions the whole function holds.
+fn countLoads(func: *const Function) u32 {
+    var loads: u32 = 0;
+    var bi: usize = 0;
+    while (bi < func.blockCount()) : (bi += 1) {
+        for (func.blockInsts(@enumFromInt(bi))) |inst| {
+            if (func.opcode(inst) == .load) loads += 1;
+        }
+    }
+    return loads;
+}
+
+test "a GPU loop unrolls by exactly the factor the SIMT rule predicts, and stays verifiable" {
+    // The end-to-end check of the rule at the IR level. `buildGpuLoop(pad)` makes a loop whose body
+    // budget is `pad + 4` (two header instructions plus the load, the pads and the increment), and
+    // the function must come out holding exactly `unrollFactor` loads.
+    const registry = @import("registry.zig");
+    const allocator = std.testing.allocator;
+    const g = registry.modelFor(.sm_120);
+
+    const cases = [_]struct { pad: u32, factor: u32 }{
+        .{ .pad = 0, .factor = 8 }, // body 4: the shared MAX_FACTOR cap, not the register budget
+        .{ .pad = 8, .factor = 6 }, // body 12
+        .{ .pad = 16, .factor = 4 }, // body 20
+        .{ .pad = 23, .factor = 2 }, // body 27
+        .{ .pad = 37, .factor = 1 }, // body 41: two copies already cost the occupancy
+    };
+    for (cases) |c| {
+        var func = Function.init(allocator);
+        defer func.deinit();
+        try buildGpuLoop(&func, c.pad);
+
+        // The rule's own answer for this body size, so the table below is pinned to the rule and
+        // not only to a number typed out by hand.
+        try std.testing.expectEqual(c.factor, unrollFactor(g, c.pad + 4));
+
+        const before_blocks = func.blockCount();
+        const changed = try run(allocator, &func, g);
+        try std.testing.expectEqual(c.factor > 1, changed);
+        try std.testing.expectEqual(c.factor, countLoads(&func));
+        if (c.factor == 1) try std.testing.expectEqual(before_blocks, func.blockCount());
+
+        var diags = try ir.verify.verify(allocator, &func, .low);
+        defer diags.deinit();
+        try std.testing.expect(diags.ok());
+    }
+}
+
+test "the same GPU loop under a CPU model unrolls by the CPU factor, not the SIMT one" {
+    // The two rules must not be reading each other's numbers. A body of 12 gives 6 copies on
+    // sm_120 (register budget) and 1 on ampere-altra ((4*3)/12 = 0, clamped to 1).
+    const registry = @import("registry.zig");
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    try buildGpuLoop(&func, 8);
+
+    const changed = try run(allocator, &func, registry.modelFor(.@"ampere-altra"));
+    try std.testing.expect(!changed);
+    try std.testing.expectEqual(@as(u32, 1), countLoads(&func));
 }
 
 test "run leaves an ineligible loop (impure header) unchanged" {

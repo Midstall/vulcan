@@ -414,6 +414,104 @@ fn riverPipelinedThroughput(op: ir.function.Opcode, elem_float: bool) u32 {
     };
 }
 
+// NVIDIA sm_120 (Blackwell consumer, the RTX 5070 class part vulcan's NVIDIA backend targets).
+//
+// PROVENANCE WARNING, read before trusting a number in this table. Nothing reads this latency table
+// today: `microarch.schedule` refuses a SIMT model outright (the NVIDIA backend does its own
+// scoreboard scheduling in nvidia/schedule.zig), and `microarch.cost` is reached only from the
+// vectorizer, which a SIMT model turns off. `Model` requires the two functions, so they exist and
+// they are as accurate as the sources allow, but a pass that starts reading them must re-derive
+// them first. The numbers that ARE load-bearing for a SIMT model live in `sm120_simt` below.
+//
+// Sourcing: NVIDIA publishes no SASS latency table. The fixed-pipe figures are the ones the public
+// microbenchmark literature reports for recent NVIDIA parts (Volta and later put a dependent
+// integer or FMA ALU result about 4 to 5 cycles after issue). They are NOT measured on sm_120 here,
+// and every arm that is a placeholder rather than a sourced figure says so.
+fn sm120Arith(op: ir.function.BinOp) u32 {
+    return switch (op) {
+        // IMAD and the FP multiply both run on the FMA pipe.
+        .mul, .mulh => 5,
+        // sm_120 HAS NO INTEGER DIVIDE INSTRUCTION. The backend expands one into a reciprocal
+        // sequence, so this prices a whole expansion and not an instruction. 64 is an
+        // order-of-magnitude placeholder, matching what the CPU models use for an op their target
+        // does not have natively. It is not a measured figure.
+        .div, .rem => 64,
+        .add, .sub, .bit_and, .bit_or, .bit_xor, .shl, .shr => 4,
+    };
+}
+
+fn sm120Latency(op: ir.function.Opcode) u32 {
+    return switch (op) {
+        .arith => |a| sm120Arith(a.op),
+        .arith_imm => |a| sm120Arith(a.op),
+        // A load is priced at the GLOBAL figure, which is the larger of the two the model carries.
+        // `latency` is given only an `Opcode`, and an `Opcode` does not carry the pointer's address
+        // space, so this function cannot tell a global load from a shared one. The conservative
+        // choice is the global figure. See `sm120_simt.shared_latency` for what is missing.
+        .load => sm120_simt.global_latency,
+        // An atomic read-modify-write is DECOUPLED on sm_120, the same latency class as a load
+        // (NAK's sm120_instr_latencies classes `Op::Atom(_) => DecoupledAgu`, cited in
+        // nvidia/schedule.zig), so it is priced the same way and for the same reason.
+        .atomic_rmw => sm120_simt.global_latency,
+        // I2F, F2I and MUFU are all DECOUPLED on sm_120 (NAK's sm120_instr_latencies, cited in
+        // nvidia/schedule.zig), which means there IS no fixed number: the result lands an unknown
+        // number of cycles after issue and the hardware needs a scoreboard, not a stall count. 8 is
+        // a placeholder that says "more than an ALU op" and nothing more.
+        .convert, .unary => 8,
+        // ISETP and SEL are ordinary fixed-pipe ALU instructions, unlike the bookkeeping group.
+        .icmp, .select => 4,
+        // A BAR.SYNC waits for the slowest warp of the workgroup to arrive. That is a property of
+        // the program and not of the instruction, so no per-opcode number can be right. 32 is a
+        // placeholder, kept above the ALU figures so nothing treats a barrier as free.
+        .barrier => 32,
+        // Priced like a multiply because a dot is a multiply-accumulate, but the NVIDIA backend
+        // lowers no `dot`, so this can never price a real one.
+        .dot => 5,
+        // The NVIDIA backend lowers no `matmul`: `gpu.tensor.nvidia` declares no dtype at all, so
+        // `Model.tensor` refuses the op before it is ever built. Placeholder, as on every other
+        // model with no tensor unit.
+        .matmul => 64,
+        // Cheap bookkeeping, or an op no NVIDIA backend lowers. `call`/`call_indirect` are in this
+        // group because the NVIDIA target has NO CALL STACK (nvidia/isel.zig) and refuses both, and
+        // `prefetch` because the backend drops it (see `Model.prefetches`).
+        .iconst, .fconst, .fconst128, .struct_new, .extract, .alloca, .call, .call_indirect, .global_addr, .store, .prefetch, .@"if" => 1,
+        // No backend expands these, and a GPU kernel has no C variadic call anyway.
+        .va_start, .va_arg, .va_end => 1,
+    };
+}
+
+// An SM is throughput hardware: each pipe accepts a new INDEPENDENT instruction on its own schedule
+// while earlier ones are still in flight. This is exactly the property unrolling exploits, and it is
+// why a load prices at 1 here and at hundreds of cycles in `sm120Latency`.
+fn sm120ArithThroughput(op: ir.function.BinOp, elem_float: bool) u32 {
+    _ = elem_float; // the integer and FP pipes are both pipelined, so the element type does not split
+    return switch (op) {
+        .mul, .mulh => 1,
+        // The divide expansion is many instructions, so a second independent divide cannot start
+        // before the first finishes: throughput equals latency, as on every other model.
+        .div, .rem => 64,
+        .add, .sub, .bit_and, .bit_or, .bit_xor, .shl, .shr => 1,
+    };
+}
+
+fn sm120Throughput(op: ir.function.Opcode, elem_float: bool) u32 {
+    return switch (op) {
+        .arith => |a| sm120ArithThroughput(a.op, elem_float),
+        .arith_imm => |a| sm120ArithThroughput(a.op, elem_float),
+        // The load/store unit accepts a new request while earlier ones are outstanding. THIS is the
+        // number the unroll rule is built on: independent loads cost issue slots, not latencies.
+        .load, .atomic_rmw => 1,
+        .convert, .unary => 1,
+        .icmp, .select => 1,
+        // A barrier is not pipelined: a second one cannot start before the first releases.
+        .barrier => 32,
+        .dot => 1,
+        .matmul => 64, // no lowering. Non-pipelined placeholder, as in `sm120Latency`
+        .iconst, .fconst, .fconst128, .struct_new, .extract, .alloca, .call, .call_indirect, .global_addr, .store, .prefetch, .@"if" => 1,
+        .va_start, .va_arg, .va_end => 1,
+    };
+}
+
 fn sharedArithUnit(op: ir.function.BinOp) UnitClass {
     return switch (op) {
         .mul, .mulh, .div, .rem => .muldiv,
@@ -604,6 +702,91 @@ const cascadelake = Model{
     .fusion = &cascadelake_fusion,
 };
 
+/// The sm_120 SM description. Every number carries its source.
+const sm120_simt = model.Simt{
+    // A warp is 32 lanes on every NVIDIA part ever shipped. CUDA C Programming Guide, "Hardware
+    // Implementation". It is also what `vulcan-gpu` already assumes for `lane_id` and for the
+    // warp-collective tensor fragment layout.
+    .warp_size = 32,
+    // Maximum resident warps per SM for compute capability 12.0: 48 (equivalently 1536 resident
+    // threads). CUDA C Programming Guide, "Technical Specifications per Compute Capability". Ada
+    // (8.9) carries the same 48. Hopper and datacenter Blackwell carry 64, so this is a per-part
+    // number and not a family constant.
+    .warps_per_sm = 48,
+    // 64 Ki 32-bit registers per SM. Same table, the "Maximum number of 32-bit registers per SM"
+    // row, which has read 64 K for every compute capability since 7.0.
+    .regfile_per_sm = 65536,
+    // 255 registers per thread. Same table, unchanged since compute capability 3.5. Note that the
+    // allocation granularity below means the largest reachable allocation is 248, not 255.
+    .max_regs_per_thread = 255,
+    // Registers are handed out in multiples of 8 per thread, floor 16. MEASURED on Blackwell
+    // silicon and already relied on by the NVIDIA backend: see `regCount` in nvidia/isel.zig, whose
+    // comment records that a kernel using R14 silently loses it unless the allocation is rounded
+    // this way. Recomputed against that rule by the comptime block below rather than trusted.
+    .reg_alloc_granularity = 8,
+    .min_regs_per_thread = 16,
+    // NOT MEASURED ON THIS PART. NVIDIA publishes no memory latency figure, and this repo has no
+    // sm_120 measurement of one. 500 cycles is the round trip to device memory that the public
+    // microbenchmark literature reports for recent NVIDIA parts (an L2 hit lands near 200 cycles
+    // and a DRAM access near 400 to 600). The unroll rule uses it only through
+    // `unroll.coversLatency`, and on this part that clause never fires, which a comptime block in
+    // unroll.zig asserts rather than assumes: so an error in this figure cannot change a factor
+    // here. It WOULD matter to a part whose warp ceiling is large relative to it.
+    .global_latency = 500,
+    // NOT MEASURED ON THIS PART either. About 30 cycles is what the same literature reports for a
+    // shared-memory load-to-use on Volta and later. It has no consumer today: `Model.latency` is
+    // given an `Opcode`, which does not carry the pointer's address space, so nothing can ask for
+    // the shared figure rather than the global one. It is recorded because it is the number a
+    // shared-memory-aware cost model needs first, and because `validate` uses the two together to
+    // check that they are the right way round.
+    .shared_latency = 30,
+};
+
+comptime {
+    // Assertions that RECOMPUTE, not comments that record. Each line below is a published CUDA
+    // occupancy figure for compute capability 12.0, re-derived from the four fields above. A typo
+    // in the register file size or the warp ceiling fails the build here instead of quietly moving
+    // every unroll factor.
+    if (sm120_simt.residentWarps(32) != 48) @compileError("32 regs/thread must still reach the full 48 resident warps");
+    if (sm120_simt.residentWarps(64) != 32) @compileError("64 regs/thread must give 32 resident warps");
+    if (sm120_simt.residentWarps(128) != 16) @compileError("128 regs/thread must give 16 resident warps");
+    if (sm120_simt.residentWarps(248) != 8) @compileError("the largest reachable allocation must give 8 resident warps");
+    // The granularity is a step, not a rounding detail: asking for one register past a multiple of
+    // 8 costs a whole further multiple, and that is what makes occupancy fall in tiers.
+    if (sm120_simt.allocFor(65) != 72) @compileError("one register past a multiple of 8 must cost the next multiple of 8");
+    if (sm120_simt.allocFor(1) != 16) @compileError("the minimum allocation is 16 registers");
+}
+
+// NVIDIA sm_120. A `simt` model: it describes a streaming multiprocessor, so it carries a `Simt`
+// block and leaves every CPU-only field at zero. `Model.validate` refuses a simt model that sets
+// one, so none of those zeros can later be given a value that only exists to feed a formula.
+//
+// `unitOf` is `unitOfShared` because the unit classes are ISA-neutral (an SM does have ALU, memory
+// and branch pipes), but note that the PORT COUNTS are all zero, so nothing can read a width off
+// this model. The classes are descriptive only here.
+const sm_120 = Model{
+    .tag = .sm_120,
+    .arch = .nvidia,
+    .exec = .simt,
+    .simt = sm120_simt,
+    .issue_width = 0,
+    .rob_size = 0,
+    .units = .{ .alu = 0, .muldiv = 0, .mem = 0, .branch = 0, .fpsimd = 0 },
+    .vector_bits = 0,
+    // The L1 line is 128 bytes, made of four 32-byte sectors which are the granularity a global
+    // access actually moves. CUDA C Programming Guide, "Device Memory Accesses". No pass reads it
+    // for this model today: the only consumer is prefetch insertion, and `Model.prefetches` is
+    // false for NVIDIA.
+    .cache_line = 128,
+    // No loop-header alignment hint: the NVIDIA backend emits no padding and has no alignment hook.
+    .fetch_align = 0,
+    .features = .{ .nvidia = .{} },
+    .latency = sm120Latency,
+    .throughput = sm120Throughput,
+    .unitOf = unitOfShared,
+    .fusion = &.{},
+};
+
 comptime {
     Model.validate(altra);
     Model.validate(etsoc);
@@ -613,6 +796,7 @@ comptime {
     Model.validate(river_f);
     Model.validate(river_ma);
     Model.validate(cascadelake);
+    Model.validate(sm_120);
 }
 
 /// The model for a predefined part. Total, one arm per Microarch.
@@ -626,6 +810,7 @@ pub fn modelFor(tag: Microarch) *const Model {
         .@"river-rc1.f" => &river_f,
         .@"river-rc1.ma" => &river_ma,
         .@"cascadelake-sp" => &cascadelake,
+        .sm_120 => &sm_120,
     };
 }
 
@@ -753,6 +938,48 @@ test "the Ampere and ET-SOC models carry the measured and documented shape" {
     // et-soc's vpu capability is what lets it reach the CORE-ET packed-single unit:
     // vectorize.runModel and the riscv64 backend both gate on this.
     try std.testing.expect(e.vpu());
+}
+
+test "sm_120 is a SIMT model: it carries an SM block and leaves every CPU-only field at zero" {
+    const g = modelFor(.sm_120);
+    try std.testing.expectEqual(model.Arch.nvidia, g.arch);
+    try std.testing.expectEqual(model.ExecMode.simt, g.exec);
+    // Zero here means NOT APPLICABLE, and `Model.validate` refuses a simt model that sets one of
+    // them. These assertions are the runtime half of that refusal.
+    try std.testing.expectEqual(@as(u8, 0), g.issue_width);
+    try std.testing.expectEqual(@as(u16, 0), g.rob_size);
+    try std.testing.expectEqual(@as(u16, 0), g.vector_bits);
+    try std.testing.expectEqual(@as(u8, 0), g.units.alu);
+    try std.testing.expectEqual(@as(usize, 0), g.fusion.len);
+    // So the CPU-shaped queries all answer "no" rather than something derived from a zero.
+    try std.testing.expect(!g.superscalar());
+    try std.testing.expect(!g.reorders());
+    try std.testing.expect(!g.prefetches()); // the NVIDIA backend drops a .prefetch
+    try std.testing.expect(!g.vpu());
+    try std.testing.expect(g.tensor() == null); // no HMMA or IMMA lowering yet
+
+    const s = g.simt.?;
+    try std.testing.expectEqual(@as(u8, 32), s.warp_size);
+    try std.testing.expectEqual(@as(u16, 48), s.warps_per_sm);
+    try std.testing.expectEqual(@as(u32, 65536), s.regfile_per_sm);
+    try std.testing.expectEqual(@as(u16, 255), s.max_regs_per_thread);
+    // The published CUDA occupancy tiers for compute capability 12.0, re-derived from those four.
+    try std.testing.expectEqual(@as(u32, 48), s.residentWarps(32));
+    try std.testing.expectEqual(@as(u32, 32), s.residentWarps(64));
+    try std.testing.expectEqual(@as(u32, 16), s.residentWarps(128));
+    // A load is priced at the global figure, because `latency` is given only an Opcode and an
+    // Opcode does not carry the pointer's address space.
+    try std.testing.expectEqual(s.global_latency, g.latency(.{ .load = .{ .ptr = undefined } }));
+}
+
+test "every CPU model carries no SM block, and only sm_120 does" {
+    // The tie `Model.validate` enforces at compile time, checked once more over the whole registry
+    // so a new model cannot quietly arrive with SM numbers nothing reads.
+    inline for (std.meta.tags(model.Microarch)) |t| {
+        const m = modelFor(t);
+        try std.testing.expectEqual(m.exec == .simt, m.simt != null);
+        if (t != .sm_120) try std.testing.expect(m.simt == null);
+    }
 }
 
 test "cascadelakeDiscriminator matches model 85 with VNNI, rejects Skylake-SP (no VNNI) and other models" {

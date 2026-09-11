@@ -1,18 +1,77 @@
 //! Microarchitecture model: the target-independent data a microarch-aware pass reads. A `Model`
-//! describes one CPU part's execution mode, issue width, functional units, latencies, vector width,
-//! cache geometry, and ISA extensions. It is public and user-constructible, so a caller can hand a
-//! model for a part Vulcan does not ship. There is no generic model, code with no microarch simply
-//! does not run the optimizer.
+//! describes one part's execution mode, latencies and ISA extensions. A CPU part adds its issue
+//! width, functional units, vector width and cache geometry. A SIMT part (a GPU streaming
+//! multiprocessor) has none of those and adds a `Simt` block instead, because what bounds it is the
+//! register budget and the resident warp count. It is public and user-constructible, so a caller
+//! can hand a model for a part Vulcan does not ship. There is no generic model, code with no
+//! microarch simply does not run the optimizer.
 
 const std = @import("std");
 const ir = @import("vulcan-ir");
 const gpu = @import("vulcan-gpu");
 
 /// Which Vulcan backend a model targets.
-pub const Arch = enum { aarch64, riscv64, x86_64 };
+pub const Arch = enum { aarch64, riscv64, x86_64, nvidia };
 
-/// Whether the core reorders instructions in hardware.
-pub const ExecMode = enum { in_order, out_of_order };
+/// How the target issues instructions.
+///
+/// `in_order` and `out_of_order` both describe a CPU core: there is one instruction stream, and the
+/// only question is whether the hardware reorders it. `simt` describes a streaming multiprocessor,
+/// which is a different machine. Many warps share one instruction stream, and the hardware hides a
+/// long latency by switching to another resident warp instead of by reordering. A `simt` model
+/// therefore carries a `Simt` block and leaves every CPU-only field at zero. `Model.validate`
+/// refuses a `simt` model that sets one, so `issue_width` and its neighbours cannot later acquire a
+/// value that is true only as an input to one formula.
+pub const ExecMode = enum { in_order, out_of_order, simt };
+
+/// The execution resources of ONE streaming multiprocessor, for a `simt` model.
+///
+/// An SM hides a memory access by switching to another resident warp, so the count of RESIDENT
+/// warps is the latency-hiding mechanism. That count is set by the register file: it is a fixed
+/// budget and every resident warp takes a share of it, so the more registers a thread holds the
+/// fewer warps stay resident. This is why a SIMT model bounds loop unrolling by the register
+/// budget and not by an issue width, which an SM does not have.
+pub const Simt = struct {
+    /// Lanes in one warp. The register file is charged per warp, so a per-thread register count is
+    /// multiplied by this to get what one warp costs.
+    warp_size: u8,
+    /// The most warps that are resident on one SM at once. This is the ceiling on latency hiding:
+    /// no register budget makes more warps than this available.
+    warps_per_sm: u16,
+    /// 32-bit registers in one SM's register file. This is the budget the resident warps divide.
+    regfile_per_sm: u32,
+    /// The most registers one thread may hold. A kernel that needs more spills to local memory.
+    max_regs_per_thread: u16,
+    /// Registers are given to a thread in multiples of this. A kernel that asks for one register
+    /// more than a multiple pays for the whole next multiple, which is why occupancy falls in steps
+    /// and not smoothly.
+    reg_alloc_granularity: u8,
+    /// The smallest allocation a thread gets, whatever it asks for.
+    min_regs_per_thread: u16,
+    /// Cycles from issue to result for a load that misses to device memory.
+    global_latency: u32,
+    /// Cycles from issue to result for a load from the SM's own shared memory.
+    shared_latency: u32,
+
+    /// What a thread that asks for `regs` registers actually costs: rounded up to
+    /// `reg_alloc_granularity`, and never below `min_regs_per_thread`. The rounding is the whole
+    /// reason occupancy is a step function, so a caller must price a thread through this and never
+    /// with the raw count.
+    pub fn allocFor(self: Simt, regs: u32) u32 {
+        const g: u32 = self.reg_alloc_granularity;
+        const rounded = (regs + g - 1) / g * g;
+        return @max(@as(u32, self.min_regs_per_thread), rounded);
+    }
+
+    /// How many warps stay resident on one SM when each thread asks for `regs` registers: the
+    /// register file divided by what one warp costs, capped by the hardware's own resident-warp
+    /// ceiling. `regs` is the RAW request, rounded through `allocFor` here.
+    pub fn residentWarps(self: Simt, regs: u32) u32 {
+        const per_warp = self.allocFor(regs) * @as(u32, self.warp_size);
+        const by_budget = self.regfile_per_sm / per_warp;
+        return @min(@as(u32, self.warps_per_sm), by_budget);
+    }
+};
 
 /// The functional-unit class an IR op binds to, for port-pressure modeling.
 pub const UnitClass = enum { alu, muldiv, mem, branch, fpsimd, none };
@@ -62,6 +121,13 @@ pub const Features = union(Arch) {
         avx512vnni: bool = false,
         bmi2: bool = false,
     },
+    /// NVIDIA ships no feature bit yet. Every capability the NVIDIA backend gates on today is a
+    /// property of one instruction encoder and not of the model, and the tensor-core dtype set is
+    /// already described by `vulcan-gpu.tensor`. An empty struct says that honestly. A bit belongs
+    /// here only when a pass reads it to make a different choice.
+    ///
+    /// The field ORDER of this union must match `Arch`'s, so `nvidia` is last in both.
+    nvidia: struct {},
 };
 
 /// An abstract fusible pair category. A backend maps each to its concrete instruction pattern.
@@ -79,6 +145,7 @@ pub const Microarch = enum {
     @"river-rc1.f",
     @"river-rc1.ma",
     @"cascadelake-sp",
+    sm_120,
 
     pub fn parse(name_: []const u8) ?Microarch {
         return std.meta.stringToEnum(Microarch, name_);
@@ -94,6 +161,9 @@ pub const Model = struct {
     tag: Microarch,
     arch: Arch,
     exec: ExecMode,
+    /// The SM description, set for a `simt` model and null for every CPU model. `validate` ties it
+    /// to `exec` in both directions, so `exec == .simt` and `simt != null` can never disagree.
+    simt: ?Simt = null,
     issue_width: u8,
     rob_size: u16,
     units: Units,
@@ -153,6 +223,10 @@ pub const Model = struct {
             .aarch64 => true,
             .riscv64 => self.features.riscv64.zicbop,
             .x86_64 => false,
+            // The NVIDIA backend drops a `.prefetch` at emission. There is no CPU-style prefetch
+            // instruction on this GPU to lower one to (see nvidia/isel.zig), so inserting one is
+            // pure overhead: extra IR and extra address arithmetic for nothing.
+            .nvidia => false,
         };
     }
 
@@ -162,7 +236,7 @@ pub const Model = struct {
     pub fn vpu(self: *const Model) bool {
         return switch (self.features) {
             .riscv64 => |f| f.vpu,
-            .aarch64, .x86_64 => false,
+            .aarch64, .x86_64, .nvidia => false,
         };
     }
 
@@ -177,6 +251,10 @@ pub const Model = struct {
     /// The descriptor answers which dtypes, tiles and epilogues the target takes, and it records
     /// the alignment and the register ownership that no query over the IR can decide. See
     /// `vulcan-gpu.tensor`.
+    ///
+    /// An NVIDIA model gets null, which is the same answer `gpu.tensor.nvidia` gives: that
+    /// descriptor lowers no dtype at all (`lowersAny()` is false) because the NVIDIA backend has no
+    /// HMMA and no IMMA case yet. Both say "raise no matmul for this target".
     pub fn tensor(self: *const Model) ?*const gpu.tensor.Tensor {
         if (self.vpu()) return &gpu.tensor.et_soc;
         return null;
@@ -194,6 +272,37 @@ pub const Model = struct {
         @setEvalBranchQuota(4000); // the per-BinOp throughput<=latency sweep below grows with the enum
         if (m.exec == .in_order and m.rob_size != 0)
             @compileError("in-order model must have rob_size 0");
+        // A SIMT model and its `Simt` block are tied in BOTH directions, so no model can claim an
+        // SM without describing one, and no CPU model can carry SM numbers that nothing reads.
+        if ((m.exec == .simt) != (m.simt != null))
+            @compileError("exec == .simt and a non-null simt block must agree");
+        if (m.simt) |s| {
+            // An SM has no issue width, no reorder buffer, no vector register width, no
+            // functional-unit port table and no macro-op fusion. Zero is NOT APPLICABLE here, and
+            // this refusal is what stops one of them being filled in later with a number that is
+            // true only because it makes some formula produce a wanted answer.
+            if (m.issue_width != 0 or m.rob_size != 0 or m.vector_bits != 0)
+                @compileError("simt model must leave issue_width, rob_size and vector_bits 0: an SM has none of them");
+            if (m.units.alu != 0 or m.units.muldiv != 0 or m.units.mem != 0 or m.units.branch != 0 or m.units.fpsimd != 0)
+                @compileError("simt model must leave every Units port count 0: an SM has no port table");
+            if (m.fusion.len != 0)
+                @compileError("simt model must declare no macro-op fusion");
+            // The occupancy arithmetic divides by all four of these, so none may be zero.
+            if (s.warp_size == 0 or s.warps_per_sm == 0 or s.regfile_per_sm == 0 or s.max_regs_per_thread == 0)
+                @compileError("simt model needs a nonzero warp_size, warps_per_sm, regfile_per_sm and max_regs_per_thread");
+            if (s.reg_alloc_granularity == 0 or @popCount(s.reg_alloc_granularity) != 1)
+                @compileError("reg_alloc_granularity must be a power of two");
+            if (s.min_regs_per_thread == 0 or s.min_regs_per_thread % s.reg_alloc_granularity != 0)
+                @compileError("min_regs_per_thread must be a nonzero multiple of reg_alloc_granularity");
+            // The smallest allocation must leave room for the full warp ceiling, or the part could
+            // never reach its own stated occupancy and `warps_per_sm` would be fiction.
+            if (s.residentWarps(0) != s.warps_per_sm)
+                @compileError("a thread at the minimum allocation must reach warps_per_sm: the stated ceiling is unreachable");
+            // A shared-memory access is served inside the SM and a global one leaves it, so the
+            // shared figure is the smaller of the two on every part that has both.
+            if (s.shared_latency >= s.global_latency)
+                @compileError("shared_latency must be below global_latency");
+        }
         if (m.units.fpsimd == 0 and m.vector_bits != 0)
             @compileError("no fpsimd ports but nonzero vector_bits");
         if (m.fetch_align != 0 and @popCount(m.fetch_align) != 1)
@@ -211,7 +320,7 @@ pub const Model = struct {
                 if (m.fuses(.shift_add) and !f.zba)
                     @compileError("riscv64 model declares shift_add fusion but lacks Zba");
             },
-            .x86_64 => {},
+            .x86_64, .nvidia => {},
         }
         // The throughput <= latency invariant, checked over the ops the cost model actually weights:
         // every arith BinOp (including the mul/div a model may mark non-pipelined) plus a load, and for
@@ -464,6 +573,41 @@ test "cascadelake-sp tag parses and x86_64 Features carries the avx512 gating fl
     const f: Features = .{ .x86_64 = .{ .avx512vnni = true, .fma = true } };
     try std.testing.expect(f.x86_64.avx512vnni and f.x86_64.fma);
     try std.testing.expect(!f.x86_64.avx2); // defaults false
+}
+
+/// An SM block with round numbers, for the arithmetic tests below. Not a real part: 64 warps, a
+/// 65536-register file, 32 lanes, granularity 8, floor 16.
+const test_simt = Simt{
+    .warp_size = 32,
+    .warps_per_sm = 64,
+    .regfile_per_sm = 65536,
+    .max_regs_per_thread = 255,
+    .reg_alloc_granularity = 8,
+    .min_regs_per_thread = 16,
+    .global_latency = 500,
+    .shared_latency = 30,
+};
+
+test "Simt.allocFor rounds a request up to the granularity and never below the minimum" {
+    // The rounding is the reason occupancy falls in steps: one register past a multiple costs the
+    // whole next multiple.
+    try std.testing.expectEqual(@as(u32, 16), test_simt.allocFor(0));
+    try std.testing.expectEqual(@as(u32, 16), test_simt.allocFor(1));
+    try std.testing.expectEqual(@as(u32, 16), test_simt.allocFor(16));
+    try std.testing.expectEqual(@as(u32, 24), test_simt.allocFor(17));
+    try std.testing.expectEqual(@as(u32, 32), test_simt.allocFor(32));
+    try std.testing.expectEqual(@as(u32, 40), test_simt.allocFor(33));
+}
+
+test "Simt.residentWarps divides the register file and is capped by the warp ceiling" {
+    // 65536 registers / (32 lanes * regs) warps, capped at 64.
+    try std.testing.expectEqual(@as(u32, 64), test_simt.residentWarps(16)); // budget would allow 128
+    try std.testing.expectEqual(@as(u32, 64), test_simt.residentWarps(32)); // budget allows exactly 64
+    try std.testing.expectEqual(@as(u32, 32), test_simt.residentWarps(64));
+    try std.testing.expectEqual(@as(u32, 16), test_simt.residentWarps(128));
+    // The step: 64 registers holds 32 warps, and asking for ONE more drops it to 28, because the
+    // request rounds up to 72.
+    try std.testing.expectEqual(@as(u32, 28), test_simt.residentWarps(65));
 }
 
 fn testLatency(op: ir.function.Opcode) u32 {

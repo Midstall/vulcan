@@ -128,6 +128,14 @@ pub fn classPorts(model: *const Model, class: UnitClass) u32 {
 
 /// Schedule every block of `func` in place for `model`.
 pub fn run(allocator: std.mem.Allocator, func: *Function, model: *const Model) std.mem.Allocator.Error!void {
+    // A SIMT target schedules itself, and the two schedulers would fight. This pass reorders IR by
+    // functional-unit latency and port count, neither of which an SM has. The NVIDIA backend then
+    // does the real work in nvidia/schedule.zig, over SASS, with the hardware's own mechanisms:
+    // six scoreboards, per-instruction stall counts and convergence barriers. Reordering the IR
+    // first would move instructions the backend must then re-derive barriers for, with no model of
+    // what it costs. Refusing here and not in the caller keeps every caller covered, including a
+    // backend that delegates to this pass the way riscv64/schedule.zig does.
+    if (model.exec == .simt) return;
     for (0..func.blockCount()) |bi| {
         try scheduleBlock(allocator, func, @enumFromInt(bi), model);
     }
@@ -295,6 +303,36 @@ test "issues independent high-latency ops early to hide latency (single-issue ri
         func.definingInst(v2).?, func.definingInst(v4).?, func.definingInst(v3).?,
         func.definingInst(v5).?, func.definingInst(v6).?,
     }, func.blockInsts(block));
+}
+
+test "a SIMT model is refused: the NVIDIA backend owns SASS scheduling and the two would fight" {
+    // The same block twice. Under a CPU model the two multiplies hoist ahead of the adds that
+    // depend on them (proven by the river test above). Under sm_120 the order must be EXACTLY as
+    // built, because nvidia/schedule.zig schedules SASS itself with scoreboards, stall counts and
+    // convergence barriers, and this pass has no model of any of them.
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const block = try func.appendBlock();
+    const v0 = try func.appendBlockParam(block, i32_t);
+    const v1 = try func.appendBlockParam(block, i32_t);
+    const v2 = try func.appendInst(block, i32_t, .{ .arith = .{ .op = .mul, .lhs = v0, .rhs = v1 } });
+    const v3 = try func.appendInst(block, i32_t, .{ .arith = .{ .op = .add, .lhs = v2, .rhs = v0 } });
+    const v4 = try func.appendInst(block, i32_t, .{ .arith = .{ .op = .mul, .lhs = v0, .rhs = v0 } });
+    const v5 = try func.appendInst(block, i32_t, .{ .arith = .{ .op = .add, .lhs = v4, .rhs = v1 } });
+    const v6 = try func.appendInst(block, i32_t, .{ .arith = .{ .op = .add, .lhs = v3, .rhs = v5 } });
+    func.setTerminator(block, .{ .ret = ir.function.Ret.one(v6) });
+
+    const before = try std.testing.allocator.dupe(Inst, func.blockInsts(block));
+    defer std.testing.allocator.free(before);
+
+    try run(std.testing.allocator, &func, registry.modelFor(.sm_120));
+    try expectEqualSlices(Inst, before, func.blockInsts(block));
+
+    // The same block under a CPU model DOES move, so the test above is proving a refusal and not
+    // an input this pass would have left alone anyway.
+    try run(std.testing.allocator, &func, registry.modelFor(.@"river-rc1.s"));
+    try std.testing.expect(!std.mem.eql(Inst, before, func.blockInsts(block)));
 }
 
 test "a dependent chain stays in order and verifies for a wide out-of-order model" {

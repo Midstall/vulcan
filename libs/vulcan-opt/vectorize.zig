@@ -117,6 +117,10 @@ pub fn runModel(allocator: std.mem.Allocator, func: *Function, model: *const mm.
         .aarch64 => |f| f.neon,
         .riscv64 => |f| f.v or f.vpu,
         .x86_64 => false,
+        // An NVIDIA model vectorizes nothing here: a warp lane IS the vector lane on an SM, so
+        // packing several f32 into one IR vector op describes the wrong machine and the NVIDIA
+        // backend has no lowering for one.
+        .nvidia => false,
     };
     if (!vec_ok) return false;
     if (model.vector_bits < 2 * ELEM_BITS) return false;
