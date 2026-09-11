@@ -96,6 +96,15 @@ pub fn decodeOne(w: encode.Inst) Inst {
     const srcC: u8 = @intCast(getBits(w, 64, 8));
     const form = getBits(w, 9, 3);
 
+    // The ALU source FORM in bits 9..11 decides what bits 32..63 hold. Form 1 puts a
+    // REGISTER srcB at bit 32. Forms 2 and 4 put a 32-BIT IMMEDIATE across 32..63, so
+    // bits 32..39 are the low byte of that immediate and NOT a register number.
+    // Reading them as a register names a register the instruction never touches, which
+    // is how a constant such as 0.25 becomes a phantom source in the listing. Only the
+    // ALU family carries this field, so the non-ALU decoders keep reading `srcB`.
+    const alu_imm_form = form == 2 or form == 4;
+    const aluB: u8 = if (alu_imm_form) RZ else srcB;
+
     // ALU-family ops carry the source FORM in bits 9..11, so their full low-12-bit
     // value is `base | form << 9` (e.g. MOV.imm = 0x002 | 4<<9 = 0x802, IADD3.reg =
     // 0x010 | 1<<9 = 0x210, MUFU = 0x108 | 1<<9 = 0x308). The non-ALU ops below set
@@ -192,87 +201,99 @@ pub fn decodeOne(w: encode.Inst) Inst {
             d.dst = dst; // dst[0] = R,G and dst+2 (bit 64) = B,A
             d.srcs = .{ srcA, srcB, RZ, RZ }; // coord pair @24, handle @32
         },
-        else => switch (base9) {
-            // ALU MOV: form 4 = immediate, form 1 = register copy.
-            0x002 => {
-                d.dst = dst;
-                if (form == 4) {
-                    d.mnemonic = "MOV.imm";
-                    d.imm = @intCast(getBits(w, 32, 32)); // 32-bit immediate value
-                    d.has_imm = true;
-                } else {
-                    d.mnemonic = "MOV";
-                    d.srcs[0] = srcB; // movReg sources at bit 32
-                }
-            },
-            0x010 => { // IADD3 (and ISUB / carry variants)
-                d.mnemonic = if (getBits(w, 63, 1) != 0) "IADD3.sub" else "IADD3";
-                d.dst = dst;
-                d.srcs = .{ srcA, srcB, RZ, RZ };
-            },
-            0x012 => { // LOP3.LUT
-                d.mnemonic = "LOP3";
-                d.dst = dst;
-                d.srcs = .{ srcA, srcB, RZ, RZ };
-            },
-            0x00c => { // ISETP -> predicate
-                d.mnemonic = "ISETP";
-                d.dst_pred = @intCast(getBits(w, 81, 3));
-                d.srcs = .{ srcA, srcB, RZ, RZ };
-            },
-            0x00b => { // FSETP (float set-predicate) -> predicate
-                d.mnemonic = "FSETP";
-                d.dst_pred = @intCast(getBits(w, 81, 3));
-                d.srcs = .{ srcA, srcB, RZ, RZ };
-            },
-            0x007 => { // SEL
-                d.mnemonic = "SEL";
-                d.dst = dst;
-                d.srcs = .{ srcA, srcB, RZ, RZ };
-            },
-            0x019 => { // SHF
-                d.mnemonic = if (getBits(w, 76, 1) != 0) "SHF.R" else "SHF.L";
-                d.dst = dst;
-                d.srcs = .{ srcA, srcB, srcC, RZ };
-            },
-            0x021 => {
-                d.mnemonic = if (getBits(w, 63, 1) != 0) "FADD.sub" else "FADD";
-                d.dst = dst;
-                d.srcs = .{ srcA, srcB, RZ, RZ };
-            },
-            0x020 => {
-                d.mnemonic = "FMUL";
-                d.dst = dst;
-                d.srcs = .{ srcA, srcB, RZ, RZ };
-            },
-            0x023 => {
-                d.mnemonic = "FFMA";
-                d.dst = dst;
-                d.srcs = .{ srcA, srcB, srcC, RZ };
-            },
-            0x024 => {
-                d.mnemonic = "IMAD";
-                d.dst = dst;
-                d.srcs = .{ srcA, srcB, srcC, RZ };
-            },
-            0x106 => {
-                d.mnemonic = "I2F";
-                d.dst = dst;
-                d.srcs = .{ srcB, RZ, RZ, RZ }; // i2f sources at bit 32
-            },
-            0x105 => {
-                d.mnemonic = "F2I";
-                d.dst = dst;
-                d.srcs = .{ srcB, RZ, RZ, RZ };
-            },
-            0x108 => { // MUFU (encode emits the register form -> full op 0x308)
-                d.mnemonic = "MUFU";
-                d.dst = dst;
-                d.srcs = .{ srcB, RZ, RZ, RZ };
-            },
-            else => {
-                d.mnemonic = "??";
-            },
+        else => {
+            // Every arm below is ALU family, so the immediate form applies here and
+            // nowhere else. A non-ALU opcode sets all 12 bits directly, and its bits
+            // 9..11 are part of the opcode rather than a form (LDG 0x981 reads as
+            // form 4), so this must NOT be tested outside this branch.
+            switch (base9) {
+                // ALU MOV: form 4 = immediate, form 1 = register copy.
+                0x002 => {
+                    d.dst = dst;
+                    if (form == 4) {
+                        d.mnemonic = "MOV.imm";
+                        d.imm = @intCast(getBits(w, 32, 32)); // 32-bit immediate value
+                        d.has_imm = true;
+                    } else {
+                        d.mnemonic = "MOV";
+                        d.srcs[0] = srcB; // movReg sources at bit 32
+                    }
+                },
+                0x010 => { // IADD3 (and ISUB / carry variants)
+                    d.mnemonic = if (getBits(w, 63, 1) != 0) "IADD3.sub" else "IADD3";
+                    d.dst = dst;
+                    d.srcs = .{ srcA, aluB, RZ, RZ };
+                },
+                0x012 => { // LOP3.LUT
+                    d.mnemonic = "LOP3";
+                    d.dst = dst;
+                    d.srcs = .{ srcA, aluB, RZ, RZ };
+                },
+                0x00c => { // ISETP -> predicate
+                    d.mnemonic = "ISETP";
+                    d.dst_pred = @intCast(getBits(w, 81, 3));
+                    d.srcs = .{ srcA, aluB, RZ, RZ };
+                },
+                0x00b => { // FSETP (float set-predicate) -> predicate
+                    d.mnemonic = "FSETP";
+                    d.dst_pred = @intCast(getBits(w, 81, 3));
+                    d.srcs = .{ srcA, aluB, RZ, RZ };
+                },
+                0x007 => { // SEL
+                    d.mnemonic = "SEL";
+                    d.dst = dst;
+                    d.srcs = .{ srcA, aluB, RZ, RZ };
+                },
+                0x019 => { // SHF
+                    d.mnemonic = if (getBits(w, 76, 1) != 0) "SHF.R" else "SHF.L";
+                    d.dst = dst;
+                    d.srcs = .{ srcA, aluB, srcC, RZ };
+                },
+                0x021 => {
+                    d.mnemonic = if (getBits(w, 63, 1) != 0) "FADD.sub" else "FADD";
+                    d.dst = dst;
+                    d.srcs = .{ srcA, aluB, RZ, RZ };
+                },
+                0x020 => {
+                    d.mnemonic = "FMUL";
+                    d.dst = dst;
+                    d.srcs = .{ srcA, aluB, RZ, RZ };
+                },
+                0x023 => {
+                    d.mnemonic = "FFMA";
+                    d.dst = dst;
+                    d.srcs = .{ srcA, aluB, srcC, RZ };
+                },
+                0x024 => {
+                    d.mnemonic = "IMAD";
+                    d.dst = dst;
+                    d.srcs = .{ srcA, aluB, srcC, RZ };
+                },
+                0x106 => {
+                    d.mnemonic = "I2F";
+                    d.dst = dst;
+                    d.srcs = .{ aluB, RZ, RZ, RZ }; // i2f sources at bit 32
+                },
+                0x105 => {
+                    d.mnemonic = "F2I";
+                    d.dst = dst;
+                    d.srcs = .{ aluB, RZ, RZ, RZ };
+                },
+                0x108 => { // MUFU (encode emits the register form -> full op 0x308)
+                    d.mnemonic = "MUFU";
+                    d.dst = dst;
+                    d.srcs = .{ aluB, RZ, RZ, RZ };
+                },
+                else => {
+                    d.mnemonic = "??";
+                },
+            }
+            // The operand those 32..63 bits actually hold. `aluB` has already kept it
+            // out of `srcs`; this reports the value itself. MOV.imm sets it already.
+            if (alu_imm_form and !d.has_imm) {
+                d.imm = @intCast(getBits(w, 32, 32));
+                d.has_imm = true;
+            }
         },
     }
     return d;
@@ -513,4 +534,50 @@ test "format produces a readable listing with registers and barriers" {
     try std.testing.expect(std.mem.indexOf(u8, txt, "IMAD R5") != null);
     try std.testing.expect(std.mem.indexOf(u8, txt, "wait=0x1") != null);
     try std.testing.expect(std.mem.indexOf(u8, txt, "EXIT") != null);
+}
+
+test "an immediate ALU operand is not decoded as a source register" {
+    // Bits 32..63 of an immediate-form ALU instruction hold the operand. Before this
+    // was form-aware, the decoder read bits 32..39 as a register, so the low byte of
+    // the constant became a phantom source. The immediate here is chosen so that low
+    // byte is a PLAUSIBLE register number: 0x00000011 would read as R17. A test whose
+    // immediate had a zero low byte would pass against the broken decoder too.
+    const imm: u32 = 0x00000011;
+
+    const add = decodeOne(encode.faddImm(6, 4, imm, .{}));
+    try std.testing.expectEqualStrings("FADD", add.mnemonic);
+    try std.testing.expectEqual(@as(u8, 6), add.dst);
+    try std.testing.expectEqual(@as(u8, 4), add.srcs[0]); // the real register source
+    try std.testing.expectEqual(RZ, add.srcs[1]); // NOT R17
+    try std.testing.expect(add.has_imm);
+    try std.testing.expectEqual(imm, add.imm);
+
+    const mul = decodeOne(encode.fmulImm(7, 5, imm, .{}));
+    try std.testing.expectEqual(RZ, mul.srcs[1]);
+    try std.testing.expectEqual(imm, mul.imm);
+
+    const iadd = decodeOne(encode.iadd3Imm(8, 9, imm, .{}));
+    try std.testing.expectEqual(@as(u8, 9), iadd.srcs[0]);
+    try std.testing.expectEqual(RZ, iadd.srcs[1]);
+    try std.testing.expectEqual(imm, iadd.imm);
+
+    // The REGISTER form must still report its register. A decoder that simply stopped
+    // reading bits 32..39 would pass every assertion above and break every one here,
+    // so this is the guard in the other direction.
+    const add_reg = decodeOne(encode.fadd(6, 4, 17, .{}));
+    try std.testing.expectEqual(@as(u8, 4), add_reg.srcs[0]);
+    try std.testing.expectEqual(@as(u8, 17), add_reg.srcs[1]);
+    try std.testing.expect(!add_reg.has_imm);
+
+    const imad_reg = decodeOne(encode.imad(5, 4, 6, 7, .{}));
+    try std.testing.expectEqual(@as(u8, 6), imad_reg.srcs[1]);
+    try std.testing.expectEqual(@as(u8, 7), imad_reg.srcs[2]);
+    try std.testing.expect(!imad_reg.has_imm);
+
+    // A NON-ALU opcode must be untouched. LDG is 0x981, whose bits 9..11 read as 4,
+    // the same value form 4 uses. Testing the form outside the ALU branch would give
+    // it a phantom immediate.
+    const ldg = decodeOne(encode.ldgU32(4, 6, .{}));
+    try std.testing.expectEqualStrings("LDG", ldg.mnemonic);
+    try std.testing.expect(!ldg.has_imm);
 }
