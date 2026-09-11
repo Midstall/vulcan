@@ -42,7 +42,15 @@
 //! CLOBBERED address every time, and no fault. ptxas assigns a read barrier to exactly this
 //! shape, and so does NAK (`calc_instr_deps.rs`, `assign_barriers`).
 //!
-//! Limits: stall delays are left as the isel set them.
+//! Two more passes run beside the scoreboard walk, both inside `scheduleBlocks` so the
+//! isel's single call site gets them with no new wiring:
+//!
+//!   - `assignStalls` computes the stall field from the COUPLED (fixed-latency)
+//!     producers each source register waits on. Before it, every instruction carried the
+//!     `Control` default of 15, which is correct and about fifteen times slower than
+//!     ptxas on a dependent chain.
+//!   - `markReuse` sets the operand-reuse bits at 122..125 for the source slots a later
+//!     instruction in the same block reads again, the policy ptxas follows on sm_120.
 
 const std = @import("std");
 const encode = @import("encode.zig");
@@ -884,6 +892,15 @@ pub fn scheduleBlocks(insts: []Inst, block_starts: []const usize) void {
             }
         }
     }
+
+    // The stall and reuse passes run on the FINAL stream, after every wait mask and
+    // barrier above is settled: the stall model reads the wait masks (an instruction
+    // that waits on a scoreboard keeps its computed stall, which the scoreboard wait
+    // makes sound), and the reuse scan must see the block starts exactly as the
+    // scoreboard walk did. Both live inside `scheduleBlocks` because the isel calls it
+    // exactly once on the finished code, so every caller gets them without new wiring.
+    assignStalls(insts);
+    markReuse(insts, block_starts, entry_start);
 }
 
 /// Whether `opcode` reads its GPR sources AFTER it issues, so an instruction that
@@ -1049,6 +1066,412 @@ fn drainAll(inst: *Inst, scoreboard_of: *[256]u8, read_scoreboard_of: *[256]u8, 
     @memset(scoreboard_of, 0);
     @memset(read_scoreboard_of, 0);
     free_mask.* = (1 << num_scoreboards) - 1;
+}
+
+/// Whether `opcode` is one of the memory, control-flow, attribute, texture or tensor
+/// opcodes `readsSrc` names its own source fields for. Everything else is an ALU op
+/// whose three source fields follow the shared layout: srcA at bit 24, and srcB and
+/// srcC at bits 32 and 64 in an order the form bits pick.
+///
+/// THE LIST MUST STAY IN LOCKSTEP WITH THE ARMS OF `readsSrc`. Each arm there states
+/// the source layout of one opcode that is not an ALU op, and this predicate is the
+/// complement of that set. An opcode added there and not here would let `markReuse`
+/// read a field that holds no register, and one added here and not there would make
+/// `markReuse` skip an ALU op it could have marked. The encoder emits only the opcodes
+/// both lists name, so the two cannot drift apart silently.
+fn isAluOp(opcode: u32) bool {
+    return switch (opcode) {
+        0x355, 0x945, 0x941, 0xb1d => false, // BCLEAR, BSSY, BSYNC, BAR
+        0x326, 0x919 => false, // IPA, S2R
+        0x947, 0x94d, 0x95b => false, // BRA, EXIT, KIL
+        0x81c => false, // PLOP3
+        0x202, 0x802 => false, // MOV, register and immediate form
+        0xb82, 0x321, 0x322 => false, // LDC, ALD, AST
+        0xf89, 0x822 => false, // SHFL, FSWZADD
+        0x981, 0x984 => false, // LDG, LDS
+        0x986, 0x988, encode.RED_OPCODE => false, // STG, STS, RED
+        encode.ATOMG_OPCODE, encode.ATOMS_OPCODE => false,
+        encode.ATOMG_CAS_OPCODE, encode.ATOMS_CAS_OPCODE => false,
+        encode.HMMA_OPCODE, encode.IMMA_OPCODE => false,
+        encode.LDSM_OPCODE, encode.MOVM_OPCODE => false,
+        encode.TEX_OPCODE, encode.TLD4_OPCODE, encode.TLD_OPCODE => false,
+        else => true,
+    };
+}
+
+/// Which of the three ALU source slots the field at bit `pos` holds, in the instruction
+/// form `form`. 0 is srcA, 1 is srcB, 2 is srcC. Null when the field holds no register:
+/// the immediate in forms 2 and 4 sits at bits 32..63, and a form this backend never
+/// emits has no meaning here.
+///
+/// WHICH LOGICAL SOURCE A FIELD HOLDS, AND NOT WHICH FIELD, IS WHAT THE REUSE BIT
+/// SELECTS. The bits at 122..125 are keyed by logical source: 122 marks srcA, 123 marks
+/// srcB and 124 marks srcC. Measured on sm_120 against ptxas output: a form 4 FFMA chain
+/// sharing its ADDEND register at bits 64..71 (logical srcC) sets bit 124, ptxas k2n's
+/// form 2 FFMA chain with its MULTIPLIER register at bits 64..71 (logical srcB) sets bit
+/// 123, and IMAD.WIDE and IADD chains with the shared register at bits 24..31 (srcA) set
+/// bit 122. The 12-bit FFMA opcodes pin the same two forms from the other side: 0x823 is
+/// form 4 and 0x423 is form 2, and ptxas emits 0x423 for the contracted
+/// `acc = acc * k1 + k2` loop shape.
+fn aluSrcSlot(pos: usize, form: u32) ?u2 {
+    if (pos == 24) return 0; // srcA, in every form
+    if (pos == 32) return if (form == 1) 1 else null; // srcB, in the all-register form
+    if (pos == 64) return if (form == 2) 1 else 2; // srcB in form 2, srcC otherwise
+    return null;
+}
+
+/// Whether `opcode` is control flow the stall model leaves alone, keeping the value the
+/// isel chose. ptxas emits non-trivial stalls on these (a loop branch carries 6 and an
+/// EXIT 5 in every measured sm_120 stream), and their latency has no model here, so the
+/// isel's choice stands rather than a guess.
+fn isControlFlow(opcode: u32) bool {
+    return switch (opcode) {
+        0x947, 0x94d, 0x95b => true, // BRA, EXIT, KIL
+        0x945, 0x941, 0x355 => true, // BSSY, BSYNC, BCLEAR
+        0xb1d => true, // BAR
+        else => false,
+    };
+}
+
+/// The latency of a COUPLED producer, in cycles, for the stall model. Two classes cover
+/// every coupled op this backend emits: the FMA pipe and everything else.
+///
+/// THE VALUES ARE CALIBRATED AGAINST PTXAS OUTPUT, NOT DERIVED FROM A MANUAL. The FMA
+/// anchor is ptxas's own dependent chains on sm_120: a back-to-back pair carries stall 4
+/// and a four-accumulator chain carries stall 1, and both give a latency of 5. The ALU
+/// anchor is the integer half of the same streams: an IMAD whose result a LEA reads one
+/// instruction later carries stall 5, and ptxas k2n's IMAD.WIDE whose store reads it two
+/// instructions later carries stall 4, and both give a latency of 6. A first version of
+/// this model took 4 for the ALU class, and every hardware test with an integer address
+/// chain came back reading a stale register, which the RTX 5070 confirmed directly.
+const coupled_fma_latency: u32 = 5;
+const coupled_alu_latency: u32 = 6;
+
+fn coupledLatency(opcode: u32) u32 {
+    return switch (opcode & 0x1ff) {
+        0x020, 0x021, 0x023 => coupled_fma_latency, // FMUL, FADD, FFMA
+        else => coupled_alu_latency,
+    };
+}
+
+/// The predicate a coupled instruction WRITES, or null when it writes none.
+///
+/// IADD3's carry-out sits at bits 81..83, and the isel reserves P6 for the carry chain
+/// and nothing else, so an IADD3 writes a predicate only when that field names P6: a
+/// plain IADD3 leaves the field at zero, which is P0, and would otherwise look like a
+/// write of P0. ISETP, FSETP and PLOP3 write their result predicate in the same field,
+/// and their results always come from the P0..P5 pool.
+fn predWritten(inst: Inst, opcode: u32) ?u8 {
+    const base = opcode & 0x1ff;
+    switch (base) {
+        0x010 => { // IADD3
+            const p: u8 = @intCast(getField(inst, 81, 3));
+            return if (p == encode.PT or p != carry_pred) null else p;
+        },
+        0x00c, 0x00b, 0x81c => { // ISETP, FSETP, PLOP3
+            const p: u8 = @intCast(getField(inst, 81, 3));
+            return if (p == encode.PT) null else p;
+        },
+        else => return null,
+    }
+}
+
+/// The carry-chain predicate, which the isel reserves for the 64-bit IADD3 add.
+const carry_pred: u8 = 6;
+
+/// Whether `inst` READS the predicate `pred`, through any of the three read points this
+/// backend emits: the guard predicate at bits 12..14, the SEL predicate at 87..89, and
+/// the IADD3.X carry-in at 87..89, which bit 74 gates.
+fn predRead(inst: Inst, pred: u8) bool {
+    const guard: u8 = @intCast(getField(inst, 12, 3));
+    if (guard != encode.PT and guard == pred) return true;
+    const base = getField(inst, 0, 12) & 0x1ff;
+    if (base == 0x007) { // SEL
+        const p: u8 = @intCast(getField(inst, 87, 3));
+        if (p != encode.PT and p == pred) return true;
+    }
+    if (base == 0x010 and getField(inst, 74, 1) == 1) { // IADD3.X reads its carry-in
+        const p: u8 = @intCast(getField(inst, 87, 3));
+        if (p != encode.PT and p == pred) return true;
+    }
+    return false;
+}
+
+/// Compute the stall field of every instruction the model covers, replacing the
+/// `Control` default of 15 the isel leaves.
+///
+/// THE STALL IS A DELAY THE WARP TAKES AFTER THE INSTRUCTION ISSUES, NOT A WAIT BEFORE
+/// IT. The hardware proved the direction: a first version of this pass put the computed
+/// wait on the READING instruction, ten kernels on the RTX 5070 returned wrong values,
+/// and the same kernels with the wait moved to the PRODUCING instruction pass. A stall on
+/// instruction i delays the issue of instruction i+1, so a coupled producer must carry
+/// the delay that covers its own result: the consumer reads its operands at issue, and
+/// only a delay in front of that issue protects the read.
+///
+/// The stall of a coupled producer is its LATENCY MINUS THE DISTANCE to the first
+/// instruction that reads or overwrites its register. A warp issues at most one
+/// instruction per cycle, so one cycle per instruction is a lower bound on the time
+/// between two issues, and every instruction between the producer and its first consumer
+/// adds at least one cycle. The delay therefore covers the dependency exactly, and any
+/// stall another instruction carries only adds more. That is the direction of safety:
+/// a stall that is too long costs cycles, and one that is too short reads a register
+/// before its value lands.
+///
+/// THE CALIBRATION: ptxas k2n's FFMA chain on sm_120 is sixteen FFMA over four
+/// independent accumulators, each result read four instructions later, and every FFMA
+/// carries stall 1. This model gives latency 5 minus distance 4, which is 1, the ptxas
+/// value. A back-to-back dependent pair gives 4, and an instruction whose consumer sits
+/// at or beyond the latency gives 0.
+///
+/// The first consumer is searched FORWARD ONLY, and the search stops at control flow:
+/// a reader across a branch is reached through the branch, whose own latency separates it
+/// from the producer, exactly as it did when every instruction carried 15. A reader
+/// across a block start that is not a branch is a fall-through continuation of the same
+/// straight-line region, so the search crosses it.
+///
+/// A variable-latency producer carries no stall: its consumer waits on a scoreboard,
+/// which the walk above already assigns, and a delay on top of that wait would cover the
+/// same dependency twice. The write-after-write half is included: a coupled result still
+/// in flight must land before another instruction overwrites its register, or a later
+/// reader can take the older value. The decoupled half of that hazard is the scoreboard
+/// walk's job.
+///
+/// PREDICATES ARE DEPENDENCIES TOO. The 64-bit pointer add is an IADD3 that writes its
+/// carry-out to P6 and an IADD3.X one instruction later that reads it, and a boolean
+/// from ISETP reaches a later SEL or a guarded instruction the same way. The producer
+/// covers those reads with the same latency-minus-distance rule, through `predWritten`
+/// and `predRead`. The hardware proved the need: without this half, every kernel with a
+/// 64-bit address came back with values from the wrong location.
+///
+/// Control flow keeps the stall the isel set, and bit 109 (the yield bit NAK's encoder
+/// writes only below sm_120) stays untouched: ptxas sets it on most sm_120 instructions
+/// and no measurement here says what it does.
+fn assignStalls(insts: []Inst) void {
+    for (insts, 0..) |*inst, idx| {
+        const opcode = getField(inst.*, 0, 12);
+
+        // Control flow keeps what it has: the model has no latency for a branch, and
+        // the isel's choice is already the measured value on silicon for the ops it set
+        // by hand.
+        if (isControlFlow(opcode)) continue;
+
+        var need: u32 = 0;
+        var found = false;
+        const own_pred = predWritten(inst.*, opcode);
+        const has_gpr_dst = writesDst(opcode) and !isVariableLatency(opcode) and
+            getField(inst.*, 16, 8) != RZ;
+        if (has_gpr_dst or own_pred != null) {
+            const wdst = getField(inst.*, 16, 8);
+            const latency = coupledLatency(opcode);
+            const wspan = if (has_gpr_dst) dstSpan(opcode, inst.*) else 0;
+            var j = idx + 1;
+            scan: while (j < insts.len) : (j += 1) {
+                // A branch ends the straight-line region. A reader beyond it is
+                // reached through the branch, and the branch's own stall does NOT
+                // delay the taken path: only the instructions BEFORE the branch,
+                // through their stalls, push the branch's issue later. The distance
+                // through a branch is therefore not the stream distance, and a
+                // producer whose first reader sits across one keeps the stall the
+                // isel gave it, which the hardware has run correctly since the
+                // backend existed.
+                const later = insts[j];
+                const later_op = getField(later, 0, 12);
+                if (isControlFlow(later_op)) break :scan;
+
+                // A reader of the predicate this instruction writes. A carry chain is
+                // the live shape: IADD3 writes the carry-out and IADD3.X, the high
+                // half of the same 64-bit add, reads it, usually one instruction
+                // later.
+                if (own_pred) |p| {
+                    if (predRead(later, p)) {
+                        need = @max(need, latency -| @as(u32, @intCast(j - idx)));
+                        found = true;
+                    }
+                }
+
+                if (has_gpr_dst) {
+                    // A reader of any register this instruction writes. The distance in
+                    // instructions is the lower bound on the cycles between the two
+                    // issues, which is what the latency is measured against.
+                    const later_form = getField(later, 9, 3);
+                    inline for (.{ 24, 32, 64 }) |pos| {
+                        if (readsSrc(later_op, later_form, pos)) {
+                            const reg = getField(later, pos, 8);
+                            if (reg != RZ) {
+                                const rspan = srcSpan(later_op, later, pos);
+                                var r: u32 = 0;
+                                while (r < rspan and reg + r < RZ) : (r += 1) {
+                                    if (readsWrittenReg(reg + r, wdst, wspan)) {
+                                        need = @max(need, latency -| @as(u32, @intCast(j - idx)));
+                                        found = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // The write-after-write half: an overwriter of the same register.
+                    if (writesDst(later_op)) {
+                        const owdst = getField(later, 16, 8);
+                        if (owdst != RZ) {
+                            const owspan = dstSpan(later_op, later);
+                            var w: u32 = 0;
+                            while (w < owspan and owdst + w < RZ) : (w += 1) {
+                                if (readsWrittenReg(owdst + w, wdst, wspan)) {
+                                    need = @max(need, latency -| @as(u32, @intCast(j - idx)));
+                                    found = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // No reader inside the straight-line region means the value crosses a branch or
+        // dies here, and the isel's stall stands for it: see the branch note above.
+        if (!found) continue;
+        if (need > 15) need = 15;
+        // THE FLOOR IS 1, NOT 0, AND THE REASON IS NOT A HINT. A stall of 0 on an ALU op
+        // is an ILLEGAL encoding on sm_120: nvdisasm rejects it outright ("undefined
+        // value for table TABLES_opex_8"), and the silicon runs it through a path so
+        // slow that a whole FFMA loop came out 1.77x slower than the same code at
+        // stall 15, with every value still correct. ptxas never writes 0 on an ALU op:
+        // its minimum is 1, which is what "no wait needed" encodes to.
+        if (need == 0) need = 1;
+        setField(inst, 105, 4, need);
+    }
+}
+
+/// Whether register `reg` is inside the block `base .. base + span`.
+fn readsWrittenReg(reg: u32, base: u32, span: u32) bool {
+    return reg >= base and reg < base + span;
+}
+
+/// Set the operand-reuse bits at 122..125: an instruction's source slot carries the bit
+/// when a later instruction in the same basic block reads the SAME register in the SAME
+/// logical source slot. The Volta-and-later operand collector holds one cached value
+/// per source slot, and the bit tells it to keep the value it collects there, so the
+/// next reader of that register in that slot takes it without a register-file read.
+///
+/// THE BITS EXIST ON SM_120. NAK's encoder writes them only below sm_120, but that guard
+/// is stale: NAK defines the setter and never calls it, and every ptxas sm_120 binary
+/// measured here carries the bits. The mapping is keyed by LOGICAL source, which
+/// `aluSrcSlot` states the evidence for.
+///
+/// The marking policy is the one the ptxas output shows. A source slot is marked when a
+/// later instruction in the same basic block reads the same register in the same slot.
+/// The forward scan stops at the first of: the slot used by a DIFFERENT register, the
+/// register WRITTEN by any instruction, or a branch or block start. The scan crosses the
+/// ENTRY block start, exactly as the scoreboard walk does, because the prologue above it
+/// is a single linear predecessor. Every reader of the chain is marked, including the
+/// first, which leaves the LAST reader unmarked, as ptxas leaves it. The window between
+/// two marked readers can be long: ptxas marks an IMAD.WIDE whose next same-slot read is
+/// nine instructions away.
+///
+/// Only COUPLED ALU ops are marked. Those are the ops the measured ptxas output carries
+/// bits on (FFMA, IMAD.WIDE, IADD). A memory, texture or control opcode never shows a
+/// bit in any measured stream, and a variable-latency op reads its sources through a
+/// path this backend has no evidence about, so both stay unmarked. Only single-register
+/// source operands are marked: a run such as a load's address pair spans slots this
+/// model does not describe.
+fn markReuse(insts: []Inst, block_starts: []const usize, entry_start: usize) void {
+    for (insts, 0..) |*inst, idx| {
+        const opcode = getField(inst.*, 0, 12);
+        // Only a coupled ALU op gets bits. See the marking policy above.
+        if (!isAluOp(opcode) or isVariableLatency(opcode)) continue;
+        // An instruction the stall pass left at 15 carries a value across a branch, and
+        // that stall is load-bearing. It also makes a legal encoding with bit 109:
+        // nvdisasm's validator rejects a word with stall 15 AND bit 109 set ("undefined
+        // value for table TABLES_opex_8"), while ptxas never writes stall 15 at all.
+        // Reuse buys nothing across a branch anyway, so the mark waits for a computed
+        // stall.
+        if (getField(inst.*, 105, 4) == 15) continue;
+        const form = getField(inst.*, 9, 3);
+
+        var mask: u4 = 0;
+        inline for (.{ 24, 32, 64 }) |pos| {
+            if (aluSrcSlot(pos, form)) |slot| {
+                if (readsSrc(opcode, form, pos)) {
+                    const reg = getField(inst.*, pos, 8);
+                    // RZ is a fixed zero, not a register, and a multi-register operand
+                    // is not one slot.
+                    if (reg != RZ and srcSpan(opcode, inst.*, pos) == 1) {
+                        if (reuseScanFinds(insts, idx, block_starts, entry_start, slot, reg))
+                            mask |= @as(u4, 1) << slot;
+                    }
+                }
+            }
+        }
+        if (mask != 0) {
+            setField(inst, 122, 4, getField(inst.*, 122, 4) | mask);
+            // BIT 109 RIDES WITH THE REUSE BITS. Every reuse-marked instruction in every
+            // measured ptxas sm_120 stream carries it, and nvdisasm prints `.reuse` only
+            // when it is set: clearing it on a ptxas word makes the annotation disappear.
+            // The hardware agrees from the other side: a chain marked with the slot bits
+            // but without bit 109 came off the RTX 5070 with the WRONG VALUES, the stale
+            // multiplier a collector served from a cache this bit apparently enables.
+            setField(inst, 109, 1, 1);
+        }
+    }
+}
+
+/// Whether a later instruction reads `reg` in logical source `slot` before the scan
+/// stops. The stop conditions are the ones the marking policy above states.
+fn reuseScanFinds(
+    insts: []const Inst,
+    idx: usize,
+    block_starts: []const usize,
+    entry_start: usize,
+    slot: u2,
+    reg: u32,
+) bool {
+    var j = idx + 1;
+    while (j < insts.len) : (j += 1) {
+        // A branch ends the straight-line region, and a block start means control flow
+        // from more than one predecessor, so a value cached across either is not
+        // guaranteed to be the value this path produced. The ENTRY block start is the
+        // one exception, the same one the scoreboard walk makes: the prologue above it
+        // has a single linear predecessor.
+        const later = insts[j];
+        const later_op = getField(later, 0, 12);
+        if (isControlFlow(later_op)) return false;
+        for (block_starts) |bs| if (bs == j and bs != entry_start) return false;
+
+        const later_form = getField(later, 9, 3);
+        // Does this instruction use the SAME logical slot? An ALU op uses the slot
+        // whenever its field for it holds a register, whatever register that is, and a
+        // non-ALU op never does: the slot's cache belongs to the ALU collector.
+        inline for (.{ 24, 32, 64 }) |pos| {
+            if (aluSrcSlot(pos, later_form)) |other_slot| {
+                if (other_slot == slot) {
+                    if (isAluOp(later_op) and
+                        readsSrc(later_op, later_form, pos) and
+                        getField(later, pos, 8) != RZ and
+                        srcSpan(later_op, later, pos) == 1)
+                    {
+                        // A different register in the slot replaces the cached value, so
+                        // the chain ends here. The same register is the hit this scan
+                        // looks for.
+                        return getField(later, pos, 8) == reg;
+                    }
+                }
+            }
+        }
+
+        // A write to the register changes the value, so a later read of the slot takes
+        // the new value and not the cached one.
+        if (writesDst(later_op)) {
+            const wdst = getField(later, 16, 8);
+            if (wdst != RZ) {
+                const wspan = dstSpan(later_op, later);
+                var w: u32 = 0;
+                while (w < wspan and wdst + w < RZ) : (w += 1) {
+                    if (wdst + w == reg) return false;
+                }
+            }
+        }
+    }
+    return false;
 }
 
 test "a load's consumer waits on the load's scoreboard" {
@@ -2696,4 +3119,329 @@ test "a BSSY and a BSYNC carry an empty wait mask too" {
     const ldg_bar = getField(insts[0], 110, 3);
     try std.testing.expect(ldg_bar < 6);
     try std.testing.expect((getField(insts[4], 116, 6) & (@as(u32, 1) << @intCast(ldg_bar))) != 0);
+}
+
+test "a form 2 FFMA chain marks every multiplier reader but the last" {
+    // The ptxas k2n shape: FFMA Rd, Ra, R9.reuse, imm, with the loop-invariant
+    // multiplier R9 read by every FFMA in the srcB slot (bits 64..71 of form 2). Each
+    // FFMA also reads the one before it, so every result has a consumer and the stall
+    // pass computes it a stall below 15, which is what makes it markable. ptxas marks
+    // every reader except the last, and so does the scan: the last reader caches a
+    // value nothing later takes, so it carries no bit.
+    const five_hundredths: u32 = @bitCast(@as(f32, 0.05));
+    var insts = [_]Inst{
+        encode.ffmaAddendImm(4, 4, 9, five_hundredths, .{}),
+        encode.ffmaAddendImm(5, 4, 9, five_hundredths, .{}),
+        encode.ffmaAddendImm(6, 5, 9, five_hundredths, .{}),
+        encode.ffmaAddendImm(7, 6, 9, five_hundredths, .{}),
+        encode.exit(.{}),
+    };
+    scheduleBlocks(&insts, &.{0});
+
+    // The first FFMA marks both slots: the next one reads its RESULT in srcA and the
+    // shared multiplier in srcB. The second and third mark only srcB, because the
+    // srcA chain broke: each reads a different accumulator than the one before it, and
+    // a different register in a slot replaces the cached value. The last reader marks
+    // nothing.
+    try std.testing.expectEqual(@as(u32, 0x3), getField(insts[0], 122, 4));
+    try std.testing.expectEqual(@as(u32, 1), getField(insts[0], 109, 1)); // rides with reuse
+    try std.testing.expectEqual(@as(u32, 0x2), getField(insts[1], 122, 4));
+    try std.testing.expectEqual(@as(u32, 0x2), getField(insts[2], 122, 4));
+    try std.testing.expectEqual(@as(u32, 0), getField(insts[3], 122, 4)); // the last reader
+}
+
+test "a shared form 4 FFMA addend at bits 64 gets the srcC reuse bit" {
+    // The DECISIVE ptxas experiment for the slot mapping, run against ptxas 13.2 for
+    // sm_120a: a chain `FFMA Rd, Ra, 0.9, R9.reuse` sharing the ADDEND register R9 at
+    // bits 64..71 carries reuse 0x4, because that field is logical srcC in form 4. A
+    // model that keyed the bits by field position would expect 0x2 here and get the
+    // wrong lane, which is why this test pins the logical mapping.
+    const nine_tenths: u32 = @bitCast(@as(f32, 0.9));
+    var insts = [_]Inst{
+        encode.ffmaImm(4, 4, nine_tenths, 9, .{}),
+        encode.ffmaImm(5, 4, nine_tenths, 9, .{}),
+        encode.ffmaImm(6, 5, nine_tenths, 9, .{}),
+        encode.exit(.{}),
+    };
+    scheduleBlocks(&insts, &.{0});
+
+    try std.testing.expectEqual(@as(u32, 0x5), getField(insts[0], 122, 4)); // srcA and srcC
+    try std.testing.expectEqual(@as(u32, 1), getField(insts[0], 109, 1)); // rides with reuse
+    try std.testing.expectEqual(@as(u32, 0x4), getField(insts[1], 122, 4)); // srcC: srcA broke
+    try std.testing.expectEqual(@as(u32, 0), getField(insts[2], 122, 4)); // the last reader
+    try std.testing.expectEqual(@as(u32, 0), getField(insts[2], 109, 1)); // and no bit 109
+}
+
+test "a form 1 ALU chain marks the srcA and srcB slots separately" {
+    // IMAD.WIDE and IADD chains with the shared register at bits 24..31 carry bit 122 in
+    // every measured ptxas stream, and a register form ALU op reads srcB at bits 32..39,
+    // which is bit 123. An IADD3 sharing both a srcA register and a srcB register across
+    // two instructions marks both bits at once. Each result also feeds the next IADD3,
+    // so the stall pass computes a stall below 15 for every marked instruction.
+    var insts = [_]Inst{
+        encode.iadd3(4, 8, 9, .{}),
+        encode.iadd3(5, 8, 9, .{}),
+        encode.iadd3(6, 8, 9, .{}),
+        encode.iadd3(7, 4, 5, .{}), // reads the results of the first two
+        encode.exit(.{}),
+    };
+    scheduleBlocks(&insts, &.{0});
+
+    try std.testing.expectEqual(@as(u32, 0b11), getField(insts[0], 122, 4)); // srcA and srcB
+    try std.testing.expectEqual(@as(u32, 0b11), getField(insts[1], 122, 4));
+    try std.testing.expectEqual(@as(u32, 0), getField(insts[2], 122, 4)); // no reader: stall 15
+}
+
+test "a different register in the slot ends the reuse chain" {
+    // The slot cache holds one value, so an instruction that reads a DIFFERENT register
+    // in the same logical slot replaces it. A reader after that point cannot take the
+    // cached value, so the scan must not mark the first reader.
+    const five_hundredths: u32 = @bitCast(@as(f32, 0.05));
+    var insts = [_]Inst{
+        encode.ffmaAddendImm(4, 4, 9, five_hundredths, .{}), // reads R9 in srcB
+        encode.ffmaAddendImm(5, 5, 10, five_hundredths, .{}), // reads R10 in srcB
+        encode.ffmaAddendImm(6, 6, 9, five_hundredths, .{}), // back to R9, too late
+        encode.exit(.{}),
+    };
+    scheduleBlocks(&insts, &.{0});
+
+    try std.testing.expectEqual(@as(u32, 0), getField(insts[0], 122, 4));
+    // The second reader of R10 has no later reader either.
+    try std.testing.expectEqual(@as(u32, 0), getField(insts[1], 122, 4));
+}
+
+test "a write to the register ends the reuse chain" {
+    // A write changes the value, so a later read of the slot takes the new value and
+    // not the cached one. The chain through R9 breaks at the IADD3 that overwrites it.
+    const five_hundredths: u32 = @bitCast(@as(f32, 0.05));
+    var insts = [_]Inst{
+        encode.ffmaAddendImm(4, 4, 9, five_hundredths, .{}), // reads R9 in srcB
+        encode.iadd3(9, 20, 21, .{}), // overwrites R9
+        encode.ffmaAddendImm(6, 6, 9, five_hundredths, .{}), // reads the NEW R9
+        encode.exit(.{}),
+    };
+    scheduleBlocks(&insts, &.{0});
+
+    try std.testing.expectEqual(@as(u32, 0), getField(insts[0], 122, 4));
+    // The reader of the new value still has its own later reader, itself none: the last
+    // reader carries no bit either way here.
+    try std.testing.expectEqual(@as(u32, 0), getField(insts[2], 122, 4));
+}
+
+test "a block boundary ends the reuse scan, and the entry block start does not" {
+    // A branch target can be reached from more than one predecessor, so a value cached
+    // across it is not guaranteed to be the value this path produced. The ENTRY block
+    // start is the exception the scoreboard walk also makes: the prologue above it is a
+    // single linear predecessor, so the scan crosses it. Each FFMA reads the one before
+    // it, so every result has a consumer and the stall pass computes a stall below 15.
+    const five_hundredths: u32 = @bitCast(@as(f32, 0.05));
+    var insts = [_]Inst{
+        encode.ffmaAddendImm(4, 4, 9, five_hundredths, .{}), // before the entry block start
+        encode.ffmaAddendImm(5, 4, 9, five_hundredths, .{}), // block 0 starts here: entry
+        encode.ffmaAddendImm(6, 5, 9, five_hundredths, .{}),
+        encode.exit(.{}),
+    };
+    // Block 0 starts at index 1, and index 1 is the entry start, so the scan crosses it.
+    scheduleBlocks(&insts, &.{1});
+
+    // The first FFMA marks both slots (its result feeds the second in srcA, and the
+    // multiplier chain crosses the entry start); the second marks only srcB.
+    try std.testing.expectEqual(@as(u32, 0x3), getField(insts[0], 122, 4));
+    try std.testing.expectEqual(@as(u32, 0x2), getField(insts[1], 122, 4));
+
+    // A SECOND block start at index 2 is a real branch target: the chain breaks there.
+    var split = [_]Inst{
+        encode.ffmaAddendImm(4, 4, 9, five_hundredths, .{}),
+        encode.ffmaAddendImm(5, 4, 9, five_hundredths, .{}),
+        encode.ffmaAddendImm(6, 5, 9, five_hundredths, .{}),
+        encode.exit(.{}),
+    };
+    scheduleBlocks(&split, &.{1, 2});
+
+    // The reader before the real branch target still marks: its scan crosses the ENTRY
+    // start at 1 and finds the next reader there.
+    try std.testing.expectEqual(@as(u32, 0x3), getField(split[0], 122, 4));
+    // The reader at the entry start scans toward index 2, a real branch target, so the
+    // scan stops and it carries no bit.
+    try std.testing.expectEqual(@as(u32, 0), getField(split[1], 122, 4));
+    // Inside the last block, the lone reader of R9 in srcB carries no bit either.
+    try std.testing.expectEqual(@as(u32, 0), getField(split[2], 122, 4));
+}
+
+test "a lone reader and a memory op carry no reuse bits" {
+    // A lone reader caches a value nothing later takes, so it carries no bit. A memory
+    // op never shows a bit in any measured ptxas stream, so it marks none: the LDG here
+    // reads its address through the srcA field and writes R8, and the FFMA chain around
+    // it keeps its srcB bits because the load touches neither the srcB slot nor R9.
+    const five_hundredths: u32 = @bitCast(@as(f32, 0.05));
+    var insts = [_]Inst{
+        encode.ffmaAddendImm(4, 4, 9, five_hundredths, .{}),
+        encode.ldgU32(8, 12, .{}), // a memory op between two chain readers
+        encode.ffmaAddendImm(5, 4, 9, five_hundredths, .{}), // reads R4
+        encode.ffmaAddendImm(6, 5, 9, five_hundredths, .{}), // reads R5
+        encode.exit(.{}),
+    };
+    scheduleBlocks(&insts, &.{0});
+
+    try std.testing.expectEqual(@as(u32, 0), getField(insts[1], 122, 4)); // the LDG
+    // The chain spans the load: the first reader marks both slots (the load touches
+    // neither the srcB slot nor R9), and the middle reader marks only srcB because its
+    // srcA register differs from the next reader's.
+    try std.testing.expectEqual(@as(u32, 0x3), getField(insts[0], 122, 4));
+    try std.testing.expectEqual(@as(u32, 0x2), getField(insts[2], 122, 4));
+    try std.testing.expectEqual(@as(u32, 0), getField(insts[3], 122, 4)); // the last
+}
+
+test "a four-accumulator FFMA chain stalls one cycle, as ptxas's does" {
+    // THE CALIBRATION TEST for the stall model. ptxas k2n's loop is sixteen FFMA over
+    // four independent accumulators, each result read four instructions later, and
+    // every FFMA carries stall 1. The producer carries the delay, so the first round,
+    // whose results the second round reads four instructions later, stalls one cycle
+    // each, and the last round, whose results nothing reads, stalls nothing.
+    const five_hundredths: u32 = @bitCast(@as(f32, 0.05));
+    var insts: [13]Inst = undefined;
+    inline for (0..12) |i| {
+        const accs = [_]u8{ 4, 5, 6, 7 };
+        insts[i] = encode.ffmaAddendImm(accs[i % 4], accs[i % 4], 9, five_hundredths, .{});
+    }
+    insts[12] = encode.exit(.{});
+    scheduleBlocks(&insts, &.{0});
+
+    for (insts[0..8]) |f| {
+        try std.testing.expectEqual(@as(u32, 1), getField(f, 105, 4)); // the ptxas value
+    }
+    for (insts[8..12]) |f| {
+        try std.testing.expectEqual(@as(u32, 15), getField(f, 105, 4)); // nothing reads these: the isel stall stands
+    }
+    // The chain also carries the reuse bits, every reader whose stall the pass computed.
+    // The third round's results have no reader, so those FFMA keep the isel's stall 15
+    // and with it no mark: a legal word cannot carry stall 15 and bit 109 at once.
+    for (insts[0..8]) |f| {
+        try std.testing.expectEqual(@as(u32, 0x2), getField(f, 122, 4));
+    }
+    for (insts[8..12]) |f| {
+        try std.testing.expectEqual(@as(u32, 0), getField(f, 122, 4));
+    }
+}
+
+test "a tight dependent pair stalls more than an independent pair" {
+    // A back-to-back dependent FFMA makes its producer wait out the FMA latency minus
+    // one issue slot. An independent one waits for nothing, and the pass must tell the
+    // two apart.
+    const nine_tenths: u32 = @bitCast(@as(f32, 0.9));
+    var dep = [_]Inst{
+        encode.ffmaImm(4, 8, nine_tenths, 9, .{}),
+        encode.ffmaImm(5, 4, nine_tenths, 9, .{}), // reads R4 one slot later
+        encode.exit(.{}),
+    };
+    scheduleBlocks(&dep, &.{0});
+    try std.testing.expectEqual(coupled_fma_latency - 1, getField(dep[0], 105, 4));
+    try std.testing.expectEqual(@as(u32, 15), getField(dep[1], 105, 4));
+
+    var indep = [_]Inst{
+        encode.ffmaImm(4, 8, nine_tenths, 9, .{}),
+        encode.ffmaImm(5, 20, nine_tenths, 9, .{}), // reads nothing in flight
+        encode.exit(.{}),
+    };
+    scheduleBlocks(&indep, &.{0});
+    try std.testing.expectEqual(@as(u32, 15), getField(indep[0], 105, 4));
+    try std.testing.expectEqual(@as(u32, 15), getField(indep[1], 105, 4));
+}
+
+test "a variable-latency producer contributes no stall: the scoreboard covers it" {
+    // The LDG is decoupled, so the stall model sets no ready time for its result and its
+    // consumer stalls zero. The consumer still waits on the load's scoreboard, which the
+    // walk above assigns and a test above already checks, so the dependency is covered
+    // exactly once.
+    var insts = [_]Inst{
+        encode.ldgU32(8, 4, .{}),
+        encode.fadd(9, 8, 8, .{}), // reads the load result
+        encode.exit(.{}),
+    };
+    scheduleBlocks(&insts, &.{0});
+
+    try std.testing.expectEqual(@as(u32, 15), getField(insts[1], 105, 4));
+    const ldg_bar = getField(insts[0], 110, 3);
+    try std.testing.expect(ldg_bar < 6);
+    try std.testing.expect((getField(insts[1], 116, 6) & (@as(u32, 1) << @intCast(ldg_bar))) != 0);
+}
+
+test "control flow keeps the stall the isel set" {
+    // The model has no latency for a branch, so the isel's choice stands. The bra keeps
+    // its 6 and the exit keeps its 1. The FFMA's reader sits across the branch, so it
+    // finds no consumer in its region and keeps the isel's default too.
+    const five_hundredths: u32 = @bitCast(@as(f32, 0.05));
+    var insts = [_]Inst{
+        encode.ffmaAddendImm(4, 4, 9, five_hundredths, .{}),
+        encode.bra(2, .{ .stall = 6 }),
+        encode.exit(.{ .stall = 1 }),
+    };
+    scheduleBlocks(&insts, &.{2});
+
+    try std.testing.expectEqual(@as(u32, 15), getField(insts[0], 105, 4));
+    try std.testing.expectEqual(@as(u32, 6), getField(insts[1], 105, 4));
+    try std.testing.expectEqual(@as(u32, 1), getField(insts[2], 105, 4));
+}
+
+test "a fall-through consumer keeps its producer's stall, and a branch cuts the scan" {
+    // A block start that is not a branch is a fall-through continuation, so the
+    // producer's search crosses it and covers its consumer. A real branch ends the
+    // straight-line region: a reader beyond it is reached through the branch, whose own
+    // latency separates it from the producer, so the producer carries nothing there.
+    const five_hundredths: u32 = @bitCast(@as(f32, 0.05));
+    var insts = [_]Inst{
+        encode.iadd3(4, 20, 21, .{}), // produces R4
+        encode.iadd3(22, 23, 24, .{}), // filler, no branch: a fall-through block start follows
+        encode.ffmaAddendImm(5, 4, 9, five_hundredths, .{}), // block 1 starts here, reads R4
+        encode.exit(.{}),
+    };
+    scheduleBlocks(&insts, &.{0, 2});
+
+    // The distance from the producer to its reader is 2, so the stall is the ALU
+    // latency minus 2.
+    try std.testing.expectEqual(coupled_alu_latency - 2, getField(insts[0], 105, 4));
+
+    // The same shape with a branch between producer and reader: the search stops at
+    // the branch, so the producer carries nothing.
+    var split = [_]Inst{
+        encode.iadd3(4, 20, 21, .{}), // produces R4
+        encode.bra(0, .{}), // the branch that ends the region
+        encode.ffmaAddendImm(5, 4, 9, five_hundredths, .{}), // reads R4 across the branch
+        encode.exit(.{}),
+    };
+    scheduleBlocks(&split, &.{0, 2});
+
+    try std.testing.expectEqual(@as(u32, 15), getField(split[0], 105, 4));
+}
+
+test "an IADD3 carry chain covers its predicate dependency" {
+    // The 64-bit pointer add: the low half writes its carry-out to P6 and the high half
+    // reads it, usually one instruction later. The carry is a COUPLED result, so the
+    // producer must delay the high half by the ALU latency minus the distance, exactly
+    // as for a register. Without this half of the model every kernel with a 64-bit
+    // address read stale carries on the silicon and stored to the wrong location.
+    var insts = [_]Inst{
+        encode.iadd3CarryOut(4, 8, 9, 6, .{}), // low half, carry-out to P6
+        encode.iadd3CarryIn(5, 10, 11, 6, .{}), // high half, carry-in from P6
+        encode.exit(.{}),
+    };
+    scheduleBlocks(&insts, &.{0});
+
+    // The high half reads the carry one instruction later.
+    try std.testing.expectEqual(coupled_alu_latency - 1, getField(insts[0], 105, 4));
+    try std.testing.expectEqual(@as(u32, 15), getField(insts[1], 105, 4));
+}
+
+test "an ISETP result predicate delays the guarded instruction that reads it" {
+    // A boolean from ISETP that a later SEL reads is the same coupled dependency as a
+    // carry, at the same latency, so the ISETP carries the delay.
+    var insts = [_]Inst{
+        encode.isetp(0, 8, 9, .lt, true, .{}), // P0 = R8 < R9
+        encode.iadd3(20, 21, 22, .{}), // filler at distance 1
+        encode.sel(4, 8, 9, 0, .{}), // reads P0 at distance 2
+        encode.exit(.{}),
+    };
+    scheduleBlocks(&insts, &.{0});
+
+    try std.testing.expectEqual(coupled_alu_latency - 2, getField(insts[0], 105, 4));
 }

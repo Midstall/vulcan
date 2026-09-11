@@ -30,6 +30,11 @@ pub const Control = struct {
     wr_barrier: u3 = 7, // scoreboard to set on completion (7 = none)
     rd_barrier: u3 = 7,
     wait_mask: u6 = 0, // scoreboards to wait on before issue
+    /// The operand-reuse bits, 122..125, one per ALU source operand. Bit 122
+    /// marks the operand at bits 24..31, bit 123 the SECOND source (bits
+    /// 32..39 in form 1, bits 64..71 in form 2), and bit 124 the THIRD source
+    /// (bits 64..71 in forms 1 and 4). `markReuse` in schedule.zig sets them.
+    reuse_mask: u4 = 0,
     pred: u8 = PT, // guard predicate (PT = unconditional)
     pred_neg: bool = false, // guard on !pred
 };
@@ -69,6 +74,7 @@ fn base(c: Control) Inst {
     setBits(&w, 110, 3, c.wr_barrier);
     setBits(&w, 113, 3, c.rd_barrier);
     setBits(&w, 116, 6, c.wait_mask);
+    setBits(&w, 122, 4, c.reuse_mask);
     return w;
 }
 
@@ -616,6 +622,28 @@ pub fn fmulImm(dst: u8, a: u8, imm: u32, c: Control) Inst {
 /// NVIDIA's own decoder agrees on the form and on all three operands.
 pub fn ffmaImm(dst: u8, a: u8, imm: u32, c_in: u8, c: Control) Inst {
     return aluImm(0x023, dst, a, imm, c_in, c);
+}
+
+/// `FFMA dst, a, b, imm`: fused multiply-add whose ADDEND is a 32-bit float
+/// immediate, given as its IEEE-754 binary32 bit pattern, and whose MULTIPLIER
+/// is the register `b`. This is the shape `x * y + k` takes.
+///
+/// IT IS FORM 2, NOT FORM 4. The form field states which of the two later
+/// sources is the immediate, and NAK's `encode_alu` picks it from that pair:
+/// an immediate at src2 is form 2 and an immediate at src1 is form 4. Here the
+/// addend is the immediate, so it sits at bits 32..63 as src2 and the
+/// multiplier register moves to the srcC slot at bits 64..71, exactly as
+/// `aluImm2` lays it out.
+///
+/// THIS IS THE FORM PTXAS EMITS for the contracted `acc = acc * k1 + k2`
+/// chain: it hoists the multiplier k1 into a register ahead of the loop and
+/// keeps the addend k2 in the instruction. Read out of an sm_120 cubin
+/// (`nvdisasm -b SM120 -c`): `FFMA R0, R0, R9.reuse, 0.05`, whose 12-bit
+/// opcode is 0x423. The immediate-FFMA test below pins the same encoding from
+/// this side, and `nvdisasm` reads this exact word back as
+/// `FFMA R6, R4, R9, 0.05`.
+pub fn ffmaAddendImm(dst: u8, a: u8, b: u8, imm: u32, c: Control) Inst {
+    return aluImm2(0x023, dst, a, imm, b, c);
 }
 
 /// `IMAD.WIDE dst:dst+1, a, b, c:c+1`: a 32 by 32 multiply added to a 64-bit
@@ -2260,6 +2288,46 @@ test "the immediate FFMA is form 4: the multiplier at src1, the addend still a r
     // Bits 81..90 stay clear, exactly as the register FFMA and FADD leave them. Writing PT
     // into them turned the register FADD into a bfloat16 add. See the note above `fadd`.
     try std.testing.expectEqual(@as(u32, 0), w[2] >> 8);
+}
+
+test "the addend-immediate FFMA is form 2: the multiplier at bits 64, the addend at 32" {
+    // `FFMA R6, R4, R9, 0.05`. The form is the whole difference between this and `ffmaImm`,
+    // and the two forms put their operands in OPPOSITE halves of the same two fields: form 2
+    // keeps the multiplier REGISTER at bits 64..71 and moves the addend IMMEDIATE into
+    // bits 32..63. ptxas emits exactly this opcode (0x423) for the contracted
+    // `acc = acc * 0.9 + 0.05` loop shape on sm_120.
+    //
+    // `nvdisasm -b SM120 -c` reads this exact word back as `FFMA R6, R4, R9, 0.05`.
+    const five_hundredths: u32 = @bitCast(@as(f32, 0.05));
+    const w = ffmaAddendImm(6, 4, 9, five_hundredths, .{});
+    try std.testing.expectEqual(@as(u32, 0x423), w[0] & 0xfff); // 0x023 with form 2 at bits 9..11
+    try std.testing.expectEqual(@as(u32, 6), (w[0] >> 16) & 0xff); // dst R6
+    try std.testing.expectEqual(@as(u32, 4), (w[0] >> 24) & 0xff); // srcA R4
+    try std.testing.expectEqual(five_hundredths, w[1]); // the addend at bits 32..63
+    try std.testing.expectEqual(@as(u32, 9), w[2] & 0xff); // the multiplier R9 at bits 64..71
+    // Bits 81..90 stay clear, exactly as every other float ALU op leaves them.
+    try std.testing.expectEqual(@as(u32, 0), w[2] >> 8);
+    // The two FFMA immediate forms differ in the form field and in which operand each
+    // later field holds, and nothing else: the same three logical operands, swapped.
+    const form4 = ffmaImm(6, 4, @bitCast(@as(f32, 0.9)), 9, .{});
+    try std.testing.expectEqual(@as(u32, 0x823), form4[0] & 0xfff);
+    try std.testing.expectEqual(@as(u32, 9), form4[2] & 0xff); // the addend register at 64
+}
+
+test "the operand-reuse bits land at 122..125, one per ALU source field" {
+    // ptxas emits these bits on sm_120 (the guard in NAK's `set_instr_deps` that
+    // gates them on sm < 120 is stale), and the hardware runs such code. The mapping
+    // is verified against `nvdisasm -b SM120` one bit at a time: bit 122 marks the
+    // operand at bits 24..31, bit 123 the second source (bits 32..39 in form 1, and
+    // bits 64..71 in form 2, which is where the form puts the second source), and bit
+    // 124 the third source (bits 64..71 in forms 1 and 4). See `markReuse`.
+    const w = ffma(6, 4, 7, 8, .{ .reuse_mask = 0b0111 });
+    try std.testing.expectEqual(@as(u32, 0b0111), (w[3] >> 26) & 0xf);
+    try std.testing.expectEqual(@as(u32, 0), ffma(6, 4, 7, 8, .{})[3] >> 26);
+    // The bits sit beside the wait mask, above bit 121, and touch nothing else.
+    const a = ffma(6, 4, 7, 8, .{ .stall = 15, .wait_mask = 0x3f });
+    const b = ffma(6, 4, 7, 8, .{ .stall = 15, .wait_mask = 0x3f, .reuse_mask = 0b1001 });
+    try std.testing.expectEqual(@as(u32, 0b1001) << 26, a[3] ^ b[3]);
 }
 
 test "the immediate IMAD keeps its addend, which is what an integer multiply-add needs" {

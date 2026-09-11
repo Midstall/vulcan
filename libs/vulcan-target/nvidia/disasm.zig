@@ -1,10 +1,10 @@
 //! NVIDIA SASS disassembler for sm_120 (Blackwell). This is the strict INVERSE of
 //! `encode.zig`: it decodes exactly the instructions the encoder produces, dumps a
 //! readable per-instruction listing with destination/source register numbers, the
-//! guard predicate, and the scheduling control bits (stall, write/read barrier, wait
-//! mask). It is the oracle for the register-allocation / liveness hunt - so a human
-//! (or a diff) can SEE which physical register each value landed in and which
-//! scoreboards gate it.
+//! guard predicate, and the scheduling control bits (stall, write/read barrier,
+//! wait mask, operand reuse). It is the oracle for the register-allocation /
+//! liveness hunt - so a human (or a diff) can SEE which physical register each
+//! value landed in and which scoreboards gate it.
 //!
 //! It does NOT aim to cover the full SASS ISA - only the subset `encode.zig` emits.
 //! An unknown 12-bit opcode is printed as `??.<hex>` with the raw dwords so nothing
@@ -37,7 +37,7 @@ fn getBits(w: encode.Inst, lo: usize, width: usize) u64 {
 
 /// The scheduling control + guard a decoded instruction carries (the inverse of
 /// encode.base): the stall, the scoreboard a variable-latency op sets, the read
-/// barrier, and the wait mask its consumers carry.
+/// barrier, the wait mask its consumers carry, and the operand-reuse bits.
 pub const Sched = struct {
     pred: u8,
     pred_neg: bool,
@@ -45,6 +45,7 @@ pub const Sched = struct {
     wr_barrier: u3,
     rd_barrier: u3,
     wait_mask: u6,
+    reuse_mask: u4,
 };
 
 fn decodeSched(w: encode.Inst) Sched {
@@ -55,6 +56,7 @@ fn decodeSched(w: encode.Inst) Sched {
         .wr_barrier = @intCast(getBits(w, 110, 3)),
         .rd_barrier = @intCast(getBits(w, 113, 3)),
         .wait_mask = @intCast(getBits(w, 116, 6)),
+        .reuse_mask = @intCast(getBits(w, 122, 4)),
     };
 }
 
@@ -321,7 +323,7 @@ fn regName(buf: []u8, r: u8) []const u8 {
 
 /// Format a compiled code stream as a readable per-instruction listing. The caller
 /// owns the returned string. Each line:
-///   `NNN: [@PRED] MNEMONIC dst <- srcs   {stall, wb=N, wait=0xMM}`
+///   `NNN: [@PRED] MNEMONIC dst <- srcs   {stall, wb=N, wait=0xMM, reuse=0xR}`
 pub fn format(allocator: std.mem.Allocator, code: []const u32) ![]u8 {
     const insts = try decode(allocator, code);
     defer allocator.free(insts);
@@ -404,6 +406,7 @@ pub fn format(allocator: std.mem.Allocator, code: []const u32) ![]u8 {
         if (it.sched.wr_barrier != 7) try out.print(allocator, ", wb={d}", .{it.sched.wr_barrier});
         if (it.sched.rd_barrier != 7) try out.print(allocator, ", rb={d}", .{it.sched.rd_barrier});
         if (it.sched.wait_mask != 0) try out.print(allocator, ", wait=0x{x}", .{it.sched.wait_mask});
+        if (it.sched.reuse_mask != 0) try out.print(allocator, ", reuse=0x{x}", .{it.sched.reuse_mask});
         try out.print(allocator, "}}", .{});
         if (it.opcode != 0x947 and it.opcode != 0x94d and it.mnemonic[0] == '?') {
             try out.print(allocator, "  [raw {x:0>8} {x:0>8} {x:0>8} {x:0>8}]", .{ it.raw[0], it.raw[1], it.raw[2], it.raw[3] });
@@ -580,4 +583,57 @@ test "an immediate ALU operand is not decoded as a source register" {
     const ldg = decodeOne(encode.ldgU32(4, 6, .{}));
     try std.testing.expectEqualStrings("LDG", ldg.mnemonic);
     try std.testing.expect(!ldg.has_imm);
+}
+
+test "an FFMA with an immediate ADDEND decodes in the form-2 operand order" {
+    // Form 2 keeps the multiplier REGISTER at bits 64..71 and puts the addend IMMEDIATE
+    // at bits 32..63, so the printed order must be dst, srcA, multiplier, imm. The
+    // immediate-aware `aluB` already keeps bits 32..39 out of `srcs` for BOTH immediate
+    // forms, and the multiplier at 64 lands in `srcs[2]`, so the listing names it in the
+    // right place. `nvdisasm -b SM120 -c` prints this exact word as
+    // `FFMA R6, R4, R9, 0.05`.
+    const five_hundredths: u32 = @bitCast(@as(f32, 0.05));
+    const w = encode.ffmaAddendImm(6, 4, 9, five_hundredths, .{});
+    const d = decodeOne(w);
+    try std.testing.expectEqual(@as(u12, 0x423), d.opcode); // 0x023 with form 2
+    try std.testing.expectEqualStrings("FFMA", d.mnemonic);
+    try std.testing.expectEqual(@as(u8, 6), d.dst);
+    try std.testing.expectEqual(@as(u8, 4), d.srcs[0]); // srcA, the value scaled
+    try std.testing.expectEqual(RZ, d.srcs[1]); // the immediate is NOT a source register
+    try std.testing.expectEqual(@as(u8, 9), d.srcs[2]); // the multiplier register at 64
+    try std.testing.expect(d.has_imm);
+    try std.testing.expectEqual(five_hundredths, d.imm);
+    // The form-4 immediate FFMA keeps its own operand order: the multiplier is the
+    // immediate at 32..63 and the ADDEND is the register at 64.
+    const quarter: u32 = @bitCast(@as(f32, 0.25));
+    const f4 = decodeOne(encode.ffmaImm(6, 4, quarter, 9, .{}));
+    try std.testing.expectEqual(@as(u12, 0x823), f4.opcode);
+    try std.testing.expectEqual(@as(u8, 4), f4.srcs[0]);
+    try std.testing.expectEqual(@as(u8, 9), f4.srcs[2]); // the addend register at 64
+    try std.testing.expectEqual(quarter, f4.imm);
+}
+
+test "the operand-reuse bits survive an encode/decode round trip" {
+    // Bit 122 marks the operand at bits 24..31, bit 123 the second source, and bit 124
+    // the third. A form-2 FFMA carries its multiplier register as the SECOND source, so
+    // a chain-reader marking that register sets bit 123 only, exactly as ptxas does on
+    // the `FFMA Rd, Ra, R9.reuse, 0.05` chain it emits for this shape.
+    const five_hundredths: u32 = @bitCast(@as(f32, 0.05));
+    const chain = encode.ffmaAddendImm(6, 4, 9, five_hundredths, .{ .reuse_mask = 0b0010 });
+    const d = decodeOne(chain);
+    try std.testing.expectEqual(@as(u4, 0b0010), d.sched.reuse_mask);
+    try std.testing.expectEqual(@as(u4, 0), decodeOne(encode.ffmaAddendImm(6, 4, 9, five_hundredths, .{})).sched.reuse_mask);
+    // A form-1 FFMA marks all three register slots with the low three bits.
+    const reg = encode.ffma(6, 4, 7, 8, .{ .reuse_mask = 0b0101 });
+    const rd = decodeOne(reg);
+    try std.testing.expectEqual(@as(u4, 0b0101), rd.sched.reuse_mask);
+    try std.testing.expectEqual(@as(u8, 4), rd.srcs[0]); // bit 122 marks this one
+    try std.testing.expectEqual(@as(u8, 7), rd.srcs[1]); // bit 123 this one
+    try std.testing.expectEqual(@as(u8, 8), rd.srcs[2]); // bit 124 this one
+    // The reuse bits share dword 3 with the stall and the wait mask, and decode apart
+    // from both.
+    const both = decodeOne(encode.ffma(6, 4, 7, 8, .{ .stall = 3, .wait_mask = 0x21, .reuse_mask = 0b1000 }));
+    try std.testing.expectEqual(@as(u4, 3), both.sched.stall);
+    try std.testing.expectEqual(@as(u6, 0x21), both.sched.wait_mask);
+    try std.testing.expectEqual(@as(u4, 0b1000), both.sched.reuse_mask);
 }
