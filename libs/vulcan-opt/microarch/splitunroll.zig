@@ -49,6 +49,14 @@ const Plan = struct {
 
 pub fn run(allocator: std.mem.Allocator, func: *Function, model: *const mm.Model) Error!bool {
     if (model.exec == .in_order and model.issue_width <= 1) return false;
+    // A SIMT machine wants none of this. The split exists to expose independent
+    // accumulators to an in-order CPU pipeline, and it costs a whole extra compare and
+    // branch per unrolled trip: the shape keeps the ORIGINAL loop as an inner loop the
+    // outer loop re-enters, so K trips of the body pay K compares instead of one. A GPU
+    // hides latency with warp occupancy rather than ILP within one thread, so the cost is
+    // paid for nothing. The guarded unroller, which the SIMT models were built for,
+    // duplicates the body inline and pays ONE compare per unrolled trip.
+    if (model.exec == .simt) return false;
     const fast_math = functionHasFastMath(func);
 
     var info = try loops.analyze(allocator, func);

@@ -128,16 +128,167 @@ pub fn classPorts(model: *const Model, class: UnitClass) u32 {
 
 /// Schedule every block of `func` in place for `model`.
 pub fn run(allocator: std.mem.Allocator, func: *Function, model: *const Model) std.mem.Allocator.Error!void {
-    // A SIMT target schedules itself, and the two schedulers would fight. This pass reorders IR by
-    // functional-unit latency and port count, neither of which an SM has. The NVIDIA backend then
-    // does the real work in nvidia/schedule.zig, over SASS, with the hardware's own mechanisms:
-    // six scoreboards, per-instruction stall counts and convergence barriers. Reordering the IR
-    // first would move instructions the backend must then re-derive barriers for, with no model of
-    // what it costs. Refusing here and not in the caller keeps every caller covered, including a
-    // backend that delegates to this pass the way riscv64/schedule.zig does.
-    if (model.exec == .simt) return;
+    // A SIMT machine has no issue ports and no functional-unit table to schedule around, so
+    // the CPU list scheduler below has nothing to say. What a SIMT machine DOES pay for, and
+    // what its own SASS scheduler cannot fix, is PLACEMENT: the branch-predicate latency is
+    // 14 cycles on sm_120, so a compare that sits beside its branch stalls the warp for 13,
+    // while the same compare a dozen instructions earlier costs one, and a load whose
+    // consumer waits stalls every instruction behind it, warp issue being in order. The
+    // SASS scheduler in nvidia/schedule.zig sets control bits on a fixed stream and never
+    // moves an instruction, so this pass does the moving: the guard chain goes to the top
+    // of its block and loads go above the pure ops that wait on them.
+    if (model.exec == .simt) {
+        try simtSchedule(allocator, func);
+        return;
+    }
     for (0..func.blockCount()) |bi| {
         try scheduleBlock(allocator, func, @enumFromInt(bi), model);
+    }
+}
+
+/// Whether `op` writes memory, so a load must not be hoisted across it. A block holding one
+/// pins the pass's load hoisting off entirely: aliasing is out of reach, so the pass refuses
+/// to reason about what a moved load would read.
+fn writesMemory(op: ir.function.Opcode) bool {
+    return switch (op) {
+        .store, .matmul, .@"if", .call, .call_indirect, .va_start, .va_arg, .va_end, .atomic_rmw, .barrier => true,
+        else => false,
+    };
+}
+
+/// The SIMT placement pass: reorder each block's instructions as
+/// `[the guard chain] [loads with their address chains] [everything else]`, in program
+/// order within each part.
+///
+/// THE GUARD CHAIN is the transitive operand set of the block's trailing `if` condition,
+/// through movable defs. Hoisting it to the top puts the compare a whole body's worth of
+/// issue slots before the branch it feeds, which is how ptxas hides the branch-predicate
+/// latency: it schedules the compare mid-body, seven or more slots from the branch, and
+/// gives it stall 1. Without the hoist the compare sits beside its branch and the stall
+/// field must carry the whole latency.
+///
+/// LOADS are hoisted above the pure ops that consume them because a warp issues in order:
+/// a consumer's scoreboard wait blocks every instruction behind it, so the next load not
+/// issuing until the previous data arrives serializes a whole loop on memory latency.
+/// Loads first keeps the memory pipe full. A load never crosses a store, an atomic or a
+/// barrier: a block holding one keeps its loads in program order, because aliasing is
+/// out of reach for this pass.
+///
+/// The result is VALIDATED, not trusted: every instruction's in-block operands must
+/// precede it in the new order and the trailing `if` must still be last, and a block that
+/// fails either keeps its program order. A pass that only ever reorders pure instructions
+/// and loads inside a store-free region cannot change results, and the validation is the
+/// proof it did not try.
+fn simtSchedule(allocator: std.mem.Allocator, func: *Function) std.mem.Allocator.Error!void {
+    const none = std.math.maxInt(usize);
+    var buf: std.ArrayList(Value) = .empty;
+    defer buf.deinit(allocator);
+    for (0..func.blockCount()) |bi| {
+        const block: Block = @enumFromInt(bi);
+        const insts = func.blockInsts(block);
+        const n = insts.len;
+        if (n < 2) continue;
+
+        const local_of = try allocator.alloc(usize, func.valueCount());
+        defer allocator.free(local_of);
+        @memset(local_of, none);
+        for (insts, 0..) |inst, i| {
+            if (func.instResult(inst)) |r| local_of[@intFromEnum(r)] = i;
+        }
+
+        // A block with an `if` has it LAST by construction, and the emission keeps it
+        // there. Anything memory-writing pins the loads.
+        var has_if = false;
+        var writes = false;
+        for (insts) |inst| {
+            const op = func.opcode(inst);
+            if (op == .@"if") has_if = true;
+            if (writesMemory(op)) writes = true;
+        }
+        if (has_if and func.opcode(insts[n - 1]) != .@"if") continue; // not the shape this models
+
+        const chain = try allocator.alloc(bool, n);
+        defer allocator.free(chain);
+        const preload = try allocator.alloc(bool, n);
+        defer allocator.free(preload);
+        @memset(chain, false);
+        @memset(preload, false);
+
+        // The guard chain: walk the `if` condition's operands back through movable defs.
+        // An operand defined by an immovable instruction stops the walk there, and the
+        // validation below is what makes that safe.
+        if (has_if) {
+            const cf = func.opcode(insts[n - 1]).@"if";
+            var work: std.ArrayList(Value) = .empty;
+            defer work.deinit(allocator);
+            try work.append(allocator, cf.cond);
+            while (work.pop()) |v| {
+                const li = local_of[@intFromEnum(v)];
+                if (li == none) continue;
+                if (chain[li]) continue;
+                if (!movable(func.opcode(insts[li]))) continue;
+                chain[li] = true;
+                try collectOperands(allocator, func, insts[li], &buf);
+                for (buf.items) |operand| try work.append(allocator, operand);
+            }
+        }
+
+        // The load groups: each load plus the movable defs its address depends on. A block
+        // holding a memory write keeps its loads in program order.
+        if (!writes) {
+            for (insts, 0..) |inst, i| {
+                if (func.opcode(inst) != .load) continue;
+                var work: std.ArrayList(usize) = .empty;
+                defer work.deinit(allocator);
+                try work.append(allocator, i);
+                while (work.pop()) |li| {
+                    if (preload[li]) continue;
+                    preload[li] = true;
+                    try collectOperands(allocator, func, insts[li], &buf);
+                    for (buf.items) |operand| {
+                        const oi = local_of[@intFromEnum(operand)];
+                        if (oi == none) continue;
+                        if (!movable(func.opcode(insts[oi]))) continue;
+                        if (!preload[oi]) try work.append(allocator, oi);
+                    }
+                }
+            }
+        }
+
+        // The emission: chain, then preload, then the rest, program order inside each part.
+        var order: std.ArrayList(Inst) = .empty;
+        defer order.deinit(allocator);
+        try order.ensureTotalCapacity(allocator, n);
+        for (insts, 0..) |inst, i| if (chain[i]) try order.append(allocator, inst);
+        for (insts, 0..) |inst, i| if (preload[i] and !chain[i]) try order.append(allocator, inst);
+        for (insts, 0..) |inst, i| if (!chain[i] and !preload[i]) try order.append(allocator, inst);
+        if (order.items.len != n) continue;
+
+        // Validation: every in-block operand precedes its user in the new order, and the
+        // `if` is still last. A block that fails keeps its program order.
+        const pos_of = try allocator.alloc(usize, func.valueCount());
+        defer allocator.free(pos_of);
+        @memset(pos_of, none);
+        var ok = true;
+        for (order.items, 0..) |inst, new_i| {
+            try collectOperands(allocator, func, inst, &buf);
+            for (buf.items) |operand| {
+                const oi = local_of[@intFromEnum(operand)];
+                if (oi == none) continue;
+                const def = func.instResult(insts[oi]).?;
+                const p = pos_of[@intFromEnum(def)];
+                if (p == none or p >= new_i) {
+                    ok = false;
+                    break;
+                }
+            }
+            if (!ok) break;
+            if (func.instResult(inst)) |r| pos_of[@intFromEnum(r)] = new_i;
+        }
+        if (ok and has_if and func.opcode(order.items[n - 1]) != .@"if") ok = false;
+        if (!ok) continue;
+
+        try func.setBlockInsts(block, order.items);
     }
 }
 
@@ -305,11 +456,13 @@ test "issues independent high-latency ops early to hide latency (single-issue ri
     }, func.blockInsts(block));
 }
 
-test "a SIMT model is refused: the NVIDIA backend owns SASS scheduling and the two would fight" {
+test "a SIMT model leaves a pure-arithmetic block untouched: only guards and loads move" {
     // The same block twice. Under a CPU model the two multiplies hoist ahead of the adds that
-    // depend on them (proven by the river test above). Under sm_120 the order must be EXACTLY as
-    // built, because nvidia/schedule.zig schedules SASS itself with scoreboards, stall counts and
-    // convergence barriers, and this pass has no model of any of them.
+    // depend on them (proven by the river test above). Under sm_120 the order must be EXACTLY
+    // as built: the SIMT placement pass moves only a trailing guard chain and loads, and this
+    // block holds neither, so its program order stands. The CPU latency scheduler below still
+    // never runs for SIMT, because an SM has no ports or functional-unit table to schedule
+    // around.
     var func = Function.init(std.testing.allocator);
     defer func.deinit();
     const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
@@ -575,4 +728,73 @@ test "an atomic is pinned in place, and nothing is hoisted across it" {
         // Both instructions after it are the second multiply-add pair.
         try std.testing.expect(func.opcode(insts[3]) == .arith and func.opcode(insts[3]).arith.op == .mul);
     }
+}
+
+test "a SIMT model hoists the guard chain above the body it guards" {
+    // The loop-body shape the placement pass exists for: a compare beside its branch
+    // makes the warp eat the whole branch-predicate latency, 13 stall cycles on sm_120,
+    // while the same compare a body's worth of issue slots earlier costs one. ptxas
+    // schedules its compares mid-body for exactly this reason.
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const bool_t = try func.types.intern(.bool);
+    const blk = try func.appendBlock();
+    const t = try func.appendBlockParam(blk, i32_t);
+    const n = try func.appendBlockParam(blk, i32_t);
+    const acc = try func.appendBlockParam(blk, f32_t);
+    // The body: three multiplies chained on the accumulator.
+    const k = try func.appendInst(blk, f32_t, .{ .fconst = 0.9 });
+    var v = acc;
+    for (0..3) |_| v = try func.appendInst(blk, f32_t, .{ .arith = .{ .op = .mul, .lhs = v, .rhs = k } });
+    // The guard chain: the counter increment and the compare, LAST in program order.
+    const one = try func.appendInst(blk, i32_t, .{ .iconst = 1 });
+    const nt = try func.appendInst(blk, i32_t, .{ .arith = .{ .op = .add, .lhs = t, .rhs = one } });
+    const more = try func.appendInst(blk, bool_t, .{ .icmp = .{ .op = .lt, .lhs = nt, .rhs = n } });
+    try func.appendIf(blk, more, .{ .target = blk, .args = &.{} }, .{ .target = blk, .args = &.{} });
+    func.setTerminator(blk, .{ .ret = ir.function.Ret.one(v) });
+
+    try run(std.testing.allocator, &func, registry.modelFor(.sm_120));
+
+    // The guard chain leads: both chain members come before every multiply, and the `if`
+    // stays last.
+    const order = func.blockInsts(blk);
+    try std.testing.expect(order.len == 8);
+    try std.testing.expect(func.opcode(order[7]) == .@"if");
+    const one_at = std.mem.indexOfScalar(Inst, order, func.definingInst(one).?).?;
+    const k_at = std.mem.indexOfScalar(Inst, order, func.definingInst(k).?).?;
+    const nt_at = std.mem.indexOfScalar(Inst, order, func.definingInst(nt).?).?;
+    try std.testing.expect(nt_at < k_at);
+    try std.testing.expect(one_at < k_at);
+}
+
+test "a SIMT model hoists loads above the pure ops that wait on them" {
+    // The memory-latency shape: a consumer's scoreboard wait blocks every instruction
+    // behind it, warp issue being in order, so a load that follows another load's
+    // consumer issues only after that data arrives. Hoisting the second load above the
+    // first consumer keeps the memory pipe full. ptxas unrolls its matmul into exactly
+    // this arrangement: all the loads, then all the arithmetic.
+    var func = Function.init(std.testing.allocator);
+    defer func.deinit();
+    const f32_t = try func.types.intern(.{ .float = .f32 });
+    const ptr_t = try func.types.ptrGlobal();
+    const blk = try func.appendBlock();
+    const p1 = try func.appendBlockParam(blk, ptr_t);
+    const p2 = try func.appendBlockParam(blk, ptr_t);
+    const l1 = try func.appendInst(blk, f32_t, .{ .load = .{ .ptr = p1 } });
+    const c1 = try func.appendInst(blk, f32_t, .{ .arith = .{ .op = .add, .lhs = l1, .rhs = l1 } });
+    const l2 = try func.appendInst(blk, f32_t, .{ .load = .{ .ptr = p2 } });
+    const c2 = try func.appendInst(blk, f32_t, .{ .arith = .{ .op = .add, .lhs = l2, .rhs = c1 } });
+    func.setTerminator(blk, .{ .ret = ir.function.Ret.one(c2) });
+
+    try run(std.testing.allocator, &func, registry.modelFor(.sm_120));
+
+    // The second load now precedes the first consumer.
+    const order = func.blockInsts(blk);
+    const l1_at = std.mem.indexOfScalar(Inst, order, func.definingInst(l1).?).?;
+    const l2_at = std.mem.indexOfScalar(Inst, order, func.definingInst(l2).?).?;
+    const c1_at = std.mem.indexOfScalar(Inst, order, func.definingInst(c1).?).?;
+    try std.testing.expect(l2_at < c1_at);
+    try std.testing.expect(l1_at < l2_at);
 }
