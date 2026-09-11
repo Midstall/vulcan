@@ -7,6 +7,11 @@
 //! own register enum. See each backend's `*RegDescription` for the numbering it picked. For
 //! example, aarch64 uses the register's own enum integer value. So gpr class index n names x_n,
 //! and fpr class index n names v_n.
+//!
+//! A value normally occupies ONE register. A backend that supplies `RegDescription.regWidth` may
+//! give a value a span of N CONSECUTIVE registers under an alignment, which is what an NVIDIA 64-bit
+//! address pair needs. `Location.reg` then names the BASE of the span, and every place the allocator
+//! picks, blocks, or compares a register works over the whole span. See `RegWidth`.
 
 const std = @import("std");
 const ir = @import("vulcan-ir");
@@ -24,6 +29,27 @@ pub const Error = std.mem.Allocator.Error;
 /// Where a value lives at a program point: a physical register (a class-relative INDEX) or a
 /// spill slot. The value's `classOf` sets the class.
 pub const Location = union(enum) { reg: u16, slot: u32 };
+
+/// How many CONSECUTIVE physical registers ONE value occupies, and the alignment its BASE register
+/// index must satisfy. The default, one register at any index, is the model every backend used
+/// before this type existed.
+///
+/// A value with `regs = 2, alignment = 2` occupies `R(n)` and `R(n + 1)` with `n` even, which is how
+/// an NVIDIA 64-bit address is held. `Location.reg` always names the BASE of the span, and the
+/// backend derives the other registers of the span from that base.
+///
+/// A width above one puts TWO obligations on the backend:
+///   1. `RegClass.slot_bytes` must be large enough for the WIDEST value of the class, because a
+///      spilled value still gets exactly ONE slot. This is the rule aarch64 already follows to keep
+///      a 128-bit vector in a 16-byte slot.
+///   2. The class `scratch`, and `scratch2` when it is supplied, must reserve a whole ALIGNED span
+///      of that width, because a move the resolver routes through the scratch carries a whole value.
+/// `allocate` checks obligation 2 while safety checks are on. Obligation 1 is a byte count the
+/// allocator cannot see, so it stays a documented contract.
+pub const RegWidth = struct {
+    regs: u16 = 1,
+    alignment: u16 = 1,
+};
 
 /// Whether an operand use requires a register. A `must_have_register` operand cannot read from a
 /// spill slot on this target. This is the safe, conservative default. A `should_have_register`
@@ -116,6 +142,16 @@ pub const RegDescription = struct {
     // the guard ever fails the whole coalescing is dropped and the byte-identical distinct-slot
     // placement stands. False (the default) keeps the allocator byte-identical for a non-opting backend.
     coalesce_spill_slots: bool = false,
+    // OPTIONAL multi-register width hook. Return how many CONSECUTIVE registers value `v` occupies
+    // and the alignment its base register index must satisfy. It exists because an NVIDIA 64-bit
+    // address lives in an EVEN-ALIGNED GPR pair `R(n):R(n + 1)`, the first value in this project that
+    // needs more than one architectural register. aarch64 and x86_64 hold a 128-bit vector in ONE
+    // register, so they never need it. The hook is read once per value while the intervals are built,
+    // and once per entry-parameter pin, so its answer must not change for a value inside one
+    // function. Null (the default) gives every value exactly one register at any index, byte-identical
+    // to the prior behavior for a backend that does not opt in. Read the `RegWidth` doc comment for
+    // the two obligations a width above one puts on the backend.
+    regWidth: ?*const fn (ctx: *const anyopaque, func: *const Function, v: Value) RegWidth = null,
 
     /// Free every owned slice the backend builder allocated: each class's `allocatable` and
     /// `callee_saved`, the `classes` slice, each call site's per-class `regs` and its `clobbered`
@@ -191,6 +227,14 @@ pub const Interval = struct {
     // set, so the clobber spares a `narrow` value. False by default (a full clobber, or a value
     // interval).
     preserves_narrow: bool = false,
+    // How many CONSECUTIVE registers this interval occupies, and the alignment its base register
+    // must meet. Both come from the backend's `RegDescription.regWidth` for the interval's value.
+    // They stay 1 and 1 for every backend that does not opt in, and for a CALL-CLOBBER fixed
+    // interval, which always blocks exactly one register. An ENTRY-PARAMETER fixed interval carries
+    // the width of the parameter it pins, so the pin blocks the whole span. A split child inherits
+    // both from its parent, because a split cuts a lifetime and never changes a value's width.
+    regs: u16 = 1,
+    reg_align: u16 = 1,
 
     /// The interval's first live position. Programmer error to call on an empty interval.
     pub fn start(self: *const Interval) u32 {
@@ -606,6 +650,9 @@ pub fn buildIntervals(allocator: std.mem.Allocator, func: *const Function, desc:
             }
         }
         const narrow = if (desc.isNarrow) |hook| hook(desc.ctx, func, value) else false;
+        // The register width is read ONCE here and carried on the interval, so every later site
+        // (the scan, the splitter, the resolver, the verifier) reads one answer.
+        const width = widthOf(desc, func, value);
         try result.append(allocator, .{
             .value = value,
             .class = class,
@@ -614,6 +661,8 @@ pub fn buildIntervals(allocator: std.mem.Allocator, func: *const Function, desc:
             .uses = us,
             .copy_src = copy_src,
             .narrow = narrow,
+            .regs = width.regs,
+            .reg_align = width.alignment,
         });
     }
 
@@ -648,8 +697,6 @@ const FixedKey = struct { class: u16, reg: u16 };
 /// over each call position) and one per entry parameter (pinning its ABI register at `[0, 1)`, with
 /// the parameter value kept as an allocation hint for the scan).
 fn appendFixedIntervals(allocator: std.mem.Allocator, func: *const Function, desc: *const RegDescription, result: *std.ArrayList(Interval)) Error!void {
-    _ = func;
-
     // Merge call clobbers per (class, reg): each clobbered register gets a [pos, pos+1) range at
     // every call it is live across, collected into a single interval with multiple ranges + holes.
     var keys: std.ArrayList(FixedKey) = .empty;
@@ -708,12 +755,18 @@ fn appendFixedIntervals(allocator: std.mem.Allocator, func: *const Function, des
         rs[0] = .{ .from = 0, .to = 1 };
         const us = try allocator.alloc(UsePos, 0);
         errdefer allocator.free(us);
+        // The pin covers the parameter's WHOLE register span. A two-register parameter pinned at
+        // `R(n)` owns `R(n)` and `R(n + 1)` at entry, so a pin that blocked only the base would let
+        // the scan hand `R(n + 1)` to another value that is live at entry.
+        const width = widthOf(desc, func, ef.value);
         try result.append(allocator, .{
             .value = ef.value,
             .class = ef.class,
             .fixed_reg = ef.reg,
             .ranges = rs,
             .uses = us,
+            .regs = width.regs,
+            .reg_align = width.alignment,
         });
     }
 }
@@ -832,6 +885,61 @@ fn containsReg(set: []const u16, reg: u16) bool {
     return false;
 }
 
+/// The register width value `v` occupies, from the backend's optional `regWidth` hook. A backend
+/// that does not supply the hook gets one register at any index, which is what every backend but
+/// NVIDIA needs.
+fn widthOf(desc: *const RegDescription, func: *const Function, v: Value) RegWidth {
+    const hook = desc.regWidth orelse return .{};
+    const w = hook(desc.ctx, func, v);
+    // A width of zero holds no bits, and an alignment of zero divides nothing. Both are programmer
+    // errors in the backend, not runtime faults, so they assert.
+    std.debug.assert(w.regs >= 1);
+    std.debug.assert(w.alignment >= 1);
+    return w;
+}
+
+/// True iff the register spans `[base_a, base_a + regs_a)` and `[base_b, base_b + regs_b)` share at
+/// least one register. This is the WHOLE-SPAN test that replaces a base-only equality compare. A
+/// check that tests only the base lets a two-register value sit on top of its neighbor, which is a
+/// silent wrong-answer bug, so every interference site uses this.
+fn spansOverlap(base_a: u16, regs_a: u16, base_b: u16, regs_b: u16) bool {
+    return base_a < base_b +| regs_b and base_b < base_a +| regs_a;
+}
+
+/// True iff `[base, base + regs)` is a legal placement for a value of this alignment: the base meets
+/// the alignment, the span fits inside the per-register bookkeeping, and every register of the span
+/// is in the candidate set. When `evictable` is given, every register of the span must be evictable
+/// too. For a one-register value with alignment 1 this reduces to the candidate (and evictable) flag
+/// of the single register, which is what the scan tested before multi-register values existed.
+fn spanPlaceable(
+    is_candidate: *const [max_phys_regs]bool,
+    evictable: ?*const [max_phys_regs]bool,
+    base: usize,
+    regs: u16,
+    alignment: u16,
+) bool {
+    if (base % alignment != 0) return false;
+    if (base + regs > max_phys_regs) return false;
+    for (base..base + regs) |r| {
+        if (!is_candidate[r]) return false;
+        if (evictable) |e| {
+            if (!e[r]) return false;
+        }
+    }
+    return true;
+}
+
+/// The minimum of `arr` over the register span `[base, base + regs)`. A span is only as free, or as
+/// unblocked, as its most constrained register. The caller checks `spanPlaceable` first, so the span
+/// is in range.
+fn spanMin(arr: *const [max_phys_regs]u32, base: usize, regs: u16) u32 {
+    var m: u32 = infinity;
+    for (base..base + regs) |r| {
+        if (arr[r] < m) m = arr[r];
+    }
+    return m;
+}
+
 /// The earliest position at which the call-clobber `fixed` interval genuinely forces `current` out
 /// of its register: a clobber point `c` that `current` holds a register ACROSS, i.e. it `covers(c)`
 /// and `covers(c + 1)`. A value that merely READS an operand at the call (`covers(c)` but dead at
@@ -892,9 +1000,14 @@ fn tryAllocateFreeReg(
     }
     const hint = if (current.value) |v| entryHint(desc, v, class_idx) else null;
     if (hint) |h| {
-        std.debug.assert(h < max_phys_regs);
-        is_candidate[h] = true;
-        free_until[h] = infinity;
+        // The pin names the BASE of the parameter's span, so every register of that span joins the
+        // candidate set. For a one-register value this is the single hinted register, as before.
+        var k: u16 = 0;
+        while (k < current.regs) : (k += 1) {
+            std.debug.assert(h + k < max_phys_regs);
+            is_candidate[h + k] = true;
+            free_until[h + k] = infinity;
+        }
     }
 
     // An active interval of this class occupies its register right now (free until position 0). An
@@ -912,7 +1025,13 @@ fn tryAllocateFreeReg(
             if (r < max_phys_regs and is_candidate[r]) coalesce_hint = r;
             continue;
         }
-        if (r < max_phys_regs and is_candidate[r]) free_until[r] = 0;
+        // The occupant holds its WHOLE span right now, so every register of it is busy. Marking only
+        // the base would leave the second register of a pair looking free.
+        var k: u16 = 0;
+        while (k < it.regs) : (k += 1) {
+            const rr = r +| k;
+            if (rr < max_phys_regs and is_candidate[rr]) free_until[rr] = 0;
+        }
     }
     // An inactive interval of this class has a hole here, so its register is free only until the two
     // ranges next intersect. A call-clobber fixed interval (seeded into `inactive`) uses the
@@ -921,10 +1040,14 @@ fn tryAllocateFreeReg(
         if (it.class != class_idx) continue;
         if (sameValue(it, current)) continue;
         const r = assignedReg(it);
-        if (r < max_phys_regs and is_candidate[r]) {
-            const x = if (it.fixed_reg != null) fixedClobberConflict(current, it) else current.nextIntersection(it);
-            if (x) |xx| {
-                if (xx < free_until[r]) free_until[r] = xx;
+        if (r >= max_phys_regs) continue;
+        const x = if (it.fixed_reg != null) fixedClobberConflict(current, it) else current.nextIntersection(it);
+        if (x) |xx| {
+            // The reclaim takes back the occupant's WHOLE span, so clamp every register of it.
+            var k: u16 = 0;
+            while (k < it.regs) : (k += 1) {
+                const rr = r +| k;
+                if (rr < max_phys_regs and is_candidate[rr] and xx < free_until[rr]) free_until[rr] = xx;
             }
         }
     }
@@ -935,29 +1058,36 @@ fn tryAllocateFreeReg(
     // move), and the entry-parameter hint (a parameter keeps its ABI register). The coalesce hint
     // wins, then the block-parameter hint, then the entry hint. These three never apply to the same
     // value (a copy destination is not a parameter, and only a block-0 parameter has an entry hint).
+    // The candidate now is a BASE register, and its span is free only as long as its most
+    // constrained register. For the one-register default this is exactly the old per-register scan,
+    // in the same ascending order, so the pick is byte-identical.
     const pref_hint = coalesce_hint orelse param_hint orelse hint;
     var best_free: u32 = 0;
-    for (0..max_phys_regs) |r| {
-        if (is_candidate[r] and free_until[r] > best_free) best_free = free_until[r];
+    for (0..max_phys_regs) |b| {
+        if (!spanPlaceable(&is_candidate, null, b, current.regs, current.reg_align)) continue;
+        const f = spanMin(&free_until, b, current.regs);
+        if (f > best_free) best_free = f;
     }
     if (best_free == 0) return null;
     var chosen: ?u16 = null;
     if (pref_hint) |h| {
-        if (is_candidate[h] and free_until[h] == best_free) chosen = h;
+        if (spanPlaceable(&is_candidate, null, h, current.regs, current.reg_align) and
+            spanMin(&free_until, h, current.regs) == best_free) chosen = h;
     }
     if (chosen == null) {
-        for (0..max_phys_regs) |r| {
-            if (is_candidate[r] and free_until[r] == best_free) {
-                chosen = @intCast(r);
+        for (0..max_phys_regs) |b| {
+            if (!spanPlaceable(&is_candidate, null, b, current.regs, current.reg_align)) continue;
+            if (spanMin(&free_until, b, current.regs) == best_free) {
+                chosen = @intCast(b);
                 break;
             }
         }
     }
     const reg = chosen.?;
 
-    // A register free at least to `current.end()` (half-open) covers the whole interval. Anything
-    // less would need a split, which this function does not do.
-    if (free_until[reg] >= current.end()) return reg;
+    // A span free at least to `current.end()` (half-open) covers the whole interval. Anything less
+    // would need a split, which this function does not do.
+    if (best_free >= current.end()) return reg;
     return null;
 }
 
@@ -973,6 +1103,11 @@ fn copyDiesAt(dst: *const Interval, src: *const Interval) bool {
     if (src.fixed_reg != null) return false;
     const sv = src.value orelse return false;
     if (cs != sv) return false;
+    // Two values can share ONE register span only when they have the same shape. A width or an
+    // alignment difference means the two cover different register sets, so placing one on the other
+    // would leave part of the wider one on a register the narrower one does not own. Both fields are
+    // 1 for a backend with no `regWidth` hook, so this is byte-identical there.
+    if (src.regs != dst.regs or src.reg_align != dst.reg_align) return false;
     return src.end() == dst.start() + 1;
 }
 
@@ -1259,6 +1394,12 @@ fn edgeSlotBothSrcAndDst(all: []const *Interval, intervals: []const Interval, ch
 /// distinct-slot placement, keeping the allocation byte-identical to the non-coalescing path. A no-op
 /// unless the backend set `RegDescription.coalesce_spill_slots`. Rewrites the `location` of the
 /// spilled intervals in place and compacts `slots` to the reduced per-class count.
+///
+/// Register WIDTH never enters this code, and that is correct rather than an oversight: a spilled
+/// value takes exactly ONE slot whatever its register width, because a slot is `RegClass.slot_bytes`
+/// wide and the backend sizes that for its widest value (see `RegWidth`). Sharing is decided by live
+/// ranges alone, so a two-register value coalesces with a non-interfering partner exactly as a
+/// one-register value does, and the slot renumbering stays a plain dense remap.
 fn coalesceSpillSlots(allocator: std.mem.Allocator, func: *const Function, intervals: []Interval, children: []const *Interval, slots: []u32, desc: *const RegDescription) Error!void {
     if (!desc.coalesce_spill_slots) return;
     const nclasses: u16 = @intCast(desc.classes.len);
@@ -1425,6 +1566,12 @@ pub fn allocate(allocator: std.mem.Allocator, func: *const Function, desc: *cons
     const intervals = try buildIntervals(allocator, func, desc);
     defer freeIntervals(allocator, intervals);
 
+    // A move the resolver routes through a class scratch carries a WHOLE value, so a class that
+    // holds a multi-register value needs an aligned, fully reserved scratch span of that width.
+    // Checking it here, against the widths this function actually built, beats a comment that says
+    // the backend must remember. It costs nothing for a backend with no `regWidth` hook.
+    if (std.debug.runtime_safety) assertScratchFitsWidth(intervals, desc);
+
     // Split children are heap-allocated intervals born during the scan. They are tracked here, so
     // their owned `ranges`, `uses`, and the interval box itself are freed even on an error path.
     var children: std.ArrayList(*Interval) = .empty;
@@ -1567,6 +1714,41 @@ pub fn allocate(allocator: std.mem.Allocator, func: *const Function, desc: *cons
     return result;
 }
 
+/// Assert the reserved scratch registers of every class can hold that class's WIDEST value. The
+/// resolver routes a slot-to-slot move, and a broken move cycle, through the class scratch, and that
+/// transfer carries a whole value. So a class whose widest value takes N registers needs the N
+/// registers from the scratch base reserved, and the base must meet the alignment that width demands.
+/// A backend that reserved only the base would silently destroy the register beside its scratch.
+/// A backend with no `regWidth` hook cannot report a width above one, so this returns at once and
+/// costs such a backend nothing, even in a safety build.
+fn assertScratchFitsWidth(intervals: []const Interval, desc: *const RegDescription) void {
+    if (desc.regWidth == null) return;
+    for (0..desc.classes.len) |ci| {
+        var regs: u16 = 1;
+        var alignment: u16 = 1;
+        for (intervals) |*iv| {
+            if (iv.class != ci) continue;
+            if (iv.regs > regs) regs = iv.regs;
+            if (iv.reg_align > alignment) alignment = iv.reg_align;
+        }
+        if (regs == 1 and alignment == 1) continue;
+        const bases = [_]?u16{
+            if (ci < desc.scratch.len) desc.scratch[ci] else null,
+            if (ci < desc.scratch2.len) desc.scratch2[ci] else null,
+        };
+        for (bases) |maybe_base| {
+            const base = maybe_base orelse continue;
+            std.debug.assert(base % alignment == 0);
+            // Every register the scratch span covers must be outside the allocatable pool, so no
+            // value is ever placed where a routed move will overwrite it.
+            var k: u16 = 1;
+            while (k < regs) : (k += 1) {
+                std.debug.assert(!containsReg(desc.classes[ci].allocatable, base + k));
+            }
+        }
+    }
+}
+
 /// The per-block half-open position bounds `[from, to)`, numbered EXACTLY as `buildIntervals` does
 /// (block start row, one position per instruction, one terminator slot), so a position looked up
 /// here lands in the same block the intervals were built against. Blocks are contiguous
@@ -1688,6 +1870,10 @@ fn splitInterval(allocator: std.mem.Allocator, parent: *Interval, pos: u32, chil
         .uses = tu,
         .location = null,
         .narrow = parent.narrow,
+        // A split cuts a LIFETIME, never a value's shape, so the child holds the same number of
+        // registers under the same alignment as its parent.
+        .regs = parent.regs,
+        .reg_align = parent.reg_align,
     };
     try children.append(allocator, child);
 
@@ -1707,6 +1893,12 @@ fn splitInterval(allocator: std.mem.Allocator, parent: *Interval, pos: u32, chil
 /// this function. It returns `error.Unsupported` when a same-position must-have demand exceeds
 /// the register pool, the unsatisfiable case the old allocator also rejects as "too many live
 /// params".
+///
+/// A MULTI-REGISTER value spills the same way a one-register value does, into ONE slot. The slot is
+/// `RegClass.slot_bytes` wide and the backend must size that for the class's widest value, so the
+/// store and the reload the resolver emits carry the whole span. `Move.value` names the IR value, so
+/// a width-aware backend picks the wide store and the wide load from it, the same mechanism aarch64
+/// uses for a 128-bit vector in a 16-byte slot. Nothing here counts registers.
 fn spillCurrent(
     allocator: std.mem.Allocator,
     current: *Interval,
@@ -1780,10 +1972,18 @@ fn allocateBlockedReg(
         if (it.class != class_idx) continue;
         if (it.fixed_reg != null) continue;
         const r = assignedReg(it);
-        if (r >= max_phys_regs or !is_candidate[r]) continue;
+        if (r >= max_phys_regs) continue;
         const u = it.firstUseAfter(p) orelse it.end();
-        if (u < next_use[r]) next_use[r] = u;
-        if (it.start() == p) evictable[r] = false;
+        // The occupant holds its WHOLE span, so every register of it is wanted again at that use,
+        // and every register of it is unevictable when the occupant starts here. Recording the base
+        // only would let the scan steal the second half of a two-register value.
+        var k: u16 = 0;
+        while (k < it.regs) : (k += 1) {
+            const rr = r +| k;
+            if (rr >= max_phys_regs or !is_candidate[rr]) continue;
+            if (u < next_use[rr]) next_use[rr] = u;
+            if (it.start() == p) evictable[rr] = false;
+        }
     }
     // An inactive VALUE interval only reclaims its register where it next intersects `current`.
     // Its next use bounds how soon that register is genuinely wanted.
@@ -1791,10 +1991,15 @@ fn allocateBlockedReg(
         if (it.class != class_idx) continue;
         if (it.fixed_reg != null) continue;
         const r = assignedReg(it);
-        if (r >= max_phys_regs or !is_candidate[r]) continue;
+        if (r >= max_phys_regs) continue;
         if (current.nextIntersection(it) == null) continue;
         const u = it.firstUseAfter(p) orelse it.end();
-        if (u < next_use[r]) next_use[r] = u;
+        var k: u16 = 0;
+        while (k < it.regs) : (k += 1) {
+            const rr = r +| k;
+            if (rr >= max_phys_regs or !is_candidate[rr]) continue;
+            if (u < next_use[rr]) next_use[rr] = u;
+        }
     }
     // A fixed interval is a HARD block on its register: record it in both `next_use` (the register
     // cannot be chosen past there) and `block_pos` (the point `current` must be split before). A
@@ -1810,25 +2015,35 @@ fn allocateBlockedReg(
             if (it.class != class_idx) continue;
             if (sameValue(it, current)) continue;
             const r = it.fixed_reg.?;
-            if (r >= max_phys_regs or !is_candidate[r]) continue;
+            if (r >= max_phys_regs) continue;
             const x = if (it.value == null) fixedClobberConflict(current, it) else current.nextIntersection(it);
             if (x) |xx| {
-                if (xx < next_use[r]) next_use[r] = xx;
-                if (xx < block_pos[r]) block_pos[r] = xx;
+                // A call clobber is one register wide, but an entry pin covers its parameter's whole
+                // span, so block every register the fixed interval owns.
+                var k: u16 = 0;
+                while (k < it.regs) : (k += 1) {
+                    const rr = r +| k;
+                    if (rr >= max_phys_regs or !is_candidate[rr]) continue;
+                    if (xx < next_use[rr]) next_use[rr] = xx;
+                    if (xx < block_pos[rr]) block_pos[rr] = xx;
+                }
             }
         }
     }
 
     // Pick the EVICTABLE register whose next use is furthest away (the least costly to steal). A
     // register whose active occupant starts at `p` is skipped: it cannot be split at `p` to make room.
+    // The candidate is a BASE register whose whole span is placeable and evictable, and the span is
+    // wanted back as soon as its earliest-wanted register. For the one-register default this is the
+    // old per-register loop in the same order, so the pick is byte-identical.
     var chosen: ?u16 = null;
     var best: u32 = 0;
-    for (0..max_phys_regs) |r| {
-        if (!is_candidate[r]) continue;
-        if (!evictable[r]) continue;
-        if (chosen == null or next_use[r] > best) {
-            best = next_use[r];
-            chosen = @intCast(r);
+    for (0..max_phys_regs) |b| {
+        if (!spanPlaceable(&is_candidate, &evictable, b, current.regs, current.reg_align)) continue;
+        const nu = spanMin(&next_use, b, current.regs);
+        if (chosen == null or nu > best) {
+            best = nu;
+            chosen = @intCast(b);
         }
     }
 
@@ -1842,41 +2057,48 @@ fn allocateBlockedReg(
 
     // If `current`'s own first use is later than the chosen register's next use, `current` is the
     // cheapest to spill: keep it in memory over the head and re-allocate the register-needing tail.
+    // `best` is the chosen span's next-use position, the value `next_use[reg]` held before spans
+    // existed.
     const current_first_use = current.firstUseAfter(p);
-    if (current_first_use == null or current_first_use.? > next_use[reg]) {
+    if (current_first_use == null or current_first_use.? > best) {
         try spillCurrent(allocator, current, unhandled, children, slots, class_idx);
         return;
     }
 
-    // Otherwise take `reg` for `current` and split whatever occupies it.
+    // Otherwise take the span based at `reg` for `current` and split whatever occupies any register
+    // of it.
     current.location = .{ .reg = reg };
 
-    // The single active value interval on `reg` is split at `p`: its head keeps the register up to
-    // here (and expires next step), its tail is re-allocated elsewhere.
+    // Every active value interval whose span OVERLAPS the taken span is split at `p`: its head keeps
+    // its registers up to here (and expires next step), its tail is re-allocated elsewhere. Register
+    // exclusivity means a ONE-register span has at most one such occupant, so this walks the same
+    // single interval the earlier base-equality test found. A WIDER span can displace more than one
+    // occupant, so the loop no longer stops at the first.
     for (active.items) |it| {
         if (it.class != class_idx) continue;
         if (it.fixed_reg != null) continue;
-        if (assignedReg(it) != reg) continue;
+        if (!spansOverlap(assignedReg(it), it.regs, reg, current.regs)) continue;
         std.debug.assert(it.start() < p);
         const tail = try splitInterval(allocator, it, p, children);
         try insertSorted(allocator, unhandled, tail);
-        break;
     }
-    // Each inactive value interval on `reg` that would reclaim it inside `current`'s life is split
-    // at that intersection. Its tail is re-allocated elsewhere.
+    // Each inactive value interval overlapping the taken span that would reclaim it inside
+    // `current`'s life is split at that intersection. Its tail is re-allocated elsewhere.
     for (inactive.items) |it| {
         if (it.class != class_idx) continue;
         if (it.fixed_reg != null) continue;
-        if (assignedReg(it) != reg) continue;
+        if (!spansOverlap(assignedReg(it), it.regs, reg, current.regs)) continue;
         const x = current.nextIntersection(it) orelse continue;
         std.debug.assert(x > it.start() and x < it.end());
         const tail = try splitInterval(allocator, it, x, children);
         try insertSorted(allocator, unhandled, tail);
     }
-    // A fixed interval clobbers `reg` before `current` ends: `current` cannot hold `reg` across the
-    // clobber, so split it before the block and re-allocate the far side.
-    if (block_pos[reg] < current.end()) {
-        const bp = block_pos[reg];
+    // A fixed interval clobbers some register of the taken span before `current` ends: `current`
+    // cannot hold the span across the clobber, so split it before the block and re-allocate the far
+    // side.
+    const span_block_pos = spanMin(&block_pos, reg, current.regs);
+    if (span_block_pos < current.end()) {
+        const bp = span_block_pos;
         // `bp <= p` means the clobber falls AT `current`'s very start, which is not a legal split
         // point, since `splitInterval` needs pos > start. This arises when `current` is a value used
         // AT `p` and ALSO live past a clobber it cannot escape, for example an xmm value that is a
@@ -2112,11 +2334,20 @@ fn buildAllocation(allocator: std.mem.Allocator, func: *const Function, interval
                 .reg => |r| r,
                 .slot => return,
             };
-            if (!containsReg(self.desc.classes[iv.class].callee_saved, reg)) return;
-            for (self.used.items) |u| {
-                if (u.class == iv.class and u.reg == reg) return;
+            // A multi-register value occupies its WHOLE span, so EVERY callee-saved register of the
+            // span needs a prologue save. Recording the base only would leave the second half of a
+            // pair unsaved, and the function would destroy its caller's copy.
+            var k: u16 = 0;
+            while (k < iv.regs) : (k += 1) {
+                const rr = reg +| k;
+                if (!containsReg(self.desc.classes[iv.class].callee_saved, rr)) continue;
+                var seen = false;
+                for (self.used.items) |u| {
+                    if (u.class == iv.class and u.reg == rr) seen = true;
+                }
+                if (seen) continue;
+                try self.used.append(self.allocator, .{ .class = iv.class, .reg = rr });
             }
-            try self.used.append(self.allocator, .{ .class = iv.class, .reg = reg });
         }
     };
     var used: std.ArrayList(UsedSaved) = .empty;
@@ -2588,22 +2819,28 @@ fn assertNoCriticalEdges(allocator: std.mem.Allocator, func: *const Function) Er
 // the split children flattened into one slice, and checks three soundness
 // properties:
 //
-//   1. REGISTER EXCLUSIVITY: no two same-class intervals in the same physical
-//      register have overlapping live ranges. This is the core soundness
-//      property.
+//   1. REGISTER EXCLUSIVITY: no two same-class intervals whose register SPANS
+//      overlap have overlapping live ranges. This is the core soundness
+//      property. A value that occupies N consecutive registers is compared over
+//      its whole span, not its base alone, so a two-register value sitting on
+//      top of its neighbor is caught here.
 //   2. MUST_HAVE_REGISTER: every `must_have_register` use is covered by a
 //      register-located interval of its value, never only a spill slot.
 //   3. ASSIGNMENT: every value interval with a use was placed somewhere.
+//   4. SPAN LEGALITY: a placed interval's base register meets the alignment its
+//      width demands, and its span fits the register-index space.
 //
-// The one legitimate same-(class, reg) overlap, a value interval and its OWN
-// entry-parameter fixed interval at entry, is exempt from check 1.
+// The two legitimate same-span overlaps, a value interval and its OWN
+// entry-parameter fixed interval at entry, and a coalesced copy pair, are
+// exempt from check 1. Both share a WHOLE span. A PARTIAL span overlap is never
+// legitimate, so it stays a violation even for such a pair.
 // ===========================================================================
 
 /// One thing the allocation got wrong, found by `verifyIntervals`. `a` and `b` index the intervals
 /// slice passed to the verifier, and `b == a` for the single-interval checks. `pos` is the program
 /// position the violation manifests at.
 pub const Violation = struct {
-    kind: enum { reg_overlap, must_have_spilled, unassigned },
+    kind: enum { reg_overlap, must_have_spilled, unassigned, misaligned_span },
     a: usize,
     b: usize,
     pos: u32,
@@ -2630,6 +2867,16 @@ fn isEntryParamHintPair(a: *const Interval, b: *const Interval) bool {
     const bv = b.value orelse return false;
     if (av != bv) return false;
     return (a.fixed_reg != null) != (b.fixed_reg != null);
+}
+
+/// True iff the two intervals occupy the SAME register span: same base, same width. Both legitimate
+/// same-register overlaps, an entry-parameter pin and a coalesced copy pair, share a whole span, so
+/// the exemptions in check 1 are gated on this. A PARTIAL overlap, for example a two-register value
+/// based one register into another two-register value, is never legitimate and stays a violation.
+/// For a one-register model this is exactly the `base_a == base_b` the check already required before
+/// reaching an exemption.
+fn sameSpan(a: *const Interval, base_a: u16, b: *const Interval, base_b: u16) bool {
+    return base_a == base_b and a.regs == b.regs;
 }
 
 /// The earliest position two same-(class, reg) intervals genuinely conflict at, or null. When one is a
@@ -2666,20 +2913,25 @@ pub fn verifyIntervals(allocator: std.mem.Allocator, intervals: []const Interval
     var violations: std.ArrayList(Violation) = .empty;
     errdefer violations.deinit(allocator);
 
-    // CHECK 1: register exclusivity. Every pair of same-class intervals occupying the same physical
-    // register must have disjoint live ranges, except a value interval and its own entry-param fixed
-    // interval sharing the ABI register at entry.
+    // CHECK 1: register exclusivity. Every pair of same-class intervals whose register SPANS overlap
+    // must have disjoint live ranges, except a value interval and its own entry-param fixed interval
+    // sharing the ABI register span at entry, or a coalesced copy pair.
     for (intervals, 0..) |*ia, i| {
         const ra = occupiedReg(ia) orelse continue;
         for (intervals[i + 1 ..], i + 1..) |*ib, j| {
             if (ia.class != ib.class) continue;
             const rb = occupiedReg(ib) orelse continue;
-            if (ra != rb) continue;
-            if (isEntryParamHintPair(ia, ib)) continue;
-            // A coalesced copy destination and its source share one register over the single copy
-            // position, a no-op move. That is their only overlap (the source dies at the copy), so
-            // it is not a conflict.
-            if (isCopyCoalescePair(ia, ib)) continue;
+            // The FULL span, not just the base. A two-register value based at R4 occupies R4 AND R5,
+            // so it conflicts with anything that holds R5 as well. A base-only compare misses that,
+            // and a missed conflict is a silent wrong-answer bug.
+            if (!spansOverlap(ra, ia.regs, rb, ib.regs)) continue;
+            if (sameSpan(ia, ra, ib, rb)) {
+                if (isEntryParamHintPair(ia, ib)) continue;
+                // A coalesced copy destination and its source share one register span over the
+                // single copy position, a no-op move. That is their only overlap (the source dies at
+                // the copy), so it is not a conflict.
+                if (isCopyCoalescePair(ia, ib)) continue;
+            }
             if (occupancyConflict(ia, ib)) |pos| {
                 try violations.append(allocator, .{ .kind = .reg_overlap, .a = i, .b = j, .pos = pos });
             }
@@ -2708,6 +2960,18 @@ pub fn verifyIntervals(allocator: std.mem.Allocator, intervals: []const Interval
         if (ia.location == null) {
             try violations.append(allocator, .{ .kind = .unassigned, .a = i, .b = i, .pos = ia.start() });
         }
+    }
+
+    // CHECK 4: span legality. A placed interval's BASE must meet the alignment its width demands,
+    // and the whole span must fit the register-index space the scan reasons over. A misaligned base
+    // is the first shape of bug a width-aware backend hits, for example an odd base handed to a
+    // 64-bit address pair, and the hardware would then read the wrong register. An alignment of 1
+    // divides every index, so a one-register model never reaches this.
+    for (intervals, 0..) |*ia, i| {
+        const ra = occupiedReg(ia) orelse continue;
+        std.debug.assert(ia.reg_align >= 1);
+        if (ra % ia.reg_align == 0 and @as(usize, ra) + ia.regs <= max_phys_regs) continue;
+        try violations.append(allocator, .{ .kind = .misaligned_span, .a = i, .b = i, .pos = ia.start() });
     }
 
     return violations.toOwnedSlice(allocator);

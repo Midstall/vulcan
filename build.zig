@@ -305,6 +305,19 @@ pub fn build(b: *std.Build) void {
     }) });
     test_step.dependOn(&b.addRunArtifact(wimmer_tests).step);
 
+    // Multi-register (aligned register-span) allocator tests. They run against a SYNTHETIC backend,
+    // because no shipping backend puts one value in more than one architectural register yet.
+    const wimmer_multireg_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("libs/vulcan-target/wimmer_multireg_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "vulcan-ir", .module = vulcan_ir },
+            .{ .name = "vulcan-target", .module = vulcan_target },
+        },
+    }) });
+    test_step.dependOn(&b.addRunArtifact(wimmer_multireg_tests).step);
+
     // GPU offload execution tests: lower a kernel to a host loop nest with `vulcan-gpu`, JIT
     // it for the host, run the whole grid, and assert the buffer it wrote. Every other kernel
     // test is structural, so this is the one that proves a kernel computes the right numbers.
