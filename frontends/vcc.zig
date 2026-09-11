@@ -937,14 +937,20 @@ fn compileToObject(allocator: std.mem.Allocator, io: std.Io, path: []const u8, p
 /// `mm.optimize` (the microarch layer, which needs that mem2reg'd form to do anything) over the
 /// same IR, and is handed to `writeObjectDataForModel` so the backend tunes its own choices
 /// (instruction selection, scheduling) for it too.
+///
+/// The target-independent pipeline runs in TWO halves with the microarch layer between them.
+/// `opt.optimizeLate` reduces a loop's addresses to loop-carried pointers, which changes the shape
+/// four microarch idiom recognizers match on, so it has to come after them. `opt.optimize` is the
+/// two halves back to back, for a caller with no microarch layer to fit in between.
 fn compileSourceToObject(allocator: std.mem.Allocator, source: []const u8, pp_opts: preproc.Options, arch: link.Arch, model: ?*const mm.Model, optimize: bool) ![]u8 {
     var mod = try cc.compileWithOpts(allocator, source, pp_opts);
     defer mod.deinit(allocator);
 
     var mfs: std.ArrayList(target.native.ModuleFunction) = .empty;
     for (mod.funcs) |*nf| {
-        if (optimize) _ = try opt.optimize(allocator, &nf.func);
+        if (optimize) _ = try opt.optimizeEarly(allocator, &nf.func);
         if (model) |m| _ = try mm.optimize(allocator, &nf.func, m);
+        if (optimize) _ = try opt.optimizeLate(allocator, &nf.func);
         try mfs.append(allocator, .{ .name = nf.name, .func = &nf.func });
     }
 
