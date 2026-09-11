@@ -1048,17 +1048,10 @@ pub fn compileShaderOpts(allocator: std.mem.Allocator, func: *Function, stage: S
         };
     }
 
-    // Scoreboard scheduling: add write barriers on variable-latency ops (LDG,
-    // S2R) and waits on their consumers, so code reads results only once
-    // they are ready. The block-start indices let the scheduler drain
-    // scoreboards at each basic-block boundary, so its linear walk stays
-    // correct across the control flow that inlining introduces.
-    schedule.scheduleBlocks(code.items, block_start);
-
     // Patch each control-flow op's relative displacement. The destination is
     // a block start (resolved through block_start) or a direct instruction
     // index (a local label from emitIf). The offset is computed exactly like
-    // NAK's get_rel_offset (sm70_encode.rs): `target_ip - cur_ip - 4`, where
+    // NAK's `get_rel_offset` (sm70_encode.rs): `target_ip - cur_ip - 4`, where
     // `ip` counts in 32-bit words and one 128-bit instruction equals 4
     // words. So the encoded value is in word units:
     // `(dst_inst - cur_inst)*4 - 4 = (dst_inst - next_inst)*4`. An earlier
@@ -1083,11 +1076,26 @@ pub fn compileShaderOpts(allocator: std.mem.Allocator, func: *Function, stage: S
         // ptxas gives every branch stall 6 on sm_120, never the field's maximum: the
         // branch pipe needs its resolution cycles and nothing more. The isel used to
         // leave the Control default of 15 here, which cost nine idle cycles on every
-        // loop back edge. A producer whose consumer sits across a branch keeps its own
-        // 15 through the found-gate in `assignStalls`, so this field covers only the
-        // branch itself.
+        // loop back edge.
         code.items[f.at] = encode.bra(off_words, .{ .pred = @intCast(pred), .pred_neg = neg, .stall = 6 });
     }
+
+    // Scoreboard scheduling: add write barriers on variable-latency ops (LDG,
+    // S2R) and waits on their consumers, so code reads results only once
+    // they are ready. The block-start indices let the scheduler drain
+    // scoreboards at each basic-block boundary, so its linear walk stays
+    // correct across the control flow that inlining introduces.
+    //
+    // THIS RUNS AFTER THE DISPLACEMENT PATCH, and the order is load-bearing:
+    // `assignStalls` decodes each branch's target to measure the distance to a
+    // consumer across it, which reads the patched offset. Run before the patch,
+    // every branch still holds its placeholder offset and decodes to its own
+    // fallthrough, so a loop-carried consumer looks a step away instead of around
+    // the back edge and the computed stalls come out far too small. The order
+    // also keeps the patch's re-encoded branches from wiping a wait mask or a
+    // stall the scheduler chose for them: the re-encode builds a fresh Control,
+    // and with the patch first the scheduler runs last and its choices stand.
+    schedule.scheduleBlocks(code.items, block_start);
 
     // Flatten to dwords.
     const out = try allocator.alloc(u32, code.items.len * 4);

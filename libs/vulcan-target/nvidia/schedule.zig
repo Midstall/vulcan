@@ -1154,6 +1154,130 @@ fn coupledLatency(opcode: u32) u32 {
     };
 }
 
+/// What one producer waits to be consumed: the register run it writes and the
+/// predicate it writes, either of which may be absent.
+const Consumer = struct {
+    pred: ?u8,
+    reg: u32,
+    span: u32,
+    reg_live: bool,
+};
+
+/// Read `width` bits at bit `lo` where the field can span a 32-bit word boundary.
+fn getField64(inst: Inst, comptime lo: usize, comptime width: usize) u64 {
+    const word = lo / 32;
+    const off: u6 = @intCast(lo % 32);
+    var v: u64 = @as(u64, inst[word]) | (@as(u64, inst[word + 1]) << 32);
+    v >>= off;
+    return v & ((@as(u64, 1) << @intCast(width)) - 1);
+}
+
+/// The instruction index the BRA at index `at` jumps to. The offset is the
+/// 56-bit signed field NAK's `get_rel_offset` writes: the low 8 bits at 16..24,
+/// the high 48 at 34..82, holding `(dst - cur) * 4 - 4` in word units. Null when
+/// the decoding lands outside the stream, which a fixed-up stream never does.
+fn braTargetIndex(inst: Inst, at: usize, len: usize) ?usize {
+    var off: u64 = getField64(inst, 16, 8) | (getField64(inst, 34, 48) << 8);
+    // Sign-extend the 56-bit field so a backward branch decodes as negative.
+    if (off & (@as(u64, 1) << 55) != 0) off |= ~((@as(u64, 1) << 56) - 1);
+    const delta: i64 = @bitCast(off);
+    const dst: i64 = @as(i64, @intCast(at)) + @divTrunc(delta + 4, 4);
+    if (dst < 0 or dst >= @as(i64, @intCast(len))) return null;
+    return @intCast(dst);
+}
+
+/// What `inst` does with what `want` describes: reads the register run, overwrites
+/// it, or reads the predicate. `.branch_pred` is the one case where the consumer is
+/// a branch reading its taken condition: that read has NO latency model here, and a
+/// computed stall at the model's boundary let a real loop read a stale predicate and
+/// skip its whole body, so the caller keeps the isel's stall for it instead.
+const Consumes = enum { none, consumer, branch_pred };
+
+fn consumes(inst: Inst, later_op: u32, want: Consumer) Consumes {
+    if (want.pred) |p| {
+        if (later_op == 0x947) { // BRA: its taken condition reads the predicate
+            const c: u8 = @intCast(getField(inst, 87, 3));
+            if (c == p) return .branch_pred;
+        }
+        if (predRead(inst, p)) return .consumer;
+    }
+    if (!want.reg_live) return .none;
+    const form = getField(inst, 9, 3);
+    inline for (.{ 24, 32, 64 }) |pos| {
+        if (readsSrc(later_op, form, pos)) {
+            const reg = getField(inst, pos, 8);
+            if (reg != RZ) {
+                const rspan = srcSpan(later_op, inst, pos);
+                var r: u32 = 0;
+                while (r < rspan and reg + r < RZ) : (r += 1) {
+                    if (readsWrittenReg(reg + r, want.reg, want.span)) return .consumer;
+                }
+            }
+        }
+    }
+    // The write-after-write half: an overwriter of the same register.
+    if (writesDst(later_op)) {
+        const owdst = getField(inst, 16, 8);
+        if (owdst != RZ) {
+            const owspan = dstSpan(later_op, inst);
+            var w: u32 = 0;
+            while (w < owspan and owdst + w < RZ) : (w += 1) {
+                if (readsWrittenReg(owdst + w, want.reg, want.span)) return .consumer;
+            }
+        }
+    }
+    return .none;
+}
+
+/// The consumer search for the stall model: a depth-first walk over every
+/// instruction that can issue after the producer, counting one issue slot per
+/// instruction, CROSSING BRANCHES at their decoded targets, and bounded by the
+/// latency because a consumer farther than the latency needs no stall at all.
+///
+/// CROSSING A BRANCH COSTS ONE SLOT, ITS ISSUE SLOT, AND NOTHING MORE. That is the
+/// ptxas calibration: the last FFMA of its k2n loop carries stall 1 for a consumer
+/// five instructions around the back edge, which only covers the latency if the
+/// branch itself counts as one slot. The hardware's branch resolution adds cycles on
+/// top, and every cycle it adds only makes a computed stall longer than needed, which
+/// is the safe direction.
+///
+/// A CONDITIONAL BRANCH FORKS the walk: the consumer may sit past its target or past
+/// its fallthrough, and the walk takes both. Only a conditional branch can fork, so
+/// the walk visits at most 2 to the power of the latency instructions, and it needs
+/// no visited set: the depth bound alone ends it.
+fn scanConsumers(
+    insts: []const Inst,
+    from: usize,
+    dist: u32,
+    latency: u32,
+    want: Consumer,
+    need: *u32,
+    branch_pred: *bool,
+) void {
+    if (dist > latency or from >= insts.len) return;
+    const later = insts[from];
+    const later_op = getField(later, 0, 12);
+
+    switch (consumes(later, later_op, want)) {
+        .consumer => need.* = @max(need.*, latency -| dist),
+        .branch_pred => branch_pred.* = true,
+        .none => {},
+    }
+
+    if (later_op == 0x947) { // BRA
+        const t = braTargetIndex(later, from, insts.len);
+        if (t) |tt| scanConsumers(insts, tt, dist + 1, latency, want, need, branch_pred);
+        // A taken-condition other than PT makes the fallthrough a live path too.
+        const cond = getField(later, 87, 3);
+        const neg = getField(later, 90, 1);
+        if (cond != encode.PT or neg == 1)
+            scanConsumers(insts, from + 1, dist + 1, latency, want, need, branch_pred);
+        return;
+    }
+    if (later_op == 0x94d or later_op == 0x95b) return; // EXIT, KIL: the path ends
+    scanConsumers(insts, from + 1, dist + 1, latency, want, need, branch_pred);
+}
+
 /// The predicate a coupled instruction WRITES, or null when it writes none.
 ///
 /// IADD3's carry-out sits at bits 81..83, and the isel reserves P6 for the carry chain
@@ -1181,7 +1305,9 @@ const carry_pred: u8 = 6;
 
 /// Whether `inst` READS the predicate `pred`, through any of the three read points this
 /// backend emits: the guard predicate at bits 12..14, the SEL predicate at 87..89, and
-/// the IADD3.X carry-in at 87..89, which bit 74 gates.
+/// the IADD3.X carry-in at 87..89, which bit 74 gates. A branch reading its taken
+/// condition is the fourth read point, which `consumes` handles itself as
+/// `.branch_pred`, because that one has no latency model.
 fn predRead(inst: Inst, pred: u8) bool {
     const guard: u8 = @intCast(getField(inst, 12, 3));
     if (guard != encode.PT and guard == pred) return true;
@@ -1223,11 +1349,15 @@ fn predRead(inst: Inst, pred: u8) bool {
 /// value. A back-to-back dependent pair gives 4, and an instruction whose consumer sits
 /// at or beyond the latency gives 0.
 ///
-/// The first consumer is searched FORWARD ONLY, and the search stops at control flow:
-/// a reader across a branch is reached through the branch, whose own latency separates it
-/// from the producer, exactly as it did when every instruction carried 15. A reader
-/// across a block start that is not a branch is a fall-through continuation of the same
-/// straight-line region, so the search crosses it.
+/// The first consumer is found by `scanConsumers`: a depth-first walk that crosses
+/// branches at their decoded targets and counts every instruction, branch included, as
+/// one issue slot. A reader across a branch is therefore measured by the path it is
+/// reached on, and a loop-carried accumulator gets the same computed stall as an
+/// in-block one. The walk is bounded by the latency, so a value whose consumer sits
+/// farther than that, or that no consumer reads at all, lands on the floor, which is
+/// sound: the latency is covered by the issue slots alone. An earlier version stopped
+/// the search at branches and kept the isel's default stall 15 for every cross-branch
+/// reader, which cost the loop tail of every kernel nine idle cycles a trip.
 ///
 /// A variable-latency producer carries no stall: its consumer waits on a scoreboard,
 /// which the walk above already assigns, and a delay on top of that wait would cover the
@@ -1256,7 +1386,6 @@ fn assignStalls(insts: []Inst) void {
         if (isControlFlow(opcode)) continue;
 
         var need: u32 = 0;
-        var found = false;
         const own_pred = predWritten(inst.*, opcode);
         const has_gpr_dst = writesDst(opcode) and !isVariableLatency(opcode) and
             getField(inst.*, 16, 8) != RZ;
@@ -1264,72 +1393,15 @@ fn assignStalls(insts: []Inst) void {
             const wdst = getField(inst.*, 16, 8);
             const latency = coupledLatency(opcode);
             const wspan = if (has_gpr_dst) dstSpan(opcode, inst.*) else 0;
-            var j = idx + 1;
-            scan: while (j < insts.len) : (j += 1) {
-                // A branch ends the straight-line region. A reader beyond it is
-                // reached through the branch, and the branch's own stall does NOT
-                // delay the taken path: only the instructions BEFORE the branch,
-                // through their stalls, push the branch's issue later. The distance
-                // through a branch is therefore not the stream distance, and a
-                // producer whose first reader sits across one keeps the stall the
-                // isel gave it, which the hardware has run correctly since the
-                // backend existed.
-                const later = insts[j];
-                const later_op = getField(later, 0, 12);
-                if (isControlFlow(later_op)) break :scan;
-
-                // A reader of the predicate this instruction writes. A carry chain is
-                // the live shape: IADD3 writes the carry-out and IADD3.X, the high
-                // half of the same 64-bit add, reads it, usually one instruction
-                // later.
-                if (own_pred) |p| {
-                    if (predRead(later, p)) {
-                        need = @max(need, latency -| @as(u32, @intCast(j - idx)));
-                        found = true;
-                    }
-                }
-
-                if (has_gpr_dst) {
-                    // A reader of any register this instruction writes. The distance in
-                    // instructions is the lower bound on the cycles between the two
-                    // issues, which is what the latency is measured against.
-                    const later_form = getField(later, 9, 3);
-                    inline for (.{ 24, 32, 64 }) |pos| {
-                        if (readsSrc(later_op, later_form, pos)) {
-                            const reg = getField(later, pos, 8);
-                            if (reg != RZ) {
-                                const rspan = srcSpan(later_op, later, pos);
-                                var r: u32 = 0;
-                                while (r < rspan and reg + r < RZ) : (r += 1) {
-                                    if (readsWrittenReg(reg + r, wdst, wspan)) {
-                                        need = @max(need, latency -| @as(u32, @intCast(j - idx)));
-                                        found = true;
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // The write-after-write half: an overwriter of the same register.
-                    if (writesDst(later_op)) {
-                        const owdst = getField(later, 16, 8);
-                        if (owdst != RZ) {
-                            const owspan = dstSpan(later_op, later);
-                            var w: u32 = 0;
-                            while (w < owspan and owdst + w < RZ) : (w += 1) {
-                                if (readsWrittenReg(owdst + w, wdst, wspan)) {
-                                    need = @max(need, latency -| @as(u32, @intCast(j - idx)));
-                                    found = true;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            const want = Consumer{ .pred = own_pred, .reg = wdst, .span = wspan, .reg_live = has_gpr_dst };
+            var feeds_branch = false;
+            scanConsumers(insts, idx + 1, 1, latency, want, &need, &feeds_branch);
+            // A predicate that a branch reads as its taken condition has NO latency
+            // model: the read sits inside the branch pipe, not at its issue, and a
+            // computed stall at the model's boundary let a real loop read a stale
+            // predicate and skip its whole body. The isel's stall stands for that one.
+            if (feeds_branch) continue;
         }
-        // No reader inside the straight-line region means the value crosses a branch or
-        // dies here, and the isel's stall stands for it: see the branch note above.
-        if (!found) continue;
         if (need > 15) need = 15;
         // THE FLOOR IS 1, NOT 0, AND THE REASON IS NOT A HINT. A stall of 0 on an ALU op
         // is an ILLEGAL encoding on sm_120: nvdisasm rejects it outright ("undefined
@@ -3311,17 +3383,16 @@ test "a four-accumulator FFMA chain stalls one cycle, as ptxas's does" {
         try std.testing.expectEqual(@as(u32, 1), getField(f, 105, 4)); // the ptxas value
     }
     for (insts[8..12]) |f| {
-        try std.testing.expectEqual(@as(u32, 15), getField(f, 105, 4)); // nothing reads these: the isel stall stands
+        try std.testing.expectEqual(@as(u32, 1), getField(f, 105, 4)); // nothing reads these: the floor covers
     }
-    // The chain also carries the reuse bits, every reader whose stall the pass computed.
-    // The third round's results have no reader, so those FFMA keep the isel's stall 15
-    // and with it no mark: a legal word cannot carry stall 15 and bit 109 at once.
-    for (insts[0..8]) |f| {
+    // The chain also carries the reuse bits, every reader but the last. The third
+    // round's results have no reader, but the walk still gives those FFMA the floor,
+    // so they mark like the rest: only the last reader of the shared multiplier
+    // carries no bit.
+    for (insts[0..11]) |f| {
         try std.testing.expectEqual(@as(u32, 0x2), getField(f, 122, 4));
     }
-    for (insts[8..12]) |f| {
-        try std.testing.expectEqual(@as(u32, 0), getField(f, 122, 4));
-    }
+    try std.testing.expectEqual(@as(u32, 0), getField(insts[11], 122, 4));
 }
 
 test "a tight dependent pair stalls more than an independent pair" {
@@ -3336,7 +3407,7 @@ test "a tight dependent pair stalls more than an independent pair" {
     };
     scheduleBlocks(&dep, &.{0});
     try std.testing.expectEqual(coupled_fma_latency - 1, getField(dep[0], 105, 4));
-    try std.testing.expectEqual(@as(u32, 15), getField(dep[1], 105, 4));
+    try std.testing.expectEqual(@as(u32, 1), getField(dep[1], 105, 4));
 
     var indep = [_]Inst{
         encode.ffmaImm(4, 8, nine_tenths, 9, .{}),
@@ -3344,8 +3415,8 @@ test "a tight dependent pair stalls more than an independent pair" {
         encode.exit(.{}),
     };
     scheduleBlocks(&indep, &.{0});
-    try std.testing.expectEqual(@as(u32, 15), getField(indep[0], 105, 4));
-    try std.testing.expectEqual(@as(u32, 15), getField(indep[1], 105, 4));
+    try std.testing.expectEqual(@as(u32, 1), getField(indep[0], 105, 4));
+    try std.testing.expectEqual(@as(u32, 1), getField(indep[1], 105, 4));
 }
 
 test "a variable-latency producer contributes no stall: the scoreboard covers it" {
@@ -3360,7 +3431,7 @@ test "a variable-latency producer contributes no stall: the scoreboard covers it
     };
     scheduleBlocks(&insts, &.{0});
 
-    try std.testing.expectEqual(@as(u32, 15), getField(insts[1], 105, 4));
+    try std.testing.expectEqual(@as(u32, 1), getField(insts[1], 105, 4));
     const ldg_bar = getField(insts[0], 110, 3);
     try std.testing.expect(ldg_bar < 6);
     try std.testing.expect((getField(insts[1], 116, 6) & (@as(u32, 1) << @intCast(ldg_bar))) != 0);
@@ -3378,16 +3449,17 @@ test "control flow keeps the stall the isel set" {
     };
     scheduleBlocks(&insts, &.{2});
 
-    try std.testing.expectEqual(@as(u32, 15), getField(insts[0], 105, 4));
+    try std.testing.expectEqual(@as(u32, 1), getField(insts[0], 105, 4));
     try std.testing.expectEqual(@as(u32, 6), getField(insts[1], 105, 4));
     try std.testing.expectEqual(@as(u32, 1), getField(insts[2], 105, 4));
 }
 
-test "a fall-through consumer keeps its producer's stall, and a branch cuts the scan" {
+test "a fall-through consumer and a consumer across a branch both get the computed stall" {
     // A block start that is not a branch is a fall-through continuation, so the
-    // producer's search crosses it and covers its consumer. A real branch ends the
-    // straight-line region: a reader beyond it is reached through the branch, whose own
-    // latency separates it from the producer, so the producer carries nothing there.
+    // producer's search crosses it and covers its consumer. A branch no longer ends the
+    // search either: the walk decodes the branch's target and measures the consumer by
+    // the path it is reached on, counting the branch itself as one issue slot, which is
+    // the ptxas calibration for a loop-carried value.
     const five_hundredths: u32 = @bitCast(@as(f32, 0.05));
     var insts = [_]Inst{
         encode.iadd3(4, 20, 21, .{}), // produces R4
@@ -3411,7 +3483,7 @@ test "a fall-through consumer keeps its producer's stall, and a branch cuts the 
     };
     scheduleBlocks(&split, &.{0, 2});
 
-    try std.testing.expectEqual(@as(u32, 15), getField(split[0], 105, 4));
+    try std.testing.expectEqual(coupled_alu_latency - 2, getField(split[0], 105, 4));
 }
 
 test "an IADD3 carry chain covers its predicate dependency" {
@@ -3429,7 +3501,7 @@ test "an IADD3 carry chain covers its predicate dependency" {
 
     // The high half reads the carry one instruction later.
     try std.testing.expectEqual(coupled_alu_latency - 1, getField(insts[0], 105, 4));
-    try std.testing.expectEqual(@as(u32, 15), getField(insts[1], 105, 4));
+    try std.testing.expectEqual(@as(u32, 1), getField(insts[1], 105, 4));
 }
 
 test "an ISETP result predicate delays the guarded instruction that reads it" {
@@ -3445,3 +3517,4 @@ test "an ISETP result predicate delays the guarded instruction that reads it" {
 
     try std.testing.expectEqual(coupled_alu_latency - 2, getField(insts[0], 105, 4));
 }
+
