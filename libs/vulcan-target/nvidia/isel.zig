@@ -221,12 +221,22 @@ fn blockSuccessors(func: *const Function, bi: usize, buf: *[2]usize) []const usi
 /// Whether block bi ends in a divergent `if` (a conditional branch whose two
 /// arms reach different blocks). A degenerate `if` whose then and else target
 /// the same block is not divergent and needs no barrier.
-fn divergentIf(func: *const Function, bi: usize) ?ir.function.If {
+fn divergentIf(func: *const Function, uni: *const opt.uniform.Uniformity, bi: usize) ?ir.function.If {
     const block: Block = @enumFromInt(bi);
     for (func.blockInsts(block)) |inst| {
         if (func.opcode(inst) == .@"if") {
             const cf = func.opcode(inst).@"if";
             if (cf.then.target == cf.@"else".target) return null;
+            // A UNIFORM condition never splits the warp, so its branch needs no
+            // convergence barrier: every thread of the workgroup takes the same side,
+            // so nothing reconverges and no quad uniformity is lost. ptxas emits no
+            // BSSY for such a loop either: its counted loops are one compare, one
+            // branch and the body. The uniformity analysis is the one
+            // `checkBarrierConvergence` already trusts for the same question, with
+            // the same conservative seeds: a load is always divergent, and so is any
+            // value defined under a branch this one could be. `blockIsSplit` keeps a
+            // uniform if nested inside a genuinely divergent region on the safe side.
+            if (!uni.blockIsSplit(bi) and uni.isUniform(cf.cond)) return null;
             return cf;
         }
     }
@@ -241,7 +251,7 @@ fn divergentIf(func: *const Function, bi: usize) ?ir.function.If {
 /// barriers. This matches how NAK's allocator keeps overlapping convergence
 /// barriers in distinct Bar registers. Returns a plan with no barriers (all
 /// null) when there are no divergent ifs.
-fn computeConvergence(allocator: std.mem.Allocator, func: *const Function) Error!Convergence {
+fn computeConvergence(allocator: std.mem.Allocator, func: *const Function, uni: *const opt.uniform.Uniformity) Error!Convergence {
     const n = func.blockCount();
     const bar_at_if = try allocator.alloc(?u4, n);
     @memset(bar_at_if, null);
@@ -256,7 +266,7 @@ fn computeConvergence(allocator: std.mem.Allocator, func: *const Function) Error
     // Any divergent ifs at all?
     var any = false;
     for (0..n) |bi| {
-        if (divergentIf(func, bi) != null) {
+        if (divergentIf(func, uni, bi) != null) {
             any = true;
             break;
         }
@@ -332,7 +342,7 @@ fn computeConvergence(allocator: std.mem.Allocator, func: *const Function) Error
     // post-dominator tree.
     var depth: u4 = 0;
     for (0..n) |bi| {
-        if (divergentIf(func, bi) == null) continue;
+        if (divergentIf(func, uni, bi) == null) continue;
         const row = pdom[bi * word_count ..][0..word_count];
         var best: ?usize = null;
         var best_size: usize = 0;
@@ -492,7 +502,7 @@ fn isUniformLoopExit(
 /// guard: a wrong answer that varies with scheduling is much worse than a compile error. A guard
 /// around a barrier must be PREDICATED, not branched, and `encode.barSync` takes a full `Control`
 /// so a predicated barrier stays expressible once a lowering builds one.
-fn checkBarrierConvergence(allocator: std.mem.Allocator, func: *const Function, conv: *const Convergence) Error!void {
+fn checkBarrierConvergence(allocator: std.mem.Allocator, func: *const Function, conv: *const Convergence, uni: *const opt.uniform.Uniformity) Error!void {
     const n = func.blockCount();
 
     var any = false;
@@ -504,14 +514,13 @@ fn checkBarrierConvergence(allocator: std.mem.Allocator, func: *const Function, 
     }
     if (!any) return;
 
-    // Only a function that holds a barrier pays for these two analyses.
-    var uni = try opt.uniform.analyze(allocator, func);
-    defer uni.deinit(allocator);
+    // Only a function that holds a barrier pays for the loop analysis. The uniformity
+    // analysis the caller already ran, for `divergentIf`, is the same one.
     var loop_info = try opt.loops.analyze(allocator, func);
     defer loop_info.deinit(allocator);
 
     for (0..n) |ai| {
-        if (divergentIf(func, ai) == null) continue;
+        if (divergentIf(func, uni, ai) == null) continue;
         // `computeConvergence` records a join only where it found an immediate post-dominator.
         // Without one the two arms never meet again (each one exits), so nothing reconverges
         // the warp and every barrier the branch can reach runs split.
@@ -524,7 +533,7 @@ fn checkBarrierConvergence(allocator: std.mem.Allocator, func: *const Function, 
             if (b == ai) continue;
             // The one exemption: A is the exit branch of a loop that holds B, and the exit
             // condition is uniform, so the whole workgroup makes the same trips.
-            if (isUniformLoopExit(func, &uni, &loop_info, ai, b)) continue;
+            if (isUniformLoopExit(func, uni, &loop_info, ai, b)) continue;
 
             const m = merge orelse {
                 if (try reachesFromSuccessors(allocator, func, ai, b, null, null)) return error.Unsupported;
@@ -972,12 +981,17 @@ pub fn compileShaderOpts(allocator: std.mem.Allocator, func: *Function, stage: S
     // ops produce per-pixel noise, because the lanes that took the other arm
     // are inactive for the quad op. See computeConvergence and
     // encode.{bssy,bsync}.
-    var conv = try computeConvergence(allocator, func);
+    // The uniformity analysis runs ONCE here and feeds every question about
+    // whether a branch can split the warp: the convergence plan, which now
+    // emits no BSSY for a uniform condition, and the barrier legality check.
+    var uni = try opt.uniform.analyze(allocator, func);
+    defer uni.deinit(allocator);
+    var conv = try computeConvergence(allocator, func, &uni);
     defer conv.deinit(allocator);
 
     // Refuse a barrier the warp can split around, before a single instruction is emitted. See
     // `checkBarrierConvergence` for the hardware fact behind this.
-    try checkBarrierConvergence(allocator, func, &conv);
+    try checkBarrierConvergence(allocator, func, &conv, &uni);
 
     for (0..nblocks) |bi| {
         const block: Block = @enumFromInt(bi);
@@ -1005,7 +1019,7 @@ pub fn compileShaderOpts(allocator: std.mem.Allocator, func: *Function, stage: S
                     try code.append(allocator, encode.bssy(bar, 0, .{ .stall = 1 }));
                     try fixups.append(allocator, .{ .at = at, .target = @intFromEnum(conv.merge_of_if[bi]), .is_bssy = true });
                 }
-                try emitIf(allocator, func, &loc, &code, &fixups, func.opcode(inst).@"if");
+                try emitIf(allocator, func, &loc, &code, &fixups, bi + 1, func.opcode(inst).@"if");
                 terminated = true;
             }
         }
@@ -1030,7 +1044,7 @@ pub fn compileShaderOpts(allocator: std.mem.Allocator, func: *Function, stage: S
                 }
                 try code.append(allocator, encode.exit(.{ .stall = 1 }));
             },
-            .jump => |j| try emitJump(allocator, func, &loc, &code, &fixups, j),
+            .jump => |j| try emitJump(allocator, func, &loc, &code, &fixups, bi + 1, j),
         };
     }
 
@@ -1066,7 +1080,13 @@ pub fn compileShaderOpts(allocator: std.mem.Allocator, func: *Function, stage: S
         // 12..14 guard, which is PT.
         const pred = (code.items[f.at][2] >> 23) & 0x7;
         const neg = ((code.items[f.at][2] >> 26) & 1) == 1;
-        code.items[f.at] = encode.bra(off_words, .{ .pred = @intCast(pred), .pred_neg = neg });
+        // ptxas gives every branch stall 6 on sm_120, never the field's maximum: the
+        // branch pipe needs its resolution cycles and nothing more. The isel used to
+        // leave the Control default of 15 here, which cost nine idle cycles on every
+        // loop back edge. A producer whose consumer sits across a branch keeps its own
+        // 15 through the found-gate in `assignStalls`, so this field covers only the
+        // branch itself.
+        code.items[f.at] = encode.bra(off_words, .{ .pred = @intCast(pred), .pred_neg = neg, .stall = 6 });
     }
 
     // Flatten to dwords.
@@ -4197,7 +4217,7 @@ fn isSignedRaw(func: *const Function, v: Value) bool {
     };
 }
 
-fn emitIf(allocator: std.mem.Allocator, func: *const Function, loc: *std.AutoHashMapUnmanaged(Value, Loc), code: *std.ArrayList(Inst), fixups: *std.ArrayList(Fixup), cf: ir.function.If) Error!void {
+fn emitIf(allocator: std.mem.Allocator, func: *const Function, loc: *std.AutoHashMapUnmanaged(Value, Loc), code: *std.ArrayList(Inst), fixups: *std.ArrayList(Fixup), next: usize, cf: ir.function.If) Error!void {
     const pred = predOf(loc.*, cf.cond);
     // Each path's phi edge moves must execute only on that path. The old
     // layout emitted the `then` moves unconditionally, before the guarded
@@ -4223,13 +4243,23 @@ fn emitIf(allocator: std.mem.Allocator, func: *const Function, loc: *std.AutoHas
     // L_then: patch the guarded branch to here (a local fixup by instruction index).
     try fixups.append(allocator, .{ .at = skip_else, .target_inst = code.items.len });
     try emitMoves(allocator, func, loc, code, cf.then);
-    const then_bra = code.items.len;
-    try code.append(allocator, encode.bra(0, .{}));
-    try fixups.append(allocator, .{ .at = then_bra, .target = @intFromEnum(cf.then.target) });
+    // A jump to the block that comes next in emission order is a fallthrough: the
+    // code that follows this block IS the target, so the branch costs an issue slot
+    // and a branch latency for nothing. ptxas emits no such trampoline. The else
+    // branch below cannot elide the same way, because the then-edge moves sit between
+    // it and the next block.
+    if (@intFromEnum(cf.then.target) != next) {
+        const then_bra = code.items.len;
+        try code.append(allocator, encode.bra(0, .{}));
+        try fixups.append(allocator, .{ .at = then_bra, .target = @intFromEnum(cf.then.target) });
+    }
 }
 
-fn emitJump(allocator: std.mem.Allocator, func: *const Function, loc: *std.AutoHashMapUnmanaged(Value, Loc), code: *std.ArrayList(Inst), fixups: *std.ArrayList(Fixup), jump: ir.function.Jump) Error!void {
+fn emitJump(allocator: std.mem.Allocator, func: *const Function, loc: *std.AutoHashMapUnmanaged(Value, Loc), code: *std.ArrayList(Inst), fixups: *std.ArrayList(Fixup), next: usize, jump: ir.function.Jump) Error!void {
     try emitMoves(allocator, func, loc, code, jump);
+    // The same fallthrough rule as the then-branch of an `if`: a jump to the next
+    // emitted block needs no BRA.
+    if (@intFromEnum(jump.target) == next) return;
     const at = code.items.len;
     try code.append(allocator, encode.bra(0, .{}));
     try fixups.append(allocator, .{ .at = at, .target = @intFromEnum(jump.target) });
@@ -5520,19 +5550,22 @@ test "convergence: a DIVERGENT if (distinct then/else blocks) wraps in BCLEAR/BS
     const bool_t = try func.types.intern(.bool);
 
     // entry: if c { then_b } else { else_b }. Both go to merge. Merge does
-    // a ret. This is a genuinely divergent branch, since then and else are
-    // distinct blocks, so the Volta-and-later convergence barrier must wrap
-    // it: BCLEAR plus BSSY before the branch, and BSYNC at the merge. A
-    // degenerate if whose then and else targets match is not divergent and
-    // gets no barrier. See the "max via if" test above.
+    // a ret. The condition reads the thread index, so the threads of one
+    // workgroup can disagree and the branch is genuinely divergent, and the
+    // Volta-and-later convergence barrier must wrap it: BCLEAR plus BSSY before
+    // the branch, and BSYNC at the merge. A condition over kernel parameters
+    // alone is uniform and gets no barrier, which the test below pins. A
+    // degenerate if whose then and else targets match is not divergent either.
+    // See the "max via if" test above.
     const entry = try func.appendBlock();
+    const tid = try func.appendBlockParam(entry, t);
+    try gpu.attrs.setBuiltin(&func, tid, .thread_id_x);
     const a = try func.appendBlockParam(entry, t);
-    const b = try func.appendBlockParam(entry, t);
     const then_b = try func.appendBlock();
     const else_b = try func.appendBlock();
     const merge = try func.appendBlock();
     const r = try func.appendBlockParam(merge, t);
-    const c = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .gt, .lhs = a, .rhs = b } });
+    const c = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .gt, .lhs = tid, .rhs = a } });
     try func.appendIf(entry, c, .{ .target = then_b, .args = &.{} }, .{ .target = else_b, .args = &.{} });
     const one = try func.appendInst(then_b, t, .{ .iconst = 1 });
     func.setTerminator(then_b, .{ .jump = .{ .target = merge, .args = try func.internValues(&.{one}) } });
@@ -6396,7 +6429,41 @@ test "a barrier INSIDE a divergent arm is refused" {
     // corrupts a staged shared-memory tile. The BSSY/BSYNC pair this backend emits does not
     // save it, because BSYNC sits at the JOIN, after the arm's body. The other arm reaches
     // the merge without running the barrier, so this placement is refused rather than
-    // trusted to a frontend that may not have predicated the guard.
+    // trusted to a frontend that may not have predicated the guard. The condition reads
+    // the thread index: a parameter-only condition is uniform, all threads take one arm
+    // together, and that shape is the accepted test below.
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+
+    const entry = try func.appendBlock();
+    const tid = try func.appendBlockParam(entry, t);
+    try gpu.attrs.setBuiltin(&func, tid, .thread_id_x);
+    const a = try func.appendBlockParam(entry, t);
+    const then_b = try func.appendBlock();
+    const else_b = try func.appendBlock();
+    const merge = try func.appendBlock();
+    const r = try func.appendBlockParam(merge, t);
+    const c = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .gt, .lhs = tid, .rhs = a } });
+    try func.appendIf(entry, c, .{ .target = then_b, .args = &.{} }, .{ .target = else_b, .args = &.{} });
+    try func.appendBarrier(then_b, .workgroup); // only ONE arm runs it
+    const one = try func.appendInst(then_b, t, .{ .iconst = 1 });
+    func.setTerminator(then_b, .{ .jump = .{ .target = merge, .args = try func.internValues(&.{one}) } });
+    const two = try func.appendInst(else_b, t, .{ .iconst = 2 });
+    func.setTerminator(else_b, .{ .jump = .{ .target = merge, .args = try func.internValues(&.{two}) } });
+    func.setTerminator(merge, .{ .ret = ir.function.Ret.one(r) });
+
+    try testing.expectError(error.Unsupported, compileKernel(allocator, &func, nvidia_abi));
+}
+
+test "a barrier inside an arm of a UNIFORM condition compiles" {
+    // The other side of the same question. The condition is a pair of kernel parameters,
+    // so the uniformity analysis proves every thread of the workgroup takes the same arm:
+    // the barrier runs for all of them or for none, and the placement is safe without a
+    // convergence barrier. This is the widening the old refusal test pinned as a separate
+    // decision, now taken: ptxas compiles the same shape with no BSSY at all.
     const allocator = testing.allocator;
     var func = Function.init(allocator);
     defer func.deinit();
@@ -6412,14 +6479,25 @@ test "a barrier INSIDE a divergent arm is refused" {
     const r = try func.appendBlockParam(merge, t);
     const c = try func.appendInst(entry, bool_t, .{ .icmp = .{ .op = .gt, .lhs = a, .rhs = b } });
     try func.appendIf(entry, c, .{ .target = then_b, .args = &.{} }, .{ .target = else_b, .args = &.{} });
-    try func.appendBarrier(then_b, .workgroup); // only ONE arm runs it
+    try func.appendBarrier(then_b, .workgroup);
     const one = try func.appendInst(then_b, t, .{ .iconst = 1 });
     func.setTerminator(then_b, .{ .jump = .{ .target = merge, .args = try func.internValues(&.{one}) } });
     const two = try func.appendInst(else_b, t, .{ .iconst = 2 });
     func.setTerminator(else_b, .{ .jump = .{ .target = merge, .args = try func.internValues(&.{two}) } });
     func.setTerminator(merge, .{ .ret = ir.function.Ret.one(r) });
 
-    try testing.expectError(error.Unsupported, compileKernel(allocator, &func, nvidia_abi));
+    var kernel = try compileKernel(allocator, &func, nvidia_abi);
+    defer kernel.deinit(allocator);
+    try testing.expectEqual(@as(u32, 1), kernel.launch.barrier_count);
+
+    // No convergence machinery for a uniform condition: no BCLEAR, no BSSY, no BSYNC.
+    var i: usize = 0;
+    while (i < kernel.code.len) : (i += 4) {
+        switch (kernel.code[i] & 0xfff) {
+            0x355, 0x945, 0x941 => return error.TestUnexpectedResult,
+            else => {},
+        }
+    }
 }
 
 test "a barrier BEFORE and AFTER a divergent region is accepted" {
@@ -6579,12 +6657,14 @@ test "a barrier in a LOOP body is refused when the trip count arrives as a block
     try testing.expectError(error.Unsupported, compileKernel(allocator, &func, nvidia_abi));
 }
 
-test "a UNIFORM if inside a uniform loop is still refused around a barrier" {
-    // The exemption stops at the loop's own exit branch. This `if` sits in the body with both
-    // edges inside the loop, and its condition is a pair of kernel parameters, so the whole
-    // workgroup does take the same arm and the placement is in fact safe. The backend refuses it
-    // all the same, exactly as it refuses the same shape outside a loop. Widening the acceptance
-    // to a plain `if` is a separate decision, and this test pins where the line sits today.
+test "a UNIFORM if inside a uniform loop compiles around a barrier" {
+    // The line this test pins has MOVED. The `if` sits in the loop body with both edges
+    // inside the loop, and its condition is a pair of kernel parameters, so the whole
+    // workgroup takes the same arm and the placement is safe: the barrier runs for every
+    // thread of the workgroup or for none. The backend used to refuse this because it
+    // could not prove the condition uniform; the uniformity analysis now can, the same
+    // one the barrier legality check already trusted, so the kernel compiles with the
+    // barrier declared and no convergence machinery around the branch.
     const allocator = testing.allocator;
     var func = Function.init(allocator);
     defer func.deinit();
@@ -6612,7 +6692,18 @@ test "a UNIFORM if inside a uniform loop is still refused around a barrier" {
     func.setTerminator(latch, .{ .jump = .{ .target = head, .args = try func.internValues(&.{next}) } });
     func.setTerminator(done, .{ .ret = ir.function.Ret.one(tiles) });
 
-    try testing.expectError(error.Unsupported, compileKernel(allocator, &func, nvidia_abi));
+    var kernel = try compileKernel(allocator, &func, nvidia_abi);
+    defer kernel.deinit(allocator);
+    try testing.expectEqual(@as(u32, 1), kernel.launch.barrier_count);
+
+    // No convergence machinery for a uniform condition: no BCLEAR, no BSSY, no BSYNC.
+    var w: usize = 0;
+    while (w < kernel.code.len) : (w += 4) {
+        switch (kernel.code[w] & 0xfff) {
+            0x355, 0x945, 0x941 => return error.TestUnexpectedResult,
+            else => {},
+        }
+    }
 }
 
 test "a uniform loop nested inside a divergent guard is still refused" {
