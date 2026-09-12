@@ -1618,8 +1618,8 @@ fn nvidiaRegDescription(allocator: std.mem.Allocator, ctx: *const WimmerCtx) Err
     };
 }
 
-/// The `copySource` hook: a contracted multiply-add's result takes the register of the
-/// operand that dies at it, which is the loop-carried accumulator.
+/// The `copySource` hook: a contracted multiply-add or a 64-bit pointer add takes the register of
+/// the operand that dies at it. This is the loop-carried accumulator or address.
 ///
 /// THIS EXTENDS THE HOOK'S DOCUMENTED CONTRACT, and the extension is sound for exactly the
 /// two consumers `copy_src` has inside the allocator. The contract asks for a plain copy
@@ -1637,17 +1637,27 @@ fn nvidiaRegDescription(allocator: std.mem.Allocator, ctx: *const WimmerCtx) Err
 /// with the parameter's register, and every later one coalesces with the value before it,
 /// so the back-edge move that a four-accumulator loop paid five MOVs a trip for becomes a
 /// same-register no-op the edge resolver drops. ptxas's loop carries no such MOVs.
+/// A wide pointer add has the same read-before-write property for its aligned register pair.
+/// Coalescing it removes the two register moves that otherwise copy a carried address on the
+/// unrolled loop edge.
 ///
 /// WHICH OPERAND: the addend when it is a value (`acc = a * b + acc`), else the multiplier's
 /// left operand (`acc = acc * k + c`). Those are the two loop shapes this backend
 /// contracts, and the operand named is the one whose death at the instruction makes the
-/// hint fire.
+/// hint fire. For a wide pointer add, the base pointer is the matching operand.
 fn wimmerCopySource(ctx: *const anyopaque, func: *const Function, v: Value) ?Value {
-    _ = func;
     const self: *const WimmerCtx = @ptrCast(@alignCast(ctx));
-    const m = self.fma.at.get(v) orelse return null;
-    if (m.addend) |a| return a;
-    return m.mul_a;
+    if (self.fma.at.get(v)) |m| {
+        if (m.addend) |a| return a;
+        return m.mul_a;
+    }
+    if (!isWidePtr(func, v)) return null;
+    const inst = func.definingInst(v) orelse return null;
+    return switch (func.opcode(inst)) {
+        .arith => |a| if (a.op == .add) a.lhs else null,
+        .arith_imm => |a| if (a.op == .add) a.lhs else null,
+        else => null,
+    };
 }
 
 /// Turn a completed `wimmer.Allocation` into the one-location-per-value map the emitter reads,
@@ -1857,6 +1867,47 @@ fn hasAnyAttribute(func: *const Function, v: Value) bool {
     return it.next() != null;
 }
 
+/// Collapse a chain of constant pointer increments into its last increment.
+///
+/// Unrolling turns a carried address into `p + 4`, `(p + 4) + 4`, and so on. After the
+/// displacement fold moves each intermediate address into its load, only the last address is
+/// needed by the loop edge. Keeping the chain costs two carry instructions and one register pair
+/// for every unrolled step. Addition is associative at the pointer width, so the last value can
+/// read the original base and add the sum once. The dead-address scan below then removes the
+/// bypassed steps.
+fn collapsePointerAddChains(func: *Function) void {
+    for (0..func.blockCount()) |bi| {
+        for (func.blockInsts(@enumFromInt(bi))) |inst| {
+            const result = func.instResult(inst) orelse continue;
+            if (ptrSpace(func, result) == null or hasAnyAttribute(func, result)) continue;
+            const op = func.opcodeMut(inst);
+            var add = switch (op.*) {
+                .arith_imm => |a| a,
+                else => continue,
+            };
+            if (add.op != .add) continue;
+
+            var base = add.lhs;
+            while (!hasAnyAttribute(func, base)) {
+                const defining = func.definingInst(base) orelse break;
+                const previous = switch (func.opcode(defining)) {
+                    .arith_imm => |a| a,
+                    else => break,
+                };
+                if (previous.op != .add or ptrSpace(func, previous.lhs) == null) break;
+                const sum = @addWithOverflow(add.imm, previous.imm);
+                if (sum[1] != 0) break;
+                add.imm = sum[0];
+                base = previous.lhs;
+            }
+            if (base != add.lhs) {
+                add.lhs = base;
+                op.* = .{ .arith_imm = add };
+            }
+        }
+    }
+}
+
 /// Move every constant byte displacement out of a load's or store's address chain and into
 /// the access itself, then record which address instructions that left with nothing to do.
 ///
@@ -1907,6 +1958,10 @@ fn foldAddressDisplacements(allocator: std.mem.Allocator, func: *Function, out: 
             try out.at.put(allocator, inst, @intCast(total));
         }
     }
+
+    // The accesses no longer use the intermediate constant addresses. Shorten the remaining
+    // loop-carried chain before finding dead address instructions.
+    collapsePointerAddChains(func);
 
     // An address instruction whose result nothing reads any more. The fold above is the
     // only thing that removes a use, so this finds exactly the addresses it emptied, plus
@@ -7309,6 +7364,25 @@ fn gprOfCompiled(func: *Function, v: Value, options: Options) u8 {
     var max_reg: u8 = r_outptr + 1;
     assignLocsWimmer(allocator, func, .compute, &locs, &max_reg, &fma) catch unreachable;
     return gprOf(locs, v);
+}
+
+test "constant pointer increments collapse into the last address" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const ptr_t = try func.types.ptrGlobal();
+    const b = try func.appendBlock();
+    const base = try func.appendBlockParam(b, ptr_t);
+    const p1 = try func.appendArithImm(b, ptr_t, .add, base, 4);
+    const p2 = try func.appendArithImm(b, ptr_t, .add, p1, 4);
+    const p3 = try func.appendArithImm(b, ptr_t, .add, p2, -2);
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(p3) });
+
+    collapsePointerAddChains(&func);
+
+    const folded = func.opcode(func.definingInst(p3).?).arith_imm;
+    try testing.expectEqual(base, folded.lhs);
+    try testing.expectEqual(@as(i64, 6), folded.imm);
 }
 
 test "a shared atomic wider than workgroup scope is refused, not silently narrowed" {
