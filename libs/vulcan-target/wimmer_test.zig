@@ -548,6 +548,13 @@ fn findFixed(intervals: []const wimmer.Interval, class: u16, reg: u16) ?*const w
     return null;
 }
 
+fn lateMulOperand(ctx: *const anyopaque, func: *const Function, inst: ir.function.Inst, operand: Value) bool {
+    _ = ctx;
+    _ = operand;
+    const op = func.opcode(inst);
+    return op == .arith and op.arith.op == .mul;
+}
+
 test "intervals: a value dead between two uses has a hole" {
     const allocator = std.testing.allocator;
     var func = Function.init(allocator);
@@ -708,6 +715,31 @@ test "intervals: use positions carry must_have_register on aarch64" {
     const iv = findValueInterval(intervals, x) orelse return error.MissingInterval;
     try std.testing.expect(iv.uses.len >= 1);
     for (iv.uses) |u| try std.testing.expectEqual(wimmer.UseKind.must_have_register, u.kind);
+}
+
+test "intervals: a late-read operand stays live until the result's first consumer" {
+    const allocator = std.testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const t = try func.types.intern(i32k);
+    const b = try func.appendBlock();
+    const x = try func.appendBlockParam(b, t);
+    const y = try func.appendBlockParam(b, t);
+    const product = try func.appendInst(b, t, .{ .arith = .{ .op = .mul, .lhs = x, .rhs = y } });
+    const filler = try func.appendInst(b, t, .{ .iconst = 7 });
+    const sum = try func.appendInst(b, t, .{ .arith = .{ .op = .add, .lhs = product, .rhs = filler } });
+    func.setTerminator(b, .{ .ret = ir.function.Ret.one(sum) });
+
+    var desc = try aarch64.aarch64RegDescription(allocator, &func);
+    defer desc.deinit(allocator);
+    desc.lateRead = lateMulOperand;
+
+    const intervals = try wimmer.buildIntervals(allocator, &func, &desc);
+    defer wimmer.freeIntervals(allocator, intervals);
+
+    const ix = findValueInterval(intervals, x) orelse return error.MissingInterval;
+    const ip = findValueInterval(intervals, product) orelse return error.MissingInterval;
+    try std.testing.expect(ix.covers(ip.uses[0].pos));
 }
 
 // ---------------------------------------------------------------------------

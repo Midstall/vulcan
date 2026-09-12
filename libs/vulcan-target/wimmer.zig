@@ -187,6 +187,12 @@ pub const RegDescription = struct {
     // their registers, with no diagnostic. And the product, counted as a use it is not, holds a
     // register across the fused instruction and blocks the very register the result wants.
     fusedOperands: ?*const fn (ctx: *const anyopaque, func: *const Function, inst: Inst, out: *[max_fused_operands]Value) ?u8 = null,
+    // OPTIONAL late-read hook. Return true when `inst` may collect `operand` after issue. The
+    // allocator then keeps the operand live until the instruction result's first use in this
+    // block, where the result dependency proves that the instruction completed. If the result has
+    // no local use, the operand stays live to the block boundary. This prevents a later value from
+    // overwriting a decoupled instruction's source register while the instruction is in flight.
+    lateRead: ?*const fn (ctx: *const anyopaque, func: *const Function, inst: Inst, operand: Value) bool = null,
 
     /// Free every owned slice the backend builder allocated: each class's `allocatable` and
     /// `callee_saved`, the `classes` slice, each call site's per-class `regs` and its `clobbered`
@@ -457,6 +463,15 @@ pub fn buildIntervals(allocator: std.mem.Allocator, func: *const Function, desc:
     for (use_lists) |*ul| ul.* = .empty;
     defer for (use_lists) |*ul| ul.deinit(allocator);
 
+    const LateRead = struct {
+        operand: Value,
+        result: Value,
+        block: u32,
+        producer_pos: u32,
+    };
+    var late_reads: std.ArrayList(LateRead) = .empty;
+    defer late_reads.deinit(allocator);
+
     // Liveness bitsets, indexed `bi * nval + vi`. `defined`/`used` are the block-local gen/kill sets.
     const defined = try allocator.alloc(bool, nblocks * nval);
     defer allocator.free(defined);
@@ -483,6 +498,9 @@ pub fn buildIntervals(allocator: std.mem.Allocator, func: *const Function, desc:
         pos: u32,
         inst: Inst,
         term_kind: bool, // true when visiting a terminator (no `inst`, default kind)
+        block: u32,
+        result: ?Value,
+        late_reads: *std.ArrayList(LateRead),
         err: ?Error = null,
 
         fn visit(self: *@This(), v: Value, is_edge_arg: bool) void {
@@ -515,6 +533,18 @@ pub fn buildIntervals(allocator: std.mem.Allocator, func: *const Function, desc:
             self.range_lists[vi].append(self.allocator, .{ .from = self.block_from, .to = self.pos + 1 }) catch |e| {
                 self.err = e;
             };
+            if (!self.term_kind and self.result != null and self.desc.lateRead != null and
+                self.desc.lateRead.?(self.desc.ctx, self.func, self.inst, v))
+            {
+                self.late_reads.append(self.allocator, .{
+                    .operand = v,
+                    .result = self.result.?,
+                    .block = self.block,
+                    .producer_pos = self.pos,
+                }) catch |e| {
+                    self.err = e;
+                };
+            }
         }
     };
 
@@ -542,6 +572,9 @@ pub fn buildIntervals(allocator: std.mem.Allocator, func: *const Function, desc:
                 .pos = pos,
                 .inst = inst,
                 .term_kind = false,
+                .block = @intCast(bi),
+                .result = func.instResult(inst),
+                .late_reads = &late_reads,
             };
             // What the MACHINE instruction reads, which a fusing backend may report as a different
             // list from the IR operands. See `RegDescription.fusedOperands`.
@@ -580,6 +613,9 @@ pub fn buildIntervals(allocator: std.mem.Allocator, func: *const Function, desc:
                 .pos = term_pos,
                 .inst = undefined,
                 .term_kind = true,
+                .block = @intCast(bi),
+                .result = null,
+                .late_reads = &late_reads,
             };
             visitTermOperands(func, term, &g, Gather.visit);
             if (g.err) |e| return e;
@@ -587,6 +623,25 @@ pub fn buildIntervals(allocator: std.mem.Allocator, func: *const Function, desc:
         }
         block_to[bi] = term_pos + 1;
         pos += 1;
+    }
+
+    // A decoupled instruction has certainly collected its operands once its result is consumed.
+    // Keep each late-read operand live to that first local result use. A result with no local use is
+    // protected through the block boundary, where the target's control-flow schedule drains it.
+    for (late_reads.items) |late| {
+        const bi: usize = late.block;
+        var until = block_to[bi] - 1;
+        const result_uses = use_lists[@intFromEnum(late.result)].items;
+        for (result_uses) |use| {
+            if (use.pos > late.producer_pos and use.pos < block_to[bi]) {
+                until = use.pos;
+                break;
+            }
+        }
+        try range_lists[@intFromEnum(late.operand)].append(allocator, .{
+            .from = block_from[bi],
+            .to = until + 1,
+        });
     }
 
     // --- Liveness fixpoint: live_out[b] is the union of successors' live_in. live_in[b] is used[b]

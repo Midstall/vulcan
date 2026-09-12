@@ -203,7 +203,7 @@ fn simtSchedule(allocator: std.mem.Allocator, func: *Function) std.mem.Allocator
         for (insts) |inst| {
             const op = func.opcode(inst);
             if (op == .@"if") has_if = true;
-            if (writesMemory(op)) writes = true;
+            if (writesMemory(op) and op != .@"if") writes = true;
         }
         if (has_if and func.opcode(insts[n - 1]) != .@"if") continue; // not the shape this models
 

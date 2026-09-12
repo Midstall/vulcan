@@ -671,6 +671,10 @@ pub fn scheduleBlocks(insts: []Inst, block_starts: []const usize) void {
     // barrier says "the operands are not collected yet". See `readsLate`.
     var read_scoreboard_of = [_]u8{0} ** 256;
     var free_mask: u8 = (1 << num_scoreboards) - 1; // scoreboards 0..5 free
+    // Consecutive global loads can share one write barrier. The hardware barrier counts the whole
+    // group, and one consumer wait retires every load assigned to it. ptxas uses this for its k3
+    // load batches, which can contain more loads than the six physical scoreboard numbers.
+    var ldg_group: u8 = num_scoreboards;
 
     for (insts, 0..) |*inst, idx| {
         const opcode = getField(inst.*, 0, 12);
@@ -691,6 +695,7 @@ pub fn scheduleBlocks(insts: []Inst, block_starts: []const usize) void {
                 @memset(&scoreboard_of, 0);
                 @memset(&read_scoreboard_of, 0);
                 free_mask = (1 << num_scoreboards) - 1;
+                ldg_group = num_scoreboards;
                 break;
             };
         }
@@ -747,6 +752,16 @@ pub fn scheduleBlocks(insts: []Inst, block_starts: []const usize) void {
             // For a single-register producer (LDG/S2R/LDC/ALD/IPA) the one read register
             // clears and the scoreboard frees immediately - identical to the old free-on-
             // first-wait behavior.
+            var grouped: u3 = 0;
+            while (grouped < num_scoreboards) : (grouped += 1) {
+                if ((wait & (@as(u32, 1) << grouped)) != 0 and grouped == ldg_group) {
+                    const tag = @as(u8, grouped) + 1;
+                    for (&scoreboard_of) |*entry| if (entry.* == tag) {
+                        entry.* = 0;
+                    };
+                    ldg_group = num_scoreboards;
+                }
+            }
             clearReadRegs(inst.*, opcode, form, &scoreboard_of, wait);
             var sb: u3 = 0;
             while (sb < num_scoreboards) : (sb += 1) {
@@ -826,9 +841,12 @@ pub fn scheduleBlocks(insts: []Inst, block_starts: []const usize) void {
         if (isVariableLatency(opcode) and writesDst(opcode)) {
             const dst = getField(inst.*, 16, 8);
             if (dst != RZ) {
+                const reuse_ldg = opcode == 0x981 and ldg_group < num_scoreboards and
+                    barrierHeld(&scoreboard_of, &read_scoreboard_of, @intCast(ldg_group));
                 if (free_mask == 0) drainAll(inst, &scoreboard_of, &read_scoreboard_of, &free_mask);
-                const sb: u3 = @intCast(@ctz(free_mask));
-                free_mask &= ~(@as(u8, 1) << sb);
+                const sb: u3 = if (reuse_ldg) @intCast(ldg_group) else @intCast(@ctz(free_mask));
+                if (!reuse_ldg) free_mask &= ~(@as(u8, 1) << sb);
+                if (opcode == 0x981 and (reuse_ldg or hasLargeLdgBatch(insts, idx, block_starts))) ldg_group = sb;
                 own_write_barrier = sb;
                 setField(inst, 110, 3, sb); // write barrier
                 // TEX writes a 4-register RGBA result BLOCK (dst..dst+3), all gated by
@@ -905,6 +923,22 @@ pub fn scheduleBlocks(insts: []Inst, block_starts: []const usize) void {
     // exactly once on the finished code, so every caller gets them without new wiring.
     assignStalls(insts);
     markReuse(insts, block_starts, entry_start);
+}
+
+/// Whether this point begins a load batch large enough to exhaust the physical scoreboards if each
+/// result gets a private barrier. Once such a batch starts, later LDGs join its barrier until the
+/// first consumer waits it out.
+fn hasLargeLdgBatch(insts: []const Inst, idx: usize, block_starts: []const usize) bool {
+    var loads: u8 = 0;
+    var j = idx;
+    while (j < insts.len) : (j += 1) {
+        if (j != idx) for (block_starts) |start| if (start == j) return false;
+        if (getField(insts[j], 0, 12) == 0x981) {
+            loads += 1;
+            if (loads > num_scoreboards) return true;
+        }
+    }
+    return false;
 }
 
 /// Whether `opcode` reads its GPR sources AFTER it issues, so an instruction that
@@ -987,6 +1021,18 @@ fn overwritesSourceLater(
         if (drains) return !covered_at_boundary;
         const later = insts[j];
         const later_op = getField(later, 0, 12);
+        const later_form = getField(later, 9, 3);
+        // A consumer of this instruction's result waits on its write barrier. At that point the
+        // instruction completed, so it has necessarily collected every source and no later source
+        // overwrite needs a read barrier. This is common after a batch of hoisted loads.
+        if (covered_at_boundary) {
+            const dst = getField(inst, 16, 8);
+            const dspan = dstSpan(opcode, inst);
+            var d: u32 = 0;
+            while (d < dspan and dst + d < RZ) : (d += 1) {
+                if (readsRegister(later, later_op, later_form, dst + d)) return false;
+            }
+        }
         if (!writesDst(later_op)) continue;
         const wdst = getField(later, 16, 8);
         if (wdst == RZ) continue;
@@ -1597,6 +1643,21 @@ test "a load's consumer waits on the load's scoreboard" {
 
     // The S2R scoreboard was freed at inst 1 and reused for the LDG.
     try std.testing.expectEqual(s2r_bar, ldg_bar);
+}
+
+test "a large LDG batch shares one write barrier and one wait retires the group" {
+    var insts: [10]Inst = undefined;
+    for (0..7) |i| insts[i] = encode.ldgU32(@intCast(8 + i), @intCast(32 + i * 2), .{});
+    insts[7] = encode.iadd3(20, 8, 8, .{});
+    insts[8] = encode.iadd3(21, 14, 14, .{});
+    insts[9] = encode.exit(.{});
+    scheduleBlocks(&insts, &.{0});
+
+    const group = getField(insts[0], 110, 3);
+    try std.testing.expect(group < num_scoreboards);
+    for (insts[1..7]) |load| try std.testing.expectEqual(group, getField(load, 110, 3));
+    try std.testing.expectEqual(@as(u32, 1) << @intCast(group), getField(insts[7], 116, 6));
+    try std.testing.expectEqual(@as(u32, 0), getField(insts[8], 116, 6));
 }
 
 test "an independent instruction adds no wait" {

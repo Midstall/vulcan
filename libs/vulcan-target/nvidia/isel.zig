@@ -1517,6 +1517,14 @@ fn wimmerRegWidth(ctx: *const anyopaque, func: *const Function, v: Value) wimmer
     return if (isWidePtr(func, v)) .{ .regs = 2, .alignment = 2 } else .{};
 }
 
+/// Global and shared loads collect their address registers on the decoupled memory pipe. Keep an
+/// address allocated until the loaded value's first consumer waits for completion.
+fn wimmerLateRead(ctx: *const anyopaque, func: *const Function, inst: ir.function.Inst, operand: Value) bool {
+    _ = ctx;
+    _ = operand;
+    return func.opcode(inst) == .load;
+}
+
 /// What a CONTRACTED multiply-add really reads: the two multiply sources and the addend, which is
 /// exactly the operand list `fmaInst` encodes. The IR instead says the add reads the PRODUCT, and
 /// both halves of that difference matter.
@@ -1605,6 +1613,7 @@ fn nvidiaRegDescription(allocator: std.mem.Allocator, ctx: *const WimmerCtx) Err
         .hosts_critical_edge_moves = true,
         .regWidth = wimmerRegWidth,
         .fusedOperands = wimmerFusedOperands,
+        .lateRead = wimmerLateRead,
         .copySource = wimmerCopySource,
     };
 }
