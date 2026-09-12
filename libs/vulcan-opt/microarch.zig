@@ -7,6 +7,12 @@ const builtin = @import("builtin");
 const ir = @import("vulcan-ir");
 const pass = @import("pass.zig");
 const vectorize = @import("vectorize.zig"); // vulcan-opt root module
+const ivsr = @import("ivsr.zig");
+const constfold = @import("constfold.zig");
+const simplify = @import("simplify.zig");
+const strength = @import("strength.zig");
+const immform = @import("immform.zig");
+const dce = @import("dce.zig");
 
 const model_mod = @import("microarch/model.zig");
 const registry = @import("microarch/registry.zig");
@@ -60,6 +66,25 @@ pub fn optimize(allocator: std.mem.Allocator, func: *ir.function.Function, m: *c
     // widen), and the guarded unroller handles everything else.
     const looped = try loopvec.run(allocator, func, m);
     const split = try splitunroll.run(allocator, func, m);
+    // NVIDIA's address-heavy scalar loops need induction-variable strength
+    // reduction before the general unroller measures their body. Besides
+    // replacing per-iteration multiplies with carried pointer increments, the
+    // cleanup exposes their true smaller body and therefore the load-level
+    // parallelism the SIMT model can afford. Keep this after loopvec and
+    // splitunroll, whose recognizers intentionally consume the original loop
+    // shape; the remaining shape-sensitive dot/matmul recognizers do not
+    // lower on NVIDIA.
+    const iv_reduced = if (m.arch == .nvidia)
+        try pass.runToFixpoint(allocator, func, &.{
+            ivsr.pass_def,
+            constfold.pass_def,
+            simplify.pass_def,
+            strength.pass_def,
+            immform.pass_def,
+            dce.pass_def,
+        }, 16)
+    else
+        false;
     const unrolled = try unroll.run(allocator, func, m);
     const vectorized = try vectorize.runModel(allocator, func, m);
     // INT8 dot-product recognition runs after the general vectorizer (it needs the scalar reduction
@@ -72,7 +97,7 @@ pub fn optimize(allocator: std.mem.Allocator, func: *ir.function.Function, m: *c
     const matmuled = try matmul_recog.run(allocator, func, m);
     const prefetched = try prefetch.run(allocator, func, m);
     try schedule.run(allocator, func, m);
-    return split or looped or unrolled or vectorized or dotted or matmuled or prefetched;
+    return split or looped or iv_reduced or unrolled or vectorized or dotted or matmuled or prefetched;
 }
 
 test {

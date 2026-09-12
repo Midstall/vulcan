@@ -96,6 +96,20 @@ fn alu(op: u9, dst: u8, a: u8, b: u8, c_in: u8, c: Control) Inst {
     return w;
 }
 
+/// A regular ALU instruction whose second source is a uniform register.
+/// NAK assigns this operand shape form 6.
+fn aluUregB(op: u9, dst: u8, a: u8, b: u8, c_in: u8, c: Control) Inst {
+    var w = base(c);
+    setBits(&w, 0, 9, op);
+    setBits(&w, 9, 3, 6);
+    setBits(&w, 91, 1, 1); // uniform-register source marker
+    setBits(&w, 16, 8, dst);
+    setBits(&w, 24, 8, a);
+    setBits(&w, 32, 8, b);
+    setBits(&w, 64, 8, c_in);
+    return w;
+}
+
 /// `MOV dst, imm32`: load a 32-bit immediate (ALU MOV 0x002, form 4). Verified.
 pub fn movImm(dst: u8, imm: u32, c: Control) Inst {
     var w = base(c);
@@ -198,6 +212,13 @@ pub fn imad(dst: u8, a: u8, b: u8, c_in: u8, c: Control) Inst {
     return w;
 }
 
+/// `IMAD dst, a, ub, c_in` with a uniform-register multiplier.
+pub fn imadUreg(dst: u8, a: u8, ub: u8, c_in: u8, c: Control) Inst {
+    var w = aluUregB(0x024, dst, a, ub, c_in, c);
+    setBits(&w, 81, 3, PT);
+    return w;
+}
+
 /// `LOP3.LUT dst, a, b, RZ, lut`: bitwise op through a 3-input lookup table.
 /// AND, OR, and XOR use luts 0xC0, 0xFC, and 0x3C. Regular LOP3 0x012.
 pub fn lop3(dst: u8, a: u8, b: u8, lut: u8, c: Control) Inst {
@@ -245,14 +266,36 @@ pub fn plop3(dst_pred: u8, p_a: u8, p_b: u8, lut: u8, c: Control) Inst {
 /// integer type (signed) at 73, combine-op (AND=0) at 74..75, result
 /// predicate at 81..83. Regular ISETP 0x00c.
 pub fn isetp(dst_pred: u8, a: u8, b: u8, cmp: Cmp, signed: bool, c: Control) Inst {
-    var w = alu(0x00c, RZ, a, b, RZ, c);
+    return isetpAnd(dst_pred, a, b, cmp, signed, PT, c);
+}
+
+/// `ISETP.cmp.AND dst_pred, a, b, accum`: compare and combine with an existing
+/// predicate. This absorbs a following predicate AND when the compare result
+/// has no other reader.
+pub fn isetpAnd(dst_pred: u8, a: u8, b: u8, cmp: Cmp, signed: bool, accum: u8, c: Control) Inst {
+    // ISETP has no register destination. ptxas writes zero in that otherwise
+    // unused field for both register and uniform-register source forms.
+    var w = alu(0x00c, 0, a, b, 0, c);
     setBits(&w, 73, 1, if (signed) 1 else 0); // I32 vs U32
     setBits(&w, 74, 2, 0); // set-op = AND
     setBits(&w, 76, 3, @intFromEnum(cmp)); // comparison
     setBits(&w, 68, 3, PT); // low compare predicate (unused for 32-bit)
     setBits(&w, 81, 3, dst_pred); // result predicate
     setBits(&w, 84, 3, PT); // second result predicate = none
-    setBits(&w, 87, 3, PT); // accumulate predicate = PT
+    setBits(&w, 87, 3, accum); // accumulate predicate
+    return w;
+}
+
+/// `ISETP.cmp.AND dst_pred, a, ub, accum` with a uniform second source.
+pub fn isetpUregAnd(dst_pred: u8, a: u8, ub: u8, cmp: Cmp, signed: bool, accum: u8, c: Control) Inst {
+    var w = aluUregB(0x00c, 0, a, ub, 0, c);
+    setBits(&w, 73, 1, if (signed) 1 else 0);
+    setBits(&w, 74, 2, 0);
+    setBits(&w, 76, 3, @intFromEnum(cmp));
+    setBits(&w, 68, 3, PT);
+    setBits(&w, 81, 3, dst_pred);
+    setBits(&w, 84, 3, PT);
+    setBits(&w, 87, 3, accum);
     return w;
 }
 
@@ -750,6 +793,22 @@ pub fn ldcSized(dst: u8, bank: u5, offset: u16, ty: MemType, c: Control) Inst {
     setBits(&w, 38, 16, offset);
     setBits(&w, 54, 5, bank);
     setBits(&w, 73, 3, @intFromEnum(ty));
+    return w;
+}
+
+/// `LDCU udst, c[bank][offset]`: load one uniform 32-bit kernel parameter.
+pub fn ldcu(udst: u8, bank: u5, offset: u16, c: Control) Inst {
+    std.debug.assert(offset % 2 == 0);
+    var w = base(c);
+    setBits(&w, 0, 12, 0x7ac);
+    setBits(&w, 16, 8, udst);
+    setBits(&w, 24, 8, URZ);
+    // LDCU measures this field in two-byte units. The public encoder API,
+    // like LDC and the IR ABI layout, names offsets in bytes.
+    setBits(&w, 38, 16, offset / 2);
+    setBits(&w, 54, 5, bank);
+    setBits(&w, 73, 3, @intFromEnum(MemType.b32));
+    setBits(&w, 91, 1, 1);
     return w;
 }
 
@@ -2164,6 +2223,29 @@ test "PLOP3 places the warp-form opcode, the LUT split, and the predicate source
     try std.testing.expectEqual(@as(u32, 1), (w[2] >> 13) & 0x7); // src1 (p_b) = P1 at bit 77
     try std.testing.expectEqual(@as(u32, 0), (w[2] >> 23) & 0x7); // src0 (p_a) = P0 at bit 87
     try std.testing.expectEqual(@as(u32, PT), (w[2] >> 4) & 0x7); // src2 = PT at bit 68
+}
+
+test "ISETP AND reads the requested accumulator predicate" {
+    const w = isetpAnd(2, 4, 5, .lt, true, 1, .{});
+    try std.testing.expectEqual(@as(u32, 0x20c), w[0] & 0xfff);
+    try std.testing.expectEqual(@as(u32, 2), (w[2] >> (81 - 64)) & 0x7);
+    try std.testing.expectEqual(@as(u32, 1), (w[2] >> (87 - 64)) & 0x7);
+}
+
+test "uniform parameter encodings match ptxas operand forms" {
+    const load = ldcu(6, 0, 0x388, .{});
+    try std.testing.expectEqual(@as(u32, 0xff0677ac), load[0]);
+    try std.testing.expectEqual(@as(u32, 0x00007100), load[1]);
+    try std.testing.expectEqual(@as(u32, 1), (load[2] >> (91 - 64)) & 1);
+
+    const mul = imadUreg(5, 5, 6, RZ, .{});
+    try std.testing.expectEqual(@as(u32, 0x05057c24), mul[0]);
+    try std.testing.expectEqual(@as(u32, 0x00000006), mul[1]);
+
+    const cmp = isetpUregAnd(0, 5, 6, .ge, false, PT, .{});
+    try std.testing.expectEqual(@as(u32, 0x05007c0c), cmp[0]);
+    try std.testing.expectEqual(@as(u32, 0x00000006), cmp[1]);
+    try std.testing.expectEqual(@as(u32, 0x0bf06070), cmp[2]);
 }
 
 test "subtract sets the srcB negate modifier (bit 63)" {

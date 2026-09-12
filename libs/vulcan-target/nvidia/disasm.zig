@@ -20,6 +20,7 @@ const encode = @import("encode.zig");
 
 const RZ = encode.RZ;
 const PT = encode.PT;
+const URZ = encode.URZ;
 
 /// Read `width` bits at bit offset `lo` from a 128-bit instruction (four LE dwords).
 /// Mirrors encode.setBits exactly, handling fields that span a 32-bit word boundary.
@@ -71,10 +72,12 @@ pub const Inst = struct {
     dst: u8 = RZ,
     /// Destination predicate register (7 = none).
     dst_pred: u8 = PT,
+    dst_ureg: u8 = URZ,
     /// Source GPRs this instruction reads (RZ entries are placeholders to keep the
     /// positions stable for diffing). Up to four (srcA@24, srcB@32, srcC@64, + a
     /// derived address-pair high half).
     srcs: [4]u8 = .{ RZ, RZ, RZ, RZ },
+    src_ureg: u8 = URZ,
     /// An immediate / offset operand the instruction carries (MOV.imm value, LDC
     /// CB offset, ALD/AST attribute byte address). `has_imm` gates printing.
     imm: u32 = 0,
@@ -105,7 +108,7 @@ pub fn decodeOne(w: encode.Inst) Inst {
     // is how a constant such as 0.25 becomes a phantom source in the listing. Only the
     // ALU family carries this field, so the non-ALU decoders keep reading `srcB`.
     const alu_imm_form = form == 2 or form == 4;
-    const aluB: u8 = if (alu_imm_form) RZ else srcB;
+    const aluB: u8 = if (alu_imm_form or form == 6) RZ else srcB;
 
     // ALU-family ops carry the source FORM in bits 9..11, so their full low-12-bit
     // value is `base | form << 9` (e.g. MOV.imm = 0x002 | 4<<9 = 0x802, IADD3.reg =
@@ -120,6 +123,13 @@ pub fn decodeOne(w: encode.Inst) Inst {
             d.dst = dst;
             // dynamic offset reg at 24 (RZ = static), not a real data dependency.
             d.imm = @intCast(getBits(w, 38, 16)); // 16-bit static CB offset
+            d.bank = @intCast(getBits(w, 54, 5));
+            d.has_imm = true;
+        },
+        0x7ac => { // LDCU
+            d.mnemonic = "LDCU";
+            d.dst_ureg = dst;
+            d.imm = @intCast(getBits(w, 38, 16) * 2);
             d.bank = @intCast(getBits(w, 54, 5));
             d.has_imm = true;
         },
@@ -235,6 +245,7 @@ pub fn decodeOne(w: encode.Inst) Inst {
                     d.mnemonic = "ISETP";
                     d.dst_pred = @intCast(getBits(w, 81, 3));
                     d.srcs = .{ srcA, aluB, RZ, RZ };
+                    if (form == 6) d.src_ureg = srcB;
                 },
                 0x00b => { // FSETP (float set-predicate) -> predicate
                     d.mnemonic = "FSETP";
@@ -270,6 +281,7 @@ pub fn decodeOne(w: encode.Inst) Inst {
                     d.mnemonic = "IMAD";
                     d.dst = dst;
                     d.srcs = .{ srcA, aluB, srcC, RZ };
+                    if (form == 6) d.src_ureg = srcB;
                 },
                 0x106 => {
                     d.mnemonic = "I2F";
@@ -373,6 +385,8 @@ pub fn format(allocator: std.mem.Allocator, code: []const u32) ![]u8 {
             // barrier op: dst/srcs already printed as B<n>
         } else if (it.dst_pred != PT) {
             try out.print(allocator, " P{d}", .{it.dst_pred});
+        } else if (it.dst_ureg != URZ) {
+            try out.print(allocator, " UR{d}", .{it.dst_ureg});
         } else if (it.dst != RZ) {
             try out.print(allocator, " {s}", .{regName(&ba, it.dst)});
             // TEX writes a split RGBA block: dst..dst+1 here, dst[1] = bit64.
@@ -389,11 +403,15 @@ pub fn format(allocator: std.mem.Allocator, code: []const u32) ![]u8 {
                 try out.print(allocator, "{s}{s}", .{ if (first) " <- " else ", ", regName(&ba, s) });
                 first = false;
             }
+            if (it.src_ureg != URZ) {
+                try out.print(allocator, "{s}UR{d}", .{ if (first) " <- " else ", ", it.src_ureg });
+                first = false;
+            }
         }
         // Immediate / memory offset operand (MOV.imm value, LDC c[bank][off],
         // ALD/AST attribute byte address).
         if (it.has_imm) {
-            if (it.opcode == 0xb82) {
+            if (it.opcode == 0xb82 or it.opcode == 0x7ac) {
                 try out.print(allocator, ", c[{d}][0x{x}]", .{ it.bank, it.imm });
             } else if (it.opcode == 0x321 or it.opcode == 0x322) {
                 try out.print(allocator, " @0x{x}", .{it.imm});
@@ -438,6 +456,20 @@ test "decodes the hardware-verified MOV/STG/EXIT round-trip" {
     const ex = decodeOne(encode.exit(.{ .stall = 1 }));
     try std.testing.expectEqualStrings("EXIT", ex.mnemonic);
     try std.testing.expectEqual(@as(u4, 1), ex.sched.stall);
+}
+
+test "decodes uniform parameter loads and mixed ALU sources" {
+    const load = decodeOne(encode.ldcu(4, 0, 8, .{}));
+    try std.testing.expectEqualStrings("LDCU", load.mnemonic);
+    try std.testing.expectEqual(@as(u8, 4), load.dst_ureg);
+    try std.testing.expectEqual(RZ, load.dst);
+    try std.testing.expectEqual(@as(u32, 8), load.imm);
+
+    const mul = decodeOne(encode.imadUreg(6, 7, 4, RZ, .{}));
+    try std.testing.expectEqualStrings("IMAD", mul.mnemonic);
+    try std.testing.expectEqual(@as(u8, 7), mul.srcs[0]);
+    try std.testing.expectEqual(@as(u8, 4), mul.src_ureg);
+    try std.testing.expectEqual(RZ, mul.srcs[1]);
 }
 
 test "decodes the shared-memory and barrier ops this backend emits" {

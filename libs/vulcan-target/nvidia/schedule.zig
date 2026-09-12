@@ -185,6 +185,8 @@ fn writesDst(opcode: u32) bool {
         // scoreboard and CLEARS its tag, so the instruction that really consumes R0 emits
         // no wait of its own and reads stale.
         0x322, 0x95b => false,
+        // LDCU writes the uniform register file. Bits 16..23 name a UREG, not a GPR.
+        0x7ac => false,
         // PLOP3 (0x81c), the predicate-logic op. Its result is a PREDICATE at bits 81..83.
         // Bits 16..23 hold the SECOND lookup table, which the encoder sets to 0, so the
         // field reads as R0 with the same phantom-write result as AST and KIL.
@@ -265,6 +267,8 @@ fn readsSrc(opcode: u32, form: u32, pos: usize) bool {
         // The 16-bit static offset lives at bits 38..53 and the bank at 54..58, so bits
         // 64..71 are zero and the ALU rule read them as R0.
         0xb82 => pos == 24,
+        // LDCU's static address and destination are both outside the GPR file.
+        0x7ac => false,
         // ALD (0x321), the vertex attribute load: the dynamic offset at 24 and the
         // per-vertex index at 32, both RZ as the encoder emits them. The attribute address
         // is an immediate at bits 40..49, and bits 64..71 are zero, so the ALU rule read
@@ -1469,6 +1473,10 @@ fn markReuse(insts: []Inst, block_starts: []const usize, entry_start: usize) voi
         const opcode = getField(inst.*, 0, 12);
         // Only a coupled ALU op gets bits. See the marking policy above.
         if (!isAluOp(opcode) or isVariableLatency(opcode)) continue;
+        // ISETP uses bits 109 and 122..125 as part of its operation extension,
+        // not as the generic ALU reuse encoding. nvdisasm rejects a compare
+        // with those bits set even when its scheduled stall is small.
+        if ((opcode & 0x1ff) == 0x00c) continue;
         // An instruction the stall pass left at 15 carries a value across a branch, and
         // that stall is load-bearing. Large stalls are illegal WITH the reuse encoding:
         // nvdisasm's validator rejects a word with bit 109 set and a stall of 12 or 15
@@ -3347,7 +3355,7 @@ test "a block boundary ends the reuse scan, and the entry block start does not" 
         encode.ffmaAddendImm(6, 5, 9, five_hundredths, .{}),
         encode.exit(.{}),
     };
-    scheduleBlocks(&split, &.{1, 2});
+    scheduleBlocks(&split, &.{ 1, 2 });
 
     // The reader before the real branch target still marks: its scan crosses the ENTRY
     // start at 1 and finds the next reader there.
@@ -3486,7 +3494,7 @@ test "a fall-through consumer and a consumer across a branch both get the comput
         encode.ffmaAddendImm(5, 4, 9, five_hundredths, .{}), // block 1 starts here, reads R4
         encode.exit(.{}),
     };
-    scheduleBlocks(&insts, &.{0, 2});
+    scheduleBlocks(&insts, &.{ 0, 2 });
 
     // The distance from the producer to its reader is 2, so the stall is the ALU
     // latency minus 2.
@@ -3500,7 +3508,7 @@ test "a fall-through consumer and a consumer across a branch both get the comput
         encode.ffmaAddendImm(5, 4, 9, five_hundredths, .{}), // reads R4 across the branch
         encode.exit(.{}),
     };
-    scheduleBlocks(&split, &.{0, 2});
+    scheduleBlocks(&split, &.{ 0, 2 });
 
     try std.testing.expectEqual(coupled_alu_latency - 2, getField(split[0], 105, 4));
 }
@@ -3537,14 +3545,20 @@ test "an ISETP result predicate delays the guarded instruction that reads it" {
     try std.testing.expectEqual(coupled_alu_latency - 2, getField(insts[0], 105, 4));
 }
 
+test "LDCU does not alias the same-numbered GPR" {
+    var insts = [_]Inst{
+        encode.ldc(4, 0, 0, .{}),
+        encode.ldcu(4, 0, 4, .{}),
+        encode.exit(.{}),
+    };
+    scheduleBlocks(&insts, &.{0});
+    try std.testing.expectEqual(@as(u32, 0), getField(insts[1], 116, 6));
+}
 
-test "an instruction whose predicate feeds a nearby PLOP3 carries no reuse bits" {
-    // The reuse encoding is illegal beside a large stall: nvdisasm's validator
-    // rejects a word with bit 109 set and a stall of 12 or 15 ("undefined
-    // value for table TABLES_opex_8"). A compare feeding a PLOP3 one slot
-    // later needs a stall of 13 to cover the slow predicate hop, so the
-    // reuse mark must stay off it even though its operands repeat in a later
-    // reader. With the slow hop far away, the same compare takes the mark.
+test "ISETP never carries generic ALU reuse bits" {
+    // Bits 109 and 122..125 select an ISETP operation extension. nvdisasm
+    // rejects the instruction when the generic ALU reuse pass sets them,
+    // independent of the compare's scheduled stall.
     var near = [_]Inst{
         encode.isetp(0, 4, 5, .lt, true, .{}),
         encode.plop3(2, 0, 1, encode.LUT_AND, .{}),
@@ -3576,6 +3590,6 @@ test "an instruction whose predicate feeds a nearby PLOP3 carries no reuse bits"
     };
     scheduleBlocks(&far, &.{0});
     try std.testing.expect(getField(far[0], 105, 4) <= 6);
-    try std.testing.expectEqual(@as(u32, 0b11), getField(far[0], 122, 4));
-    try std.testing.expectEqual(@as(u32, 1), getField(far[0], 109, 1));
+    try std.testing.expectEqual(@as(u32, 0), getField(far[0], 122, 4));
+    try std.testing.expectEqual(@as(u32, 0), getField(far[0], 109, 1));
 }

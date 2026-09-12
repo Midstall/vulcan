@@ -5,8 +5,9 @@
 //! transform emits one of two shapes, both correct by construction. A CPU model, or a SIMT loop
 //! that fails the strict counted checks, gets a guarded partial unroll: K body copies, each closed
 //! by its own recomputed guard. A SIMT loop that passes those checks gets a main loop plus a
-//! remainder: one guard, K unguarded copies in one block, and the original loop left whole as the
-//! tail. The guarded shape is proven by the differential JIT tests in
+//! remainder: one guard and K unguarded copies in one block. Load-bearing factor-five loops use
+//! four guarded forward tail copies; other factors leave the original loop whole as the tail.
+//! The guarded shape is proven by the differential JIT tests in
 //! libs/vulcan-target/tests/unroll_differential.zig.
 //!
 //! Why the second shape exists: the SIMT scheduler (microarch/schedule.zig) hoists loads only
@@ -614,8 +615,9 @@ fn rv(map: *const ValueMap, v: Value) Value {
 /// ineligible or un-cleanly-transformable loop is always left exactly as it was.
 /// Two shapes are emitted: K guarded body copies, or, when the model is SIMT
 /// and the loop matches the strict counted shape, a main block of K unguarded
-/// copies plus the original loop as the remainder. See `countedShape` for
-/// what the strict checks prove.
+/// copies plus a bounded remainder. A load-bearing factor-five loop gets four
+/// forward tail copies; other factors retain the original scalar loop. See
+/// `countedShape` for what the strict checks prove.
 /// Idempotence note: re-running `run` on its own output stays correct. The
 /// remainder loop loses its preheader (the main header branches to two
 /// blocks), the main loop no longer matches the strict shape, and any nested
@@ -796,7 +798,7 @@ fn eligible(
     while (bi < n) : (bi += 1) {
         if (bi < in_loop.len and in_loop[bi]) body_ops += @intCast(func.blockInsts(@enumFromInt(bi)).len);
     }
-    const factor = unrollFactor(model, body_ops);
+    var factor = unrollFactor(model, body_ops);
     if (factor < 2) return null;
 
     // Snapshot the body blocks (loop minus header) and the body bitset.
@@ -823,6 +825,14 @@ fn eligible(
         back_args,
     );
 
+    // The instruction-count register bound is deliberately conservative, but
+    // it under-unrolls arithmetic recurrences whose temporary results die in
+    // each copy. On sm_120, ptxas carries 64 FFMAs per branch for k2 while the
+    // generic factor carries 32. Four copies retain the same four accumulator
+    // registers and match that hot-loop shape.
+    if (factor == 2 and counted != null and arithmeticRecurrenceCanUseFour(func, in_loop, body_ops))
+        factor = 4;
+
     return Plan{
         .header = header,
         .if_inst = iff,
@@ -835,6 +845,23 @@ fn eligible(
         .preheader = @enumFromInt(loop.preheader.?),
         .counted = counted,
     };
+}
+
+fn arithmeticRecurrenceCanUseFour(func: *const Function, in_loop: []const bool, body_ops: u32) bool {
+    if (body_ops > 64) return false;
+    var float_arith: u32 = 0;
+    for (in_loop, 0..) |member, block_index| {
+        if (!member) continue;
+        for (func.blockInsts(@enumFromInt(block_index))) |inst| switch (func.opcode(inst)) {
+            .load, .store, .call, .call_indirect, .prefetch, .matmul, .atomic_rmw, .barrier, .va_start, .va_arg, .va_end => return false,
+            .arith, .arith_imm => if (func.instResult(inst)) |result| switch (func.types.type_kind(func.valueType(result))) {
+                .float => float_arith += 1,
+                else => {},
+            },
+            else => {},
+        };
+    }
+    return float_arith >= 8;
 }
 
 /// Whether `v` is a parameter or an instruction result of `block`.
@@ -1137,6 +1164,23 @@ fn applyCounted(a: std.mem.Allocator, func: *Function, plan: *const Plan, ct: Co
     const bparams = try a.dupe(Value, func.blockParams(plan.body_entry));
     const body_insts = try a.dupe(Inst, func.blockInsts(plan.body_entry));
     const back_args = try a.dupe(Value, func.blockArgs(func.terminator(plan.latch).?.jump));
+    const step_value = back_args[ct.counter];
+    const step_inst = func.definingInst(step_value).?;
+    const exit_jump = blk: {
+        const cf = func.opcode(plan.if_inst).@"if";
+        break :blk if (cf.then.target == plan.exit) cf.then else cf.@"else";
+    };
+    const exit_args = try a.dupe(Value, func.blockArgs(exit_jump));
+    const collapsed_counter = inductionStepIsPrivate(
+        func,
+        body_insts,
+        hparams[ct.counter],
+        if (bparams.len == hparams.len) bparams[ct.counter] else null,
+        step_inst,
+        step_value,
+        back_args,
+        ct.counter,
+    );
 
     // H_main: one param per original header param, same types. It holds the
     // guard for the FIRST main trip only, so its short predicate chain runs
@@ -1156,6 +1200,20 @@ fn applyCounted(a: std.mem.Allocator, func: *Function, plan: *const Plan, ct: Co
     const fits0 = try func.appendInst(h_main, bool_t, .{ .icmp = .{ .op = ct.op, .lhs = last0, .rhs = ct.bound } });
     const guard0 = try func.appendInst(h_main, bool_t, .{ .arith = .{ .op = .bit_and, .lhs = nowrap0, .rhs = fits0 } });
 
+    // Once the exact first guard admits a signed `<` loop whose counter is
+    // private, `counter + K` cannot overflow: it is at most `bound`. The next
+    // K iterations then fit exactly when `counter + K <= bound - K`. Hoist
+    // that invariant subtraction out of the hot loop and replace its
+    // add/wrap-test/bound-test chain with one comparison.
+    const threshold_guard = collapsed_counter and ct.op == .lt and switch (func.types.type_kind(counter_t)) {
+        .int => |int| int.signedness == .signed,
+        else => false,
+    };
+    const main_limit = if (threshold_guard)
+        try func.appendArithImm(h_main, counter_t, .add, ct.bound, -@as(i64, @intCast(plan.factor)))
+    else
+        undefined;
+
     // M: the rotated main body, one param per header param. The trip enters
     // through its params, computes the guard for the NEXT trip at the top,
     // runs the K copies, and closes with the guarded branch at the bottom.
@@ -1164,17 +1222,25 @@ fn applyCounted(a: std.mem.Allocator, func: *Function, plan: *const Plan, ct: Co
     for (hparams, 0..) |hp, k| mparams[k] = try func.appendBlockParam(m, func.valueType(hp));
     try func.appendIf(h_main, guard0, .{ .target = m, .args = hmparams }, .{ .target = plan.header, .args = hmparams });
 
-    // The guard compares for the next trip, from THIS trip's entry counter.
-    // The copies advance the counter by exactly K, so the next trip's last
-    // copy runs the counter `c + 2K - 1`: one add covers it. The wrap check
-    // reads the entry counter itself: a positive addend that wraps lands the
-    // sum below the value it was added to, and with no wrap the counter rises
-    // by exactly one per copy, so the last copy's test proves every earlier
-    // copy's test at once. Sitting at the top, the compares have the whole
-    // body to travel before anything reads their predicates.
-    const last = try func.appendArithImm(m, counter_t, .add, mparams[ct.counter], @intCast(2 * plan.factor - 1));
-    const nowrap = try func.appendInst(m, bool_t, .{ .icmp = .{ .op = .gt, .lhs = last, .rhs = mparams[ct.counter] } });
-    const fits = try func.appendInst(m, bool_t, .{ .icmp = .{ .op = ct.op, .lhs = last, .rhs = ct.bound } });
+    const advanced_counter = if (collapsed_counter)
+        try func.appendArithImm(m, counter_t, .add, mparams[ct.counter], @intCast(plan.factor))
+    else
+        undefined;
+
+    // The general guard compares for the next trip from THIS trip's entry
+    // counter. Its wrap test and last-copy test remain separate until the
+    // middle of the body. The private signed-`<` case uses the hoisted
+    // threshold above and needs only one comparison.
+    var nowrap: Value = undefined;
+    var fits: Value = undefined;
+    var guard: ?Value = null;
+    if (threshold_guard) {
+        guard = try func.appendInst(m, bool_t, .{ .icmp = .{ .op = .le, .lhs = advanced_counter, .rhs = main_limit } });
+    } else {
+        const last = try func.appendArithImm(m, counter_t, .add, mparams[ct.counter], @intCast(2 * plan.factor - 1));
+        nowrap = try func.appendInst(m, bool_t, .{ .icmp = .{ .op = .gt, .lhs = last, .rhs = mparams[ct.counter] } });
+        fits = try func.appendInst(m, bool_t, .{ .icmp = .{ .op = ct.op, .lhs = last, .rhs = ct.bound } });
+    }
 
     // K copies of the body in one block, chained through the map: the entry
     // values of copy n+1 are the back-edge args of copy n, read through the
@@ -1186,6 +1252,12 @@ fn applyCounted(a: std.mem.Allocator, func: *Function, plan: *const Plan, ct: Co
         for (bparams, mparams) |bp, mp| try vmap.put(a, bp, mp);
     }
     var carried = try a.alloc(Value, back_args.len);
+    // If the induction value is observed only by its own `+ 1` update, the K
+    // cloned updates are indistinguishable from one wrapping `+ K`. Keep that
+    // update before the independent body work so scheduling can hide it, and
+    // omit the K originals. This is the counted-loop analogue of ptxas's
+    // single `UIADD3 counter, counter, K`; in an arithmetic recurrence it
+    // removes K-1 instructions from every hot trip.
     // The combine lands mid-body, after half the copies. The predicate path
     // holds two slow hops, compare to combine and combine to branch, so a
     // combine beside its compares stacks both at the top of the block, and a
@@ -1193,19 +1265,22 @@ fn applyCounted(a: std.mem.Allocator, func: *Function, plan: *const Plan, ct: Co
     // them: each hop gets half the copies to travel.
     const combine_after = (plan.factor + 1) / 2;
     var copy: u32 = 0;
-    var guard: Value = undefined;
     while (copy < plan.factor) : (copy += 1) {
-        for (body_insts) |inst| try cloneInstInto(func, m, inst, &vmap, a);
+        for (body_insts) |inst| {
+            if (collapsed_counter and inst == step_inst) continue;
+            try cloneInstInto(func, m, inst, &vmap, a);
+        }
 
         // Read the whole carried list before any map entry is overwritten. A
         // back-edge arg may name a header or body param directly, and its
         // entry still maps to the copy that just ran.
         for (back_args, 0..) |ba, k| carried[k] = rv(&vmap, ba);
+        if (collapsed_counter) carried[ct.counter] = advanced_counter;
         if (copy + 1 < plan.factor) {
             for (hparams, 0..) |hp, k| try vmap.put(a, hp, carried[k]);
             for (bparams, 0..) |bp, k| try vmap.put(a, bp, carried[k]);
         }
-        if (copy + 1 == combine_after) {
+        if (guard == null and copy + 1 == combine_after) {
             guard = try func.appendInst(m, bool_t, .{ .arith = .{ .op = .bit_and, .lhs = nowrap, .rhs = fits } });
         }
     }
@@ -1214,7 +1289,7 @@ fn applyCounted(a: std.mem.Allocator, func: *Function, plan: *const Plan, ct: Co
     // it is ready when the trip ends. Both edges carry the values the trip
     // finished on: the back edge feeds M's params, and the else edge hands
     // the remainder the counter and accumulators as they stand.
-    try func.appendIf(m, guard, .{ .target = m, .args = carried }, .{ .target = plan.header, .args = carried });
+    try func.appendIf(m, guard.?, .{ .target = m, .args = carried }, .{ .target = plan.header, .args = carried });
 
     // Move the preheader onto the main header, keeping the initial values.
     // The loop analysis names a preheader only when its single successor is
@@ -1237,6 +1312,147 @@ fn applyCounted(a: std.mem.Allocator, func: *Function, plan: *const Plan, ct: Co
             if (op.@"if".@"else".target == plan.header) op.@"if".@"else".target = h_main;
         }
     }
+
+    if (plan.factor == 5 and ct.op == .lt and bodyContainsLoad(func, body_insts) and tailExitArgsSafe(func, plan.header, exit_args)) {
+        try linearizeCountedRemainder(a, func, plan, ct, hparams, bparams, body_insts, back_args, exit_args);
+    }
+}
+
+fn bodyContainsLoad(func: *const Function, insts: []const Inst) bool {
+    for (insts) |inst| if (func.opcode(inst) == .load) return true;
+    return false;
+}
+
+/// The counted-loop update may be widened only when no body computation or
+/// other carried value observes an intermediate counter. `countedShape`
+/// already proves `step_inst` is exactly the counter's wrapping `+ 1`.
+fn inductionStepIsPrivate(
+    func: *const Function,
+    body_insts: []const Inst,
+    header_counter: Value,
+    body_counter: ?Value,
+    step_inst: Inst,
+    step_value: Value,
+    back_args: []const Value,
+    counter_index: u32,
+) bool {
+    for (body_insts) |inst| {
+        if (inst == step_inst) continue;
+        if (instUsesValue(func, inst, header_counter) or
+            (body_counter != null and instUsesValue(func, inst, body_counter.?)) or
+            instUsesValue(func, inst, step_value)) return false;
+    }
+    for (back_args, 0..) |arg, i| {
+        if (i == counter_index) continue;
+        if (arg == header_counter or arg == body_counter or arg == step_value) return false;
+    }
+    return true;
+}
+
+/// Whether one instruction reads `value`. Exhaustive so a newly added opcode
+/// cannot silently make the induction proof unsound.
+fn instUsesValue(func: *const Function, inst: Inst, value: Value) bool {
+    return switch (func.opcode(inst)) {
+        .arith => |x| x.lhs == value or x.rhs == value,
+        .arith_imm => |x| x.lhs == value,
+        .icmp => |x| x.lhs == value or x.rhs == value,
+        .select => |x| x.cond == value or x.then == value or x.@"else" == value,
+        .extract => |x| x.aggregate == value,
+        .convert => |x| x.value == value,
+        .unary => |x| x.value == value,
+        .load => |x| x.ptr == value,
+        .store => |x| x.value == value or x.ptr == value,
+        .atomic_rmw => |x| x.ptr == value or x.value == value or (x.compare != null and x.compare.? == value),
+        .prefetch => |x| x.ptr == value,
+        .va_start => |x| x.list == value,
+        .va_arg => |x| x.list == value,
+        .va_end => |x| x.list == value,
+        .dot => |x| x.acc == value or x.a == value or x.b == value,
+        .matmul => |x| x.a == value or x.b == value or x.c == value,
+        .struct_new => |x| blk: {
+            for (func.valueList(x.fields)) |field| if (field == value) break :blk true;
+            break :blk false;
+        },
+        .call => |x| blk: {
+            for (func.valueList(x.args)) |arg| if (arg == value) break :blk true;
+            break :blk false;
+        },
+        .call_indirect => |x| blk: {
+            if (x.target == value) break :blk true;
+            for (func.valueList(x.args)) |arg| if (arg == value) break :blk true;
+            break :blk false;
+        },
+        .@"if" => |x| blk: {
+            if (x.cond == value) break :blk true;
+            for (func.blockArgs(x.then)) |arg| if (arg == value) break :blk true;
+            for (func.blockArgs(x.@"else")) |arg| if (arg == value) break :blk true;
+            break :blk false;
+        },
+        .iconst, .fconst, .fconst128, .alloca, .global_addr, .barrier => false,
+    };
+}
+
+fn tailExitArgsSafe(func: *const Function, header: Block, args: []const Value) bool {
+    for (args) |arg| {
+        if (func.definingInst(arg) != null and definedInBlock(func, arg, header)) return false;
+    }
+    return true;
+}
+
+/// Replace the bounded scalar remainder with at most K minus 1 forward body
+/// copies. Each copy keeps the original test, but no copy branches backward.
+fn linearizeCountedRemainder(
+    a: std.mem.Allocator,
+    func: *Function,
+    plan: *const Plan,
+    ct: Counted,
+    hparams: []const Value,
+    bparams: []const Value,
+    body_insts: []const Inst,
+    back_args: []const Value,
+    exit_args: []const Value,
+) Error!void {
+    var prev_body = plan.body_entry;
+    var carried = try a.dupe(Value, back_args);
+    var copy: u32 = 1;
+    while (copy < plan.factor - 1) : (copy += 1) {
+        const check = try func.appendBlock();
+        const check_params = try a.alloc(Value, hparams.len);
+        for (hparams, 0..) |hp, i| check_params[i] = try func.appendBlockParam(check, func.valueType(hp));
+
+        func.terminatorPtr(prev_body).* = null;
+        try func.setJump(prev_body, check, carried);
+
+        const body = try func.appendBlock();
+        const cond = try func.appendInst(check, try func.types.intern(.bool), .{ .icmp = .{
+            .op = ct.op,
+            .lhs = check_params[ct.counter],
+            .rhs = ct.bound,
+        } });
+        var exit_map: ValueMap = .empty;
+        for (hparams, check_params) |hp, cp| try exit_map.put(a, hp, cp);
+        const out = try a.alloc(Value, exit_args.len);
+        for (exit_args, 0..) |arg, i| out[i] = rv(&exit_map, arg);
+        try func.appendIf(check, cond, .{ .target = body, .args = &.{} }, .{ .target = plan.exit, .args = out });
+
+        var vmap: ValueMap = .empty;
+        for (hparams, check_params) |hp, cp| try vmap.put(a, hp, cp);
+        if (bparams.len == hparams.len) {
+            for (bparams, check_params) |bp, cp| try vmap.put(a, bp, cp);
+        }
+        for (body_insts) |inst| try cloneInstInto(func, body, inst, &vmap, a);
+        const next = try a.alloc(Value, back_args.len);
+        for (back_args, 0..) |arg, i| next[i] = rv(&vmap, arg);
+        carried = next;
+        prev_body = body;
+    }
+
+    func.terminatorPtr(prev_body).* = null;
+    var final_map: ValueMap = .empty;
+    for (hparams, carried) |hp, value| try final_map.put(a, hp, value);
+    const out = try a.alloc(Value, exit_args.len);
+    for (exit_args, 0..) |arg, i| out[i] = rv(&final_map, arg);
+    try func.setJump(prev_body, plan.exit, out);
 }
 
 /// Copy `src`, remapping each value through `map`.
@@ -1587,6 +1803,7 @@ test "a GPU loop unrolls by exactly the factor the SIMT rule predicts, and stays
     const cases = [_]struct { pad: u32, factor: u32 }{
         .{ .pad = 0, .factor = 8 }, // body 4: the shared MAX_FACTOR cap, not the register budget
         .{ .pad = 8, .factor = 6 }, // body 12
+        .{ .pad = 12, .factor = 5 }, // body 16: four-copy forward remainder
         .{ .pad = 16, .factor = 4 }, // body 20
         .{ .pad = 23, .factor = 2 }, // body 27
         .{ .pad = 37, .factor = 1 }, // body 41: two copies already cost the occupancy
@@ -1603,14 +1820,23 @@ test "a GPU loop unrolls by exactly the factor the SIMT rule predicts, and stays
         const before_blocks = func.blockCount();
         const changed = try run(allocator, &func, g);
         try std.testing.expectEqual(c.factor > 1, changed);
-        // The counted shape holds K copies in the main block plus the one
-        // remainder body. A loop too large to unroll keeps its single load.
+        // Factor five gets four forward tail copies. Other counted loops keep
+        // one scalar remainder body.
         if (c.factor > 1) {
-            try std.testing.expectEqual(c.factor + 1, countLoads(&func));
+            const tail_copies: u32 = if (c.factor == 5) 4 else 1;
+            try std.testing.expectEqual(c.factor + tail_copies, countLoads(&func));
         } else {
             try std.testing.expectEqual(@as(u32, 1), countLoads(&func));
         }
         if (c.factor == 1) try std.testing.expectEqual(before_blocks, func.blockCount());
+
+        if (c.factor == 5) {
+            var info = try loops.analyze(allocator, &func);
+            defer info.deinit(allocator);
+            for (info.loops) |l| {
+                try std.testing.expect(l.header != 1);
+            }
+        }
 
         var diags = try ir.verify.verify(allocator, &func, .low);
         defer diags.deinit();
@@ -1683,6 +1909,24 @@ test "a counted sm_120 loop becomes one unguarded main block plus a guarded rema
     }
     try std.testing.expectEqual(@as(usize, 1), m_ifs);
     try std.testing.expect(func.terminator(m) == null);
+
+    // The body never observes its counter, so its eight cloned `+ 1`
+    // updates collapse to one `+ 8`. The signed threshold guard also hoists
+    // its bound adjustment into H_main, leaving no other add in M.
+    var main_adds: usize = 0;
+    var saw_advance = false;
+    var saw_threshold_guard = false;
+    for (func.blockInsts(m)) |inst| switch (func.opcode(inst)) {
+        .arith_imm => |arith| if (arith.op == .add) {
+            main_adds += 1;
+            saw_advance = saw_advance or arith.imm == 8;
+        },
+        .icmp => |cmp| saw_threshold_guard = saw_threshold_guard or cmp.op == .le,
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 1), main_adds);
+    try std.testing.expect(saw_advance);
+    try std.testing.expect(saw_threshold_guard);
 
     // The guard must add (K-1) to the counter, and test the sum twice: once
     // against the counter itself (the wrap check) and once against the bound

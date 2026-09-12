@@ -651,6 +651,14 @@ pub fn compileShaderOpts(allocator: std.mem.Allocator, func: *Function, stage: S
     defer fma.deinit(allocator);
     try scanFma(allocator, func, options, &fma);
 
+    var pred_fold = PredicateFold{};
+    defer pred_fold.deinit(allocator);
+    try scanPredicateAnds(allocator, func, &pred_fold);
+
+    var uniform_params = UniformParams{};
+    defer uniform_params.deinit(allocator);
+    if (stage == .compute) try scanUniformParams(allocator, func, &uniform_params);
+
     var loc = std.AutoHashMapUnmanaged(Value, Loc){};
     defer loc.deinit(allocator);
     var max_reg: u8 = r_outptr + 1; // the output pointer pair is always live
@@ -752,7 +760,10 @@ pub fn compileShaderOpts(allocator: std.mem.Allocator, func: *Function, stage: S
             // pointer at the target's address width, so the runtime writes the offset into the
             // low dword of that slot and leaves the high dword alone.
             switch (slot.kind) {
-                .scalar => try code.append(allocator, encode.ldc(lo, bank0, at, .{})),
+                .scalar => if (uniform_params.regOf(p)) |ur|
+                    try code.append(allocator, encode.ldcu(ur, bank0, at, .{}))
+                else
+                    try code.append(allocator, encode.ldc(lo, bank0, at, .{})),
                 .pointer => |space| switch (space) {
                     .global, .constant, .private => try emitPointerLdc(allocator, &code, lo, bank0, at),
                     .shared => try code.append(allocator, encode.ldc(lo, bank0, at, .{})),
@@ -1007,7 +1018,7 @@ pub fn compileShaderOpts(allocator: std.mem.Allocator, func: *Function, stage: S
         var terminated = false;
 
         for (func.blockInsts(block)) |inst| {
-            try lowerInst(allocator, func, &loc, &code, &tex, &deriv, &math, &shared, &disp, &fma, inst);
+            try lowerInst(allocator, func, &loc, &code, &tex, &deriv, &math, &shared, &disp, &fma, &pred_fold, &uniform_params, inst);
             if (func.opcode(inst) == .@"if") {
                 // Set up the convergence barrier just before the divergent
                 // branch. BCLEAR initializes the barrier register, and BSSY
@@ -1624,7 +1635,7 @@ fn nvidiaRegDescription(allocator: std.mem.Allocator, ctx: *const WimmerCtx) Err
 /// hint fire.
 fn wimmerCopySource(ctx: *const anyopaque, func: *const Function, v: Value) ?Value {
     _ = func;
-    const self: *const WimmerCtx = @alignCast(@ptrCast(ctx));
+    const self: *const WimmerCtx = @ptrCast(@alignCast(ctx));
     const m = self.fma.at.get(v) orelse return null;
     if (m.addend) |a| return a;
     return m.mul_a;
@@ -2048,6 +2059,142 @@ const FmaFold = struct {
     }
 };
 
+const PredicateAnd = struct {
+    dst: Value,
+    accum: Value,
+};
+
+/// Integer predicate AND folding. The later of two same-block compares writes
+/// the AND result directly and reads the earlier predicate as its accumulator.
+/// The later compare must have no reader besides the AND, because its own
+/// predicate register is not written by the folded instruction.
+const PredicateFold = struct {
+    at: std.AutoHashMapUnmanaged(Value, PredicateAnd) = .empty,
+    combined: std.AutoHashMapUnmanaged(Value, void) = .empty,
+
+    fn deinit(self: *PredicateFold, allocator: std.mem.Allocator) void {
+        self.at.deinit(allocator);
+        self.combined.deinit(allocator);
+    }
+};
+
+/// Entry integer parameters that stay in the uniform datapath. Promotion is
+/// limited to operand shapes with validated mixed GPR and UREG encodings.
+const UniformParams = struct {
+    regs: std.AutoHashMapUnmanaged(Value, u8) = .empty,
+
+    fn deinit(self: *UniformParams, allocator: std.mem.Allocator) void {
+        self.regs.deinit(allocator);
+    }
+
+    fn regOf(self: *const UniformParams, value: Value) ?u8 {
+        return self.regs.get(value);
+    }
+};
+
+fn scanUniformParams(allocator: std.mem.Allocator, func: *const Function, out: *UniformParams) Error!void {
+    if (func.valueCount() == 0) return;
+    const uses = try allocator.alloc(u32, func.valueCount());
+    defer allocator.free(uses);
+    opt.dce.countUses(func, uses);
+
+    var next_ureg: u16 = 4;
+    for (func.blockParams(@enumFromInt(0))) |param| {
+        if (gpu.attrs.builtinOf(func, param) != null) continue;
+        const int = switch (func.types.type_kind(func.valueType(param))) {
+            .int => |x| x,
+            else => continue,
+        };
+        if (int.bits > 32) continue;
+
+        var supported: u32 = 0;
+        var multiplies: u32 = 0;
+        for (0..func.blockCount()) |bi| {
+            for (func.blockInsts(@enumFromInt(bi))) |inst| switch (func.opcode(inst)) {
+                .icmp => |cmp| {
+                    if (cmp.lhs == param) supported += 1;
+                    if (cmp.rhs == param) supported += 1;
+                },
+                .arith => |arith_op| {
+                    if (arith_op.op != .mul or arith_op.lhs == arith_op.rhs) continue;
+                    if (arith_op.lhs == param) {
+                        supported += 1;
+                        multiplies += 1;
+                    }
+                    if (arith_op.rhs == param) {
+                        supported += 1;
+                        multiplies += 1;
+                    }
+                },
+                else => {},
+            };
+        }
+        // A compare-only parameter does not repay the extra uniform-data-path
+        // dependency. k2 measures faster with its bound in a GPR. Mixed IMAD
+        // is the profitable shape until loop induction itself is uniform.
+        if (multiplies == 0 or supported < 3 or supported != uses[@intFromEnum(param)]) continue;
+        if (next_ureg >= encode.URZ) return error.Unsupported;
+        try out.regs.put(allocator, param, @intCast(next_ureg));
+        next_ureg += 1;
+    }
+}
+
+fn scanPredicateAnds(allocator: std.mem.Allocator, func: *const Function, out: *PredicateFold) Error!void {
+    if (func.valueCount() == 0) return;
+    const uses = try allocator.alloc(u32, func.valueCount());
+    defer allocator.free(uses);
+    opt.dce.countUses(func, uses);
+
+    // A combined ISETP creates a serial predicate dependency. That removes an
+    // instruction in arithmetic loops such as k2, but it prevents the
+    // scheduler from overlapping a load-bearing loop's two comparisons and
+    // nearly doubles k3's run time. Keep those loop guards independent.
+    const avoid = try allocator.alloc(bool, func.blockCount());
+    defer allocator.free(avoid);
+    @memset(avoid, false);
+    var loop_info = try opt.loops.analyze(allocator, func);
+    defer loop_info.deinit(allocator);
+    for (loop_info.loops) |loop| {
+        var has_load = false;
+        for (loop.body, 0..) |in_loop, block_index| {
+            if (!in_loop) continue;
+            for (func.blockInsts(@enumFromInt(block_index))) |inst| {
+                if (func.opcode(inst) == .load) has_load = true;
+            }
+        }
+        if (has_load) for (loop.body, 0..) |in_loop, block_index| {
+            if (in_loop) avoid[block_index] = true;
+        };
+    }
+
+    var compare_pos: std.AutoHashMapUnmanaged(Value, u32) = .empty;
+    defer compare_pos.deinit(allocator);
+
+    for (0..func.blockCount()) |bi| {
+        compare_pos.clearRetainingCapacity();
+        if (avoid[bi]) continue;
+        var pos: u32 = 0;
+        for (func.blockInsts(@enumFromInt(bi))) |inst| {
+            const op = func.opcode(inst);
+            if (op == .icmp) {
+                const result = func.instResult(inst).?;
+                if (!isFloat(func, op.icmp.lhs)) try compare_pos.put(allocator, result, pos);
+            } else if (op == .arith and op.arith.op == .bit_and) {
+                const result = func.instResult(inst) orelse continue;
+                if (!isBool(func, result)) continue;
+                const lhs_pos = compare_pos.get(op.arith.lhs) orelse continue;
+                const rhs_pos = compare_pos.get(op.arith.rhs) orelse continue;
+                const later = if (lhs_pos > rhs_pos) op.arith.lhs else op.arith.rhs;
+                const earlier = if (lhs_pos > rhs_pos) op.arith.rhs else op.arith.lhs;
+                if (uses[@intFromEnum(later)] != 1) continue;
+                try out.at.put(allocator, later, .{ .dst = result, .accum = earlier });
+                try out.combined.put(allocator, result, {});
+            }
+            pos += 1;
+        }
+    }
+}
+
 /// Give every hoisted constant a register above all the registers `assignLocs` handed out,
 /// and step over the few the shader writes through another path.
 ///
@@ -2439,9 +2586,19 @@ fn commitHoists(allocator: std.mem.Allocator, cands: []const HoistCand, out: *Fm
 /// constant MULTIPLIER in the hoisted register and its constant addend in the instruction.
 /// IMAD has no immediate addend, so an integer holds its constant ADDEND in the register
 /// and its constant multiplier in the instruction (form 4).
-fn fmaInst(loc: std.AutoHashMapUnmanaged(Value, Loc), fold: *const FmaFold, rd: u8, m: Fma) Error!Inst {
-    const ra = gprOf(loc, m.mul_a);
+fn fmaInst(loc: std.AutoHashMapUnmanaged(Value, Loc), fold: *const FmaFold, uniform: *const UniformParams, rd: u8, m: Fma) Error!Inst {
     if (m.mul_b) |b| {
+        if (!m.is_float) {
+            if (uniform.regOf(b)) |ub| {
+                const rc = if (m.addend) |v| gprOf(loc, v) else fold.hoistRegOf(m.addend_imm) orelse return error.Unsupported;
+                return encode.imadUreg(rd, gprOf(loc, m.mul_a), ub, rc, .{});
+            }
+            if (uniform.regOf(m.mul_a)) |ua| {
+                const rc = if (m.addend) |v| gprOf(loc, v) else fold.hoistRegOf(m.addend_imm) orelse return error.Unsupported;
+                return encode.imadUreg(rd, gprOf(loc, b), ua, rc, .{});
+            }
+        }
+        const ra = gprOf(loc, m.mul_a);
         const rb = gprOf(loc, b);
         if (m.addend) |v| {
             const rc = gprOf(loc, v);
@@ -2454,6 +2611,7 @@ fn fmaInst(loc: std.AutoHashMapUnmanaged(Value, Loc), fold: *const FmaFold, rd: 
         const rc = fold.hoistRegOf(m.addend_imm) orelse return error.Unsupported;
         return encode.imad(rd, ra, rb, rc, .{});
     }
+    const ra = gprOf(loc, m.mul_a);
     if (m.addend) |v| {
         // A constant multiplier with a register addend: form 4 keeps the multiplier in
         // the immediate field and the addend register at bits 64..71, for both types.
@@ -3563,7 +3721,7 @@ fn emitCubeAtlasUv(allocator: std.mem.Allocator, code: *std.ArrayList(Inst), loc
     try code.append(allocator, encode.ffma(call.coord + 1, s + 3, s + 1, s + 1, .{})); // v
 }
 
-fn lowerInst(allocator: std.mem.Allocator, func: *const Function, loc: *std.AutoHashMapUnmanaged(Value, Loc), code: *std.ArrayList(Inst), tex: *const TexLowering, deriv: *const DerivLowering, math: *const MathLowering, shared: *const gpu.abi.SharedFrame, disp: *const DispFold, fma: *const FmaFold, inst: ir.function.Inst) Error!void {
+fn lowerInst(allocator: std.mem.Allocator, func: *const Function, loc: *std.AutoHashMapUnmanaged(Value, Loc), code: *std.ArrayList(Inst), tex: *const TexLowering, deriv: *const DerivLowering, math: *const MathLowering, shared: *const gpu.abi.SharedFrame, disp: *const DispFold, fma: *const FmaFold, pred_fold: *const PredicateFold, uniform: *const UniformParams, inst: ir.function.Inst) Error!void {
     switch (func.opcode(inst)) {
         .iconst => |c| {
             // A graphics output-attribute store pointer is a tag-carrier
@@ -3581,6 +3739,7 @@ fn lowerInst(allocator: std.mem.Allocator, func: *const Function, loc: *std.Auto
         },
         .arith => |a| {
             const result = func.instResult(inst).?;
+            if (pred_fold.combined.contains(result)) return;
             // A texture-result element pointer (`tex_alloca + c*4`) is a tag
             // carrier: the reload load resolves straight to a TEX result
             // register, so the address arithmetic is never emitted.
@@ -3593,7 +3752,7 @@ fn lowerInst(allocator: std.mem.Allocator, func: *const Function, loc: *std.Auto
             // FFMA or IMAD that multiplies and adds together. See `FmaFold`.
             if (fma.isFolded(result)) return;
             if (fma.at.get(result)) |m| {
-                try code.append(allocator, try fmaInst(loc.*, fma, gprOf(loc.*, result), m));
+                try code.append(allocator, try fmaInst(loc.*, fma, uniform, gprOf(loc.*, result), m));
                 return;
             }
             if (isWidePtr(func, result) and a.op == .add) {
@@ -3628,6 +3787,10 @@ fn lowerInst(allocator: std.mem.Allocator, func: *const Function, loc: *std.Auto
                 const pa = predOf(loc.*, a.lhs);
                 const pb = predOf(loc.*, a.rhs);
                 try code.append(allocator, encode.plop3(pd, pa, pb, try lutOf(a.op), .{}));
+            } else if (if (a.op == .mul) uniform.regOf(a.rhs) else null) |ur| {
+                try code.append(allocator, encode.imadUreg(gprOf(loc.*, result), gprOf(loc.*, a.lhs), ur, encode.RZ, .{}));
+            } else if (if (a.op == .mul) uniform.regOf(a.lhs) else null) |ur| {
+                try code.append(allocator, encode.imadUreg(gprOf(loc.*, result), gprOf(loc.*, a.rhs), ur, encode.RZ, .{}));
             } else if (a.op == .div and isFloat(func, a.lhs)) {
                 // Float divide a/b = a * (1/b): the GPU has no FDIV, so
                 // reciprocate b on the multifunction unit (MUFU.RCP), then
@@ -3806,7 +3969,7 @@ fn lowerInst(allocator: std.mem.Allocator, func: *const Function, loc: *std.Auto
             // the mixed `a * b + k2`. One instruction here either way. See `collectHoist`
             // and `contractMixed`.
             if (fma.at.get(result)) |m| {
-                try code.append(allocator, try fmaInst(loc.*, fma, gprOf(loc.*, result), m));
+                try code.append(allocator, try fmaInst(loc.*, fma, uniform, gprOf(loc.*, result), m));
                 return;
             }
             // Logical NOT lowers to `bool ^ -1` (bit_xor against all-ones).
@@ -3850,7 +4013,9 @@ fn lowerInst(allocator: std.mem.Allocator, func: *const Function, loc: *std.Auto
             }
         },
         .icmp => |cmp| {
-            const pd = predOf(loc.*, func.instResult(inst).?);
+            const result = func.instResult(inst).?;
+            const folded = pred_fold.at.get(result);
+            const pd = predOf(loc.*, if (folded) |f| f.dst else result);
             // A compare of float operands must read them as IEEE floats
             // (FSETP), not as integer bit patterns (ISETP). The shared
             // lowering emits `.icmp` for the GLSL float min, max, and clamp
@@ -3863,7 +4028,14 @@ fn lowerInst(allocator: std.mem.Allocator, func: *const Function, loc: *std.Auto
             if (isFloat(func, cmp.lhs)) {
                 try code.append(allocator, encode.fsetp(pd, gprOf(loc.*, cmp.lhs), gprOf(loc.*, cmp.rhs), cmpOf(cmp.op), .{}));
             } else {
-                try code.append(allocator, encode.isetp(pd, gprOf(loc.*, cmp.lhs), gprOf(loc.*, cmp.rhs), cmpOf(cmp.op), isSigned(func, cmp.lhs), .{}));
+                const accum = if (folded) |f| predOf(loc.*, f.accum) else encode.PT;
+                if (uniform.regOf(cmp.rhs)) |ur| {
+                    try code.append(allocator, encode.isetpUregAnd(pd, gprOf(loc.*, cmp.lhs), ur, cmpOf(cmp.op), isSigned(func, cmp.lhs), accum, .{}));
+                } else if (uniform.regOf(cmp.lhs)) |ur| {
+                    try code.append(allocator, encode.isetpUregAnd(pd, gprOf(loc.*, cmp.rhs), ur, reverseCmp(cmpOf(cmp.op)), isSigned(func, cmp.lhs), accum, .{}));
+                } else {
+                    try code.append(allocator, encode.isetpAnd(pd, gprOf(loc.*, cmp.lhs), gprOf(loc.*, cmp.rhs), cmpOf(cmp.op), isSigned(func, cmp.lhs), accum, .{}));
+                }
             }
         },
         .select => |s| {
@@ -4237,6 +4409,17 @@ fn cmpOf(op: ir.function.CmpOp) encode.Cmp {
         .le => .le,
         .gt => .gt,
         .ge => .ge,
+    };
+}
+
+fn reverseCmp(cmp: encode.Cmp) encode.Cmp {
+    return switch (cmp) {
+        .lt => .gt,
+        .le => .ge,
+        .gt => .lt,
+        .ge => .le,
+        .eq => .eq,
+        .ne => .ne,
     };
 }
 
@@ -6077,6 +6260,76 @@ test "a boolean-valued && (bit_and of two bool compares) lowers to PLOP3, not a 
         if (kernel.code[i] & 0xfff == 0x81c) saw_plop3 = true; // PLOP3 warp form
     }
     try testing.expect(saw_plop3);
+}
+
+test "a single-use integer comparison AND folds into ISETP accumulator input" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const ptr_t = try func.types.ptrGlobal();
+    const b = try func.appendBlock();
+    const a = try func.appendBlockParam(b, i32_t);
+    const lo = try func.appendBlockParam(b, i32_t);
+    const hi = try func.appendBlockParam(b, i32_t);
+    const outp = try func.appendBlockParam(b, ptr_t);
+    const above = try func.appendInst(b, bool_t, .{ .icmp = .{ .op = .gt, .lhs = a, .rhs = lo } });
+    const below = try func.appendInst(b, bool_t, .{ .icmp = .{ .op = .lt, .lhs = a, .rhs = hi } });
+    const inside = try func.appendInst(b, bool_t, .{ .arith = .{ .op = .bit_and, .lhs = above, .rhs = below } });
+    const picked = try func.appendInst(b, i32_t, .{ .select = .{ .cond = inside, .then = a, .@"else" = lo } });
+    try func.appendStore(b, picked, outp);
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
+
+    var kernel = try compileKernel(allocator, &func, nvidia_abi);
+    defer kernel.deinit(allocator);
+    var isetp_count: usize = 0;
+    var saw_accum = false;
+    var saw_plop3 = false;
+    var i: usize = 0;
+    while (i < kernel.code.len) : (i += 4) {
+        if (kernel.code[i] & 0xfff == 0x20c) {
+            isetp_count += 1;
+            if ((kernel.code[i + 2] >> (87 - 64)) & 0x7 != encode.PT) saw_accum = true;
+        }
+        if (kernel.code[i] & 0xfff == 0x81c) saw_plop3 = true;
+    }
+    try testing.expectEqual(@as(usize, 2), isetp_count);
+    try testing.expect(saw_accum);
+    try testing.expect(!saw_plop3);
+}
+
+test "a repeatedly used compute integer parameter stays in a uniform register" {
+    const allocator = testing.allocator;
+    var func = Function.init(allocator);
+    defer func.deinit();
+    const i32_t = try func.types.intern(.{ .int = .{ .signedness = .signed, .bits = 32 } });
+    const bool_t = try func.types.intern(.bool);
+    const ptr_t = try func.types.ptrGlobal();
+    const b = try func.appendBlock();
+    const n = try func.appendBlockParam(b, i32_t);
+    const x = try func.appendBlockParam(b, i32_t);
+    const outp = try func.appendBlockParam(b, ptr_t);
+    const product = try func.appendInst(b, i32_t, .{ .arith = .{ .op = .mul, .lhs = x, .rhs = n } });
+    const square = try func.appendInst(b, i32_t, .{ .arith = .{ .op = .mul, .lhs = product, .rhs = n } });
+    const below = try func.appendInst(b, bool_t, .{ .icmp = .{ .op = .lt, .lhs = square, .rhs = n } });
+    const picked = try func.appendInst(b, i32_t, .{ .select = .{ .cond = below, .then = square, .@"else" = product } });
+    try func.appendStore(b, picked, outp);
+    func.setTerminator(b, .{ .ret = ir.function.Ret.none() });
+
+    var kernel = try compileKernel(allocator, &func, nvidia_abi);
+    defer kernel.deinit(allocator);
+    var ldcu_count: usize = 0;
+    var mixed_count: usize = 0;
+    var i: usize = 0;
+    while (i < kernel.code.len) : (i += 4) {
+        const opcode = kernel.code[i] & 0xfff;
+        if (opcode == 0x7ac) ldcu_count += 1;
+        if ((opcode & 0x1ff == 0x024 or opcode & 0x1ff == 0x00c) and (opcode >> 9) & 0x7 == 6)
+            mixed_count += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), ldcu_count);
+    try testing.expectEqual(@as(usize, 3), mixed_count);
 }
 
 test "a boolean-valued NOT (bit_xor bool, -1) lowers to PLOP3 (predicate negation)" {
